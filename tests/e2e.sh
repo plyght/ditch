@@ -258,5 +258,82 @@ if "$DITCH" "${COMMON[@]}" --study-checkpoint-dir "$TMP/warm3_checkpoints" \
     fail "warm start from a different architecture was accepted"
 fi
 
+echo "==> Memory budget: streamed qwen2 run (60KB, no headroom), save, validate and evaluate"
+# The fixture holds 64,256 bytes of weights over 3 layers (largest layer ~15KB),
+# so a 60KB budget is below the whole model and above one layer. The automatic
+# headroom would take at least half of such a tiny budget; --budget-headroom 0
+# hands all of it to the model. --threads pins the per-thread kernel scratch.
+BUDGET=(--max-ram 60KB --budget-headroom 0 --threads 4 --scratch-dir "$TMP/scratch")
+"$DITCH" "${COMMON[@]}" "${BUDGET[@]}" --study-checkpoint-dir "$TMP/budget_checkpoints" \
+    --n-trials 2 --n-startup-trials 2 --print-debug-information \
+    --checkpoint-action restart --trial-index 1 --model-action save --save-directory "$TMP/budget_out" \
+    | tee "$TMP/budget.log"
+grep -q "^Memory budget: 60.0KB (headroom 0B" "$TMP/budget.log" || fail "memory budget not announced"
+grep -q "Weights: streamed layer by layer" "$TMP/budget.log" || fail "budgeted run did not stream the weights"
+grep -q "^Memory estimate:" "$TMP/budget.log" || fail "feasibility estimate not printed"
+grep -q "streamed mode: min" "$TMP/budget.log" || fail "estimate lacks the streamed-mode minimum"
+grep -q "Running trial 2 of 2" "$TMP/budget.log" || fail "budgeted trials did not run"
+[ "$(grep -c "^Memory: budget 60.0KB" "$TMP/budget.log")" -ge 3 ] || fail "memory reports missing (per trial and at exit)"
+grep -q "Model saved to" "$TMP/budget.log" || fail "budgeted model was not saved"
+grep -q "argmax agreement 100%" "$TMP/budget.log" || fail "export validation did not agree with the in-memory model"
+[ -f "$TMP/budget_out/model.safetensors" ] || fail "budgeted export lacks model.safetensors"
+[ ! -e "$TMP/budget_out/.incomplete" ] || fail "finished export still carries the .incomplete marker"
+"$DITCH" "${COMMON[@]}" "${BUDGET[@]}" --evaluate-model "$TMP/budget_out" | tee "$TMP/budget_eval.log"
+grep -q "  \* KL divergence: [0-9.]*" "$TMP/budget_eval.log" || fail "no KL divergence printed for the budgeted evaluation"
+kl=$(grep "  \* KL divergence:" "$TMP/budget_eval.log" | tail -1 | awk '{print $4}')
+awk -v kl="$kl" 'BEGIN { exit !(kl < 1.0) }' || fail "KL divergence of the budgeted export is implausible: $kl"
+grep -q "^Memory: budget 60.0KB" "$TMP/budget_eval.log" || fail "evaluation did not print the memory report"
+
+echo "==> Memory budget too small is refused with an explanation"
+if "$DITCH" "${COMMON[@]}" --max-ram 1KB --threads 4 --study-checkpoint-dir "$TMP/tiny_checkpoints" \
+    --checkpoint-action restart --model-action exit > "$TMP/tiny.log" 2>&1; then
+    fail "a 1KB budget was accepted"
+fi
+grep -q "^Memory budget too small" "$TMP/tiny.log" || fail "budget refusal not explained"
+grep -q "does not fit" "$TMP/tiny.log" || fail "budget refusal does not say what does not fit"
+
+echo "==> Time limit stops cleanly (exit 0) and leaves a resumable checkpoint"
+# 500 trials cannot finish in 5 s; the run must stop with the notice, exit 0
+# (the pipeline below would abort otherwise) and journal the completed trials.
+"$DITCH" "${COMMON[@]}" "${BUDGET[@]}" --study-checkpoint-dir "$TMP/time_checkpoints" \
+    --time-limit 5s --n-trials 500 --n-startup-trials 2 --response-prefix "" \
+    --checkpoint-action restart --trial-index 1 --model-action exit \
+    | tee "$TMP/time.log"
+grep -q "^Time limit: 5.0s" "$TMP/time.log" || fail "time limit not announced"
+grep -q "^Time limit reached (.* elapsed of 5.0s)" "$TMP/time.log" || fail "time limit notice missing"
+grep -q "checkpoint-action continue to resume" "$TMP/time.log" || fail "time limit notice lacks the resume hint"
+if grep -q "Optimization finished" "$TMP/time.log"; then fail "optimisation claimed to finish under the time limit"; fi
+TIME_CKPT="$TMP/time_checkpoints/tests--fixtures--qwen2.jsonl"
+[ -f "$TIME_CKPT" ] || fail "time-limited run left no checkpoint"
+if grep -q '"type":"finished"' "$TIME_CKPT"; then fail "time-limited study marked finished"; fi
+"$DITCH" "${COMMON[@]}" "${BUDGET[@]}" --study-checkpoint-dir "$TMP/time_checkpoints" \
+    --n-trials 1 --n-startup-trials 1 --response-prefix "" \
+    --checkpoint-action continue --trial-index 1 --model-action exit \
+    | tee "$TMP/time_resume.log"
+grep -q "Optimization finished" "$TMP/time_resume.log" || fail "time-limited study could not be resumed"
+grep -q '"type":"finished"' "$TIME_CKPT" || fail "resumed study not marked finished"
+
+echo "==> Memory budget: streamed MoE runs (separate and transposed fused experts)"
+MOE_BUDGET=(--max-ram 96KB --budget-headroom 0 --threads 4 --scratch-dir "$TMP/scratch")
+"$DITCH" "${MOE_COMMON[@]}" "${MOE_BUDGET[@]}" --study-checkpoint-dir "$TMP/moe_budget_checkpoints" \
+    --n-trials 2 --n-startup-trials 2 \
+    --checkpoint-action restart --trial-index 1 --model-action save --save-directory "$TMP/moe_budget_out" \
+    | tee "$TMP/moe_budget.log"
+grep -q "Weights: streamed layer by layer" "$TMP/moe_budget.log" || fail "budgeted MoE run did not stream the weights"
+grep -q "experts.n_selected" "$TMP/moe_budget.log" || fail "budgeted MoE run lost expert selection"
+grep -q "argmax agreement 100%" "$TMP/moe_budget.log" || fail "streamed MoE export validation disagreed"
+[ ! -e "$TMP/moe_budget_out/.incomplete" ] || fail "MoE export still carries the .incomplete marker"
+"$DITCH" "${MOE_COMMON[@]}" --evaluate-model "$TMP/moe_budget_out" | tee "$TMP/moe_budget_eval.log"
+kl=$(grep "  \* KL divergence:" "$TMP/moe_budget_eval.log" | tail -1 | awk '{print $4}')
+awk -v kl="$kl" 'BEGIN { exit !(kl < 1.0) }' || fail "KL divergence of the streamed MoE export is implausible: $kl"
+MOE_T=("${COMMON[@]}")
+MOE_T[0]=tests/fixtures/qwen3_moe_fused_t
+"$DITCH" "${MOE_T[@]}" "${MOE_BUDGET[@]}" --study-checkpoint-dir "$TMP/moe_t_checkpoints" \
+    --n-trials 1 --n-startup-trials 1 \
+    --checkpoint-action restart --trial-index 1 --model-action save --save-directory "$TMP/moe_t_out" \
+    | tee "$TMP/moe_t.log"
+grep -q "argmax agreement 100%" "$TMP/moe_t.log" || fail "streamed transposed-fused MoE export validation disagreed"
+[ -f "$TMP/moe_t_out/model.safetensors" ] || fail "transposed-fused MoE export missing"
+
 echo
 echo "e2e: all checks passed"
