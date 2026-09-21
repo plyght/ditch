@@ -32,4 +32,12 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+
+    // End-to-end test: builds ditch in ReleaseFast itself and runs the whole
+    // pipeline on a synthetic fixture model.
+    const e2e = b.addSystemCommand(&.{ "bash", "tests/e2e.sh" });
+    e2e.setEnvironmentVariable("ZIG", b.graph.zig_exe);
+    e2e.setCwd(b.path("."));
+    const e2e_step = b.step("e2e", "Run the end-to-end pipeline test (bash tests/e2e.sh)");
+    e2e_step.dependOn(&e2e.step);
 }

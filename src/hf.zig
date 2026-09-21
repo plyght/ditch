@@ -131,7 +131,7 @@ pub const Http = struct {
                 return error.SizeMismatch;
             }
         }
-        try dir.rename(self.io, tmp_name, dir, sub_path);
+        try dir.rename(tmp_name, dir, sub_path, self.io);
     }
 
     fn downloadNative(self: *Http, dir: Io.Dir, sub_path: []const u8, url: []const u8) !void {
