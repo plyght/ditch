@@ -288,7 +288,7 @@ pub const ExpertCache = struct {
         errdefer store.releaseSet(e.leases[0..n]);
         if (ex.sharesGateUpBlock()) {
             // Fused, transposed layout: gate and up come out of one block read.
-            try store.acquireTransposed(ex.gate_ref.ref, &.{ ex.gate_ref.transposed.?, ex.up_ref.transposed.? }, e.leases[0..2]);
+            try store.acquireColumns(ex.gate_ref.ref, &.{ ex.gate_ref.columns(), ex.up_ref.columns() }, e.leases[0..2]);
             n = 2;
         } else {
             e.leases[0] = try ex.gate_ref.acquire(store);

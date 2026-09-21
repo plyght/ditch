@@ -528,12 +528,7 @@ pub const Estimate = struct {
 };
 
 fn workspaceBytes(c: *const model_mod.Config, rows: usize, logit_rows: usize) u64 {
-    const hidden: u64 = c.hidden_size;
-    const qd: u64 = c.num_heads * c.head_dim;
-    const kvd: u64 = c.num_kv_heads * c.head_dim;
-    const inter: u64 = c.intermediate_size;
-    const per_row = 2 * hidden + qd + 2 * kvd + qd + hidden + 2 * inter;
-    return (@as(u64, rows) * per_row + @as(u64, logit_rows) * c.vocab_size) * 4;
+    return @as(u64, rows) * model_mod.Workspace.bytesPerRow(c) + @as(u64, logit_rows) * c.vocab_size * 4;
 }
 
 /// Computes the estimate from the model's tensor index (works before any weight is read).
@@ -554,7 +549,7 @@ pub fn estimate(model: *const model_mod.Model, p: EstimateParams) Estimate {
                 largest_name = info.name;
             }
             max_cols = @max(max_cols, info.cols());
-            if (model_mod.layerIndexOf(model.prefix, info.name)) |li| {
+            if (model.layerIndex(info.name)) |li| {
                 if (li < layer_bytes.len) layer_bytes[li] += info.byte_len;
             }
         }

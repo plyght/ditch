@@ -1,0 +1,20 @@
+{
+ "model_type": "chatglm",
+ "hidden_size": 32,
+ "ffn_hidden_size": 32,
+ "num_layers": 2,
+ "num_attention_heads": 4,
+ "multi_query_attention": true,
+ "multi_query_group_num": 2,
+ "kv_channels": 8,
+ "layernorm_epsilon": 1e-06,
+ "rmsnorm": true,
+ "add_qkv_bias": true,
+ "add_bias_linear": false,
+ "rope_ratio": 2.0,
+ "seq_length": 128,
+ "apply_residual_connection_post_layernorm": false,
+ "post_layer_norm": true,
+ "tie_word_embeddings": false,
+ "padded_vocab_size": 374
+}

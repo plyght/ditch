@@ -1,0 +1,19 @@
+{
+ "model_type": "mpt",
+ "d_model": 32,
+ "n_heads": 4,
+ "n_layers": 2,
+ "expansion_ratio": 2,
+ "max_seq_len": 128,
+ "no_bias": true,
+ "attn_config": {
+  "alibi": true,
+  "alibi_bias_max": 8,
+  "clip_qkv": null,
+  "qk_ln": false,
+  "kv_n_heads": 4
+ },
+ "layer_norm_epsilon": 1e-05,
+ "vocab_size": 275,
+ "tie_word_embeddings": true
+}

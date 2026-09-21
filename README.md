@@ -68,10 +68,45 @@ Useful flags (all also settable in `config.lua`; see `ditch --help`):
 
 ### Supported models
 
-Dense: Llama 2/3, Mistral, Qwen2/2.5, Qwen3, Gemma 2/3 (text). Mixture of
-experts: Qwen3-MoE, Qwen2-MoE, Mixtral, in separate and fused expert
-layouts. Weights are read from safetensors (F32/F16/BF16) or GGUF. Every
-family is verified against a reference implementation in the test suite.
+Families are described by an architecture registry (`src/arch.zig`, one
+entry per Hugging Face `model_type`); every entry below is verified against
+a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
+
+* Llama 2/3 layout: `llama` (Yi, SOLAR, TinyLlama, SmolLM 1/2), `mistral`,
+  `mistral3` text, `smollm3`, `granite`, `minicpm`, `baichuan` (7B, RoPE),
+  `exaone`, `exaone4`, `internlm2`, `olmo`, `olmo2`, `cohere` (Command R),
+  `stablelm`, `starcoder2`, `nemotron`
+* Qwen: `qwen2` / `qwen2.5` (also the `qwen2_vl` / `qwen2_5_vl` text configs),
+  `qwen3` (also `qwen3_vl` text), `qwen2_moe`, `qwen3_moe`
+* Gemma 2 / Gemma 3 (text), GLM-4 (`glm4`, `glm`) and ChatGLM3 / GLM-4-9B
+  (`chatglm`), Phi-1/1.5/2 (`phi`), Phi-3 / 3.5 / 4 (`phi3`)
+* GPT-2, GPT-NeoX / Pythia, GPT-BigCode (StarCoder 1), Falcon (7B layout),
+  BLOOM, OPT, MPT
+* Mixture of experts: Mixtral, Qwen2/3-MoE (separate and fused expert
+  layouts), DeepSeek V2 / V3 (MLA, group-limited and sigmoid routing, shared
+  experts), Llama 4 text (top-1 routing, NoPE layers), gpt-oss (attention
+  sinks, interleaved fused experts; BF16 checkpoints only, MXFP4 must be
+  dequantised first)
+
+Implemented from the Hugging Face reference but without a fixture: Falcon
+40B/180B (grouped qkv, `ln_attn`/`ln_mlp`) and Falcon ALiBi, Baichuan 13B
+(ALiBi), Command R7B (`cohere2`), StableLM 2 12B (parallel residual, qk
+LayerNorm), Gemma 2 logit softcapping, `dynamic` and `longrope` scaling
+beyond the original context (treated as static / short factors).
+
+Not supported: state-space and hybrid models (Mamba, Jamba, Falcon-H1,
+Nemotron-H, RWKV), encoder-decoder models, Gemma 3n (per-layer inputs),
+MiniCPM3, GraniteMoE, OPT-350m (projection layers), FP8 checkpoints, and
+tokenizers without a `tokenizer.json` (SentencePiece-only Baichuan). Unicode
+normalisers (NFKC, Precompiled) are approximated by the identity.
+
+Weights are read from safetensors (F32/F16/BF16) or GGUF (llama, Mistral,
+Mixtral, Qwen2/3, Qwen MoE and Gemma 2/3 families; the registry carries the
+llama.cpp architecture name of every family for the GGUF writer).
+Abliteration edits each family's attention output projection and MLP down
+projection (per expert on MoE layers) and exports preserve every tensor
+name and layout, including GPT-2's Conv1D transposes and fused expert
+tensors.
 
 ### Datasets
 

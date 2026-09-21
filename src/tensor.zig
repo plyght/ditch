@@ -510,15 +510,45 @@ pub const Activation = enum {
     silu,
     gelu_tanh,
     gelu,
+    relu,
+    /// `relu(x)²` (Nemotron).
+    relu2,
+    /// `x · sigmoid(1.702 x)`.
+    quick_gelu,
 
     pub fn apply(self: Activation, x: f32) f32 {
         return switch (self) {
             .silu => silu(x),
             .gelu_tanh => geluTanh(x),
             .gelu => geluErf(x),
+            .relu => @max(x, 0),
+            .relu2 => blk: {
+                const r = @max(x, 0);
+                break :blk r * r;
+            },
+            .quick_gelu => x / (1.0 + @exp(-1.702 * x)),
         };
     }
 };
+
+/// LayerNorm over `x` with optional bias; `one_plus` scales by `(1 + w)`
+/// (Nemotron). An empty `weight` means the non-parametric form (OLMo).
+pub fn layernorm(out: []f32, x: []const f32, weight: []const f32, bias: ?[]const f32, eps: f32, one_plus: bool) void {
+    const n: f32 = @floatFromInt(x.len);
+    var mean: f32 = 0;
+    for (x) |v| mean += v;
+    mean /= n;
+    var variance: f32 = 0;
+    for (x) |v| variance += (v - mean) * (v - mean);
+    variance /= n;
+    const inv = 1.0 / @sqrt(variance + eps);
+    for (out, 0..) |*o, i| {
+        var y = (x[i] - mean) * inv;
+        if (weight.len > 0) y *= if (one_plus) 1.0 + weight[i] else weight[i];
+        if (bias) |b| y += b[i];
+        o.* = y;
+    }
+}
 
 /// Applies rotary position embeddings (HF "rotate_half" convention) to a
 /// single head vector `x` of length `head_dim` at position `pos`.
@@ -530,6 +560,18 @@ pub fn applyRope(x: []f32, cos_row: []const f32, sin_row: []const f32) void {
         const x2 = x[i + half];
         x[i] = x1 * cos_row[i] - x2 * sin_row[i];
         x[i + half] = x2 * cos_row[i] + x1 * sin_row[i];
+    }
+}
+
+/// Rotary embeddings over interleaved pairs `(x[2i], x[2i+1])` (GPT-J style).
+pub fn applyRopeInterleaved(x: []f32, cos_row: []const f32, sin_row: []const f32) void {
+    const half = x.len / 2;
+    var i: usize = 0;
+    while (i < half) : (i += 1) {
+        const x1 = x[2 * i];
+        const x2 = x[2 * i + 1];
+        x[2 * i] = x1 * cos_row[i] - x2 * sin_row[i];
+        x[2 * i + 1] = x2 * cos_row[i] + x1 * sin_row[i];
     }
 }
 

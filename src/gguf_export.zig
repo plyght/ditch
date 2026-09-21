@@ -142,9 +142,8 @@ const Planner = struct {
     fn plan(self: *Planner) !void {
         const model = self.model;
         const c = &model.config;
-        const family = c.family;
-        const gemma = gguf_model.isGemma(family);
-        const permute = gguf_model.permutesQk(family);
+        const gemma = gguf_model.isGemma(c.arch);
+        const permute = gguf_model.permutesQk(c.arch);
         const p = model.prefix;
 
         try self.addMatrix("token_embd.weight", model.embed_ref.name, null, null, true);
@@ -255,7 +254,7 @@ fn ropeFactors(a: Allocator, c: *const model_mod.Config) ?[]const f32 {
 
 fn addArchKeys(w: *gguf.Writer, a: Allocator, model: *const Model, file_type: u32) !void {
     const c = &model.config;
-    const arch = gguf_model.archName(c.family);
+    const arch = gguf_model.archName(c.arch);
     const K = struct {
         a: Allocator,
         arch: []const u8,
@@ -289,9 +288,9 @@ fn addArchKeys(w: *gguf.Writer, a: Allocator, model: *const Model, file_type: u3
     }
     if (c.attn_logit_softcapping) |v| try w.addF32(try k.key("attn_logit_softcapping"), v);
     if (c.final_logit_softcapping) |v| try w.addF32(try k.key("final_logit_softcapping"), v);
-    if (gguf_model.isGemma(c.family)) {
+    if (gguf_model.isGemma(c.arch)) {
         if (c.sliding_window) |sw| try w.addU32(try k.key("attention.sliding_window"), @intCast(sw));
-        if (c.family == .gemma3) {
+        if (std.mem.eql(u8, c.arch.model_type, "gemma3")) {
             // Pattern of sliding layers (every n-th layer is global).
             var pattern: usize = 0;
             for (c.sliding_layers, 0..) |s, i| if (!s) {
@@ -321,18 +320,8 @@ fn isByteToken(s: []const u8) bool {
 
 fn addVocab(w: *gguf.Writer, a: Allocator, model: *const Model) !void {
     const tok = model.tokenizer;
-    const byte_level = switch (tok.pre) {
-        .byte_level_regex, .byte_level_plain => true,
-        else => false,
-    };
-    const pre: []const u8 = switch (tok.pre) {
-        .byte_level_regex => |kind| switch (kind) {
-            .qwen2 => "qwen2",
-            .llama3 => "llama-bpe",
-            .gpt2 => "gpt-2",
-        },
-        else => "default",
-    };
+    const byte_level = tok.byte_level;
+    const pre: []const u8 = tok.ggmlPreName() orelse "default";
     try w.addString("tokenizer.ggml.model", if (byte_level) "gpt2" else "llama");
     try w.addString("tokenizer.ggml.pre", pre);
 
@@ -558,6 +547,10 @@ fn saveInner(gpa: Allocator, io: Io, model: *const Model, dir: Io.Dir, opts: Opt
             std.log.err("ditch cannot quantise to {s}; use f16, bf16, f32, q8_0, q4_0, q4_1, q5_0 or q5_1", .{d.safetensorsName()});
             return error.UnsupportedDType;
         }
+    }
+    if (!gguf_model.ggufSupported(model.config.arch)) {
+        std.log.err("GGUF export is not implemented for the {s} family (export in Hugging Face format instead)", .{model.config.arch.model_type});
+        return error.UnsupportedArchitecture;
     }
     var planner = Planner{ .a = a, .model = model, .opts = opts };
     try planner.plan();

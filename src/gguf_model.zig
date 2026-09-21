@@ -16,10 +16,10 @@ const tensor = @import("tensor.zig");
 const safetensors = @import("safetensors.zig");
 const model_mod = @import("model.zig");
 const Tokenizer = @import("tokenizer.zig").Tokenizer;
+const arch = @import("arch.zig");
 
 const Allocator = std.mem.Allocator;
 const Model = model_mod.Model;
-const Family = model_mod.Family;
 
 /// Metadata keys ditch adds to the files it writes (all optional on read).
 pub const key_hf_config = "ditch.hf.config_json";
@@ -44,7 +44,8 @@ pub const Source = struct {
     dir_path: []const u8,
     file_name: []const u8,
     arch: []const u8,
-    family: Family,
+    /// Registry entry of the family (see `archFromGguf`).
+    desc: *const arch.Arch,
     /// GGUF tensors without a Hugging Face counterpart (`rope_freqs.weight`, ...), copied verbatim on GGUF export.
     extra: []const gguf.TensorInfo,
     /// Sum of all tensor bytes in the file.
@@ -102,51 +103,41 @@ pub fn locate(io: Io, arena: Allocator, path: []const u8) !?[]const u8 {
 // Attaching to a model
 // ---------------------------------------------------------------------------
 
-fn familyFromArch(arch: []const u8, has_experts: bool) ?Family {
-    if (std.mem.eql(u8, arch, "llama")) return if (has_experts) .mixtral else .llama;
-    if (std.mem.eql(u8, arch, "qwen2")) return .qwen2;
-    if (std.mem.eql(u8, arch, "qwen3")) return .qwen3;
-    if (std.mem.eql(u8, arch, "gemma2")) return .gemma2;
-    if (std.mem.eql(u8, arch, "gemma3")) return .gemma3;
-    if (std.mem.eql(u8, arch, "qwen2moe")) return .qwen2_moe;
-    if (std.mem.eql(u8, arch, "qwen3moe")) return .qwen3_moe;
+/// The families whose tensors the GGUF reader and writer map (llama-style
+/// Hugging Face names; the registry's other families have no GGUF path).
+const gguf_families = [_][]const u8{ "llama", "mistral", "mixtral", "qwen2", "qwen3", "gemma2", "gemma3", "qwen2_moe", "qwen3_moe" };
+
+pub fn ggufSupported(a: *const arch.Arch) bool {
+    for (gguf_families) |f| if (std.mem.eql(u8, a.model_type, f)) return true;
+    return false;
+}
+
+/// The registry entry for a `general.architecture` name (`llama` with experts is Mixtral).
+fn archFromGguf(name: []const u8, has_experts: bool) ?*const arch.Arch {
+    if (std.mem.eql(u8, name, "llama")) return arch.lookup(if (has_experts) "mixtral" else "llama");
+    for (gguf_families) |f| {
+        const a = arch.lookup(f) orelse continue;
+        if (a.llama_cpp) |l| if (std.mem.eql(u8, l, name)) return a;
+    }
     return null;
 }
 
 /// llama.cpp architecture name of a family.
-pub fn archName(family: Family) []const u8 {
-    return switch (family) {
-        .llama, .mistral, .mixtral => "llama",
-        .qwen2 => "qwen2",
-        .qwen3 => "qwen3",
-        .gemma2 => "gemma2",
-        .gemma3 => "gemma3",
-        .qwen2_moe => "qwen2moe",
-        .qwen3_moe => "qwen3moe",
-    };
+pub fn archName(a: *const arch.Arch) []const u8 {
+    return a.llama_cpp orelse a.model_type;
 }
 
-fn modelTypeName(family: Family) []const u8 {
-    return switch (family) {
-        .llama => "llama",
-        .mistral => "mistral",
-        .mixtral => "mixtral",
-        .qwen2 => "qwen2",
-        .qwen3 => "qwen3",
-        .gemma2 => "gemma2",
-        .gemma3 => "gemma3_text",
-        .qwen2_moe => "qwen2_moe",
-        .qwen3_moe => "qwen3_moe",
-    };
+fn isType(a: *const arch.Arch, model_type: []const u8) bool {
+    return std.mem.eql(u8, a.model_type, model_type);
 }
 
 /// Whether llama.cpp permutes q/k for this family.
-pub fn permutesQk(family: Family) bool {
-    return family == .llama or family == .mistral or family == .mixtral;
+pub fn permutesQk(a: *const arch.Arch) bool {
+    return isType(a, "llama") or isType(a, "mistral") or isType(a, "mixtral");
 }
 
-pub fn isGemma(family: Family) bool {
-    return family == .gemma2 or family == .gemma3;
+pub fn isGemma(a: *const arch.Arch) bool {
+    return a.norm == .rms_gemma;
 }
 
 /// The per-frequency rope factors llama.cpp derives from a llama3 rope scaling
@@ -196,13 +187,13 @@ pub fn attach(model: *Model, gguf_path: []const u8, mapped: bool, opts: AttachOp
     const file = try gguf.File.openOptions(gpa, io, dir, file_name, .{ .map = false });
     errdefer file.close(gpa, io);
 
-    const arch = file.architecture() orelse {
+    const arch_name = file.architecture() orelse {
         std.log.err("{s}: general.architecture missing", .{gguf_path});
         return error.InvalidGguf;
     };
     const has_experts = (file.archInt("expert_count") orelse 0) > 0;
-    const family = familyFromArch(arch, has_experts) orelse {
-        std.log.err("unsupported GGUF architecture: {s}", .{arch});
+    const desc = archFromGguf(arch_name, has_experts) orelse {
+        std.log.err("unsupported GGUF architecture: {s}", .{arch_name});
         return error.UnsupportedArchitecture;
     };
     const src = try arena.create(Source);
@@ -210,8 +201,8 @@ pub fn attach(model: *Model, gguf_path: []const u8, mapped: bool, opts: AttachOp
         .file = file,
         .dir_path = try arena.dupe(u8, dir_path),
         .file_name = try arena.dupe(u8, file_name),
-        .arch = arch,
-        .family = family,
+        .arch = arch_name,
+        .desc = desc,
         .extra = &.{},
         .total_bytes = 0,
         .embedded_config = false,
@@ -224,7 +215,7 @@ pub fn attach(model: *Model, gguf_path: []const u8, mapped: bool, opts: AttachOp
         model.config_json = try arena.dupe(u8, file.getStr(key_hf_config).?);
         src.embedded_config = true;
     } else {
-        model.config_json = try buildConfigJson(arena, io, file, family);
+        model.config_json = try buildConfigJson(arena, io, file, desc);
     }
     model.config = try model_mod.parseConfig(arena, model.config_json);
     if (model.config.rope_scaling == .none) {
@@ -282,7 +273,7 @@ fn jsonStr(w: *Io.Writer, s: []const u8) !void {
     try std.json.Stringify.encodeJsonString(s, .{}, w);
 }
 
-fn buildConfigJson(a: Allocator, io: Io, f: *const gguf.File, family: Family) ![]const u8 {
+fn buildConfigJson(a: Allocator, io: Io, f: *const gguf.File, desc: *const arch.Arch) ![]const u8 {
     var out: Io.Writer.Allocating = .init(a);
     const w = &out.writer;
     const hidden = f.archInt("embedding_length") orelse return error.InvalidGguf;
@@ -297,11 +288,11 @@ fn buildConfigJson(a: Allocator, io: Io, f: *const gguf.File, family: Family) ![
     const theta = f.archFloat("rope.freq_base") orelse 10000.0;
     const ctx = f.archInt("context_length") orelse 4096;
     const tied = f.getTensor("output.weight") == null;
-    const gemma = isGemma(family);
+    const gemma = isGemma(desc);
 
     try w.writeAll("{");
     try w.writeAll("\"model_type\":");
-    try jsonStr(w, modelTypeName(family));
+    try jsonStr(w, desc.model_type);
     try w.print(",\"hidden_size\":{d},\"intermediate_size\":{d},\"num_hidden_layers\":{d},\"num_attention_heads\":{d},\"num_key_value_heads\":{d},\"head_dim\":{d},\"vocab_size\":{d}", .{ hidden, inter, layers, heads, kv_heads, head_dim, vocab });
     try w.print(",\"rms_norm_eps\":{d},\"rope_theta\":{d},\"max_position_embeddings\":{d},\"tie_word_embeddings\":{s}", .{ eps, theta, ctx, if (tied) "true" else "false" });
     try w.print(",\"hidden_act\":\"{s}\"", .{if (gemma) "gelu_pytorch_tanh" else "silu"});
@@ -338,24 +329,24 @@ fn buildConfigJson(a: Allocator, io: Io, f: *const gguf.File, family: Family) ![
     }
     if (f.archFloat("attn_logit_softcapping")) |v| try w.print(",\"attn_logit_softcapping\":{d}", .{v});
     if (f.archFloat("final_logit_softcapping")) |v| try w.print(",\"final_logit_softcapping\":{d}", .{v});
-    if (gemma or family == .mistral) {
+    if (gemma or isType(desc, "mistral")) {
         if (f.archInt("attention.sliding_window")) |sw| try w.print(",\"sliding_window\":{d}", .{sw});
     }
-    if (family == .gemma3) {
+    if (isType(desc, "gemma3")) {
         try w.print(",\"sliding_window_pattern\":{d}", .{f.archInt("attention.sliding_window_pattern") orelse 6});
         try w.print(",\"rope_local_base_freq\":{d}", .{f.archFloat("rope.freq_base_swa") orelse 10000.0});
     }
     if (gemma) {
         // llama.cpp derives the attention scale from the model size: the 27B
         // variants (46 / 62 blocks) use hidden / heads, every other one head_dim.
-        const is_27b = (family == .gemma2 and layers == 46) or (family == .gemma3 and layers == 62);
+        const is_27b = (isType(desc, "gemma2") and layers == 46) or (isType(desc, "gemma3") and layers == 62);
         try w.print(",\"query_pre_attn_scalar\":{d}", .{if (is_27b) @divTrunc(hidden, heads) else head_dim});
     }
     if (f.archInt("expert_count")) |n_exp| {
         if (n_exp > 0) {
             try w.print(",\"num_experts\":{d},\"num_experts_per_tok\":{d},\"moe_intermediate_size\":{d}", .{ n_exp, f.archInt("expert_used_count") orelse 2, f.archInt("expert_feed_forward_length") orelse inter });
             if (f.archInt("expert_shared_feed_forward_length")) |s| try w.print(",\"shared_expert_intermediate_size\":{d}", .{s});
-            try w.print(",\"norm_topk_prob\":{s}", .{if (family == .qwen3_moe or family == .mixtral) "true" else "false"});
+            try w.print(",\"norm_topk_prob\":{s}", .{if (isType(desc, "qwen3_moe") or isType(desc, "mixtral")) "true" else "false"});
             // Dense layers of a MoE model have no stacked expert tensors.
             try w.writeAll(",\"mlp_only_layers\":[");
             var first = true;
@@ -676,9 +667,9 @@ fn rawBytes(src: *const Source, weights: *const safetensors.File, io: Io, arena:
 
 fn mapTensors(src: *Source, weights: *safetensors.File, arena: Allocator, io: Io, config: *const model_mod.Config) !void {
     const f = src.file;
-    const family = src.family;
-    const gemma = isGemma(family);
-    const mixtral = family == .mixtral;
+    const desc = src.desc;
+    const gemma = isGemma(desc);
+    const mixtral = isType(desc, "mixtral");
     const mlp: []const u8 = if (mixtral) "block_sparse_moe." else "mlp.";
     var extra = std.ArrayList(gguf.TensorInfo).empty;
     var it = f.tensors.iterator();
@@ -732,10 +723,10 @@ fn mapTensors(src: *Source, weights: *safetensors.File, arena: Allocator, io: Io
             if (suffix == null) {
                 if (std.mem.eql(u8, tail, "attn_q.weight") or std.mem.eql(u8, tail, "attn_q.bias")) {
                     suffix = if (tail[tail.len - 1] == 't') "self_attn.q_proj.weight" else "self_attn.q_proj.bias";
-                    if (permutesQk(family)) permute_heads = config.num_heads;
+                    if (permutesQk(desc)) permute_heads = config.num_heads;
                 } else if (std.mem.eql(u8, tail, "attn_k.weight") or std.mem.eql(u8, tail, "attn_k.bias")) {
                     suffix = if (tail[tail.len - 1] == 't') "self_attn.k_proj.weight" else "self_attn.k_proj.bias";
-                    if (permutesQk(family)) permute_heads = config.num_kv_heads;
+                    if (permutesQk(desc)) permute_heads = config.num_kv_heads;
                 } else if (std.mem.eql(u8, tail, "ffn_norm.weight")) {
                     suffix = if (gemma) "pre_feedforward_layernorm.weight" else "post_attention_layernorm.weight";
                 } else if (std.mem.eql(u8, tail, "ffn_gate_inp.weight")) {

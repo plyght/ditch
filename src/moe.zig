@@ -2,10 +2,13 @@
 //! routed forward pass, per-expert abliteration deltas, expert ranking and
 //! expert-selective abliteration.
 //!
-//! Supported architectures: `qwen3_moe`, `qwen2_moe` (with shared expert)
-//! and `mixtral`. Every expert's down projection is exposed as a
-//! `tensor.Weight` view regardless of the on-disk layout, so the abliteration
-//! kernels address a target by (layer, expert index) only.
+//! Tensor names and routing rules come from the architecture registry
+//! (`arch.zig`): Qwen2/3-MoE, Mixtral, DeepSeek V2/V3 (sigmoid or softmax
+//! scoring, group-limited top-k, correction bias, shared experts), Llama 4
+//! (top-1 routing scaling the expert input) and gpt-oss (interleaved fused
+//! experts with biases, clamped swiglu). Every expert's down projection is
+//! exposed as a `tensor.Weight` view regardless of the on-disk layout, so the
+//! abliteration kernels address a target by (layer, expert index) only.
 //!
 //! Every expert matrix also carries a `MatrixRef` describing where it lives on
 //! disk (a whole tensor, a slice of a stacked expert tensor, or a transposed
@@ -25,6 +28,7 @@ const model_mod = @import("model.zig");
 const stream = @import("stream.zig");
 const abliterate = @import("abliterate.zig");
 const search = @import("search.zig");
+const arch = @import("arch.zig");
 const expert_cache = @import("expert_cache.zig");
 
 const Allocator = std.mem.Allocator;
@@ -39,11 +43,12 @@ pub const MatrixRef = struct {
     /// The on-disk block (`[rows][cols]`).
     ref: WeightRef,
     /// null: the block is the matrix. Otherwise the matrix is columns `[lo, hi)`
-    /// of the block, transposed (`[hi - lo][block rows]`).
+    /// of the block (every `stride`-th one), transposed (`[(hi - lo) / stride][block rows]`).
     transposed: ?[2]usize = null,
+    stride: usize = 1,
 
     pub fn rows(self: MatrixRef) usize {
-        return if (self.transposed) |t| t[1] - t[0] else self.ref.rows;
+        return if (self.transposed) |t| (t[1] - t[0] + self.stride - 1) / self.stride else self.ref.rows;
     }
 
     pub fn cols(self: MatrixRef) usize {
@@ -60,11 +65,16 @@ pub const MatrixRef = struct {
         return .{ .data = &.{}, .dtype = self.ref.dtype, .rows = self.rows(), .cols = self.cols() };
     }
 
+    pub fn columns(self: MatrixRef) stream.ColumnSpec {
+        const t = self.transposed.?;
+        return .{ .lo = t[0], .hi = t[1], .stride = self.stride };
+    }
+
     /// Makes the matrix resident (streamed mode); release with `store.release`.
     pub fn acquire(self: MatrixRef, store: *stream.WeightStore) !Lease {
-        const t = self.transposed orelse return store.acquire(self.ref);
+        if (self.transposed == null) return store.acquire(self.ref);
         var out: [1]Lease = undefined;
-        try store.acquireTransposed(self.ref, &.{t}, &out);
+        try store.acquireColumns(self.ref, &.{self.columns()}, &out);
         return out[0];
     }
 };
@@ -91,6 +101,10 @@ pub const Expert = struct {
     gate_ref: MatrixRef,
     up_ref: MatrixRef,
     down_ref: MatrixRef,
+    /// Projection biases (gpt-oss).
+    gate_bias: ?[]const f32 = null,
+    up_bias: ?[]const f32 = null,
+    down_bias: ?[]const f32 = null,
 
     /// Fused, transposed layout: gate and up are column ranges of one block
     /// and come out of a single read.
@@ -114,7 +128,8 @@ pub fn expertTransientBytes(ex: *const Expert) u64 {
     return t;
 }
 
-/// Always-active expert (qwen2_moe). Its output is scaled by `sigmoid(x · gate_vec)`.
+/// Always-active expert (Qwen2-MoE, DeepSeek, Llama 4). Its output is scaled
+/// by `sigmoid(x · gate_vec)` when a gate vector exists.
 pub const SharedExpert = struct {
     gate: Weight,
     up: Weight,
@@ -132,8 +147,13 @@ pub const MoeLayer = struct {
     /// Router `[E, hidden]`.
     router: Weight,
     router_ref: WeightRef,
+    router_bias: ?[]const f32,
+    /// Selection bias added to the scores when choosing experts (DeepSeek V3 `e_score_correction_bias`).
+    correction_bias: ?[]const f32,
     top_k: usize,
     norm_topk_prob: bool,
+    routing: arch.MoeConfig,
+    activation: tensor.Activation,
     /// Expert intermediate size.
     inter: usize,
     layout: Layout,
@@ -141,6 +161,8 @@ pub const MoeLayer = struct {
     shared: ?SharedExpert,
     /// Tensor-name suffix (after `layers.{i}.`) of the fused down tensor, for export.
     fused_down_suffix: ?[]const u8,
+    /// Name templates of the family (for export lookups).
+    names: *const arch.Names,
 
     /// Number of editable down projections: routed experts plus the shared expert.
     pub fn numDown(self: *const MoeLayer) usize {
@@ -243,18 +265,24 @@ pub const MoeLayer = struct {
         if (self.fused_down_suffix) |fd| {
             if (std.mem.eql(u8, suffix, fd)) return .fused_down;
         }
-        if (self.shared != null and std.mem.eql(u8, suffix, "mlp.shared_expert.down_proj.weight")) return .{ .expert = self.experts.len };
-        const prefixes = [_][]const u8{ "mlp.experts.", "block_sparse_moe.experts." };
-        for (prefixes) |p| {
-            if (!std.mem.startsWith(u8, suffix, p)) continue;
-            const rest = suffix[p.len..];
-            const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
-            const idx = std.fmt.parseInt(usize, rest[0..dot], 10) catch return null;
-            if (idx >= self.experts.len) return null;
-            const tail = rest[dot + 1 ..];
-            if (std.mem.eql(u8, tail, "down_proj.weight") or std.mem.eql(u8, tail, "w2.weight")) return .{ .expert = idx };
-            return null;
+        const names = self.names;
+        if (self.shared != null) {
+            if (names.shared_expert) |sp| {
+                if (std.mem.startsWith(u8, suffix, sp) and std.mem.eql(u8, suffix[sp.len..], names.expert_down)) return .{ .expert = self.experts.len };
+            }
         }
+        // `mlp.experts.{e}.` → prefix before `{e}` and the text after it.
+        const marker = std.mem.indexOf(u8, names.expert, "{e}") orelse return null;
+        const head = names.expert[0..marker];
+        const mid = names.expert[marker + 3 ..];
+        if (!std.mem.startsWith(u8, suffix, head)) return null;
+        const rest = suffix[head.len..];
+        const end = std.mem.indexOf(u8, rest, mid) orelse return null;
+        if (end == 0) return null;
+        const idx = std.fmt.parseInt(usize, rest[0..end], 10) catch return null;
+        if (idx >= self.experts.len) return null;
+        const tail = rest[end + mid.len ..];
+        if (std.mem.eql(u8, tail, names.expert_down)) return .{ .expert = idx };
         return null;
     }
 
@@ -364,7 +392,7 @@ pub fn acquireLayer(model: *const Model, m: *const MoeLayer) !MoeLease {
         experts[e] = ex;
         if (ex.sharesGateUpBlock()) {
             // Fused, transposed layout: gate and up share one block; read it once.
-            try store.acquireTransposed(ex.gate_ref.ref, &.{ ex.gate_ref.transposed.?, ex.up_ref.transposed.? }, all_leases[n..][0..2]);
+            try store.acquireColumns(ex.gate_ref.ref, &.{ ex.gate_ref.columns(), ex.up_ref.columns() }, all_leases[n..][0..2]);
             experts[e].gate = all_leases[n].weight;
             experts[e].up = all_leases[n + 1].weight;
             n += 2;
@@ -396,16 +424,17 @@ fn cat(arena: Allocator, parts: []const []const u8) ![]const u8 {
     return std.mem.concat(arena, u8, parts);
 }
 
-/// Copies the sub-block `src[rows][col_lo..col_hi]` (row-major, element size `es`)
-/// transposed into a new `[col_hi-col_lo][rows]` buffer.
-fn transposeSub(arena: Allocator, es: usize, src: []const u8, rows: usize, cols: usize, col_lo: usize, col_hi: usize) ![]u8 {
-    const n = col_hi - col_lo;
+/// Copies the sub-block `src[rows][col_lo..col_hi]` (every `stride`-th column,
+/// row-major, element size `es`) transposed into a new `[n][rows]` buffer.
+fn transposeSub(arena: Allocator, es: usize, src: []const u8, rows: usize, cols: usize, col_lo: usize, col_hi: usize, stride: usize) ![]u8 {
+    const n = (col_hi - col_lo + stride - 1) / stride;
     const out = try arena.alloc(u8, n * rows * es);
     var r: usize = 0;
     while (r < rows) : (r += 1) {
-        var c: usize = col_lo;
-        while (c < col_hi) : (c += 1) {
-            @memcpy(out[((c - col_lo) * rows + r) * es ..][0..es], src[(r * cols + c) * es ..][0..es]);
+        var j: usize = 0;
+        while (j < n) : (j += 1) {
+            const c = col_lo + j * stride;
+            @memcpy(out[(j * rows + r) * es ..][0..es], src[(r * cols + c) * es ..][0..es]);
         }
     }
     return out;
@@ -439,38 +468,67 @@ fn findStacked(model: *const Model, name: []const u8) !?Stacked {
     return .{ .ref = try model.ref(name), .shape = t.shape };
 }
 
+/// Row `e` of a stacked `[E][n]` bias tensor as f32 (null if absent).
+fn biasRow(model: *Model, arena: Allocator, name: []const u8, e: usize, n: usize) !?[]f32 {
+    const r = model.store.lookup(name) orelse return null;
+    if (r.cols != n) return error.InvalidConfig;
+    return try model.store.readVecF32(arena, r.rowSlice(e, 1));
+}
+
+/// Splits an interleaved `[2I]` vector into its even and odd entries.
+fn deinterleave(arena: Allocator, v: []const f32) ![2][]f32 {
+    const n = v.len / 2;
+    const a = try arena.alloc(f32, n);
+    const b = try arena.alloc(f32, n);
+    for (0..n) |i| {
+        a[i] = v[2 * i];
+        b[i] = v[2 * i + 1];
+    }
+    return .{ a, b };
+}
+
 /// Loads the MoE block of layer `li` with tensor prefix `lp` (e.g. "model.layers.3.").
 pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !MoeLayer {
     const c = &model.config;
+    const names = &c.arch.names;
     const hidden = c.hidden_size;
     const inter = c.moe_intermediate_size;
     const n_experts = c.num_experts;
-    const mlp: []const u8 = if (c.family == .mixtral) "block_sparse_moe." else "mlp.";
     const mapped = !model.streamed();
 
-    const router_name = try cat(arena, &.{ lp, mlp, "gate.weight" });
+    const router_name = try cat(arena, &.{ lp, names.router });
     const router_ref = model.store.lookup(router_name) orelse {
-        std.log.err("missing router tensor in {s}{s}", .{ lp, mlp });
+        std.log.err("missing router tensor {s}", .{router_name});
         return error.MissingWeights;
     };
     var self = MoeLayer{
         .layer_index = li,
         .router = try model.loadMat(router_name),
         .router_ref = router_ref,
+        .router_bias = model.loadVecOpt(try model_mod.biasName(arena, router_name)),
+        .correction_bias = if (names.router_correction_bias) |t| model.loadVecOpt(try cat(arena, &.{ lp, t })) else null,
         .top_k = @min(c.num_experts_per_tok, n_experts),
         .norm_topk_prob = c.norm_topk_prob,
+        .routing = c.moe,
+        .activation = c.activation,
         .inter = inter,
         .layout = .separate,
         .experts = try arena.alloc(Expert, n_experts),
         .shared = null,
         .fused_down_suffix = null,
+        .names = names,
     };
+    if (self.router.rows != n_experts or self.router.cols != hidden) {
+        std.log.err("router {s} is [{d}][{d}], expected [{d}][{d}]", .{ router_name, self.router.rows, self.router.cols, n_experts, hidden });
+        return error.InvalidConfig;
+    }
 
     // Fused layout?
-    const gu_names = [_][]const u8{ "experts.gate_up_proj", "experts.gate_up_proj.weight" };
     var fused_gu: ?WeightRef = null;
-    for (gu_names) |gn| {
-        if (try findStacked(model, try cat(arena, &.{ lp, mlp, gn }))) |st| {
+    var fused_gu_name: []const u8 = "";
+    for (names.fused_gate_up) |gn| {
+        const full = try cat(arena, &.{ lp, gn });
+        if (try findStacked(model, full)) |st| {
             const shape = st.shape;
             if (shape[0] != n_experts) return error.InvalidConfig;
             if (shape[1] == 2 * inter and shape[2] == hidden) self.layout = .fused else if (shape[1] == hidden and shape[2] == 2 * inter) self.layout = .fused_transposed else {
@@ -478,28 +536,36 @@ pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !Mo
                 return error.InvalidConfig;
             }
             fused_gu = st.ref;
+            fused_gu_name = full;
             break;
         }
     }
     if (fused_gu) |gu| {
-        const dn_names = [_][]const u8{ "experts.down_proj", "experts.down_proj.weight" };
         var down: ?WeightRef = null;
         var down_shape: []const usize = &.{};
-        for (dn_names) |dn| {
-            const suffix = try cat(arena, &.{ mlp, dn });
-            if (try findStacked(model, try cat(arena, &.{ lp, suffix }))) |st| {
+        var down_name: []const u8 = "";
+        for (names.fused_down) |dn| {
+            if (try findStacked(model, try cat(arena, &.{ lp, dn }))) |st| {
                 down = st.ref;
                 down_shape = st.shape;
-                self.fused_down_suffix = suffix;
+                down_name = try cat(arena, &.{ lp, dn });
+                self.fused_down_suffix = dn;
                 break;
             }
         }
         const dw = down orelse return error.MissingWeights;
         if (down_shape[0] != n_experts) return error.InvalidConfig;
         const es = gu.dtype.size();
+        const interleaved = c.moe.gate_up_interleaved;
+        if (interleaved and self.layout != .fused_transposed) {
+            std.log.err("interleaved gate/up experts are only supported in the [E, hidden, 2I] layout", .{});
+            return error.InvalidConfig;
+        }
         // Views of the whole stacked tensors (data valid in mapped mode only).
         const gu_w: Weight = if (mapped) model.find(gu.name).?.asWeight() else gu.shapeOnly();
         const dw_w: Weight = if (mapped) model.find(dw.name).?.asWeight() else dw.shapeOnly();
+        const gu_bias_name = try model_mod.biasName(arena, fused_gu_name);
+        const dn_bias_name = try model_mod.biasName(arena, down_name);
         switch (self.layout) {
             .fused => {
                 if (down_shape[1] != hidden or down_shape[2] != inter) return error.InvalidConfig;
@@ -525,8 +591,8 @@ pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !Mo
                 for (self.experts, 0..) |*ex, e| {
                     const gu_block = blockRef(gu, e, hidden, 2 * inter);
                     ex.* = .{
-                        .gate_ref = .{ .ref = gu_block, .transposed = .{ 0, inter } },
-                        .up_ref = .{ .ref = gu_block, .transposed = .{ inter, 2 * inter } },
+                        .gate_ref = if (interleaved) .{ .ref = gu_block, .transposed = .{ 0, 2 * inter }, .stride = 2 } else .{ .ref = gu_block, .transposed = .{ 0, inter } },
+                        .up_ref = if (interleaved) .{ .ref = gu_block, .transposed = .{ 1, 2 * inter }, .stride = 2 } else .{ .ref = gu_block, .transposed = .{ inter, 2 * inter } },
                         .down_ref = .{ .ref = blockRef(dw, e, inter, hidden), .transposed = .{ 0, hidden } },
                         .gate = undefined,
                         .up = undefined,
@@ -536,9 +602,11 @@ pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !Mo
                         // Transposed once on load into arena-owned copies.
                         const gu_bytes = gu_w.data[e * hidden * 2 * inter * es ..][0 .. hidden * 2 * inter * es];
                         const dn_bytes = dw_w.data[e * inter * hidden * es ..][0 .. inter * hidden * es];
-                        ex.gate = .{ .data = try transposeSub(arena, es, gu_bytes, hidden, 2 * inter, 0, inter), .dtype = gu.dtype, .rows = inter, .cols = hidden };
-                        ex.up = .{ .data = try transposeSub(arena, es, gu_bytes, hidden, 2 * inter, inter, 2 * inter), .dtype = gu.dtype, .rows = inter, .cols = hidden };
-                        ex.down = .{ .data = try transposeSub(arena, es, dn_bytes, inter, hidden, 0, hidden), .dtype = dw.dtype, .rows = hidden, .cols = inter };
+                        const gcols = ex.gate_ref.columns();
+                        const ucols = ex.up_ref.columns();
+                        ex.gate = .{ .data = try transposeSub(arena, es, gu_bytes, hidden, 2 * inter, gcols.lo, gcols.hi, gcols.stride), .dtype = gu.dtype, .rows = inter, .cols = hidden };
+                        ex.up = .{ .data = try transposeSub(arena, es, gu_bytes, hidden, 2 * inter, ucols.lo, ucols.hi, ucols.stride), .dtype = gu.dtype, .rows = inter, .cols = hidden };
+                        ex.down = .{ .data = try transposeSub(arena, es, dn_bytes, inter, hidden, 0, hidden, 1), .dtype = dw.dtype, .rows = hidden, .cols = inter };
                     }
                 }
             },
@@ -551,13 +619,26 @@ pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !Mo
                 ex.down = ex.down_ref.shapeOnly();
             }
         }
-    } else {
-        const names: [3][]const u8 = if (c.family == .mixtral) .{ "w1.weight", "w3.weight", "w2.weight" } else .{ "gate_proj.weight", "up_proj.weight", "down_proj.weight" };
+        // Expert biases (`gate_up_proj_bias` [E, 2I], `down_proj_bias` [E, hidden]).
         for (self.experts, 0..) |*ex, e| {
-            const ep = try std.fmt.allocPrint(arena, "{s}{s}experts.{d}.", .{ lp, mlp, e });
-            const gate_name = try cat(arena, &.{ ep, names[0] });
-            const up_name = try cat(arena, &.{ ep, names[1] });
-            const down_name = try cat(arena, &.{ ep, names[2] });
+            if (try biasRow(model, arena, gu_bias_name, e, 2 * inter)) |gub| {
+                if (interleaved) {
+                    const parts = try deinterleave(arena, gub);
+                    ex.gate_bias = parts[0];
+                    ex.up_bias = parts[1];
+                } else {
+                    ex.gate_bias = gub[0..inter];
+                    ex.up_bias = gub[inter..];
+                }
+            }
+            ex.down_bias = try biasRow(model, arena, dn_bias_name, e, hidden);
+        }
+    } else {
+        for (self.experts, 0..) |*ex, e| {
+            const ep = try cat(arena, &.{ lp, try model_mod.resolveName(arena, names.expert, "", 0, e) });
+            const gate_name = try cat(arena, &.{ ep, names.expert_gate });
+            const up_name = try cat(arena, &.{ ep, names.expert_up });
+            const down_name = try cat(arena, &.{ ep, names.expert_down });
             ex.* = .{
                 .gate = try model.loadMat(gate_name),
                 .up = try model.loadMat(up_name),
@@ -565,6 +646,9 @@ pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !Mo
                 .gate_ref = .{ .ref = try model.ref(gate_name) },
                 .up_ref = .{ .ref = try model.ref(up_name) },
                 .down_ref = .{ .ref = try model.ref(down_name) },
+                .gate_bias = model.loadVecOpt(try model_mod.biasName(arena, gate_name)),
+                .up_bias = model.loadVecOpt(try model_mod.biasName(arena, up_name)),
+                .down_bias = model.loadVecOpt(try model_mod.biasName(arena, down_name)),
             };
         }
     }
@@ -572,21 +656,24 @@ pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !Mo
         if (ex.gate.rows != inter or ex.gate.cols != hidden or ex.down.rows != hidden or ex.down.cols != inter) return error.InvalidConfig;
     }
 
-    // Shared expert (qwen2_moe).
-    if (model.find(try cat(arena, &.{ lp, "mlp.shared_expert.down_proj.weight" }))) |_| {
-        const sp = try cat(arena, &.{ lp, "mlp.shared_expert." });
-        const gate_name = try cat(arena, &.{ sp, "gate_proj.weight" });
-        const up_name = try cat(arena, &.{ sp, "up_proj.weight" });
-        const down_name = try cat(arena, &.{ sp, "down_proj.weight" });
-        self.shared = .{
-            .gate = try model.loadMat(gate_name),
-            .up = try model.loadMat(up_name),
-            .down = try model.loadMat(down_name),
-            .gate_ref = .{ .ref = try model.ref(gate_name) },
-            .up_ref = .{ .ref = try model.ref(up_name) },
-            .down_ref = .{ .ref = try model.ref(down_name) },
-            .gate_vec = model.loadVecOpt(try cat(arena, &.{ lp, "mlp.shared_expert_gate.weight" })),
-        };
+    // Shared expert(s): one fused block (DeepSeek `shared_experts`, Qwen2-MoE
+    // `shared_expert`, Llama 4 `shared_expert`); its width comes from the weights.
+    if (names.shared_expert) |sp_t| {
+        const sp = try cat(arena, &.{ lp, sp_t });
+        const down_name = try cat(arena, &.{ sp, names.expert_down });
+        if (model.find(down_name)) |_| {
+            const gate_name = try cat(arena, &.{ sp, names.expert_gate });
+            const up_name = try cat(arena, &.{ sp, names.expert_up });
+            self.shared = .{
+                .gate = try model.loadMat(gate_name),
+                .up = try model.loadMat(up_name),
+                .down = try model.loadMat(down_name),
+                .gate_ref = .{ .ref = try model.ref(gate_name) },
+                .up_ref = .{ .ref = try model.ref(up_name) },
+                .down_ref = .{ .ref = try model.ref(down_name) },
+                .gate_vec = if (names.shared_expert_gate) |g| model.loadVecOpt(try cat(arena, &.{ lp, g })) else null,
+            };
+        }
     }
     return self;
 }
@@ -599,15 +686,49 @@ inline fn sigmoid(x: f32) f32 {
     return 1.0 / (1.0 + @exp(-x));
 }
 
-/// `out[ne][hidden] = (act(x Wgᵀ) ⊙ (x Wuᵀ)) Wdᵀ` for `ne` rows of `x`.
-fn runExpert(model: *const Model, gate_w: Weight, up_w: Weight, down_w: Weight, delta: ?*const Delta, x: []const f32, ne: usize, gate: []f32, up: []f32, out: []f32) !void {
+/// `out[ne][hidden] = (act(x Wgᵀ + bg) ⊙ (x Wuᵀ + bu)) Wdᵀ + bd` for `ne` rows of `x`.
+fn runExpert(model: *const Model, m: *const MoeLayer, gate_w: Weight, up_w: Weight, down_w: Weight, biases: [3]?[]const f32, delta: ?*const Delta, x: []const f32, ne: usize, gate: []f32, up: []f32, out: []f32) !void {
     const gpa = model.gpa;
     const inter = gate_w.rows;
+    const hidden = down_w.rows;
     try tensor.matmulT(model.pool, gpa, gate, x, ne, gate_w, null);
     try tensor.matmulT(model.pool, gpa, up, x, ne, up_w, null);
-    const act = model.config.activation;
-    for (gate[0 .. ne * inter], 0..) |*g, j| g.* = act.apply(g.*) * up[j];
+    for (0..ne) |i| {
+        if (biases[0]) |b| tensor.axpy(gate[i * inter ..][0..inter], 1.0, b[0..inter]);
+        if (biases[1]) |b| tensor.axpy(up[i * inter ..][0..inter], 1.0, b[0..inter]);
+    }
+    if (m.routing.swiglu) |sw| {
+        // gpt-oss: clamp, gate * sigmoid(alpha * gate), (up + 1) factor.
+        for (gate[0 .. ne * inter], 0..) |*g, j| {
+            const gc = @min(g.*, sw.limit);
+            const uc = std.math.clamp(up[j], -sw.limit, sw.limit);
+            g.* = (uc + 1.0) * gc * sigmoid(sw.alpha * gc);
+        }
+    } else {
+        const act = m.activation;
+        for (gate[0 .. ne * inter], 0..) |*g, j| g.* = act.apply(g.*) * up[j];
+    }
     try tensor.matmulT(model.pool, gpa, out, gate, ne, down_w, delta);
+    if (biases[2]) |b| for (0..ne) |i| tensor.axpy(out[i * hidden ..][0..hidden], 1.0, b[0..hidden]);
+}
+
+/// Picks the top-k experts of one token from `scores` (routing weights) using
+/// `sel` (selection scores, possibly biased and group-masked). Returns the
+/// selected indices and their weights (before renormalisation).
+fn topk(scores: []const f32, sel: []f32, k: usize, idx: []usize, wts: []f32) void {
+    for (0..k) |j| {
+        var best: usize = 0;
+        var bv: f32 = -std.math.inf(f32);
+        for (sel, 0..) |s, e| {
+            if (s > bv) {
+                bv = s;
+                best = e;
+            }
+        }
+        idx[j] = best;
+        wts[j] = scores[best];
+        sel[best] = -std.math.inf(f32);
+    }
 }
 
 /// Routed MoE MLP of layer `li`: `out[n][hidden]` from normalised inputs
@@ -620,8 +741,11 @@ pub fn forward(model: *const Model, m: *const MoeLayer, li: usize, out: []f32, h
     const n_experts = m.experts.len;
     const k = m.top_k;
     const inter = m.inter;
+    const r = &m.routing;
 
-    // Router: softmax over all experts, then top-k with optional renormalisation.
+    // Router scores (softmax or sigmoid), then top-k on the selection scores
+    // (scores plus the correction bias, restricted to the best groups when
+    // routing is group-limited) with optional renormalisation and scaling.
     const logits = try gpa.alloc(f32, n * n_experts);
     defer gpa.free(logits);
     try tensor.matmulT(model.pool, gpa, logits, h, n, m.router, null);
@@ -629,27 +753,69 @@ pub fn forward(model: *const Model, m: *const MoeLayer, li: usize, out: []f32, h
     defer gpa.free(sel);
     const selw = try gpa.alloc(f32, n * k);
     defer gpa.free(selw);
+    const choice = try gpa.alloc(f32, n_experts);
+    defer gpa.free(choice);
+    const n_group = if (r.topk_method == .group_limited) r.n_group else 1;
+    const group_scores = try gpa.alloc(f32, n_group);
+    defer gpa.free(group_scores);
     for (0..n) |t| {
         const row = logits[t * n_experts ..][0..n_experts];
-        tensor.softmaxInPlace(row);
-        var sum: f32 = 0;
-        for (0..k) |j| {
-            var best: usize = 0;
-            var bv: f32 = -1;
-            for (row, 0..) |p, e| {
-                if (p > bv) {
-                    bv = p;
-                    best = e;
+        if (m.router_bias) |b| tensor.axpy(row, 1.0, b[0..n_experts]);
+        switch (r.scoring) {
+            .softmax => tensor.softmaxInPlace(row),
+            .sigmoid => for (row) |*v| {
+                v.* = sigmoid(v.*);
+            },
+        }
+        for (choice, 0..) |*cv, e| cv.* = row[e] + (if (m.correction_bias) |b| b[e] else 0);
+        if (r.topk_method == .group_limited and n_group > 1) {
+            const per_group = n_experts / n_group;
+            for (0..n_group) |g| {
+                const gs = choice[g * per_group ..][0..per_group];
+                if (m.correction_bias != null) {
+                    // Sum of the two best selection scores of the group (DeepSeek V3).
+                    var b1: f32 = -std.math.inf(f32);
+                    var b2: f32 = -std.math.inf(f32);
+                    for (gs) |s| {
+                        if (s > b1) {
+                            b2 = b1;
+                            b1 = s;
+                        } else if (s > b2) b2 = s;
+                    }
+                    group_scores[g] = b1 + (if (per_group > 1) b2 else 0);
+                } else {
+                    var best: f32 = -std.math.inf(f32);
+                    for (gs) |s| best = @max(best, s);
+                    group_scores[g] = best;
                 }
             }
-            sel[t * k + j] = best;
-            selw[t * k + j] = bv;
-            sum += bv;
-            row[best] = -1;
+            // Keep the `topk_group` best groups.
+            const keep = @min(r.topk_group, n_group);
+            var kept: usize = 0;
+            while (kept < keep) : (kept += 1) {
+                var best: usize = 0;
+                var bv: f32 = -std.math.inf(f32);
+                for (group_scores, 0..) |s, g| {
+                    if (s > bv) {
+                        bv = s;
+                        best = g;
+                    }
+                }
+                group_scores[best] = std.math.nan(f32); // marked as kept
+            }
+            for (group_scores, 0..) |s, g| {
+                if (!std.math.isNan(s)) @memset(choice[g * per_group ..][0..per_group], -std.math.inf(f32));
+            }
         }
+        topk(row, choice, k, sel[t * k ..][0..k], selw[t * k ..][0..k]);
+        var sum: f32 = 0;
+        for (selw[t * k ..][0..k]) |w| sum += w;
         if (m.norm_topk_prob and sum > 0) {
             for (0..k) |j| selw[t * k + j] /= sum;
         }
+        if (r.routed_scaling_factor != 1.0) for (0..k) |j| {
+            selw[t * k + j] *= r.routed_scaling_factor;
+        };
     }
 
     @memset(out[0 .. n * hidden], 0);
@@ -696,16 +862,21 @@ pub fn forward(model: *const Model, m: *const MoeLayer, li: usize, out: []f32, h
                 }
             }
         }
-        for (0..ne) |j| @memcpy(xg[j * hidden ..][0..hidden], h[tok[j] * hidden ..][0..hidden]);
+        for (0..ne) |j| {
+            const dst = xg[j * hidden ..][0..hidden];
+            @memcpy(dst, h[tok[j] * hidden ..][0..hidden]);
+            if (r.scale_input) tensor.scale(dst, wts[j]);
+        }
         const delta: ?*const Delta = if (ex.down_delta) |*d| d else null;
+        const biases = [3]?[]const f32{ ex.gate_bias, ex.up_bias, ex.down_bias };
         if (cache) |c| {
             const entry = try c.acquire(li, m, e);
             defer c.release(entry);
-            try runExpert(model, entry.gate, entry.up, entry.down, delta, xg, ne, gate, up, eo);
+            try runExpert(model, m, entry.gate, entry.up, entry.down, biases, delta, xg, ne, gate, up, eo);
         } else {
-            try runExpert(model, ex.gate, ex.up, ex.down, delta, xg, ne, gate, up, eo);
+            try runExpert(model, m, ex.gate, ex.up, ex.down, biases, delta, xg, ne, gate, up, eo);
         }
-        for (0..ne) |j| tensor.axpy(out[tok[j] * hidden ..][0..hidden], wts[j], eo[j * hidden ..][0..hidden]);
+        for (0..ne) |j| tensor.axpy(out[tok[j] * hidden ..][0..hidden], if (r.scale_input) 1.0 else wts[j], eo[j * hidden ..][0..hidden]);
     }
 
     if (m.shared) |*sh| {
@@ -714,7 +885,7 @@ pub fn forward(model: *const Model, m: *const MoeLayer, li: usize, out: []f32, h
         defer gpa.free(sg);
         const su = try gpa.alloc(f32, n * s_inter);
         defer gpa.free(su);
-        try runExpert(model, sh.gate, sh.up, sh.down, if (sh.down_delta) |*d| d else null, h, n, sg, su, eo);
+        try runExpert(model, m, sh.gate, sh.up, sh.down, .{ null, null, null }, if (sh.down_delta) |*d| d else null, h, n, sg, su, eo);
         for (0..n) |t| {
             const s: f32 = if (sh.gate_vec) |g| sigmoid(tensor.dot(h[t * hidden ..][0..hidden], g[0..hidden])) else 1.0;
             tensor.axpy(out[t * hidden ..][0..hidden], s, eo[t * hidden ..][0..hidden]);
@@ -961,7 +1132,7 @@ test "expert ranking prefers the aligned expert" {
         const w = Weight{ .data = std.mem.sliceAsBytes(&mats[e]), .dtype = .f32, .rows = hidden, .cols = inter };
         ex.* = .{ .gate = w, .up = w, .down = w, .gate_ref = dummy_ref, .up_ref = dummy_ref, .down_ref = dummy_ref };
     }
-    const layer = MoeLayer{ .layer_index = 0, .router = experts[0].gate, .router_ref = dummy_ref.ref, .top_k = 1, .norm_topk_prob = true, .inter = inter, .layout = .separate, .experts = &experts, .shared = null, .fused_down_suffix = null };
+    const layer = MoeLayer{ .layer_index = 0, .router = experts[0].gate, .router_ref = dummy_ref.ref, .router_bias = null, .correction_bias = null, .top_k = 1, .norm_topk_prob = true, .routing = .{}, .activation = .silu, .inter = inter, .layout = .separate, .experts = &experts, .shared = null, .fused_down_suffix = null, .names = &arch.lookup("qwen3_moe").?.names };
     const scores = try scoreLayer(&pool, gpa, &layer, &v);
     defer gpa.free(scores);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), scores[1], 1e-4);

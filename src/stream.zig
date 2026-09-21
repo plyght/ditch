@@ -53,6 +53,9 @@ pub const WeightRef = struct {
     }
 };
 
+/// A strided column range `lo, lo + stride, ... < hi` of a block (see `WeightStore.acquireColumns`).
+pub const ColumnSpec = struct { lo: usize, hi: usize, stride: usize = 1 };
+
 /// A weight acquired from the store. Must be returned with `WeightStore.release`.
 pub const Lease = struct {
     weight: Weight,
@@ -274,24 +277,34 @@ pub const WeightStore = struct {
     /// is read once (a transient buffer of `ref.byteLen()` in streamed mode) and
     /// every result is an owned buffer released with `release`.
     pub fn acquireTransposed(self: *WeightStore, ref: WeightRef, ranges: []const [2]usize, out: []Lease) !void {
-        std.debug.assert(out.len >= ranges.len);
+        var specs: [8]ColumnSpec = undefined;
+        std.debug.assert(ranges.len <= specs.len);
+        for (ranges, 0..) |r, i| specs[i] = .{ .lo = r[0], .hi = r[1] };
+        return self.acquireColumns(ref, specs[0..ranges.len], out);
+    }
+
+    /// `acquireTransposed` with a column stride: `out[i]` holds columns
+    /// `lo, lo + stride, ...` below `hi` of `specs[i]` (gpt-oss stores gate and
+    /// up columns interleaved). Floating-point blocks only.
+    pub fn acquireColumns(self: *WeightStore, ref: WeightRef, specs: []const ColumnSpec, out: []Lease) !void {
+        std.debug.assert(out.len >= specs.len);
+        if (ref.dtype.isQuantized()) return error.UnsupportedDType;
         const block = try self.acquire(ref);
         defer self.release(block);
         const es = ref.dtype.size();
         const src = block.weight.data;
         var done: usize = 0;
         errdefer for (out[0..done]) |l| self.release(l);
-        for (ranges) |range| {
-            const lo = range[0];
-            const hi = range[1];
-            std.debug.assert(lo <= hi and hi <= ref.cols);
-            const n = hi - lo;
+        for (specs) |spec| {
+            std.debug.assert(spec.lo <= spec.hi and spec.hi <= ref.cols and spec.stride > 0);
+            const n = (spec.hi - spec.lo + spec.stride - 1) / spec.stride;
             const buf = try self.allocBuf(n * ref.rows * es);
             var r: usize = 0;
             while (r < ref.rows) : (r += 1) {
-                var c: usize = lo;
-                while (c < hi) : (c += 1) {
-                    @memcpy(buf[((c - lo) * ref.rows + r) * es ..][0..es], src[(r * ref.cols + c) * es ..][0..es]);
+                var j: usize = 0;
+                while (j < n) : (j += 1) {
+                    const c = spec.lo + j * spec.stride;
+                    @memcpy(buf[(j * ref.rows + r) * es ..][0..es], src[(r * ref.cols + c) * es ..][0..es]);
                 }
             }
             out[done] = .{ .weight = .{ .data = buf[0 .. n * ref.rows * es], .dtype = ref.dtype, .rows = n, .cols = ref.rows }, .buf = buf };
@@ -594,7 +607,7 @@ pub fn workspaceRows(model: *const model_mod.Model, wanted: usize, logit_rows: u
     const b = model.budget orelse return wanted;
     if (!b.limited()) return wanted;
     const c = &model.config;
-    const per_row: u64 = (2 * c.hidden_size + 2 * c.num_heads * c.head_dim + 2 * c.num_kv_heads * c.head_dim + c.hidden_size + 2 * c.intermediate_size) * 4;
+    const per_row: u64 = model_mod.Workspace.bytesPerRow(c);
     // Unpinned expert-cache entries are given back on demand, so they count as available.
     const avail = b.available() + model.expertCacheEvictable();
     // Weights, logits, KV cache, the residual-stream buffer for all rows and a

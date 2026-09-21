@@ -1,6 +1,8 @@
-//! Transformer model loading and inference for Llama-family models
-//! (Llama 2/3, Mistral, Qwen 2/2.5/3, Gemma 2/3 text) and their
-//! mixture-of-experts variants (Mixtral, Qwen2-MoE, Qwen3-MoE; see moe.zig).
+//! Transformer model loading and inference for decoder-only Hugging Face
+//! checkpoints. The family-specific knowledge (tensor names, norm and
+//! residual layout, attention/MLP layouts, positional encoding, MoE routing)
+//! lives in the architecture registry (`arch.zig`); this module is the
+//! generic loader and forward pass driven by a `Config`.
 //!
 //! Weights are accessed through a `stream.WeightStore`: memory-mapped by
 //! default, or streamed layer by layer from disk under a memory budget
@@ -22,6 +24,7 @@ const Tokenizer = @import("tokenizer.zig").Tokenizer;
 const moe = @import("moe.zig");
 const abliterate = @import("abliterate.zig");
 const search = @import("search.zig");
+pub const arch = @import("arch.zig");
 const expert_cache = @import("expert_cache.zig");
 const remote = @import("remote.zig");
 
@@ -30,313 +33,131 @@ const Weight = tensor.Weight;
 const Delta = tensor.Delta;
 const WeightRef = stream.WeightRef;
 
-pub const Family = enum {
-    llama,
-    mistral,
-    qwen2,
-    qwen3,
-    gemma2,
-    gemma3,
-    qwen2_moe,
-    qwen3_moe,
-    mixtral,
-
-    pub fn isGemma(self: Family) bool {
-        return self == .gemma2 or self == .gemma3;
-    }
-};
-
-pub const RopeScaling = union(enum) {
-    none,
-    linear: f32,
-    llama3: struct { factor: f32, low_freq_factor: f32, high_freq_factor: f32, original_max_position: f32 },
-    /// Per-frequency divisors (`rope_freqs.weight` of a GGUF file, llama.cpp's
-    /// precomputed llama3 scaling): `inv_freq[i] /= factors[i]`.
-    factors: []const f32,
-};
-
-pub const Config = struct {
-    family: Family,
-    model_type: []const u8,
-    hidden_size: usize,
-    intermediate_size: usize,
-    num_layers: usize,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    vocab_size: usize,
-    rms_norm_eps: f32,
-    rope_theta: f32,
-    rope_local_theta: f32,
-    rope_scaling: RopeScaling,
-    tie_word_embeddings: bool,
-    activation: tensor.Activation,
-    max_position_embeddings: usize,
-    sliding_window: ?usize,
-    /// Per layer: true if the layer uses sliding-window (local) attention.
-    sliding_layers: []bool,
-    attention_scale: f32,
-    attn_logit_softcapping: ?f32,
-    final_logit_softcapping: ?f32,
-    attention_bias: bool,
-    embed_scale: f32,
-    /// Mixture-of-experts settings (num_experts == 0 for dense models).
-    num_experts: usize,
-    num_experts_per_tok: usize,
-    norm_topk_prob: bool,
-    moe_intermediate_size: usize,
-    /// Per layer: true if the layer's MLP is a routed mixture of experts.
-    moe_layers: []bool,
-};
-
-fn getNum(obj: std.json.ObjectMap, key: []const u8) ?f64 {
-    const v = obj.get(key) orelse return null;
-    return switch (v) {
-        .integer => |i| @floatFromInt(i),
-        .float => |f| f,
-        else => null,
-    };
-}
-
-fn getInt(obj: std.json.ObjectMap, key: []const u8, default: usize) usize {
-    const v = getNum(obj, key) orelse return default;
-    return @intFromFloat(v);
-}
-
-fn getF32(obj: std.json.ObjectMap, key: []const u8, default: f32) f32 {
-    const v = getNum(obj, key) orelse return default;
-    return @floatCast(v);
-}
-
-fn getBool(obj: std.json.ObjectMap, key: []const u8, default: bool) bool {
-    const v = obj.get(key) orelse return default;
-    return if (v == .bool) v.bool else default;
-}
-
-pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
-    var parsed = try std.json.parseFromSlice(std.json.Value, arena, json_text, .{});
-    defer parsed.deinit();
-    var obj = parsed.value.object;
-    var model_type = if (obj.get("model_type")) |m| m.string else "llama";
-    // Multimodal wrappers keep the text config nested.
-    if (obj.get("text_config")) |tc| {
-        if (tc == .object) {
-            obj = tc.object;
-            if (obj.get("model_type")) |m| model_type = m.string;
-        }
-    }
-    const family: Family = if (std.mem.eql(u8, model_type, "llama"))
-        .llama
-    else if (std.mem.eql(u8, model_type, "mistral"))
-        .mistral
-    else if (std.mem.eql(u8, model_type, "qwen2"))
-        .qwen2
-    else if (std.mem.eql(u8, model_type, "qwen3"))
-        .qwen3
-    else if (std.mem.eql(u8, model_type, "gemma2"))
-        .gemma2
-    else if (std.mem.eql(u8, model_type, "gemma3") or std.mem.eql(u8, model_type, "gemma3_text"))
-        .gemma3
-    else if (std.mem.eql(u8, model_type, "qwen2_moe"))
-        .qwen2_moe
-    else if (std.mem.eql(u8, model_type, "qwen3_moe"))
-        .qwen3_moe
-    else if (std.mem.eql(u8, model_type, "mixtral"))
-        .mixtral
-    else {
-        std.log.err("unsupported model_type: {s}", .{model_type});
-        return error.UnsupportedArchitecture;
-    };
-
-    const hidden = getInt(obj, "hidden_size", 0);
-    const heads = getInt(obj, "num_attention_heads", 0);
-    const kv_heads = getInt(obj, "num_key_value_heads", heads);
-    const head_dim = getInt(obj, "head_dim", if (heads > 0) hidden / heads else 0);
-    const layers = getInt(obj, "num_hidden_layers", 0);
-    if (hidden == 0 or heads == 0 or layers == 0) return error.InvalidConfig;
-
-    var act: tensor.Activation = .silu;
-    const act_name = if (obj.get("hidden_activation")) |a| (if (a == .string) a.string else "") else if (obj.get("hidden_act")) |a| (if (a == .string) a.string else "") else "";
-    if (std.mem.eql(u8, act_name, "gelu_pytorch_tanh") or std.mem.eql(u8, act_name, "gelu_tanh")) act = .gelu_tanh else if (std.mem.eql(u8, act_name, "gelu")) act = .gelu else act = .silu;
-    if (family.isGemma() and act_name.len == 0) act = .gelu_tanh;
-
-    var rope_scaling: RopeScaling = .none;
-    if (obj.get("rope_scaling")) |rs| {
-        if (rs == .object) {
-            const t = if (rs.object.get("rope_type")) |t| t.string else if (rs.object.get("type")) |t| t.string else "";
-            if (std.mem.eql(u8, t, "llama3")) {
-                rope_scaling = .{ .llama3 = .{
-                    .factor = getF32(rs.object, "factor", 8),
-                    .low_freq_factor = getF32(rs.object, "low_freq_factor", 1),
-                    .high_freq_factor = getF32(rs.object, "high_freq_factor", 4),
-                    .original_max_position = getF32(rs.object, "original_max_position_embeddings", 8192),
-                } };
-            } else if (std.mem.eql(u8, t, "linear")) {
-                rope_scaling = .{ .linear = getF32(rs.object, "factor", 1) };
-            } else if (std.mem.eql(u8, t, "ditch_factors")) {
-                // Per-frequency divisors (a GGUF `rope_freqs.weight` that is not a
-                // standard llama3 scaling); written by gguf_model.zig, read only by ditch.
-                if (rs.object.get("factors")) |fa| {
-                    if (fa == .array) {
-                        const factors = try arena.alloc(f32, fa.array.items.len);
-                        for (fa.array.items, 0..) |v, i| factors[i] = switch (v) {
-                            .float => |x| @floatCast(x),
-                            .integer => |x| @floatFromInt(x),
-                            else => 1.0,
-                        };
-                        rope_scaling = .{ .factors = factors };
-                    }
-                }
-            } else if (t.len > 0 and !std.mem.eql(u8, t, "default")) {
-                std.log.warn("rope scaling type '{s}' is not supported; using unscaled RoPE", .{t});
-            }
-        }
-    }
-
-    const sliding_window: ?usize = blk: {
-        const v = obj.get("sliding_window") orelse break :blk null;
-        break :blk switch (v) {
-            .integer => |i| @intCast(i),
-            else => null,
-        };
-    };
-
-    const sliding_layers = try arena.alloc(bool, layers);
-    @memset(sliding_layers, false);
-    if (obj.get("layer_types")) |lt| {
-        if (lt == .array) {
-            for (lt.array.items, 0..) |v, i| {
-                if (i < layers and v == .string) sliding_layers[i] = std.mem.eql(u8, v.string, "sliding_attention");
-            }
-        }
-    } else if (family == .gemma2) {
-        for (sliding_layers, 0..) |*s, i| s.* = (i % 2 == 0);
-    } else if (family == .gemma3) {
-        const pattern = getInt(obj, "sliding_window_pattern", 6);
-        for (sliding_layers, 0..) |*s, i| s.* = ((i + 1) % pattern != 0);
-    } else if (sliding_window != null and family == .mistral) {
-        @memset(sliding_layers, true);
-    }
-
-    // Mixture of experts: `num_experts` (Qwen) or `num_local_experts` (Mixtral);
-    // Qwen additionally allows dense layers via `mlp_only_layers` / `decoder_sparse_step`.
-    const num_experts = getInt(obj, "num_experts", getInt(obj, "num_local_experts", 0));
-    const moe_layers = try arena.alloc(bool, layers);
-    @memset(moe_layers, false);
-    if (num_experts > 0) {
-        const sparse_step = @max(getInt(obj, "decoder_sparse_step", 1), 1);
-        for (moe_layers, 0..) |*m, i| m.* = ((i + 1) % sparse_step == 0);
-        if (obj.get("mlp_only_layers")) |ml| {
-            if (ml == .array) for (ml.array.items) |v| {
-                if (v == .integer and v.integer >= 0 and v.integer < layers) moe_layers[@intCast(v.integer)] = false;
-            };
-        }
-    }
-    const intermediate_size = getInt(obj, "intermediate_size", 4 * hidden);
-
-    const query_pre_attn_scalar = getNum(obj, "query_pre_attn_scalar");
-    const attention_scale: f32 = if (query_pre_attn_scalar) |q| @floatCast(1.0 / @sqrt(q)) else 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
-
-    return .{
-        .family = family,
-        .model_type = try arena.dupe(u8, model_type),
-        .hidden_size = hidden,
-        .intermediate_size = intermediate_size,
-        .num_layers = layers,
-        .num_heads = heads,
-        .num_kv_heads = kv_heads,
-        .head_dim = head_dim,
-        .vocab_size = getInt(obj, "vocab_size", 0),
-        .rms_norm_eps = getF32(obj, "rms_norm_eps", 1e-6),
-        .rope_theta = getF32(obj, "rope_theta", 10000.0),
-        .rope_local_theta = getF32(obj, "rope_local_base_freq", 10000.0),
-        .rope_scaling = rope_scaling,
-        .tie_word_embeddings = getBool(obj, "tie_word_embeddings", family.isGemma()),
-        .activation = act,
-        .max_position_embeddings = getInt(obj, "max_position_embeddings", 4096),
-        .sliding_window = sliding_window,
-        .sliding_layers = sliding_layers,
-        .attention_scale = attention_scale,
-        .attn_logit_softcapping = if (getNum(obj, "attn_logit_softcapping")) |v| @as(f32, @floatCast(v)) else null,
-        .final_logit_softcapping = if (getNum(obj, "final_logit_softcapping")) |v| @as(f32, @floatCast(v)) else null,
-        .attention_bias = getBool(obj, "attention_bias", family == .qwen2 or family == .qwen2_moe),
-        .embed_scale = if (family.isGemma()) @sqrt(@as(f32, @floatFromInt(hidden))) else 1.0,
-        .num_experts = num_experts,
-        .num_experts_per_tok = getInt(obj, "num_experts_per_tok", 2),
-        .norm_topk_prob = getBool(obj, "norm_topk_prob", family == .mixtral),
-        .moe_intermediate_size = getInt(obj, "moe_intermediate_size", intermediate_size),
-        .moe_layers = moe_layers,
-    };
-}
+pub const Config = arch.Config;
+pub const RopeScaling = arch.RopeScaling;
+pub const parseConfig = arch.parseConfig;
 
 // ---------------------------------------------------------------------------
 // Weights
 // ---------------------------------------------------------------------------
 
+/// A normalisation layer's parameters (`w` is empty for the non-parametric kind).
+pub const Norm = struct {
+    w: []const f32,
+    b: ?[]const f32 = null,
+};
+
+/// Which matrix of a layer a `LayerRefs` entry describes.
+pub const Slot = enum { q, k, v, qkv, o, gate, up, gate_up, down, router, q_a, q_b, kv_a, kv_b };
+
 /// Where a layer's matrices live on disk. `Model.acquireLayer` turns these
 /// into resident `Weight` views for the duration of one layer's compute.
-/// Dense layers carry `gate`/`up`/`down`; mixture-of-experts layers carry the
-/// `router` instead (the expert matrices are described by `Layer.moe`).
+/// Dense layers carry a `gate`/`up`/`gate_up`/`down` set; mixture-of-experts
+/// layers carry the `router` instead (the expert matrices are described by
+/// `Layer.moe`). A `transposed` entry is stored `[in][out]` on disk (GPT-2
+/// Conv1D) and made resident as `[out][in]`.
 pub const LayerRefs = struct {
-    q: WeightRef,
-    k: WeightRef,
-    v: WeightRef,
-    o: WeightRef,
-    gate: ?WeightRef = null,
-    up: ?WeightRef = null,
-    down: ?WeightRef = null,
-    router: ?WeightRef = null,
+    refs: [max]WeightRef = undefined,
+    slots: [max]Slot = undefined,
+    transposed: [max]bool = [_]bool{false} ** max,
+    n: usize = 0,
 
-    pub const max = 8;
+    pub const max = 12;
 
-    /// The refs in a fixed order (q, k, v, o, then gate, up, down or router).
+    pub fn add(self: *LayerRefs, slot: Slot, ref: WeightRef, transposed: bool) void {
+        std.debug.assert(self.n < max);
+        self.refs[self.n] = ref;
+        self.slots[self.n] = slot;
+        self.transposed[self.n] = transposed;
+        self.n += 1;
+    }
+
+    pub fn get(self: *const LayerRefs, slot: Slot) ?WeightRef {
+        for (self.slots[0..self.n], 0..) |s, i| if (s == slot) return self.refs[i];
+        return null;
+    }
+
+    pub fn isTransposed(self: *const LayerRefs, slot: Slot) bool {
+        for (self.slots[0..self.n], 0..) |s, i| if (s == slot) return self.transposed[i];
+        return false;
+    }
+
+    /// Every ref, in insertion order.
     pub fn all(self: *const LayerRefs, buf: *[max]WeightRef) []WeightRef {
-        buf[0] = self.q;
-        buf[1] = self.k;
-        buf[2] = self.v;
-        buf[3] = self.o;
-        var n: usize = 4;
-        inline for (.{ self.gate, self.up, self.down, self.router }) |opt| {
-            if (opt) |r| {
-                buf[n] = r;
-                n += 1;
-            }
+        @memcpy(buf[0..self.n], self.refs[0..self.n]);
+        return buf[0..self.n];
+    }
+
+    /// The refs that are read as they are (not transposed), in insertion order.
+    pub fn plain(self: *const LayerRefs, buf: *[max]WeightRef) []WeightRef {
+        var n: usize = 0;
+        for (0..self.n) |i| {
+            if (self.transposed[i]) continue;
+            buf[n] = self.refs[i];
+            n += 1;
         }
         return buf[0..n];
     }
 
     /// Bytes of the attention / dense-MLP / router matrices (expert matrices excluded).
     pub fn bytes(self: *const LayerRefs) u64 {
-        var buf: [max]WeightRef = undefined;
         var total: u64 = 0;
-        for (self.all(&buf)) |r| total += r.byteLen();
+        for (self.refs[0..self.n]) |r| total += r.byteLen();
         return total;
     }
 };
 
+/// Multi-head latent attention projections (DeepSeek V2/V3).
+pub const MlaWeights = struct {
+    /// Low-rank query down projection (null when `q_lora_rank` is unset: `q_b` is the full query projection).
+    q_a: ?Weight,
+    q_a_norm: ?[]const f32,
+    q_b: Weight,
+    /// `[kv_lora_rank + qk_rope_head_dim][hidden]`.
+    kv_a: Weight,
+    kv_a_norm: []const f32,
+    /// `[heads * (qk_nope_head_dim + v_head_dim)][kv_lora_rank]`.
+    kv_b: Weight,
+};
+
 pub const Layer = struct {
-    input_norm: []f32,
-    post_attn_norm: []f32,
-    pre_ff_norm: ?[]f32, // gemma
-    post_ff_norm: ?[]f32, // gemma
-    q_norm: ?[]f32, // qwen3
-    k_norm: ?[]f32,
-    q: Weight,
-    k: Weight,
-    v: Weight,
+    input_norm: ?Norm,
+    /// Norm on the attention output (Gemma, OLMo 2, GLM-4).
+    post_attn_norm: ?Norm,
+    /// Norm on the MLP input (sequential layouts).
+    pre_ff_norm: ?Norm,
+    post_ff_norm: ?Norm,
+    /// Separate MLP input norm (parallel residual with two norms).
+    mlp_norm: ?Norm,
+    q_norm: ?Norm,
+    k_norm: ?Norm,
+    /// Separate projections, or one fused `qkv`.
+    q: ?Weight,
+    k: ?Weight,
+    v: ?Weight,
+    qkv: ?Weight,
     o: Weight,
-    q_bias: ?[]f32,
-    k_bias: ?[]f32,
-    v_bias: ?[]f32,
+    q_bias: ?[]const f32,
+    k_bias: ?[]const f32,
+    v_bias: ?[]const f32,
+    qkv_bias: ?[]const f32,
+    o_bias: ?[]const f32,
+    /// Per-head attention sink logits (gpt-oss).
+    sinks: ?[]const f32,
+    mla: ?MlaWeights,
     /// Dense MLP (null for mixture-of-experts layers).
     ///
-    /// In mapped mode the `Weight` fields of a layer view the mapping and are
-    /// always valid. In streamed mode they carry only the shape (empty data)
-    /// and the resident views live in the `Layer` copy returned by
-    /// `Model.acquireLayer`.
+    /// In mapped mode the `Weight` fields of a layer view the mapping (or an
+    /// arena-owned transposed copy) and are always valid. In streamed mode
+    /// they carry only the shape (empty data) and the resident views live in
+    /// the `Layer` copy returned by `Model.acquireLayer`.
     gate: ?Weight,
     up: ?Weight,
+    gate_up: ?Weight,
     down: ?Weight,
+    gate_bias: ?[]const f32,
+    up_bias: ?[]const f32,
+    down_bias: ?[]const f32,
     /// Routed mixture of experts (null for dense layers).
     moe: ?moe.MoeLayer = null,
     refs: LayerRefs,
@@ -359,6 +180,25 @@ pub const Layer = struct {
         var total = self.refs.bytes();
         if (self.moe) |*m| total += m.trunkBytes();
         return total;
+    }
+
+    fn setSlot(self: *Layer, slot: Slot, w: Weight) void {
+        switch (slot) {
+            .q => self.q = w,
+            .k => self.k = w,
+            .v => self.v = w,
+            .qkv => self.qkv = w,
+            .o => self.o = w,
+            .gate => self.gate = w,
+            .up => self.up = w,
+            .gate_up => self.gate_up = w,
+            .down => self.down = w,
+            .router => self.moe.?.router = w,
+            .q_a => self.mla.?.q_a = w,
+            .q_b => self.mla.?.q_b = w,
+            .kv_a => self.mla.?.kv_a = w,
+            .kv_b => self.mla.?.kv_b = w,
+        }
     }
 };
 
@@ -405,7 +245,10 @@ pub const LoadOptions = struct {
     gguf_ignore_embedded: bool = false,
 };
 
-/// The two abliterable components, named as in heretic.
+/// The two abliterable components, named as in heretic. `attn_o_proj` is the
+/// family's attention output projection (`o_proj`, `dense`, `wo`, `c_proj`,
+/// ...) and `mlp_down_proj` its MLP down projection (`down_proj`, `fc2`,
+/// `dense_4h_to_h`, `w2`, ...; per expert on MoE layers).
 pub const Component = enum {
     attn_o_proj,
     mlp_down_proj,
@@ -425,6 +268,44 @@ pub const Component = enum {
 
     pub const all = [_]Component{ .attn_o_proj, .mlp_down_proj };
 };
+
+/// How a tensor is modified on export.
+pub const ExportEdit = union(enum) {
+    /// A 2-D `[out][in]` matrix with one delta: `W' = W + B A`.
+    whole: Delta,
+    /// A `[in][out]` (Conv1D) matrix: `W' = W + (B A)ᵀ`.
+    whole_transposed: Delta,
+    /// A fused expert down tensor of this layer; per-expert deltas are merged slice by slice.
+    fused_down: usize,
+};
+
+/// Expands a name template: `{p}` → prefix, `{i}` → layer index, `{e}` → expert index.
+pub fn resolveName(arena: Allocator, template: []const u8, prefix: []const u8, layer: usize, expert: usize) ![]const u8 {
+    var out: Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    var i: usize = 0;
+    while (i < template.len) {
+        if (template[i] == '{' and i + 2 < template.len and template[i + 2] == '}') {
+            switch (template[i + 1]) {
+                'p' => try w.writeAll(prefix),
+                'i' => try w.print("{d}", .{layer}),
+                'e' => try w.print("{d}", .{expert}),
+                else => try w.writeAll(template[i .. i + 3]),
+            }
+            i += 3;
+        } else {
+            try w.writeByte(template[i]);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice();
+}
+
+/// `x.weight` → `x.bias` (a bare parameter name gets `_bias`).
+pub fn biasName(arena: Allocator, name: []const u8) ![]const u8 {
+    if (std.mem.endsWith(u8, name, ".weight")) return std.fmt.allocPrint(arena, "{s}.bias", .{name[0 .. name.len - ".weight".len]});
+    return std.fmt.allocPrint(arena, "{s}_bias", .{name});
+}
 
 pub const Model = struct {
     /// Runtime allocator (the budget's allocator when loaded with a budget).
@@ -449,13 +330,18 @@ pub const Model = struct {
     expert_cache: ?*expert_cache.ExpertCache = null,
     budget: ?*budget_mod.Budget,
     scratch_dir: []const u8,
-    /// Tensor name prefix for the language model (e.g. "model." or "language_model.model.").
+    /// Tensor name prefix for the language model (e.g. "model." or "transformer.").
     prefix: []const u8,
     /// Shape-valid always; data valid only in mapped mode (use `embedRow` / `acquireLmHead`).
     embed: Weight,
     lm_head: Weight,
     embed_ref: WeightRef,
     lm_head_ref: WeightRef,
+    lm_head_bias: ?[]const f32,
+    /// Learned absolute position table (GPT-2, OPT).
+    pos_embed_ref: ?WeightRef,
+    /// LayerNorm on the embeddings (BLOOM).
+    embed_norm: ?Norm,
     largest_layer_bytes: u64,
     /// Largest layer without its routed experts (attention, norms, router, shared expert).
     largest_trunk_layer_bytes: u64,
@@ -465,7 +351,7 @@ pub const Model = struct {
     total_expert_bytes: u64,
     largest_tensor_bytes: u64,
     spill_always: bool,
-    final_norm: []f32,
+    final_norm: Norm,
     layers: []Layer,
     eos_ids: []u32,
     pad_id: u32,
@@ -478,11 +364,13 @@ pub const Model = struct {
     tokenizer_config_json: ?[]const u8,
     chat_template: ?[]const u8,
     dtype: tensor.DType,
-    rope_cos: []f32, // [max_pos][head_dim/2]
+    rope_cos: []f32, // [max_pos][rotary_dim/2]
     rope_sin: []f32,
     rope_cos_local: []f32,
     rope_sin_local: []f32,
     rope_len: usize,
+    /// ALiBi slope per head (empty unless `config.positional == .alibi`).
+    alibi_slopes: []f32,
 
     pub fn deinit(self: *Model) void {
         self.resetDeltas();
@@ -610,81 +498,7 @@ pub const Model = struct {
         self.store.registerReclaim();
         errdefer self.store.deinit();
 
-        // Detect prefix.
-        const prefixes = [_][]const u8{ "model.", "language_model.model.", "model.language_model.", "" };
-        self.prefix = "";
-        var found_prefix = false;
-        for (prefixes) |p| {
-            const key = try std.fmt.allocPrint(arena, "{s}embed_tokens.weight", .{p});
-            if (self.find(key) != null) {
-                self.prefix = p;
-                found_prefix = true;
-                break;
-            }
-        }
-        if (!found_prefix) return error.MissingWeights;
-
-        const embed_name = try std.fmt.allocPrint(arena, "{s}embed_tokens.weight", .{self.prefix});
-        self.embed_ref = self.store.lookup(embed_name).?;
-        self.embed = try self.loadMat(embed_name);
-        self.dtype = self.embed_ref.dtype;
-        if (self.config.vocab_size == 0) self.config.vocab_size = self.embed.rows;
-        self.final_norm = try self.loadVec(try std.fmt.allocPrint(arena, "{s}norm.weight", .{self.prefix}));
-        if (self.store.lookup("lm_head.weight")) |lm| {
-            self.lm_head_ref = lm;
-        } else if (self.store.lookup(try std.fmt.allocPrint(arena, "{s}lm_head.weight", .{std.mem.trimEnd(u8, self.prefix, "model.")}))) |lm| {
-            self.lm_head_ref = lm;
-        } else {
-            self.lm_head_ref = self.embed_ref;
-        }
-        self.lm_head = try self.loadMat(self.lm_head_ref.name);
-
-        self.largest_tensor_bytes = 0;
-        for (self.files) |f| {
-            var it = f.tensors.iterator();
-            while (it.next()) |kv| self.largest_tensor_bytes = @max(self.largest_tensor_bytes, kv.value_ptr.byte_len);
-        }
-
-        const c = &self.config;
-        self.layers = try arena.alloc(Layer, c.num_layers);
-        for (self.layers, 0..) |*layer, i| {
-            const lp = try std.fmt.allocPrint(arena, "{s}layers.{d}.", .{ self.prefix, i });
-            layer.* = .{
-                .input_norm = try self.loadVec(try cat(arena, lp, "input_layernorm.weight")),
-                .post_attn_norm = try self.loadVec(try cat(arena, lp, "post_attention_layernorm.weight")),
-                .pre_ff_norm = self.loadVecOpt(try cat(arena, lp, "pre_feedforward_layernorm.weight")),
-                .post_ff_norm = self.loadVecOpt(try cat(arena, lp, "post_feedforward_layernorm.weight")),
-                .q_norm = self.loadVecOpt(try cat(arena, lp, "self_attn.q_norm.weight")),
-                .k_norm = self.loadVecOpt(try cat(arena, lp, "self_attn.k_norm.weight")),
-                .q = try self.loadMat(try cat(arena, lp, "self_attn.q_proj.weight")),
-                .k = try self.loadMat(try cat(arena, lp, "self_attn.k_proj.weight")),
-                .v = try self.loadMat(try cat(arena, lp, "self_attn.v_proj.weight")),
-                .o = try self.loadMat(try cat(arena, lp, "self_attn.o_proj.weight")),
-                .q_bias = self.loadVecOpt(try cat(arena, lp, "self_attn.q_proj.bias")),
-                .k_bias = self.loadVecOpt(try cat(arena, lp, "self_attn.k_proj.bias")),
-                .v_bias = self.loadVecOpt(try cat(arena, lp, "self_attn.v_proj.bias")),
-                .gate = null,
-                .up = null,
-                .down = null,
-                .refs = .{
-                    .q = try self.ref(try cat(arena, lp, "self_attn.q_proj.weight")),
-                    .k = try self.ref(try cat(arena, lp, "self_attn.k_proj.weight")),
-                    .v = try self.ref(try cat(arena, lp, "self_attn.v_proj.weight")),
-                    .o = try self.ref(try cat(arena, lp, "self_attn.o_proj.weight")),
-                },
-            };
-            if (c.moe_layers[i]) {
-                layer.moe = try moe.loadLayer(self, arena, i, lp);
-                layer.refs.router = layer.moe.?.router_ref;
-            } else {
-                layer.gate = try self.loadMat(try cat(arena, lp, "mlp.gate_proj.weight"));
-                layer.up = try self.loadMat(try cat(arena, lp, "mlp.up_proj.weight"));
-                layer.down = try self.loadMat(try cat(arena, lp, "mlp.down_proj.weight"));
-                layer.refs.gate = try self.ref(try cat(arena, lp, "mlp.gate_proj.weight"));
-                layer.refs.up = try self.ref(try cat(arena, lp, "mlp.up_proj.weight"));
-                layer.refs.down = try self.ref(try cat(arena, lp, "mlp.down_proj.weight"));
-            }
-        }
+        try self.loadWeights();
         // Warp mode: streamed mixture-of-experts models get an expert cache
         // unless it was explicitly disabled (`expert_cache = 0`).
         const use_cache = self.streamed() and self.isMoe() and (opts.expert_cache orelse 1) != 0;
@@ -716,9 +530,246 @@ pub const Model = struct {
             cache.deinit();
             gpa.destroy(cache);
         };
-
         try self.buildRope();
         return self;
+    }
+
+    /// Resolves the tensor names of the family and builds the layer table.
+    fn loadWeights(self: *Model) !void {
+        const arena = self.arena.allocator();
+        const c = &self.config;
+        const names = &c.arch.names;
+
+        // Detect prefix.
+        var found_prefix = false;
+        for (names.prefixes) |p| {
+            const key = try resolveName(arena, names.embed, p, 0, 0);
+            if (self.store.lookup(key) != null) {
+                self.prefix = p;
+                found_prefix = true;
+                break;
+            }
+        }
+        if (!found_prefix) {
+            std.log.err("embedding tensor '{s}' not found under any known prefix", .{names.embed});
+            return error.MissingWeights;
+        }
+
+        const embed_name = try self.name(names.embed);
+        self.embed_ref = self.store.lookup(embed_name).?;
+        self.embed = try self.loadMat(embed_name);
+        self.dtype = self.embed_ref.dtype;
+        if (c.vocab_size == 0 or c.vocab_size > self.embed.rows) c.vocab_size = self.embed.rows;
+        self.pos_embed_ref = if (names.pos_embed) |t| self.store.lookup(try self.name(t)) else null;
+        if (c.positional == .learned and self.pos_embed_ref == null) {
+            std.log.err("missing position embedding tensor", .{});
+            return error.MissingWeights;
+        }
+        self.embed_norm = if (names.embed_norm) |t| try self.loadNormOpt(try self.name(t)) else null;
+        self.final_norm = if (c.norm == .none) Norm{ .w = &.{} } else try self.loadNorm(try self.name(names.final_norm));
+        self.lm_head_bias = null;
+        var lm: ?WeightRef = null;
+        for (names.lm_head) |t| {
+            const n = try self.name(t);
+            if (self.store.lookup(n)) |r| {
+                lm = r;
+                self.lm_head_bias = self.loadVecOpt(try biasName(arena, n));
+                break;
+            }
+        }
+        if (lm == null) {
+            // Some multimodal exports keep the head next to the language model
+            // (`language_model.lm_head.weight` beside `language_model.model.`).
+            const trimmed = if (std.mem.endsWith(u8, self.prefix, "model.")) self.prefix[0 .. self.prefix.len - "model.".len] else self.prefix;
+            if (self.store.lookup(try std.fmt.allocPrint(arena, "{s}lm_head.weight", .{trimmed}))) |r| lm = r;
+        }
+        self.lm_head_ref = lm orelse self.embed_ref;
+        self.lm_head = try self.loadMat(self.lm_head_ref.name);
+
+        self.largest_tensor_bytes = 0;
+        for (self.files) |f| {
+            var it = f.tensors.iterator();
+            while (it.next()) |kv| self.largest_tensor_bytes = @max(self.largest_tensor_bytes, kv.value_ptr.byte_len);
+        }
+
+        self.layers = try arena.alloc(Layer, c.num_layers);
+        for (self.layers, 0..) |*layer, i| {
+            const lp = try resolveName(arena, names.layer, self.prefix, i, 0);
+            layer.* = .{
+                .input_norm = null,
+                .post_attn_norm = try self.normSlot(lp, names.post_attn_norm, true),
+                .pre_ff_norm = try self.normSlot(lp, names.pre_ff_norm, !c.parallel_residual),
+                .post_ff_norm = try self.normSlot(lp, names.post_ff_norm, true),
+                .mlp_norm = try self.normSlot(lp, names.mlp_norm, false),
+                .q_norm = if (names.q_norm) |t| try self.loadNormOpt(try cat(arena, lp, t)) else null,
+                .k_norm = if (names.k_norm) |t| try self.loadNormOpt(try cat(arena, lp, t)) else null,
+                .q = null,
+                .k = null,
+                .v = null,
+                .qkv = null,
+                .o = undefined,
+                .q_bias = null,
+                .k_bias = null,
+                .v_bias = null,
+                .qkv_bias = null,
+                .o_bias = null,
+                .sinks = if (names.sinks) |t| self.loadVecOpt(try cat(arena, lp, t)) else null,
+                .mla = null,
+                .gate = null,
+                .up = null,
+                .gate_up = null,
+                .down = null,
+                .gate_bias = null,
+                .up_bias = null,
+                .down_bias = null,
+                .refs = .{},
+            };
+            if (c.norm == .none) {
+                if (names.input_norm.len > 0) layer.input_norm = Norm{ .w = &.{} };
+            } else {
+                for (names.input_norm) |t| {
+                    if (try self.loadNormOpt(try cat(arena, lp, t))) |nm| {
+                        layer.input_norm = nm;
+                        break;
+                    }
+                }
+                if (layer.input_norm == null and names.input_norm.len > 0) {
+                    std.log.err("missing tensor: {s}{s}", .{ lp, names.input_norm[0] });
+                    return error.MissingWeights;
+                }
+            }
+            if (c.qk_norm == .l2) {
+                layer.q_norm = Norm{ .w = &.{} };
+                layer.k_norm = Norm{ .w = &.{} };
+            } else if (c.qk_norm == .none) {
+                layer.q_norm = null;
+                layer.k_norm = null;
+            }
+            if (c.sinks and layer.sinks == null) {
+                std.log.err("missing attention sinks in layer {d}", .{i});
+                return error.MissingWeights;
+            }
+
+            // Attention projections.
+            if (c.mla) |m| {
+                const kv_a_name = try cat(arena, lp, names.kv_a orelse return error.InvalidConfig);
+                const kv_b_name = try cat(arena, lp, names.kv_b orelse return error.InvalidConfig);
+                var mla = MlaWeights{
+                    .q_a = null,
+                    .q_a_norm = null,
+                    .q_b = undefined,
+                    .kv_a = try self.loadMat(kv_a_name),
+                    .kv_a_norm = try self.loadVec(try cat(arena, lp, names.kv_a_norm orelse return error.InvalidConfig)),
+                    .kv_b = try self.loadMat(kv_b_name),
+                };
+                layer.refs.add(.kv_a, try self.ref(kv_a_name), false);
+                layer.refs.add(.kv_b, try self.ref(kv_b_name), false);
+                if (m.q_lora_rank != null) {
+                    const q_a_name = try cat(arena, lp, names.q_a orelse return error.InvalidConfig);
+                    const q_b_name = try cat(arena, lp, names.q_b orelse return error.InvalidConfig);
+                    mla.q_a = try self.loadMat(q_a_name);
+                    mla.q_a_norm = try self.loadVec(try cat(arena, lp, names.q_a_norm orelse return error.InvalidConfig));
+                    mla.q_b = try self.loadMat(q_b_name);
+                    layer.refs.add(.q_a, try self.ref(q_a_name), false);
+                    layer.refs.add(.q_b, try self.ref(q_b_name), false);
+                } else {
+                    const q_name = try cat(arena, lp, names.q orelse return error.InvalidConfig);
+                    mla.q_b = try self.loadMat(q_name);
+                    layer.refs.add(.q_b, try self.ref(q_name), false);
+                }
+                if (mla.kv_a.rows != m.kv_lora_rank + m.qk_rope_head_dim or mla.kv_b.rows != c.num_heads * (m.qk_nope_head_dim + m.v_head_dim)) {
+                    std.log.err("layer {d}: MLA projection shapes do not match the config", .{i});
+                    return error.InvalidConfig;
+                }
+                layer.mla = mla;
+            } else if (c.qkv_layout != .separate) {
+                const qkv_name = try cat(arena, lp, names.qkv orelse return error.InvalidConfig);
+                layer.qkv = try self.loadMatT(qkv_name, c.arch.conv1d);
+                layer.qkv_bias = self.loadVecOpt(try biasName(arena, qkv_name));
+                layer.refs.add(.qkv, try self.ref(qkv_name), c.arch.conv1d);
+                const want = c.num_heads * c.head_dim + 2 * c.num_kv_heads * c.head_dim;
+                if (layer.qkv.?.rows != want or layer.qkv.?.cols != c.hidden_size) {
+                    std.log.err("layer {d}: fused qkv tensor is [{d}][{d}], expected [{d}][{d}]", .{ i, layer.qkv.?.rows, layer.qkv.?.cols, want, c.hidden_size });
+                    return error.InvalidConfig;
+                }
+            } else {
+                const q_name = try cat(arena, lp, names.q orelse return error.InvalidConfig);
+                const k_name = try cat(arena, lp, names.k orelse return error.InvalidConfig);
+                const v_name = try cat(arena, lp, names.v orelse return error.InvalidConfig);
+                layer.q = try self.loadMat(q_name);
+                layer.k = try self.loadMat(k_name);
+                layer.v = try self.loadMat(v_name);
+                layer.q_bias = self.loadVecOpt(try biasName(arena, q_name));
+                layer.k_bias = self.loadVecOpt(try biasName(arena, k_name));
+                layer.v_bias = self.loadVecOpt(try biasName(arena, v_name));
+                layer.refs.add(.q, try self.ref(q_name), false);
+                layer.refs.add(.k, try self.ref(k_name), false);
+                layer.refs.add(.v, try self.ref(v_name), false);
+                if (layer.q.?.rows != c.num_heads * c.head_dim or layer.k.?.rows != c.num_kv_heads * c.head_dim) {
+                    std.log.err("layer {d}: q/k projection shapes do not match the config (heads {d}, kv heads {d}, head_dim {d})", .{ i, c.num_heads, c.num_kv_heads, c.head_dim });
+                    return error.InvalidConfig;
+                }
+            }
+            const o_name = try cat(arena, lp, names.o);
+            layer.o = try self.loadMatT(o_name, c.arch.conv1d);
+            layer.o_bias = self.loadVecOpt(try biasName(arena, o_name));
+            layer.refs.add(.o, try self.ref(o_name), c.arch.conv1d);
+            if (layer.o.rows != c.hidden_size or layer.o.cols != c.num_heads * c.v_head_dim) {
+                std.log.err("layer {d}: output projection is [{d}][{d}], expected [{d}][{d}]", .{ i, layer.o.rows, layer.o.cols, c.hidden_size, c.num_heads * c.v_head_dim });
+                return error.InvalidConfig;
+            }
+
+            // MLP.
+            if (c.moe_layers[i]) {
+                layer.moe = try moe.loadLayer(self, arena, i, lp);
+                layer.refs.add(.router, layer.moe.?.router_ref, false);
+            } else {
+                const down_name = try cat(arena, lp, names.down);
+                switch (c.mlp) {
+                    .gated => {
+                        const gate_name = try cat(arena, lp, names.gate orelse return error.InvalidConfig);
+                        const up_name = try cat(arena, lp, names.up orelse return error.InvalidConfig);
+                        layer.gate = try self.loadMat(gate_name);
+                        layer.up = try self.loadMat(up_name);
+                        layer.gate_bias = self.loadVecOpt(try biasName(arena, gate_name));
+                        layer.up_bias = self.loadVecOpt(try biasName(arena, up_name));
+                        layer.refs.add(.gate, try self.ref(gate_name), false);
+                        layer.refs.add(.up, try self.ref(up_name), false);
+                    },
+                    .gated_fused => {
+                        const gu_name = try cat(arena, lp, names.gate_up orelse return error.InvalidConfig);
+                        layer.gate_up = try self.loadMat(gu_name);
+                        layer.up_bias = self.loadVecOpt(try biasName(arena, gu_name));
+                        layer.refs.add(.gate_up, try self.ref(gu_name), false);
+                    },
+                    .dense => {
+                        const up_name = try cat(arena, lp, names.up orelse return error.InvalidConfig);
+                        layer.up = try self.loadMatT(up_name, c.arch.conv1d);
+                        layer.up_bias = self.loadVecOpt(try biasName(arena, up_name));
+                        layer.refs.add(.up, try self.ref(up_name), c.arch.conv1d);
+                    },
+                }
+                layer.down = try self.loadMatT(down_name, c.arch.conv1d);
+                layer.down_bias = self.loadVecOpt(try biasName(arena, down_name));
+                layer.refs.add(.down, try self.ref(down_name), c.arch.conv1d);
+                const inter = if (layer.gate_up) |g| g.rows / 2 else layer.up.?.rows;
+                if (i == 0 and inter != c.intermediate_size) {
+                    std.log.warn("intermediate_size {d} in config, {d} in the weights; using the weights", .{ c.intermediate_size, inter });
+                }
+                if (inter > c.intermediate_size) c.intermediate_size = inter;
+                if (layer.down.?.rows != c.hidden_size or layer.down.?.cols != inter) {
+                    std.log.err("layer {d}: down projection is [{d}][{d}], expected [{d}][{d}]", .{ i, layer.down.?.rows, layer.down.?.cols, c.hidden_size, inter });
+                    return error.InvalidConfig;
+                }
+            }
+        }
+        self.alibi_slopes = &.{};
+        if (c.positional == .alibi) self.alibi_slopes = try alibiSlopes(arena, c.num_heads);
+    }
+
+    /// Resolves a model-level name template with the detected prefix.
+    fn name(self: *Model, template: []const u8) ![]const u8 {
+        return resolveName(self.arena.allocator(), template, self.prefix, 0, 0);
     }
 
     /// Automatic expert cache capacity: what the budget leaves after the
@@ -759,9 +810,9 @@ pub const Model = struct {
     }
 
     /// Locates a tensor by name in the store.
-    pub fn ref(self: *const Model, name: []const u8) !WeightRef {
-        return self.store.lookup(name) orelse {
-            std.log.err("missing tensor: {s}", .{name});
+    pub fn ref(self: *const Model, name_: []const u8) !WeightRef {
+        return self.store.lookup(name_) orelse {
+            std.log.err("missing tensor: {s}", .{name_});
             return error.MissingWeights;
         };
     }
@@ -776,28 +827,35 @@ pub const Model = struct {
     pub fn acquireLayer(self: *const Model, li: usize) !LayerLease {
         const store: *stream.WeightStore = @constCast(&self.store);
         var lease = LayerLease{ .model = self, .layer = self.layers[li], .leases = undefined, .n_leases = 0 };
+        const lr = &self.layers[li].refs;
         var buf: [LayerRefs.max]WeightRef = undefined;
-        const refs = self.layers[li].refs.all(&buf);
-        try store.acquireSet(li, refs, lease.leases[0..refs.len]);
-        lease.n_leases = refs.len;
+        const plain = lr.plain(&buf);
+        try store.acquireSet(li, plain, lease.leases[0..plain.len]);
+        lease.n_leases = plain.len;
         errdefer store.releaseSet(lease.leases[0..lease.n_leases]);
         const l = &lease.layer;
-        l.q = lease.leases[0].weight;
-        l.k = lease.leases[1].weight;
-        l.v = lease.leases[2].weight;
-        l.o = lease.leases[3].weight;
+        var pi: usize = 0;
+        for (0..lr.n) |i| {
+            if (lr.transposed[i]) {
+                // Mapped mode keeps an arena-owned transposed copy in the layer already.
+                if (!self.streamed()) continue;
+                var out: [1]stream.Lease = undefined;
+                try store.acquireTransposed(lr.refs[i], &.{.{ 0, lr.refs[i].cols }}, &out);
+                lease.leases[lease.n_leases] = out[0];
+                lease.n_leases += 1;
+                l.setSlot(lr.slots[i], out[0].weight);
+            } else {
+                l.setSlot(lr.slots[i], lease.leases[pi].weight);
+                pi += 1;
+            }
+        }
         if (l.moe) |*m| {
-            m.router = lease.leases[4].weight;
             lease.experts = try moe.acquireLayer(self, m);
             l.moe = lease.experts.?.layer;
-        } else {
-            l.gate = lease.leases[4].weight;
-            l.up = lease.leases[5].weight;
-            l.down = lease.leases[6].weight;
         }
         if (li + 1 < self.layers.len) {
             var next_buf: [LayerRefs.max]WeightRef = undefined;
-            store.prefetch(li + 1, self.layers[li + 1].refs.all(&next_buf));
+            store.prefetch(li + 1, self.layers[li + 1].refs.plain(&next_buf));
         }
         return lease;
     }
@@ -806,10 +864,19 @@ pub const Model = struct {
     /// For `.mlp_down_proj` on a mixture-of-experts layer use `acquireExpertDown`.
     pub fn acquireComponent(self: *const Model, layer: usize, comp: Component) !stream.Lease {
         const store: *stream.WeightStore = @constCast(&self.store);
-        return store.acquire(switch (comp) {
-            .attn_o_proj => self.layers[layer].refs.o,
-            .mlp_down_proj => self.layers[layer].refs.down.?,
-        });
+        const slot: Slot = switch (comp) {
+            .attn_o_proj => .o,
+            .mlp_down_proj => .down,
+        };
+        const lr = &self.layers[layer].refs;
+        const r = lr.get(slot) orelse return error.NotDenseLayer;
+        if (lr.isTransposed(slot)) {
+            if (!self.streamed()) return .{ .weight = self.componentWeight(layer, comp) };
+            var out: [1]stream.Lease = undefined;
+            try store.acquireTransposed(r, &.{.{ 0, r.cols }}, &out);
+            return out[0];
+        }
+        return store.acquire(r);
     }
 
     /// Makes the down projection of expert `expert` of an MoE layer resident
@@ -827,6 +894,13 @@ pub const Model = struct {
     pub fn embedRow(self: *const Model, t: u32, out: []f32) !void {
         const store: *stream.WeightStore = @constCast(&self.store);
         try store.readRow(self.embed_ref, @min(t, self.embed_ref.rows - 1), out);
+    }
+
+    /// Reads the learned position embedding for `pos` (with the family's offset).
+    fn posEmbedRow(self: *const Model, pos: usize, out: []f32) !void {
+        const r = self.pos_embed_ref orelse return;
+        const store: *stream.WeightStore = @constCast(&self.store);
+        try store.readRow(r, @min(pos + self.config.position_offset, r.rows - 1), out);
     }
 
     /// Reads config.json, tokenizer files and opens the safetensors files of a
@@ -933,45 +1007,86 @@ pub const Model = struct {
         return std.fmt.allocPrint(arena, "{s}{s}", .{ a, b });
     }
 
-    pub fn find(self: *const Model, name: []const u8) ?safetensors.TensorInfo {
+    pub fn find(self: *const Model, name_: []const u8) ?safetensors.TensorInfo {
         for (self.files) |f| {
-            if (f.get(name)) |t| return t;
+            if (f.get(name_)) |t| return t;
         }
         return null;
     }
 
     /// Matrix view of a named tensor: the mapping in mapped mode, the shape
     /// only (empty data) in streamed mode.
-    pub fn loadMat(self: *Model, name: []const u8) !Weight {
-        const r = try self.ref(name);
+    pub fn loadMat(self: *Model, name_: []const u8) !Weight {
+        const r = try self.ref(name_);
         return switch (self.store.mode) {
-            .mapped => self.find(name).?.asWeight(),
+            .mapped => self.find(name_).?.asWeight(),
             .streamed => r.shapeOnly(),
         };
     }
 
-    fn loadVec(self: *Model, name: []const u8) ![]f32 {
-        return self.loadVecOpt(name) orelse {
-            std.log.err("missing tensor: {s}", .{name});
+    /// Like `loadMat`; a `transposed` (Conv1D `[in][out]`) tensor is returned
+    /// as `[out][in]`: an arena-owned copy in mapped mode, the shape in streamed mode.
+    fn loadMatT(self: *Model, name_: []const u8, transposed: bool) !Weight {
+        if (!transposed) return self.loadMat(name_);
+        const r = try self.ref(name_);
+        if (self.streamed()) return .{ .data = &.{}, .dtype = r.dtype, .rows = r.cols, .cols = r.rows };
+        const src = self.find(name_).?.asWeight();
+        const es = src.dtype.size();
+        const out = try self.arena.allocator().alloc(u8, src.data.len);
+        var i: usize = 0;
+        while (i < src.rows) : (i += 1) {
+            var j: usize = 0;
+            while (j < src.cols) : (j += 1) {
+                @memcpy(out[(j * src.rows + i) * es ..][0..es], src.data[(i * src.cols + j) * es ..][0..es]);
+            }
+        }
+        return .{ .data = out, .dtype = src.dtype, .rows = src.cols, .cols = src.rows };
+    }
+
+    fn loadVec(self: *Model, name_: []const u8) ![]f32 {
+        return self.loadVecOpt(name_) orelse {
+            std.log.err("missing tensor: {s}", .{name_});
             return error.MissingWeights;
         };
     }
 
     /// Reads a small tensor as an f32 vector (null if absent).
-    pub fn loadVecOpt(self: *Model, name: []const u8) ?[]f32 {
-        const r = self.store.lookup(name) orelse return null;
+    pub fn loadVecOpt(self: *Model, name_: []const u8) ?[]f32 {
+        const r = self.store.lookup(name_) orelse return null;
         return self.store.readVecF32(self.arena.allocator(), r) catch null;
+    }
+
+    /// A layer norm at `lp ++ template`: null when the family has no such
+    /// norm, a weightless slot for the non-parametric family, otherwise the
+    /// loaded parameters (`required` decides whether absence is an error).
+    fn normSlot(self: *Model, lp: []const u8, template: ?[]const u8, required: bool) !?Norm {
+        const t = template orelse return null;
+        if (self.config.norm == .none) return Norm{ .w = &.{} };
+        const name_ = try cat(self.arena.allocator(), lp, t);
+        return if (required) try self.loadNorm(name_) else try self.loadNormOpt(name_);
+    }
+
+    fn loadNormOpt(self: *Model, name_: []const u8) !?Norm {
+        const w = self.loadVecOpt(name_) orelse return null;
+        return Norm{ .w = w, .b = self.loadVecOpt(try biasName(self.arena.allocator(), name_)) };
+    }
+
+    fn loadNorm(self: *Model, name_: []const u8) !Norm {
+        return (try self.loadNormOpt(name_)) orelse {
+            std.log.err("missing tensor: {s}", .{name_});
+            return error.MissingWeights;
+        };
     }
 
     fn buildRope(self: *Model) !void {
         const c = &self.config;
         const arena = self.arena.allocator();
-        const half = c.head_dim / 2;
+        const half = c.rotary_dim / 2;
         self.rope_len = @min(c.max_position_embeddings, 8192);
         self.rope_cos = try arena.alloc(f32, self.rope_len * half);
         self.rope_sin = try arena.alloc(f32, self.rope_len * half);
         try self.fillRope(self.rope_cos, self.rope_sin, c.rope_theta, c.rope_scaling);
-        if (c.family == .gemma3) {
+        if (c.arch.norm == .rms_gemma and std.mem.startsWith(u8, c.model_type, "gemma3")) {
             self.rope_cos_local = try arena.alloc(f32, self.rope_len * half);
             self.rope_sin_local = try arena.alloc(f32, self.rope_len * half);
             try self.fillRope(self.rope_cos_local, self.rope_sin_local, c.rope_local_theta, .none);
@@ -983,13 +1098,16 @@ pub const Model = struct {
 
     fn fillRope(self: *Model, cos: []f32, sin: []f32, theta: f32, scaling: RopeScaling) !void {
         const c = &self.config;
-        const half = c.head_dim / 2;
+        const dim = c.rotary_dim;
+        const half = dim / 2;
+        if (half == 0) return;
         const inv_freq = try self.gpa.alloc(f64, half);
         defer self.gpa.free(inv_freq);
         for (inv_freq, 0..) |*f, i| {
-            const exponent: f64 = @as(f64, @floatFromInt(2 * i)) / @as(f64, @floatFromInt(c.head_dim));
+            const exponent: f64 = @as(f64, @floatFromInt(2 * i)) / @as(f64, @floatFromInt(dim));
             f.* = 1.0 / std.math.pow(f64, theta, exponent);
         }
+        var attention_factor: f64 = 1.0;
         switch (scaling) {
             .none => {},
             .linear => |factor| for (inv_freq) |*f| {
@@ -1013,13 +1131,45 @@ pub const Model = struct {
                     }
                 }
             },
+            .yarn => |y| {
+                // Blend of interpolated (low frequency) and extrapolated (high
+                // frequency) frequencies with a linear ramp between the
+                // correction dims, as in Hugging Face `_compute_yarn_parameters`.
+                const base: f64 = theta;
+                const dimf: f64 = @floatFromInt(dim);
+                const corr = struct {
+                    fn dimFor(rot: f64, d: f64, b: f64, max_pos: f64) f64 {
+                        return (d * @log(max_pos / (rot * 2.0 * std.math.pi))) / (2.0 * @log(b));
+                    }
+                };
+                var low = corr.dimFor(y.beta_fast, dimf, base, y.original_max_position);
+                var high = corr.dimFor(y.beta_slow, dimf, base, y.original_max_position);
+                if (y.truncate) {
+                    low = @floor(low);
+                    high = @ceil(high);
+                }
+                low = @max(low, 0);
+                high = @min(high, dimf - 1);
+                if (low == high) high += 0.001;
+                for (inv_freq, 0..) |*f, i| {
+                    const ramp = std.math.clamp((@as(f64, @floatFromInt(i)) - low) / (high - low), 0.0, 1.0);
+                    const extrapolation_factor = 1.0 - ramp;
+                    const interp = f.* / y.factor;
+                    f.* = interp * (1.0 - extrapolation_factor) + f.* * extrapolation_factor;
+                }
+                attention_factor = y.attention_factor;
+            },
+            .longrope => |l| {
+                for (inv_freq, 0..) |*f, i| f.* /= l.factors[i];
+                attention_factor = l.attention_factor;
+            },
         }
         var pos: usize = 0;
         while (pos < self.rope_len) : (pos += 1) {
             for (inv_freq, 0..) |f, i| {
                 const angle = @as(f64, @floatFromInt(pos)) * f;
-                cos[pos * half + i] = @floatCast(@cos(angle));
-                sin[pos * half + i] = @floatCast(@sin(angle));
+                cos[pos * half + i] = @floatCast(@cos(angle) * attention_factor);
+                sin[pos * half + i] = @floatCast(@sin(angle) * attention_factor);
             }
         }
     }
@@ -1027,6 +1177,43 @@ pub const Model = struct {
     pub fn isEos(self: *const Model, id: u32) bool {
         for (self.eos_ids) |e| if (e == id) return true;
         return false;
+    }
+
+    /// Layer index encoded in a tensor name of this model, if any.
+    pub fn layerIndex(self: *const Model, name_: []const u8) ?usize {
+        return layerIndexOfTemplate(self.config.arch.names.layer, self.prefix, name_);
+    }
+
+    /// The tensor-name suffix after the layer prefix (`self_attn.o_proj.weight`), if `name_` is a layer tensor.
+    pub fn layerSuffix(self: *const Model, name_: []const u8) ?struct { layer: usize, suffix: []const u8 } {
+        const li = self.layerIndex(name_) orelse return null;
+        var buf: [96]u8 = undefined;
+        const lp = layerPrefixBuf(&buf, self.config.arch.names.layer, self.prefix, li) orelse return null;
+        if (!std.mem.startsWith(u8, name_, lp)) return null;
+        return .{ .layer = li, .suffix = name_[lp.len..] };
+    }
+
+    /// How the export must modify tensor `name_` (null: copy as is).
+    pub fn exportEdit(self: *const Model, name_: []const u8) ?ExportEdit {
+        const ls = self.layerSuffix(name_) orelse return null;
+        if (ls.layer >= self.layers.len) return null;
+        const layer = &self.layers[ls.layer];
+        const names = &self.config.arch.names;
+        if (std.mem.eql(u8, ls.suffix, names.o)) return wholeEdit(layer.o_delta, layer.refs.isTransposed(.o));
+        if (layer.moe) |*m| {
+            const target = m.exportTarget(ls.suffix) orelse return null;
+            return switch (target) {
+                .expert => |e| wholeEdit(m.getDownDelta(e), false),
+                .fused_down => if (m.anyExpertDelta()) .{ .fused_down = ls.layer } else null,
+            };
+        }
+        if (std.mem.eql(u8, ls.suffix, names.down)) return wholeEdit(layer.down_delta, layer.refs.isTransposed(.down));
+        return null;
+    }
+
+    fn wholeEdit(delta: ?Delta, transposed: bool) ?ExportEdit {
+        const d = delta orelse return null;
+        return if (transposed) .{ .whole_transposed = d } else .{ .whole = d };
     }
 
     /// Removes all abliteration deltas.
@@ -1122,14 +1309,89 @@ pub const Model = struct {
 /// the export completed; a directory containing it is refused by `Model.load`.
 pub const export_incomplete_marker = ".incomplete";
 
+/// Writes the layer prefix (`<prefix>layers.<n>.`) for `layer` into `buf`.
+fn layerPrefixBuf(buf: []u8, template: []const u8, prefix: []const u8, layer: usize) ?[]const u8 {
+    var fbs = Io.Writer.fixed(buf);
+    var i: usize = 0;
+    while (i < template.len) {
+        if (template[i] == '{' and i + 2 < template.len and template[i + 2] == '}') {
+            switch (template[i + 1]) {
+                'p' => fbs.writeAll(prefix) catch return null,
+                'i' => fbs.print("{d}", .{layer}) catch return null,
+                else => return null,
+            }
+            i += 3;
+        } else {
+            fbs.writeByte(template[i]) catch return null;
+            i += 1;
+        }
+    }
+    return fbs.buffered();
+}
+
+/// Layer index encoded in a tensor name according to a layer template
+/// (`{p}layers.{i}.`), if any.
+pub fn layerIndexOfTemplate(template: []const u8, prefix: []const u8, name_: []const u8) ?usize {
+    const marker = std.mem.indexOf(u8, template, "{i}") orelse return null;
+    var buf: [96]u8 = undefined;
+    const head = layerPrefixBuf(&buf, template[0..marker], prefix, 0) orelse return null;
+    if (!std.mem.startsWith(u8, name_, head)) return null;
+    const after = name_[head.len..];
+    const tail = template[marker + 3 ..];
+    const end = std.mem.indexOf(u8, after, tail) orelse return null;
+    if (end == 0) return null;
+    return std.fmt.parseInt(usize, after[0..end], 10) catch null;
+}
+
 /// Layer index encoded in a tensor name (`<prefix>layers.<n>.…`), if any.
-pub fn layerIndexOf(prefix: []const u8, name: []const u8) ?usize {
-    if (!std.mem.startsWith(u8, name, prefix)) return null;
-    const rest = name[prefix.len..];
-    if (!std.mem.startsWith(u8, rest, "layers.")) return null;
-    const after = rest["layers.".len..];
-    const dot = std.mem.indexOfScalar(u8, after, '.') orelse return null;
-    return std.fmt.parseInt(usize, after[0..dot], 10) catch null;
+pub fn layerIndexOf(prefix: []const u8, name_: []const u8) ?usize {
+    return layerIndexOfTemplate("{p}layers.{i}.", prefix, name_);
+}
+
+/// ALiBi slopes for `n` heads (the BLOOM / MPT construction, identical for both).
+fn alibiSlopes(arena: Allocator, n: usize) ![]f32 {
+    const out = try arena.alloc(f32, n);
+    var pow2: usize = 1;
+    while (pow2 < n) pow2 *= 2;
+    // Slopes for the next power of two, then interleaved like MPT/BLOOM for odd counts.
+    const full = try arena.alloc(f32, pow2);
+    for (full, 0..) |*s, i| s.* = @floatCast(std.math.pow(f64, 2.0, -8.0 * @as(f64, @floatFromInt(i + 1)) / @as(f64, @floatFromInt(pow2))));
+    if (pow2 == n) {
+        @memcpy(out, full);
+    } else {
+        var k: usize = 0;
+        var i: usize = 1;
+        while (i < pow2 and k < n) : (i += 2) {
+            out[k] = full[i];
+            k += 1;
+        }
+        i = 0;
+        while (i < pow2 and k < n) : (i += 2) {
+            out[k] = full[i];
+            k += 1;
+        }
+    }
+    return out;
+}
+
+test "layer index from templates" {
+    try std.testing.expectEqual(@as(?usize, 12), layerIndexOfTemplate("{p}layers.{i}.", "model.", "model.layers.12.self_attn.o_proj.weight"));
+    try std.testing.expectEqual(@as(?usize, 3), layerIndexOfTemplate("{p}h.{i}.", "transformer.", "transformer.h.3.attn.c_proj.weight"));
+    try std.testing.expectEqual(@as(?usize, null), layerIndexOfTemplate("{p}h.{i}.", "transformer.", "transformer.wte.weight"));
+    try std.testing.expectEqual(@as(?usize, 7), layerIndexOfTemplate("{p}encoder.layers.{i}.", "transformer.", "transformer.encoder.layers.7.mlp.dense_4h_to_h.weight"));
+}
+
+test "alibi slopes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const s8 = try alibiSlopes(arena.allocator(), 8);
+    try std.testing.expectApproxEqRel(@as(f32, 0.5), s8[0], 1e-6);
+    try std.testing.expectApproxEqRel(@as(f32, 1.0 / 256.0), s8[7], 1e-6);
+    const s12 = try alibiSlopes(arena.allocator(), 12);
+    try std.testing.expectApproxEqRel(@as(f32, 0.5), s12[0], 1e-6);
+    try std.testing.expectApproxEqRel(@as(f32, 1.0 / 256.0), s12[7], 1e-6);
+    try std.testing.expectApproxEqRel(@as(f32, std.math.pow(f32, 2.0, -0.5)), s12[8], 1e-6);
+    try std.testing.expectApproxEqRel(@as(f32, std.math.pow(f32, 2.0, -3.5)), s12[11], 1e-6);
 }
 
 // ---------------------------------------------------------------------------
@@ -1278,13 +1540,16 @@ const AttnCtx = struct {
     layer: usize,
     rows: []const Row,
     q: []f32, // [n][heads*head_dim] (already roped)
-    out: []f32, // [n][heads*head_dim]
+    out: []f32, // [n][heads*head_dim]; per head the first v_head_dim entries are written
     sliding: bool,
+    sinks: ?[]const f32,
 };
 
 fn attentionWorker(ctx: *const AttnCtx, start: usize, end: usize) void {
-    const c = &ctx.model.config;
+    const model = ctx.model;
+    const c = &model.config;
     const hd = c.head_dim;
+    const vd = c.v_head_dim;
     const groups = c.num_heads / c.num_kv_heads;
     var scores_buf: [8192]f32 = undefined;
     var task = start;
@@ -1294,7 +1559,7 @@ fn attentionWorker(ctx: *const AttnCtx, start: usize, end: usize) void {
         const row = ctx.rows[r];
         const kvh = h / groups;
         const q = ctx.q[r * c.num_heads * hd + h * hd ..][0..hd];
-        const out = ctx.out[r * c.num_heads * hd + h * hd ..][0..hd];
+        const out = ctx.out[r * c.num_heads * hd + h * hd ..][0..vd];
         var lo: usize = 0;
         if (ctx.sliding) {
             if (c.sliding_window) |w| {
@@ -1303,21 +1568,37 @@ fn attentionWorker(ctx: *const AttnCtx, start: usize, end: usize) void {
         }
         const n_keys = row.pos + 1 - lo;
         const scores = scores_buf[0..n_keys];
+        const slope: f32 = if (model.alibi_slopes.len > 0) model.alibi_slopes[h] else 0;
         var p: usize = 0;
         while (p < n_keys) : (p += 1) {
             const k = ctx.cache.kSlot(ctx.layer, row.b, lo + p)[kvh * hd ..][0..hd];
             var s = tensor.dot(q, k) * c.attention_scale;
             if (c.attn_logit_softcapping) |cap| s = cap * std.math.tanh(s / cap);
+            if (slope != 0) s += slope * @as(f32, @floatFromInt(lo + p));
             scores[p] = s;
         }
-        tensor.softmaxInPlace(scores);
+        if (ctx.sinks) |sk| softmaxWithSink(scores, sk[h]) else tensor.softmaxInPlace(scores);
         @memset(out, 0);
         p = 0;
         while (p < n_keys) : (p += 1) {
-            const v = ctx.cache.vSlot(ctx.layer, row.b, lo + p)[kvh * hd ..][0..hd];
+            const v = ctx.cache.vSlot(ctx.layer, row.b, lo + p)[kvh * hd ..][0..vd];
             tensor.axpy(out, scores[p], v);
         }
     }
+}
+
+/// Softmax over `x` with an extra sink logit that takes probability mass but
+/// contributes no value (gpt-oss).
+fn softmaxWithSink(x: []f32, sink: f32) void {
+    var m: f32 = sink;
+    for (x) |v| m = @max(m, v);
+    var s: f32 = @exp(sink - m);
+    for (x) |*v| {
+        v.* = @exp(v.* - m);
+        s += v.*;
+    }
+    const inv = 1.0 / s;
+    for (x) |*v| v.* *= inv;
 }
 
 /// Workspace for forward passes, sized for `max_rows` tokens per call.
@@ -1325,48 +1606,98 @@ pub const Workspace = struct {
     gpa: Allocator,
     x: []f32,
     h: []f32,
+    h2: []f32,
     q: []f32,
     k: []f32,
     v: []f32,
+    /// Fused qkv product `[rows][q + 2 kv]` (empty for separate projections).
+    qkv: []f32,
     attn: []f32,
     o: []f32,
+    /// MLP output.
+    m: []f32,
     gate: []f32,
     up: []f32,
+    /// Fused gate/up product `[rows][2 I]` (empty unless the MLP is `gated_fused`).
+    gate_up: []f32,
     logits: []f32,
     max_rows: usize,
     max_logit_rows: usize,
+
+    /// Bytes `init` allocates per row (everything but the logits).
+    pub fn bytesPerRow(c: *const Config) u64 {
+        const hidden: u64 = c.hidden_size;
+        const qd: u64 = c.num_heads * c.head_dim;
+        const kvd: u64 = c.num_kv_heads * c.head_dim;
+        const inter: u64 = c.intermediate_size;
+        return (5 * hidden + 2 * qd + 2 * kvd + fusedQkvRows(c) + 2 * inter + fusedGateUpCols(c)) * 4;
+    }
+
+    fn fusedQkvRows(c: *const Config) usize {
+        return if (c.qkv_layout != .separate and c.mla == null) (c.num_heads + 2 * c.num_kv_heads) * c.head_dim else 0;
+    }
+
+    fn fusedGateUpCols(c: *const Config) usize {
+        return if (c.mlp == .gated_fused) 2 * c.intermediate_size else 0;
+    }
 
     pub fn init(gpa: Allocator, c: *const Config, max_rows: usize, max_logit_rows: usize) !Workspace {
         const hidden = c.hidden_size;
         const qd = c.num_heads * c.head_dim;
         const kvd = c.num_kv_heads * c.head_dim;
-        return .{
+        const qkv_rows = fusedQkvRows(c);
+        const gu = fusedGateUpCols(c);
+        var self = Workspace{
             .gpa = gpa,
-            .x = try gpa.alloc(f32, max_rows * hidden),
-            .h = try gpa.alloc(f32, max_rows * hidden),
-            .q = try gpa.alloc(f32, max_rows * qd),
-            .k = try gpa.alloc(f32, max_rows * kvd),
-            .v = try gpa.alloc(f32, max_rows * kvd),
-            .attn = try gpa.alloc(f32, max_rows * qd),
-            .o = try gpa.alloc(f32, max_rows * hidden),
-            .gate = try gpa.alloc(f32, max_rows * c.intermediate_size),
-            .up = try gpa.alloc(f32, max_rows * c.intermediate_size),
-            .logits = try gpa.alloc(f32, max_logit_rows * c.vocab_size),
+            .x = &.{},
+            .h = &.{},
+            .h2 = &.{},
+            .q = &.{},
+            .k = &.{},
+            .v = &.{},
+            .qkv = &.{},
+            .attn = &.{},
+            .o = &.{},
+            .m = &.{},
+            .gate = &.{},
+            .up = &.{},
+            .gate_up = &.{},
+            .logits = &.{},
             .max_rows = max_rows,
             .max_logit_rows = max_logit_rows,
         };
+        errdefer self.deinit();
+        self.x = try gpa.alloc(f32, max_rows * hidden);
+        self.h = try gpa.alloc(f32, max_rows * hidden);
+        self.h2 = try gpa.alloc(f32, max_rows * hidden);
+        self.q = try gpa.alloc(f32, max_rows * qd);
+        self.k = try gpa.alloc(f32, max_rows * kvd);
+        self.v = try gpa.alloc(f32, max_rows * kvd);
+        self.qkv = try gpa.alloc(f32, max_rows * qkv_rows);
+        self.attn = try gpa.alloc(f32, max_rows * qd);
+        self.o = try gpa.alloc(f32, max_rows * hidden);
+        self.m = try gpa.alloc(f32, max_rows * hidden);
+        self.gate = try gpa.alloc(f32, max_rows * c.intermediate_size);
+        self.up = try gpa.alloc(f32, max_rows * c.intermediate_size);
+        self.gate_up = try gpa.alloc(f32, max_rows * gu);
+        self.logits = try gpa.alloc(f32, max_logit_rows * c.vocab_size);
+        return self;
     }
 
     pub fn deinit(self: *Workspace) void {
         self.gpa.free(self.x);
         self.gpa.free(self.h);
+        self.gpa.free(self.h2);
         self.gpa.free(self.q);
         self.gpa.free(self.k);
         self.gpa.free(self.v);
+        self.gpa.free(self.qkv);
         self.gpa.free(self.attn);
         self.gpa.free(self.o);
+        self.gpa.free(self.m);
         self.gpa.free(self.gate);
         self.gpa.free(self.up);
+        self.gpa.free(self.gate_up);
         self.gpa.free(self.logits);
     }
 };
@@ -1381,6 +1712,299 @@ pub const ForwardOptions = struct {
     /// Rows for which logits should be computed (indexes into `rows`).
     logit_rows: []const usize = &.{},
 };
+
+/// Applies the family's normalisation to one vector.
+fn applyNorm(c: *const Config, out: []f32, x: []const f32, nm: Norm) void {
+    switch (c.norm) {
+        .rms => tensor.rmsnorm(out, x, nm.w, c.rms_norm_eps, false),
+        .rms_gemma => tensor.rmsnorm(out, x, nm.w, c.rms_norm_eps, true),
+        .layer => tensor.layernorm(out, x, nm.w, nm.b, c.rms_norm_eps, false),
+        .layer_1p => tensor.layernorm(out, x, nm.w, nm.b, c.rms_norm_eps, true),
+        .none => tensor.layernorm(out, x, &.{}, null, c.rms_norm_eps, false),
+    }
+}
+
+/// `out[i] = norm(x[i])` for `n` rows, or a copy when there is no norm.
+fn normRows(c: *const Config, out: []f32, x: []const f32, n: usize, hidden: usize, nm: ?Norm) void {
+    if (nm) |norm| {
+        var i: usize = 0;
+        while (i < n) : (i += 1) applyNorm(c, out[i * hidden ..][0..hidden], x[i * hidden ..][0..hidden], norm);
+    } else {
+        @memcpy(out[0 .. n * hidden], x[0 .. n * hidden]);
+    }
+}
+
+fn normRowsInPlace(c: *const Config, buf: []f32, n: usize, hidden: usize, nm: Norm, tmp: []f32) void {
+    normRows(c, tmp, buf, n, hidden, nm);
+    @memcpy(buf[0 .. n * hidden], tmp[0 .. n * hidden]);
+}
+
+/// Normalises a query/key vector in place: RMS or LayerNorm per the family
+/// (weightless RMS when `w` is empty, e.g. the Llama 4 L2 norm).
+fn normVecInPlace(c: *const Config, x: []f32, w: []const f32, b: ?[]const f32) void {
+    var tmp: [1024]f32 = undefined;
+    const out = tmp[0..x.len];
+    if (w.len == 0) {
+        var ss: f32 = 0;
+        for (x) |v| ss += v * v;
+        const inv = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(x.len)) + c.rms_norm_eps);
+        for (x) |*v| v.* *= inv;
+        return;
+    }
+    switch (c.norm) {
+        .rms, .none => tensor.rmsnorm(out, x, w, c.rms_norm_eps, false),
+        .rms_gemma => tensor.rmsnorm(out, x, w, c.rms_norm_eps, true),
+        .layer, .layer_1p => tensor.layernorm(out, x, w, b, c.rms_norm_eps, false),
+    }
+    @memcpy(x, out);
+}
+
+/// Applies the q/k norm to head `h` of a projection row (`.head`, `.heads`, `.l2`).
+fn qkNormHead(c: *const Config, head: []f32, nm: Norm, h: usize) void {
+    const hd = head.len;
+    switch (c.qk_norm) {
+        .head => normVecInPlace(c, head, nm.w[0..hd], if (nm.b) |b| b[0..hd] else null),
+        .heads => normVecInPlace(c, head, nm.w[h * hd ..][0..hd], if (nm.b) |b| b[h * hd ..][0..hd] else null),
+        .l2 => normVecInPlace(c, head, &.{}, null),
+        .none, .full => {},
+    }
+}
+
+fn ropeHead(c: *const Config, x: []f32, cos_row: []const f32, sin_row: []const f32) void {
+    const d = c.rotary_dim;
+    if (d == 0) return;
+    switch (c.rope_style) {
+        .neox => tensor.applyRope(x[0..d], cos_row, sin_row),
+        .gptj => tensor.applyRopeInterleaved(x[0..d], cos_row, sin_row),
+    }
+}
+
+fn addBias(buf: []f32, n: usize, width: usize, bias: []const f32) void {
+    var i: usize = 0;
+    while (i < n) : (i += 1) tensor.axpy(buf[i * width ..][0..width], 1.0, bias[0..width]);
+}
+
+fn clampAll(buf: []f32, limit: f32) void {
+    for (buf) |*v| v.* = std.math.clamp(v.*, -limit, limit);
+}
+
+/// Splits one fused qkv row into q, k and v according to the family layout.
+fn scatterQkv(c: *const Config, fused: []const f32, q: []f32, k: []f32, v: []f32) void {
+    const hd = c.head_dim;
+    const nh = c.num_heads;
+    const nkv = c.num_kv_heads;
+    const qd = nh * hd;
+    const kvd = nkv * hd;
+    switch (c.qkv_layout) {
+        .separate => unreachable,
+        .concat => {
+            @memcpy(q, fused[0..qd]);
+            @memcpy(k, fused[qd..][0..kvd]);
+            @memcpy(v, fused[qd + kvd ..][0..kvd]);
+        },
+        .heads_interleaved => {
+            std.debug.assert(nkv == nh);
+            for (0..nh) |h| {
+                @memcpy(q[h * hd ..][0..hd], fused[h * 3 * hd ..][0..hd]);
+                @memcpy(k[h * hd ..][0..hd], fused[h * 3 * hd + hd ..][0..hd]);
+                @memcpy(v[h * hd ..][0..hd], fused[h * 3 * hd + 2 * hd ..][0..hd]);
+            }
+        },
+        .grouped => {
+            const groups = nh / nkv;
+            for (0..nkv) |g| {
+                const base = g * (groups + 2) * hd;
+                for (0..groups) |j| @memcpy(q[(g * groups + j) * hd ..][0..hd], fused[base + j * hd ..][0..hd]);
+                @memcpy(k[g * hd ..][0..hd], fused[base + groups * hd ..][0..hd]);
+                @memcpy(v[g * hd ..][0..hd], fused[base + (groups + 1) * hd ..][0..hd]);
+            }
+        },
+    }
+}
+
+/// Multi-head latent attention projections: fills `ws.q` (`[n][heads][nope | rope]`),
+/// `ws.k` (same layout, the rope part shared by every head) and `ws.v`
+/// (`[n][heads][v_head_dim]` at `head_dim` stride).
+fn mlaProject(model: *const Model, layer: *const Layer, ws: *Workspace, h: []const f32, n: usize) !void {
+    const c = &model.config;
+    const m = c.mla.?;
+    const mw = layer.mla.?;
+    const gpa = model.gpa;
+    const nh = c.num_heads;
+    const hd = c.head_dim;
+    const nope = m.qk_nope_head_dim;
+    const rd = m.qk_rope_head_dim;
+    const vd = m.v_head_dim;
+    const eps = c.rms_norm_eps;
+    if (mw.q_a) |qa| {
+        const qlr = m.q_lora_rank.?;
+        const qa_out = try gpa.alloc(f32, n * qlr);
+        defer gpa.free(qa_out);
+        try tensor.matmulT(model.pool, gpa, qa_out, h, n, qa, null);
+        const tmp = try gpa.alloc(f32, qlr);
+        defer gpa.free(tmp);
+        for (0..n) |t| {
+            const row = qa_out[t * qlr ..][0..qlr];
+            tensor.rmsnorm(tmp, row, mw.q_a_norm.?, eps, false);
+            @memcpy(row, tmp);
+        }
+        try tensor.matmulT(model.pool, gpa, ws.q, qa_out, n, mw.q_b, null);
+    } else {
+        try tensor.matmulT(model.pool, gpa, ws.q, h, n, mw.q_b, null);
+    }
+    const kvr = m.kv_lora_rank + rd;
+    const kva = try gpa.alloc(f32, n * kvr);
+    defer gpa.free(kva);
+    try tensor.matmulT(model.pool, gpa, kva, h, n, mw.kv_a, null);
+    const ckv = try gpa.alloc(f32, n * m.kv_lora_rank);
+    defer gpa.free(ckv);
+    for (0..n) |t| tensor.rmsnorm(ckv[t * m.kv_lora_rank ..][0..m.kv_lora_rank], kva[t * kvr ..][0..m.kv_lora_rank], mw.kv_a_norm, eps, false);
+    const kvb_rows = nh * (nope + vd);
+    const kvb = try gpa.alloc(f32, n * kvb_rows);
+    defer gpa.free(kvb);
+    try tensor.matmulT(model.pool, gpa, kvb, ckv, n, mw.kv_b, null);
+    for (0..n) |t| {
+        const k_pe = kva[t * kvr + m.kv_lora_rank ..][0..rd];
+        for (0..nh) |hh| {
+            const src = kvb[t * kvb_rows + hh * (nope + vd) ..][0 .. nope + vd];
+            const k = ws.k[t * nh * hd + hh * hd ..][0..hd];
+            const v = ws.v[t * nh * hd + hh * hd ..][0..hd];
+            @memcpy(k[0..nope], src[0..nope]);
+            @memcpy(k[nope..][0..rd], k_pe);
+            @memset(v, 0);
+            @memcpy(v[0..vd], src[nope..][0..vd]);
+        }
+    }
+}
+
+/// Attention sublayer: projections, q/k norms, RoPE, KV cache update,
+/// attention and the output projection (with its delta). Reads `h`, writes `ws.o`.
+fn attention(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace, cache: *KvCache, h: []const f32, rows: []const Row) !void {
+    const c = &model.config;
+    const gpa = model.gpa;
+    const n = rows.len;
+    const hidden = c.hidden_size;
+    const hd = c.head_dim;
+    const qd = c.num_heads * hd;
+    const kvd = c.num_kv_heads * hd;
+    const half = c.rotary_dim / 2;
+
+    if (layer.mla != null) {
+        try mlaProject(model, layer, ws, h, n);
+    } else if (layer.qkv) |w| {
+        const qkv_rows = qd + 2 * kvd;
+        try tensor.matmulT(model.pool, gpa, ws.qkv, h, n, w, null);
+        if (layer.qkv_bias) |b| addBias(ws.qkv, n, qkv_rows, b);
+        var i: usize = 0;
+        while (i < n) : (i += 1) scatterQkv(c, ws.qkv[i * qkv_rows ..][0..qkv_rows], ws.q[i * qd ..][0..qd], ws.k[i * kvd ..][0..kvd], ws.v[i * kvd ..][0..kvd]);
+    } else {
+        try tensor.matmulT(model.pool, gpa, ws.q, h, n, layer.q.?, null);
+        try tensor.matmulT(model.pool, gpa, ws.k, h, n, layer.k.?, null);
+        try tensor.matmulT(model.pool, gpa, ws.v, h, n, layer.v.?, null);
+        if (layer.q_bias) |b| addBias(ws.q, n, qd, b);
+        if (layer.k_bias) |b| addBias(ws.k, n, kvd, b);
+        if (layer.v_bias) |b| addBias(ws.v, n, kvd, b);
+    }
+    if (c.clip_qkv) |clip| {
+        clampAll(ws.q[0 .. n * qd], clip);
+        clampAll(ws.k[0 .. n * kvd], clip);
+        clampAll(ws.v[0 .. n * kvd], clip);
+    }
+
+    const use_rope = c.rope_layers[li];
+    const sliding = c.sliding_layers[li];
+    const local = sliding and model.rope_cos_local.ptr != model.rope_cos.ptr;
+    const cos = if (local) model.rope_cos_local else model.rope_cos;
+    const sin = if (local) model.rope_sin_local else model.rope_sin;
+    const rope_off: usize = if (c.mla) |m| m.qk_nope_head_dim else 0;
+    const do_qk_norm = !(c.qk_norm_rope_only and !use_rope);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const pos = @min(rows[i].pos, model.rope_len - 1);
+        const cr = cos[pos * half ..][0..half];
+        const sr = sin[pos * half ..][0..half];
+        const qrow = ws.q[i * qd ..][0..qd];
+        const krow = ws.k[i * kvd ..][0..kvd];
+        if (do_qk_norm and c.qk_norm == .full) {
+            if (layer.q_norm) |nm| normVecInPlace(c, qrow, nm.w, nm.b);
+            if (layer.k_norm) |nm| normVecInPlace(c, krow, nm.w, nm.b);
+        }
+        var temp: ?f32 = null;
+        if (!use_rope) {
+            if (c.attn_temperature) |t| {
+                const p: f32 = @floatFromInt(rows[i].pos);
+                temp = @log(@floor((p + 1.0) / t.floor_scale) + 1.0) * t.attn_scale + 1.0;
+            }
+        }
+        var hh: usize = 0;
+        while (hh < c.num_heads) : (hh += 1) {
+            const q = qrow[hh * hd ..][0..hd];
+            if (do_qk_norm) if (layer.q_norm) |nm| qkNormHead(c, q, nm, hh);
+            if (use_rope) ropeHead(c, q[rope_off..], cr, sr);
+            if (temp) |t| tensor.scale(q, t);
+        }
+        hh = 0;
+        while (hh < c.num_kv_heads) : (hh += 1) {
+            const k = krow[hh * hd ..][0..hd];
+            if (do_qk_norm) if (layer.k_norm) |nm| qkNormHead(c, k, nm, hh);
+            if (use_rope) ropeHead(c, k[rope_off..], cr, sr);
+        }
+        @memcpy(cache.kSlot(li, rows[i].b, rows[i].pos), krow);
+        @memcpy(cache.vSlot(li, rows[i].b, rows[i].pos), ws.v[i * kvd ..][0..kvd]);
+        cache.noteWrite(rows[i].pos);
+    }
+    const actx = AttnCtx{ .model = model, .cache = cache, .layer = li, .rows = rows, .q = ws.q, .out = ws.attn, .sliding = sliding, .sinks = layer.sinks };
+    model.pool.parallelFor(n * c.num_heads, &actx, attentionWorker);
+    const vd = c.v_head_dim;
+    if (vd != hd) {
+        // Compact `[n][heads][head_dim]` (v_head_dim valid per head) to `[n][heads * v_head_dim]`.
+        var dst: usize = 0;
+        for (0..n * c.num_heads) |hi| {
+            std.mem.copyForwards(f32, ws.attn[dst..][0..vd], ws.attn[hi * hd ..][0..vd]);
+            dst += vd;
+        }
+    }
+    try tensor.matmulT(model.pool, gpa, ws.o, ws.attn, n, layer.o, if (layer.o_delta) |*d| d else null);
+    if (layer.o_bias) |b| addBias(ws.o, n, hidden, b);
+}
+
+/// MLP sublayer (dense or mixture of experts): reads `h_in`, writes `ws.m`.
+fn mlpBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace, h_in: []const f32, n: usize) !void {
+    const c = &model.config;
+    const gpa = model.gpa;
+    const hidden = c.hidden_size;
+    if (layer.moe) |*m| return moe.forward(model, m, li, ws.m, h_in, n);
+    const down = layer.down.?;
+    const inter = down.cols;
+    var din: []f32 = ws.gate;
+    switch (c.mlp) {
+        .gated => {
+            try tensor.matmulT(model.pool, gpa, ws.gate, h_in, n, layer.gate.?, null);
+            try tensor.matmulT(model.pool, gpa, ws.up, h_in, n, layer.up.?, null);
+            if (layer.gate_bias) |b| addBias(ws.gate, n, inter, b);
+            if (layer.up_bias) |b| addBias(ws.up, n, inter, b);
+            for (ws.gate[0 .. n * inter], 0..) |*g, j| g.* = c.activation.apply(g.*) * ws.up[j];
+        },
+        .gated_fused => {
+            const gu = layer.gate_up.?;
+            try tensor.matmulT(model.pool, gpa, ws.gate_up, h_in, n, gu, null);
+            if (layer.up_bias) |b| addBias(ws.gate_up, n, 2 * inter, b);
+            for (0..n) |i| {
+                const row = ws.gate_up[i * 2 * inter ..][0 .. 2 * inter];
+                const out = ws.gate[i * inter ..][0..inter];
+                for (out, 0..) |*g, j| g.* = c.activation.apply(row[j]) * row[inter + j];
+            }
+        },
+        .dense => {
+            try tensor.matmulT(model.pool, gpa, ws.up, h_in, n, layer.up.?, null);
+            if (layer.up_bias) |b| addBias(ws.up, n, inter, b);
+            for (ws.up[0 .. n * inter]) |*u| u.* = c.activation.apply(u.*);
+            din = ws.up;
+        },
+    }
+    try tensor.matmulT(model.pool, gpa, ws.m, din, n, down, if (layer.down_delta) |*d| d else null);
+    if (layer.down_bias) |b| addBias(ws.m, n, hidden, b);
+}
 
 /// Runs the transformer over `tokens`/`rows` (n tokens). Logits for the
 /// requested rows are written to `ws.logits[i * vocab ..]`.
@@ -1418,8 +2042,18 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
         const cn = @min(chunk_rows, n - start);
         const xs = if (single) ws.x[0 .. n * hidden] else act.?.chunkUninit(start, cn, ws.x);
         for (tokens[start..][0..cn], 0..) |t, i| {
-            try model.embedRow(t, xs[i * hidden ..][0..hidden]);
-            if (c.embed_scale != 1.0) tensor.scale(xs[i * hidden ..][0..hidden], c.embed_scale);
+            const x = xs[i * hidden ..][0..hidden];
+            try model.embedRow(t, x);
+            if (c.embed_scale != 1.0) tensor.scale(x, c.embed_scale);
+            if (model.pos_embed_ref != null) {
+                const pe = ws.h[0..hidden];
+                try model.posEmbedRow(rows[start + i].pos, pe);
+                tensor.axpy(x, 1.0, pe);
+            }
+            if (model.embed_norm) |nm| {
+                applyNorm(c, ws.h[0..hidden], x, nm);
+                @memcpy(x, ws.h[0..hidden]);
+            }
         }
         if (!single) try act.?.commit(start, cn, xs);
         captureResiduals(opts, 0, hidden, start, cn, xs);
@@ -1451,17 +2085,20 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
         for (opts.logit_rows, 0..) |r, i| {
             const dst = h[i * hidden ..][0..hidden];
             if (single) {
-                tensor.rmsnorm(dst, ws.x[r * hidden ..][0..hidden], model.final_norm, c.rms_norm_eps, c.family.isGemma());
+                applyNorm(c, dst, ws.x[r * hidden ..][0..hidden], model.final_norm);
             } else {
                 const tmp = ws.o[0..hidden];
                 try act.?.readRow(r, tmp);
-                tensor.rmsnorm(dst, tmp, model.final_norm, c.rms_norm_eps, c.family.isGemma());
+                applyNorm(c, dst, tmp, model.final_norm);
             }
         }
         const lm = try model.acquireLmHead();
         defer @constCast(&model.store).release(lm);
         try tensor.matmulT(model.pool, gpa, ws.logits, h, opts.logit_rows.len, lm.weight, null);
-        if (c.final_logit_softcapping) |cap| tensor.softcap(ws.logits[0 .. opts.logit_rows.len * c.vocab_size], cap);
+        const logits = ws.logits[0 .. opts.logit_rows.len * c.vocab_size];
+        if (model.lm_head_bias) |b| addBias(logits, opts.logit_rows.len, c.vocab_size, b);
+        if (c.logit_scale != 1.0) tensor.scale(logits, c.logit_scale);
+        if (c.final_logit_softcapping) |cap| tensor.softcap(logits, cap);
     }
 }
 
@@ -1476,105 +2113,41 @@ fn captureResiduals(opts: ForwardOptions, entry: usize, hidden: usize, start: us
 
 /// One transformer layer (attention + MLP) applied in place to the residual
 /// rows `x` (`rows.len` tokens). `layer` must hold resident weights.
+///
+/// Sequential layout: `x += attn(norm(x)); x += mlp(norm(x))`, with optional
+/// norms on the sublayer outputs (Gemma, OLMo 2, GLM-4) and no input norm for
+/// the post-norm families. Parallel layout (GPT-NeoX, Falcon, Phi, Cohere):
+/// `x += attn(h) + mlp(h)` with `h = norm(x)` (or a second norm for the MLP).
 fn layerBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace, cache: *KvCache, x: []f32, rows: []const Row) !void {
     const c = &model.config;
-    const gpa = model.gpa;
     const n = rows.len;
     const hidden = c.hidden_size;
-    const hd = c.head_dim;
-    const qd = c.num_heads * hd;
-    const kvd = c.num_kv_heads * hd;
-    const half = hd / 2;
     const h = ws.h[0 .. n * hidden];
+    const rm = c.residual_multiplier;
 
-    // Attention block.
-    var i: usize = 0;
-    while (i < n) : (i += 1) tensor.rmsnorm(h[i * hidden ..][0..hidden], x[i * hidden ..][0..hidden], layer.input_norm, c.rms_norm_eps, c.family.isGemma());
-    try tensor.matmulT(model.pool, gpa, ws.q, h, n, layer.q, null);
-    try tensor.matmulT(model.pool, gpa, ws.k, h, n, layer.k, null);
-    try tensor.matmulT(model.pool, gpa, ws.v, h, n, layer.v, null);
-    if (layer.q_bias) |b| {
-        i = 0;
-        while (i < n) : (i += 1) tensor.axpy(ws.q[i * qd ..][0..qd], 1.0, b);
-    }
-    if (layer.k_bias) |b| {
-        i = 0;
-        while (i < n) : (i += 1) tensor.axpy(ws.k[i * kvd ..][0..kvd], 1.0, b);
-    }
-    if (layer.v_bias) |b| {
-        i = 0;
-        while (i < n) : (i += 1) tensor.axpy(ws.v[i * kvd ..][0..kvd], 1.0, b);
-    }
-    const sliding = c.sliding_layers[li];
-    const cos = if (sliding and c.family == .gemma3) model.rope_cos_local else model.rope_cos;
-    const sin = if (sliding and c.family == .gemma3) model.rope_sin_local else model.rope_sin;
-    i = 0;
-    while (i < n) : (i += 1) {
-        const pos = @min(rows[i].pos, model.rope_len - 1);
-        const cr = cos[pos * half ..][0..half];
-        const sr = sin[pos * half ..][0..half];
-        var hh: usize = 0;
-        while (hh < c.num_heads) : (hh += 1) {
-            const q = ws.q[i * qd + hh * hd ..][0..hd];
-            if (layer.q_norm) |qn| {
-                var tmp: [512]f32 = undefined;
-                tensor.rmsnorm(tmp[0..hd], q, qn, c.rms_norm_eps, false);
-                @memcpy(q, tmp[0..hd]);
-            }
-            tensor.applyRope(q, cr, sr);
-        }
-        hh = 0;
-        while (hh < c.num_kv_heads) : (hh += 1) {
-            const k = ws.k[i * kvd + hh * hd ..][0..hd];
-            if (layer.k_norm) |kn| {
-                var tmp: [512]f32 = undefined;
-                tensor.rmsnorm(tmp[0..hd], k, kn, c.rms_norm_eps, false);
-                @memcpy(k, tmp[0..hd]);
-            }
-            tensor.applyRope(k, cr, sr);
-        }
-        @memcpy(cache.kSlot(li, rows[i].b, rows[i].pos), ws.k[i * kvd ..][0..kvd]);
-        @memcpy(cache.vSlot(li, rows[i].b, rows[i].pos), ws.v[i * kvd ..][0..kvd]);
-        cache.noteWrite(rows[i].pos);
-    }
-    const actx = AttnCtx{ .model = model, .cache = cache, .layer = li, .rows = rows, .q = ws.q, .out = ws.attn, .sliding = sliding };
-    model.pool.parallelFor(n * c.num_heads, &actx, attentionWorker);
-    try tensor.matmulT(model.pool, gpa, ws.o, ws.attn, n, layer.o, if (layer.o_delta) |*d| d else null);
-    i = 0;
-    while (i < n) : (i += 1) {
-        const o = ws.o[i * hidden ..][0..hidden];
-        if (c.family.isGemma()) {
-            const tmp = h[i * hidden ..][0..hidden];
-            tensor.rmsnorm(tmp, o, layer.post_attn_norm, c.rms_norm_eps, true);
-            tensor.axpy(x[i * hidden ..][0..hidden], 1.0, tmp);
-        } else {
-            tensor.axpy(x[i * hidden ..][0..hidden], 1.0, o);
-        }
-    }
+    normRows(c, h, x, n, hidden, layer.input_norm);
+    try attention(model, layer, li, ws, cache, h, rows);
+    const attn_out = ws.o[0 .. n * hidden];
+    if (layer.post_attn_norm) |nm| normRowsInPlace(c, attn_out, n, hidden, nm, ws.h2);
 
-    // MLP block.
-    const ff_norm = if (c.family.isGemma()) layer.pre_ff_norm.? else layer.post_attn_norm;
-    i = 0;
-    while (i < n) : (i += 1) tensor.rmsnorm(h[i * hidden ..][0..hidden], x[i * hidden ..][0..hidden], ff_norm, c.rms_norm_eps, c.family.isGemma());
-    if (layer.moe) |*m| {
-        try moe.forward(model, m, li, ws.o, h, n);
+    if (c.parallel_residual) {
+        var mlp_in: []const f32 = h;
+        if (layer.mlp_norm) |nm| {
+            normRows(c, ws.h2, x, n, hidden, nm);
+            mlp_in = ws.h2[0 .. n * hidden];
+        }
+        try mlpBlock(model, layer, li, ws, mlp_in, n);
+        const m = ws.m[0 .. n * hidden];
+        if (layer.post_ff_norm) |nm| normRowsInPlace(c, m, n, hidden, nm, ws.h2);
+        tensor.axpy(x[0 .. n * hidden], rm, attn_out);
+        tensor.axpy(x[0 .. n * hidden], rm, m);
     } else {
-        try tensor.matmulT(model.pool, gpa, ws.gate, h, n, layer.gate.?, null);
-        try tensor.matmulT(model.pool, gpa, ws.up, h, n, layer.up.?, null);
-        const inter = c.intermediate_size;
-        for (ws.gate[0 .. n * inter], 0..) |*g, j| g.* = c.activation.apply(g.*) * ws.up[j];
-        try tensor.matmulT(model.pool, gpa, ws.o, ws.gate, n, layer.down.?, if (layer.down_delta) |*d| d else null);
-    }
-    i = 0;
-    while (i < n) : (i += 1) {
-        const o = ws.o[i * hidden ..][0..hidden];
-        if (c.family.isGemma()) {
-            const tmp = h[i * hidden ..][0..hidden];
-            tensor.rmsnorm(tmp, o, layer.post_ff_norm.?, c.rms_norm_eps, true);
-            tensor.axpy(x[i * hidden ..][0..hidden], 1.0, tmp);
-        } else {
-            tensor.axpy(x[i * hidden ..][0..hidden], 1.0, o);
-        }
+        tensor.axpy(x[0 .. n * hidden], rm, attn_out);
+        normRows(c, h, x, n, hidden, layer.pre_ff_norm);
+        try mlpBlock(model, layer, li, ws, h, n);
+        const m = ws.m[0 .. n * hidden];
+        if (layer.post_ff_norm) |nm| normRowsInPlace(c, m, n, hidden, nm, ws.h2);
+        tensor.axpy(x[0 .. n * hidden], rm, m);
     }
 }
 

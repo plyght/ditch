@@ -1,0 +1,17 @@
+{
+ "model_type": "nemotron",
+ "hidden_size": 32,
+ "intermediate_size": 32,
+ "num_hidden_layers": 2,
+ "num_attention_heads": 4,
+ "num_key_value_heads": 2,
+ "norm_eps": 1e-05,
+ "partial_rotary_factor": 0.5,
+ "rope_theta": 10000.0,
+ "hidden_act": "relu2",
+ "attention_bias": false,
+ "mlp_bias": false,
+ "max_position_embeddings": 128,
+ "tie_word_embeddings": true,
+ "vocab_size": 374
+}
