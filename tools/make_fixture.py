@@ -2,7 +2,12 @@
 """Generates tiny synthetic Hugging Face-format models plus a NumPy reference
 forward pass, used to validate ditch's inference against known-good numbers.
 
-Usage: make_fixture.py <family> <out_dir>   (family: llama | qwen2 | qwen3 | gemma3)
+Usage: make_fixture.py <family> <out_dir>
+    family: llama | qwen2 | qwen3 | gemma3 | qwen3_moe | qwen3_moe_fused | qwen3_moe_fused_t
+
+The qwen3_moe variants share identical weights: `qwen3_moe` stores one tensor
+per expert, `qwen3_moe_fused` the fused [E, 2I, H] / [E, H, I] layout and
+`qwen3_moe_fused_t` the transposed fused [E, H, 2I] / [E, I, H] layout.
 
 Only NumPy is required. Weights are random but deterministic.
 """
@@ -35,7 +40,10 @@ def bytes_to_unicode():
 
 B2U = bytes_to_unicode()
 
-byte_level = FAMILY in ("qwen2", "qwen3", "llama")
+MOE = FAMILY.startswith("qwen3_moe")
+FUSED = FAMILY in ("qwen3_moe_fused", "qwen3_moe_fused_t")
+FUSED_T = FAMILY == "qwen3_moe_fused_t"
+byte_level = FAMILY.startswith("qwen") or FAMILY == "llama"
 if byte_level:
     specials = ["<|im_start|>", "<|im_end|>", "<|endoftext|>"] if FAMILY.startswith("qwen") else [
         "<|begin_of_text|>", "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>", "<|end_of_text|>"]
@@ -129,11 +137,15 @@ vocab_size = len(vocab)
 
 H, I, L, NH, NKV = 32, 48, 3, 4, 2
 HD = H // NH
+# MoE: E routed experts of size MI, top-K routing; layer 1 stays dense (mlp_only_layers).
+E, K, MI = 4, 2, 12
+MLP_ONLY = [1]
 if FAMILY == "gemma3":
     HD = 16  # gemma uses an explicit head_dim
+CFG_FAMILY = "qwen3_moe" if MOE else FAMILY
 config = {
-    "model_type": {"llama": "llama", "qwen2": "qwen2", "qwen3": "qwen3", "gemma3": "gemma3_text"}[FAMILY],
-    "architectures": [{"llama": "LlamaForCausalLM", "qwen2": "Qwen2ForCausalLM", "qwen3": "Qwen3ForCausalLM", "gemma3": "Gemma3ForCausalLM"}[FAMILY]],
+    "model_type": {"llama": "llama", "qwen2": "qwen2", "qwen3": "qwen3", "gemma3": "gemma3_text", "qwen3_moe": "qwen3_moe"}[CFG_FAMILY],
+    "architectures": [{"llama": "LlamaForCausalLM", "qwen2": "Qwen2ForCausalLM", "qwen3": "Qwen3ForCausalLM", "gemma3": "Gemma3ForCausalLM", "qwen3_moe": "Qwen3MoeForCausalLM"}[CFG_FAMILY]],
     "hidden_size": H, "intermediate_size": I, "num_hidden_layers": L, "num_attention_heads": NH,
     "num_key_value_heads": NKV, "head_dim": HD, "vocab_size": vocab_size, "rms_norm_eps": 1e-6,
     "rope_theta": 10000.0, "max_position_embeddings": 512, "tie_word_embeddings": FAMILY != "llama",
@@ -147,6 +159,9 @@ if FAMILY == "qwen2":
     config["hidden_act"] = "silu"
 if FAMILY == "qwen3":
     config["hidden_act"] = "silu"
+if MOE:
+    config.update({"hidden_act": "silu", "num_experts": E, "num_experts_per_tok": K, "norm_topk_prob": True,
+                   "moe_intermediate_size": MI, "decoder_sparse_step": 1, "mlp_only_layers": MLP_ONLY})
 if FAMILY == "gemma3":
     config.update({"hidden_activation": "gelu_pytorch_tanh", "query_pre_attn_scalar": HD, "sliding_window": 8,
                    "sliding_window_pattern": 2, "rope_local_base_freq": 10000.0, "rope_theta": 1000000.0,
@@ -179,6 +194,13 @@ def W(name, shape, scale=0.2):
     return from_bf16(u).reshape(shape)
 
 
+def rand_bf16(shape, scale=0.2):
+    """Random bf16-rounded weights that are not registered for writing (returns (u16, f32))."""
+    w = rng.normal(0, scale, size=shape).astype(np.float32)
+    u = bf16(w)
+    return u, from_bf16(u).reshape(shape)
+
+
 def ones(name, shape, scale=0.1):
     w = (1.0 + rng.normal(0, scale, size=shape)).astype(np.float32)
     if FAMILY == "gemma3":
@@ -200,15 +222,38 @@ for i in range(L):
         "k": W(p + "self_attn.k_proj.weight", (NKV * HD, H)),
         "v": W(p + "self_attn.v_proj.weight", (NKV * HD, H)),
         "o": W(p + "self_attn.o_proj.weight", (H, NH * HD)),
-        "gate": W(p + "mlp.gate_proj.weight", (I, H)),
-        "up": W(p + "mlp.up_proj.weight", (I, H)),
-        "down": W(p + "mlp.down_proj.weight", (H, I)),
     }
+    if MOE and i not in MLP_ONLY:
+        d["router"] = W(p + "mlp.gate.weight", (E, H))
+        experts = []
+        for e in range(E):
+            gu, gf = rand_bf16((MI, H))
+            uu, uf = rand_bf16((MI, H))
+            du, df = rand_bf16((H, MI))
+            experts.append({"gate": gf, "up": uf, "down": df})
+            if not FUSED:
+                weights[p + f"mlp.experts.{e}.gate_proj.weight"] = gu
+                weights[p + f"mlp.experts.{e}.up_proj.weight"] = uu
+                weights[p + f"mlp.experts.{e}.down_proj.weight"] = du
+            else:
+                gate_up = np.concatenate([gu, uu], axis=0)  # [2I, H]
+                if FUSED_T:
+                    gate_up, du = gate_up.T, du.T  # [H, 2I], [I, H]
+                weights.setdefault(p + "mlp.experts.gate_up_proj", []).append(np.ascontiguousarray(gate_up))
+                weights.setdefault(p + "mlp.experts.down_proj", []).append(np.ascontiguousarray(du))
+        if FUSED:
+            weights[p + "mlp.experts.gate_up_proj"] = np.stack(weights[p + "mlp.experts.gate_up_proj"])
+            weights[p + "mlp.experts.down_proj"] = np.stack(weights[p + "mlp.experts.down_proj"])
+        d["experts"] = experts
+    else:
+        d["gate"] = W(p + "mlp.gate_proj.weight", (I, H))
+        d["up"] = W(p + "mlp.up_proj.weight", (I, H))
+        d["down"] = W(p + "mlp.down_proj.weight", (H, I))
     if FAMILY == "qwen2":
         d["qb"] = W(p + "self_attn.q_proj.bias", (NH * HD,))
         d["kb"] = W(p + "self_attn.k_proj.bias", (NKV * HD,))
         d["vb"] = W(p + "self_attn.v_proj.bias", (NKV * HD,))
-    if FAMILY == "qwen3":
+    if FAMILY.startswith("qwen3"):
         d["qn"] = ones(p + "self_attn.q_norm.weight", (HD,))
         d["kn"] = ones(p + "self_attn.k_norm.weight", (HD,))
     if FAMILY == "gemma3":
@@ -229,7 +274,7 @@ for si, shard in enumerate(shards):
     for n in shard:
         u = weights[n]
         nbytes = u.nbytes
-        shape = list(u.shape) if u.ndim > 1 else [u.shape[0]]
+        shape = list(u.shape)
         header[n] = {"dtype": "BF16", "shape": shape, "data_offsets": [offset, offset + nbytes]}
         blobs.append(u.tobytes())
         offset += nbytes
@@ -338,7 +383,21 @@ def forward(tokens):
             o = rmsnorm(o, d["post_attn_norm"])
         x = x + o
         h = rmsnorm(x, d["pre_ff"] if gemma else d["post_attn_norm"])
-        m = (act(h @ d["gate"].T) * (h @ d["up"].T)) @ d["down"].T
+        if "router" in d:
+            # Softmax over all experts, top-K, renormalise (norm_topk_prob), weighted expert sum.
+            logits = h @ d["router"].T
+            probs = np.exp(logits - logits.max(axis=-1, keepdims=True))
+            probs = probs / probs.sum(axis=-1, keepdims=True)
+            m = np.zeros((T, H), dtype=np.float32)
+            for t in range(T):
+                idx = np.argsort(-probs[t], kind="stable")[:K]
+                w = probs[t][idx]
+                w = w / w.sum()
+                for e, we in zip(idx, w):
+                    ex = d["experts"][e]
+                    m[t] += we * ((act(h[t] @ ex["gate"].T) * (h[t] @ ex["up"].T)) @ ex["down"].T)
+        else:
+            m = (act(h @ d["gate"].T) * (h @ d["up"].T)) @ d["down"].T
         if gemma:
             m = rmsnorm(m, d["post_ff"])
         x = x + m
