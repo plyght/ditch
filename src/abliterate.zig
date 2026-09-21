@@ -70,6 +70,11 @@ pub const Options = struct {
     debug_writer: ?*std.Io.Writer = null,
     /// Directions per layer entry: `dirs` is laid out `[entries][n_directions][hidden]`.
     n_directions: usize = 1,
+    /// Mixture-of-experts models in warp mode: score and edit only routed
+    /// experts that a forward pass of this run routed to (the others cannot
+    /// have influenced any refusal); their reads are skipped. Ignored when
+    /// no expert cache tracks uses.
+    visited_experts_only: bool = false,
 };
 
 /// Computes unit residual directions `[entries][hidden]` from per-entry means.
@@ -131,7 +136,8 @@ pub fn kernelWeight(p: Params, layer: usize) ?f32 {
 
 /// Applies abliteration to every layer of `model`. `direction_index == null` means "per layer".
 /// On MoE layers the `mlp.down_proj` kernel weight is applied to every expert's
-/// down projection (routed and shared), as heretic does (broad edit).
+/// down projection (routed and shared), as heretic does (broad edit); with
+/// `opts.visited_experts_only` (warp mode) unvisited routed experts are skipped.
 pub fn apply(model: *Model, dirs: []const f32, direction_index: ?f32, params: std.EnumMap(Component, Params), opts: Options) !void {
     const gpa = model.gpa;
     const hidden = model.config.hidden_size;
@@ -139,6 +145,7 @@ pub fn apply(model: *Model, dirs: []const f32, direction_index: ?f32, params: st
     var global_dir: ?[]f32 = null;
     defer if (global_dir) |g| gpa.free(g);
     if (direction_index) |di| global_dir = try interpolateBasis(gpa, dirs, opts.n_directions, hidden, di);
+    const visited_only = opts.visited_experts_only and model.visitedExpertsKnown();
 
     model.resetDeltas();
     var seed_counter: u64 = 0;
@@ -152,9 +159,10 @@ pub fn apply(model: *Model, dirs: []const f32, direction_index: ?f32, params: st
                 const m = &layer.moe.?;
                 var idx: usize = 0;
                 while (idx < m.numDown()) : (idx += 1) {
+                    if (visited_only and idx < m.experts.len and !model.expertVisited(li, idx)) continue;
                     // One expert matrix resident at a time (streamed mode reads it from disk).
                     const lease = try model.acquireExpertDown(li, idx);
-                    defer @constCast(&model.store).release(lease);
+                    defer lease.release(model);
                     const delta = try computeDelta(model.pool, gpa, lease.weight, v, weight, opts, opts.seed +% seed_counter);
                     seed_counter += 1;
                     model.setExpertDelta(li, idx, delta);

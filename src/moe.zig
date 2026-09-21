@@ -12,7 +12,11 @@
 //! column range of such a slice). In mapped mode the `Weight` views are always
 //! valid; in streamed mode they carry only the shape and the matrices are made
 //! resident per layer through the model's `WeightStore` (`acquireLayer`), or
-//! one at a time for abliteration (`MoeLayer.acquireDown`).
+//! one at a time for abliteration (`MoeLayer.acquireDown`). With an expert
+//! cache ("warp mode", see expert_cache.zig) only the trunk of a layer is
+//! acquired with the layer; the routed experts a token batch selects are
+//! made resident on demand through the cache, from `forward` and from the
+//! abliteration entry points alike, so a trial never reads an expert twice.
 
 const std = @import("std");
 const Io = std.Io;
@@ -21,6 +25,7 @@ const model_mod = @import("model.zig");
 const stream = @import("stream.zig");
 const abliterate = @import("abliterate.zig");
 const search = @import("search.zig");
+const expert_cache = @import("expert_cache.zig");
 
 const Allocator = std.mem.Allocator;
 const Weight = tensor.Weight;
@@ -86,7 +91,28 @@ pub const Expert = struct {
     gate_ref: MatrixRef,
     up_ref: MatrixRef,
     down_ref: MatrixRef,
+
+    /// Fused, transposed layout: gate and up are column ranges of one block
+    /// and come out of a single read.
+    pub fn sharesGateUpBlock(self: *const Expert) bool {
+        return self.gate_ref.transposed != null and self.up_ref.transposed != null and self.gate_ref.ref.offset == self.up_ref.ref.offset and self.gate_ref.ref.file == self.up_ref.ref.file;
+    }
 };
+
+/// Bytes resident for one routed expert (its three matrices).
+pub fn expertBytes(ex: *const Expert) u64 {
+    return ex.gate_ref.residentBytes() + ex.up_ref.residentBytes() + ex.down_ref.residentBytes();
+}
+
+/// Transient bytes needed while an expert is read (the block buffer of a
+/// transposed fused slice; 0 for the other layouts).
+pub fn expertTransientBytes(ex: *const Expert) u64 {
+    var t: u64 = 0;
+    for ([_]MatrixRef{ ex.gate_ref, ex.up_ref, ex.down_ref }) |r| {
+        if (r.transposed != null) t = @max(t, r.ref.byteLen());
+    }
+    return t;
+}
 
 /// Always-active expert (qwen2_moe). Its output is scaled by `sigmoid(x · gate_vec)`.
 pub const SharedExpert = struct {
@@ -101,6 +127,8 @@ pub const SharedExpert = struct {
 };
 
 pub const MoeLayer = struct {
+    /// Index of the layer this block belongs to (the expert cache key).
+    layer_index: usize,
     /// Router `[E, hidden]`.
     router: Weight,
     router_ref: WeightRef,
@@ -134,28 +162,50 @@ pub const MoeLayer = struct {
         return self.shared.?.down_ref;
     }
 
-    /// Makes down projection `idx` resident (a view in mapped mode, a budgeted
-    /// buffer in streamed mode); release with `model.store.release`.
-    pub fn acquireDown(self: *const MoeLayer, model: *const Model, idx: usize) !Lease {
+    /// Makes down projection `idx` resident: a view in mapped mode, a budgeted
+    /// buffer in streamed mode, or a pinned expert-cache entry in warp mode
+    /// (all three matrices of the expert stay resident for later use).
+    /// Release with `DownLease.release`.
+    pub fn acquireDown(self: *const MoeLayer, model: *const Model, idx: usize) !DownLease {
         if (!model.streamed()) return .{ .weight = self.downWeight(idx) };
-        return self.downRef(idx).acquire(@constCast(&model.store));
-    }
-
-    /// Bytes resident while this layer computes in streamed mode: every expert
-    /// matrix (and the shared expert), plus the transient block buffer used to
-    /// transpose fused expert slices.
-    pub fn residentBytes(self: *const MoeLayer) u64 {
-        var total: u64 = 0;
-        var transient: u64 = 0;
-        for (self.experts) |ex| {
-            for ([_]MatrixRef{ ex.gate_ref, ex.up_ref, ex.down_ref }) |r| {
-                total += r.residentBytes();
-                if (r.transposed != null) transient = @max(transient, r.ref.byteLen());
+        if (model.expert_cache) |cache| {
+            if (idx < self.experts.len) {
+                const e = try cache.acquire(self.layer_index, self, idx);
+                return .{ .weight = e.down, .entry = e };
             }
         }
+        const lease = try self.downRef(idx).acquire(@constCast(&model.store));
+        return .{ .weight = lease.weight, .lease = lease };
+    }
+
+    /// Bytes of the layer's trunk part in streamed mode: the shared expert (if any).
+    pub fn trunkBytes(self: *const MoeLayer) u64 {
+        var total: u64 = 0;
         if (self.shared) |sh| {
             for ([_]MatrixRef{ sh.gate_ref, sh.up_ref, sh.down_ref }) |r| total += r.residentBytes();
         }
+        return total;
+    }
+
+    /// Bytes of the largest routed expert (0 without experts).
+    pub fn maxExpertBytes(self: *const MoeLayer) u64 {
+        var max: u64 = 0;
+        for (self.experts) |*ex| max = @max(max, expertBytes(ex));
+        return max;
+    }
+
+    /// Bytes resident while this layer computes in streamed mode: the shared
+    /// expert plus either every routed expert (`warp == false`) or the
+    /// experts one token selects (`warp == true`, the expert cache holds
+    /// them), plus the transient block buffer used to transpose fused slices.
+    pub fn residentBytes(self: *const MoeLayer, warp: bool) u64 {
+        var total: u64 = self.trunkBytes();
+        var transient: u64 = 0;
+        for (self.experts) |*ex| {
+            if (!warp) total += expertBytes(ex);
+            transient = @max(transient, expertTransientBytes(ex));
+        }
+        if (warp) total += @as(u64, self.top_k) * self.maxExpertBytes();
         return total + transient;
     }
 
@@ -240,8 +290,27 @@ pub const MoeLayer = struct {
     }
 };
 
+/// A down projection made resident by `MoeLayer.acquireDown`.
+pub const DownLease = struct {
+    weight: Weight,
+    /// Streamed mode without an expert cache: the owned buffer.
+    lease: Lease = .{ .weight = .{ .data = &.{}, .dtype = .f32, .rows = 0, .cols = 0 } },
+    /// Warp mode: the pinned cache entry.
+    entry: ?*expert_cache.Entry = null,
+
+    pub fn release(self: DownLease, model: *const Model) void {
+        if (self.entry) |e| {
+            model.expert_cache.?.release(e);
+        } else {
+            @constCast(&model.store).release(self.lease);
+        }
+    }
+};
+
 /// An MoE layer whose expert matrices are resident (streamed mode). `layer` is
-/// a copy of the model's `MoeLayer` whose experts point at `experts`.
+/// a copy of the model's `MoeLayer` whose experts point at `experts`. In warp
+/// mode only the shared expert is acquired here; the routed experts stay
+/// shape-only and `forward` fetches them through the model's expert cache.
 pub const MoeLease = struct {
     layer: MoeLayer,
     gpa: Allocator,
@@ -261,13 +330,28 @@ fn acquireInto(store: *stream.WeightStore, r: MatrixRef, leases: []Lease, n: *us
     return leases[n.* - 1].weight;
 }
 
-/// Makes every expert matrix of `m` resident through the model's store. In
-/// mapped mode the views are already valid and nothing is allocated.
+/// Makes every expert matrix of `m` resident through the model's store (only
+/// the shared expert in warp mode). In mapped mode the views are already
+/// valid and nothing is allocated.
 pub fn acquireLayer(model: *const Model, m: *const MoeLayer) !MoeLease {
     const gpa = model.gpa;
     var lease = MoeLease{ .layer = m.*, .gpa = gpa, .experts = &.{}, .leases = &.{} };
     if (!model.streamed()) return lease;
     const store: *stream.WeightStore = @constCast(&model.store);
+    if (model.expert_cache != null) {
+        const sh = m.shared orelse return lease;
+        const shared_leases = try gpa.alloc(Lease, 3);
+        errdefer gpa.free(shared_leases);
+        var n: usize = 0;
+        errdefer store.releaseSet(shared_leases[0..n]);
+        var s = sh;
+        s.gate = try acquireInto(store, sh.gate_ref, shared_leases, &n);
+        s.up = try acquireInto(store, sh.up_ref, shared_leases, &n);
+        s.down = try acquireInto(store, sh.down_ref, shared_leases, &n);
+        lease.layer.shared = s;
+        lease.leases = shared_leases;
+        return lease;
+    }
     const experts = try gpa.alloc(Expert, m.experts.len);
     errdefer gpa.free(experts);
     // Three matrices per routed expert (gate and up of a transposed fused block
@@ -278,7 +362,7 @@ pub fn acquireLayer(model: *const Model, m: *const MoeLayer) !MoeLease {
     errdefer store.releaseSet(all_leases[0..n]);
     for (m.experts, 0..) |ex, e| {
         experts[e] = ex;
-        if (ex.gate_ref.transposed != null and ex.up_ref.transposed != null and ex.gate_ref.ref.offset == ex.up_ref.ref.offset) {
+        if (ex.sharesGateUpBlock()) {
             // Fused, transposed layout: gate and up share one block; read it once.
             try store.acquireTransposed(ex.gate_ref.ref, &.{ ex.gate_ref.transposed.?, ex.up_ref.transposed.? }, all_leases[n..][0..2]);
             experts[e].gate = all_leases[n].weight;
@@ -355,8 +439,8 @@ fn findStacked(model: *const Model, name: []const u8) !?Stacked {
     return .{ .ref = try model.ref(name), .shape = t.shape };
 }
 
-/// Loads the MoE block of layer `lp` (e.g. "model.layers.3.").
-pub fn loadLayer(model: *Model, arena: Allocator, lp: []const u8) !MoeLayer {
+/// Loads the MoE block of layer `li` with tensor prefix `lp` (e.g. "model.layers.3.").
+pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !MoeLayer {
     const c = &model.config;
     const hidden = c.hidden_size;
     const inter = c.moe_intermediate_size;
@@ -370,6 +454,7 @@ pub fn loadLayer(model: *Model, arena: Allocator, lp: []const u8) !MoeLayer {
         return error.MissingWeights;
     };
     var self = MoeLayer{
+        .layer_index = li,
         .router = try model.loadMat(router_name),
         .router_ref = router_ref,
         .top_k = @min(c.num_experts_per_tok, n_experts),
@@ -525,8 +610,11 @@ fn runExpert(model: *const Model, gate_w: Weight, up_w: Weight, down_w: Weight, 
     try tensor.matmulT(model.pool, gpa, out, gate, ne, down_w, delta);
 }
 
-/// Routed MoE MLP: `out[n][hidden]` from normalised inputs `h[n][hidden]`.
-pub fn forward(model: *const Model, m: *const MoeLayer, out: []f32, h: []const f32, n: usize) !void {
+/// Routed MoE MLP of layer `li`: `out[n][hidden]` from normalised inputs
+/// `h[n][hidden]`. In warp mode the union of the experts selected for the
+/// `n` tokens is fetched through the model's expert cache (misses of the
+/// layer as one prefetch group), one expert pinned at a time while it runs.
+pub fn forward(model: *const Model, m: *const MoeLayer, li: usize, out: []f32, h: []const f32, n: usize) !void {
     const gpa = model.gpa;
     const hidden = model.config.hidden_size;
     const n_experts = m.experts.len;
@@ -578,7 +666,26 @@ pub fn forward(model: *const Model, m: *const MoeLayer, out: []f32, h: []const f
     const wts = try gpa.alloc(f32, n);
     defer gpa.free(wts);
 
-    for (m.experts, 0..) |*ex, e| {
+    // The union of selected experts, in index order (the accumulation order
+    // is the same in every mode, so results are bitwise identical).
+    const used = try gpa.alloc(bool, n_experts);
+    defer gpa.free(used);
+    @memset(used, false);
+    for (sel[0 .. n * k]) |e| used[e] = true;
+    const union_list = try gpa.alloc(usize, n_experts);
+    defer gpa.free(union_list);
+    var n_union: usize = 0;
+    for (used, 0..) |u, e| {
+        if (u) {
+            union_list[n_union] = e;
+            n_union += 1;
+        }
+    }
+    const cache = model.expert_cache;
+    if (cache) |c| c.prefetch(li, m, union_list[0..n_union]);
+
+    for (union_list[0..n_union]) |e| {
+        const ex = &m.experts[e];
         var ne: usize = 0;
         for (0..n) |t| {
             for (0..k) |j| {
@@ -589,9 +696,15 @@ pub fn forward(model: *const Model, m: *const MoeLayer, out: []f32, h: []const f
                 }
             }
         }
-        if (ne == 0) continue;
         for (0..ne) |j| @memcpy(xg[j * hidden ..][0..hidden], h[tok[j] * hidden ..][0..hidden]);
-        try runExpert(model, ex.gate, ex.up, ex.down, if (ex.down_delta) |*d| d else null, xg, ne, gate, up, eo);
+        const delta: ?*const Delta = if (ex.down_delta) |*d| d else null;
+        if (cache) |c| {
+            const entry = try c.acquire(li, m, e);
+            defer c.release(entry);
+            try runExpert(model, entry.gate, entry.up, entry.down, delta, xg, ne, gate, up, eo);
+        } else {
+            try runExpert(model, ex.gate, ex.up, ex.down, delta, xg, ne, gate, up, eo);
+        }
         for (0..ne) |j| tensor.axpy(out[tok[j] * hidden ..][0..hidden], wts[j], eo[j * hidden ..][0..hidden]);
     }
 
@@ -640,18 +753,35 @@ pub fn scoreLayer(pool: *const tensor.Pool, gpa: Allocator, m: *const MoeLayer, 
     return scores;
 }
 
-/// Scores every routed expert of `layer`, making one down projection resident at a time.
-pub fn scoreExperts(model: *const Model, layer: usize, v: []const f32) ![]f32 {
+/// Scores every routed expert of `layer`, making one down projection resident
+/// at a time (through the expert cache in warp mode). With `visited_only`,
+/// experts that no forward pass of this run routed to are not read; they
+/// score -1 and therefore rank last.
+pub fn scoreExperts(model: *const Model, layer: usize, v: []const f32, visited_only: bool) ![]f32 {
     const m = &(model.layers[layer].moe orelse return error.NotMoeLayer);
     const gpa = model.gpa;
     const scores = try gpa.alloc(f32, m.experts.len);
     errdefer gpa.free(scores);
     for (0..m.experts.len) |e| {
+        if (visited_only and !model.expertVisited(layer, e)) {
+            scores[e] = -1;
+            continue;
+        }
         const lease = try m.acquireDown(model, e);
-        defer @constCast(&model.store).release(lease);
+        defer lease.release(model);
         scores[e] = try scoreDown(model.pool, gpa, lease.weight, v);
     }
     return scores;
+}
+
+/// Number of routed experts of `layer` that are candidates for an edit:
+/// all of them, or only the visited ones (warp mode with `visited_only`).
+pub fn candidateCount(model: *const Model, layer: usize, visited_only: bool) usize {
+    const m = &(model.layers[layer].moe orelse return 0);
+    if (!visited_only) return m.experts.len;
+    var n: usize = 0;
+    for (0..m.experts.len) |e| n += @intFromBool(model.expertVisited(layer, e));
+    return n;
 }
 
 /// Expert indices sorted by descending score (ties keep index order).
@@ -669,7 +799,7 @@ pub fn rankScores(gpa: Allocator, scores: []const f32) ![]usize {
 
 /// Routed experts of `layer` ranked by descending alignment with `v` (caller frees).
 pub fn rankExperts(model: *const Model, layer: usize, v: []const f32) ![]usize {
-    const scores = try scoreExperts(model, layer, v);
+    const scores = try scoreExperts(model, layer, v, false);
     defer model.gpa.free(scores);
     return rankScores(model.gpa, scores);
 }
@@ -721,7 +851,10 @@ pub fn printExpertTable(out: *Io.Writer, layer: usize, scores: []const f32, rank
 /// routed experts receive a down-projection edit of weight `max(0, λ·strength)`.
 /// `n_experts == 0` edits every expert (broad). Routing and unselected experts
 /// are untouched; the shared expert is edited only in broad mode. Deltas are
-/// always recomputed from the base weights.
+/// always recomputed from the base weights. With `opts.visited_experts_only`
+/// (warp mode) only experts that a forward pass of this run routed to are
+/// scored and edited: the others cannot have influenced any refusal, and
+/// skipping them saves their reads.
 pub fn applyExpertSelective(model: *Model, dirs: []const f32, cfg: search.TrialConfig, opts: abliterate.Options) !void {
     if (!model.isMoe()) return error.NotMoeModel;
     const sel = cfg.experts orelse search.ExpertSelection{ .n_experts = 0, .strength = 1.0 };
@@ -733,6 +866,7 @@ pub fn applyExpertSelective(model: *Model, dirs: []const f32, cfg: search.TrialC
     if (cfg.direction_index) |di| global_dir = try abliterate.interpolateBasis(gpa, dirs, opts.n_directions, hidden, di);
 
     const store: *stream.WeightStore = @constCast(&model.store);
+    const visited_only = opts.visited_experts_only and model.visitedExpertsKnown();
     model.resetDeltas();
     var seed_counter: u64 = 0;
     for (model.layers, 0..) |*layer, li| {
@@ -759,12 +893,14 @@ pub fn applyExpertSelective(model: *Model, dirs: []const f32, cfg: search.TrialC
             model.setDelta(li, .mlp_down_proj, delta);
             continue;
         });
-        const n = @min(sel.n_experts, m.experts.len);
-        if (n == 0 or opts.expert_selection == .broad) {
+        const n_candidates = candidateCount(model, li, visited_only);
+        const n = @min(sel.n_experts, n_candidates);
+        if (sel.n_experts == 0 or opts.expert_selection == .broad) {
             var idx: usize = 0;
             while (idx < m.numDown()) : (idx += 1) {
+                if (visited_only and idx < m.experts.len and !model.expertVisited(li, idx)) continue;
                 const lease = try m.acquireDown(model, idx);
-                defer store.release(lease);
+                defer lease.release(model);
                 const delta = try abliterate.computeDelta(model.pool, gpa, lease.weight, v, lambda, opts, opts.seed +% seed_counter);
                 seed_counter += 1;
                 model.setExpertDelta(li, idx, delta);
@@ -772,8 +908,8 @@ pub fn applyExpertSelective(model: *Model, dirs: []const f32, cfg: search.TrialC
             continue;
         }
         const weight = @max(0.0, lambda * sel.strength);
-        if (weight == 0) continue;
-        const scores = try scoreExperts(model, li, v);
+        if (weight == 0 or n == 0) continue;
+        const scores = try scoreExperts(model, li, v, visited_only);
         defer gpa.free(scores);
         const ranking = try rankScores(gpa, scores);
         defer gpa.free(ranking);
@@ -781,12 +917,14 @@ pub fn applyExpertSelective(model: *Model, dirs: []const f32, cfg: search.TrialC
             .random => .{ .random = opts.seed +% 0x9e3779b97f4a7c15 *% (li + 1) },
             else => .ranked,
         };
-        const selected = try selectExperts(gpa, ranking, n, strategy);
+        // Unvisited experts score -1 and sit at the end of the ranking; the
+        // candidates are its first `n_candidates` entries.
+        const selected = try selectExperts(gpa, ranking[0..n_candidates], n, strategy);
         defer gpa.free(selected);
-        if (opts.debug_writer) |w| try printExpertTable(w, li, scores, ranking, selected);
+        if (opts.debug_writer) |w| try printExpertTable(w, li, scores, ranking[0..n_candidates], selected);
         for (selected) |e| {
             const lease = try m.acquireDown(model, e);
-            defer store.release(lease);
+            defer lease.release(model);
             const delta = try abliterate.computeDelta(model.pool, gpa, lease.weight, v, weight, opts, opts.seed +% seed_counter);
             seed_counter += 1;
             model.setExpertDelta(li, e, delta);
@@ -823,7 +961,7 @@ test "expert ranking prefers the aligned expert" {
         const w = Weight{ .data = std.mem.sliceAsBytes(&mats[e]), .dtype = .f32, .rows = hidden, .cols = inter };
         ex.* = .{ .gate = w, .up = w, .down = w, .gate_ref = dummy_ref, .up_ref = dummy_ref, .down_ref = dummy_ref };
     }
-    const layer = MoeLayer{ .router = experts[0].gate, .router_ref = dummy_ref.ref, .top_k = 1, .norm_topk_prob = true, .inter = inter, .layout = .separate, .experts = &experts, .shared = null, .fused_down_suffix = null };
+    const layer = MoeLayer{ .layer_index = 0, .router = experts[0].gate, .router_ref = dummy_ref.ref, .top_k = 1, .norm_topk_prob = true, .inter = inter, .layout = .separate, .experts = &experts, .shared = null, .fused_down_suffix = null };
     const scores = try scoreLayer(&pool, gpa, &layer, &v);
     defer gpa.free(scores);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), scores[1], 1e-4);

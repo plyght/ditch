@@ -111,6 +111,9 @@ pub fn hashFile(a: Allocator, io: Io, dir: Io.Dir, sub_path: []const u8) ![]cons
     return hexDigest(a, &h);
 }
 
+/// Recorded instead of a SHA-256 for shards read from a remote source (`hf://`).
+pub const remote_hash_placeholder = "not hashed (remote source)";
+
 /// SHA-256 over the exact prompt list (system prompt and user text of every prompt, in order).
 pub fn hashPrompts(a: Allocator, prompts: []const Prompt) ![]const u8 {
     var h = Sha256.init(.{});
@@ -162,7 +165,8 @@ pub fn build(a: Allocator, io: Io, in: Inputs) !Manifest {
     defer src.close(io);
     const config_sha = try hashFile(a, io, src, "config.json");
     const files = try a.alloc(FileHash, model.files.len);
-    for (model.files, 0..) |f, i| files[i] = .{ .name = try a.dupe(u8, f.path), .sha256 = try hashFile(a, io, src, f.path) };
+    // Shards of a remote source are not on disk; hashing them would mean downloading the model.
+    for (model.files, 0..) |f, i| files[i] = .{ .name = try a.dupe(u8, f.path), .sha256 = if (f.isRemote()) remote_hash_placeholder else try hashFile(a, io, src, f.path) };
 
     const params = try a.alloc(Param, in.space.space.names.len);
     for (in.space.space.names, 0..) |name, i| params[i] = .{ .name = name, .value = in.trial.params[i] };

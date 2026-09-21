@@ -4,10 +4,13 @@ forward pass, used to validate ditch's inference against known-good numbers.
 
 Usage: make_fixture.py <family> <out_dir>
     family: llama | qwen2 | qwen3 | gemma3 | qwen3_moe | qwen3_moe_fused | qwen3_moe_fused_t
+            | qwen3_moe_big
 
 The qwen3_moe variants share identical weights: `qwen3_moe` stores one tensor
 per expert, `qwen3_moe_fused` the fused [E, 2I, H] / [E, H, I] layout and
 `qwen3_moe_fused_t` the transposed fused [E, H, 2I] / [E, I, H] layout.
+`qwen3_moe_big` is a larger routed model (4 MoE layers, 16 experts, top-2,
+hidden size 64) used to exercise the expert cache with real evictions.
 
 Only NumPy is required. Weights are random but deterministic.
 """
@@ -41,6 +44,7 @@ def bytes_to_unicode():
 B2U = bytes_to_unicode()
 
 MOE = FAMILY.startswith("qwen3_moe")
+BIG = FAMILY == "qwen3_moe_big"
 FUSED = FAMILY in ("qwen3_moe_fused", "qwen3_moe_fused_t")
 FUSED_T = FAMILY == "qwen3_moe_fused_t"
 byte_level = FAMILY.startswith("qwen") or FAMILY == "llama"
@@ -140,6 +144,12 @@ HD = H // NH
 # MoE: E routed experts of size MI, top-K routing; layer 1 stays dense (mlp_only_layers).
 E, K, MI = 4, 2, 12
 MLP_ONLY = [1]
+if BIG:
+    # Every layer routed: 16 experts of 9 KB each, 64 experts in total, so a
+    # cache of a few experts sees evictions on every forward pass.
+    H, I, L, E, K, MI = 64, 96, 4, 16, 2, 24
+    HD = H // NH
+    MLP_ONLY = []
 if FAMILY == "gemma3":
     HD = 16  # gemma uses an explicit head_dim
 CFG_FAMILY = "qwen3_moe" if MOE else FAMILY

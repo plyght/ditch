@@ -24,4 +24,7 @@ comptime {
     _ = @import("stream_test.zig");
     _ = @import("reproduce.zig");
     _ = @import("bench.zig");
+    _ = @import("expert_cache.zig");
+    _ = @import("remote.zig");
+    _ = @import("remote_test.zig");
 }

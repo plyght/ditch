@@ -96,3 +96,6 @@ test "qwen3_moe fixture (fused expert tensors)" {
 test "qwen3_moe fixture (transposed fused expert tensors)" {
     try checkFixture("qwen3_moe_fused_t");
 }
+test "qwen3_moe_big fixture (16 experts, 4 routed layers)" {
+    try checkFixture("qwen3_moe_big");
+}

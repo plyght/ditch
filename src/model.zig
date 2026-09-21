@@ -5,7 +5,11 @@
 //! Weights are accessed through a `stream.WeightStore`: memory-mapped by
 //! default, or streamed layer by layer from disk under a memory budget
 //! (`LoadOptions`), in which case `forward` keeps one layer (plus a prefetched
-//! one) resident at a time.
+//! one) resident at a time. A streamed mixture-of-experts model additionally
+//! gets an expert cache ("warp mode", expert_cache.zig): layers acquire only
+//! their trunk and the routed experts are fetched on demand. Weights may
+//! also come from a remote safetensors source (remote.zig) instead of a
+//! local directory.
 
 const std = @import("std");
 const Io = std.Io;
@@ -17,6 +21,8 @@ const Tokenizer = @import("tokenizer.zig").Tokenizer;
 const moe = @import("moe.zig");
 const abliterate = @import("abliterate.zig");
 const search = @import("search.zig");
+const expert_cache = @import("expert_cache.zig");
+const remote = @import("remote.zig");
 
 const Allocator = std.mem.Allocator;
 const Weight = tensor.Weight;
@@ -322,10 +328,18 @@ pub const Layer = struct {
 
     /// Bytes that must be resident to run this layer (attention, MLP or
     /// router plus every expert, and the transient needed to transpose fused
-    /// expert blocks in streamed mode).
-    pub fn residentBytes(self: *const Layer) u64 {
+    /// expert blocks in streamed mode). In warp mode (`warp`) the routed
+    /// experts live in the expert cache and only one token's selection counts.
+    pub fn residentBytes(self: *const Layer, warp: bool) u64 {
         var total = self.refs.bytes();
-        if (self.moe) |*m| total += m.residentBytes();
+        if (self.moe) |*m| total += m.residentBytes(warp);
+        return total;
+    }
+
+    /// Bytes of the layer's trunk: everything except the routed experts.
+    pub fn trunkBytes(self: *const Layer) u64 {
+        var total = self.refs.bytes();
+        if (self.moe) |*m| total += m.trunkBytes();
         return total;
     }
 };
@@ -359,6 +373,15 @@ pub const LoadOptions = struct {
     prefetch: bool = true,
     /// Always spill activations and KV caches to scratch (testing aid).
     spill_always: bool = false,
+    /// Expert cache capacity in bytes for streamed mixture-of-experts models
+    /// ("warp mode"): null = automatic (what remains of the budget after the
+    /// trunk and a reserve for workspaces), 0 = no cache (every expert of a
+    /// layer is acquired with the layer, as in plain streamed mode).
+    expert_cache: ?u64 = null,
+    /// Remote safetensors source; `dir_path` then holds only the small files
+    /// (config, tokenizer) and the shards are read through the source. Implies
+    /// streamed mode.
+    remote: ?*remote.Source = null,
 };
 
 /// The two abliterable components, named as in heretic.
@@ -398,6 +421,8 @@ pub const Model = struct {
     /// prefetch state); since a `Model` always lives on the heap this is done
     /// through `@constCast` in `acquireLayer` & co.
     store: stream.WeightStore,
+    /// Warp mode: the bounded cache of resident routed experts (streamed MoE models).
+    expert_cache: ?*expert_cache.ExpertCache = null,
     budget: ?*budget_mod.Budget,
     scratch_dir: []const u8,
     /// Tensor name prefix for the language model (e.g. "model." or "language_model.model.").
@@ -408,6 +433,12 @@ pub const Model = struct {
     embed_ref: WeightRef,
     lm_head_ref: WeightRef,
     largest_layer_bytes: u64,
+    /// Largest layer without its routed experts (attention, norms, router, shared expert).
+    largest_trunk_layer_bytes: u64,
+    /// Largest routed expert (0 for dense models).
+    largest_expert_bytes: u64,
+    /// Bytes of all routed experts of all layers.
+    total_expert_bytes: u64,
     largest_tensor_bytes: u64,
     spill_always: bool,
     final_norm: []f32,
@@ -431,6 +462,11 @@ pub const Model = struct {
 
     pub fn deinit(self: *Model) void {
         self.resetDeltas();
+        if (self.expert_cache) |c| {
+            c.deinit();
+            self.meta_gpa.destroy(c);
+            self.expert_cache = null;
+        }
         self.store.deinit();
         for (self.files) |f| f.close(self.meta_gpa, self.io);
         self.tokenizer.deinit();
@@ -440,6 +476,60 @@ pub const Model = struct {
 
     pub fn streamed(self: *const Model) bool {
         return self.store.mode == .streamed;
+    }
+
+    /// True when routed experts go through the expert cache.
+    pub fn warp(self: *const Model) bool {
+        return self.expert_cache != null;
+    }
+
+    /// Bytes the expert cache could give back right now (unpinned entries).
+    pub fn expertCacheEvictable(self: *const Model) u64 {
+        const c = self.expert_cache orelse return 0;
+        return c.evictable();
+    }
+
+    /// Whether routed expert `expert` of `layer` was used by a forward pass of
+    /// this run. Without an expert cache nothing is tracked and every expert
+    /// counts as visited.
+    pub fn expertVisited(self: *const Model, layer: usize, expert: usize) bool {
+        const c = self.expert_cache orelse return true;
+        return c.visited(layer, expert);
+    }
+
+    /// True when "visited experts only" can be applied: the cache tracks
+    /// uses and at least one forward pass has run.
+    pub fn visitedExpertsKnown(self: *const Model) bool {
+        const c = self.expert_cache orelse return false;
+        return c.anyVisited();
+    }
+
+    /// Loads the hotlist written by a previous run on `model_id` (from the
+    /// scratch directory) into the expert cache. Returns the number of
+    /// experts warmed; 0 when there is no cache or no (readable) hotlist.
+    pub fn warmExpertCache(self: *Model, gpa: Allocator, model_id: []const u8) !usize {
+        const c = self.expert_cache orelse return 0;
+        const path = try expert_cache.hotlistPath(gpa, self.scratch_dir, model_id);
+        defer gpa.free(path);
+        const hot = expert_cache.ExpertCache.readHotlist(gpa, self.io, path) catch |err| switch (err) {
+            error.FileNotFound => return 0,
+            error.InvalidHotlist => {
+                std.log.warn("ignoring malformed hotlist {s}", .{path});
+                return 0;
+            },
+            else => return err,
+        };
+        defer gpa.free(hot);
+        return c.warm(self, hot);
+    }
+
+    /// Writes the expert cache's hotlist for `model_id` (no-op without a cache).
+    pub fn writeHotlist(self: *Model, gpa: Allocator, model_id: []const u8) !?[]u8 {
+        const c = self.expert_cache orelse return null;
+        const path = try expert_cache.hotlistPath(gpa, self.scratch_dir, model_id);
+        errdefer gpa.free(path);
+        try c.writeHotlist(gpa, self.io, path, model_id);
+        return path;
     }
 
     /// Bytes of weights that must be resident at once in streamed mode
@@ -461,6 +551,7 @@ pub const Model = struct {
         const self = try gpa.create(Model);
         errdefer gpa.destroy(self);
         self.* = undefined;
+        self.expert_cache = null;
         self.meta_gpa = gpa;
         self.gpa = if (opts.budget) |b| b.allocator() else gpa;
         self.budget = opts.budget;
@@ -549,7 +640,11 @@ pub const Model = struct {
         // Safetensors files.
         var files = std.ArrayList(*safetensors.File).empty;
         errdefer for (files.items) |f| f.close(gpa, io);
-        {
+        const store_mode: stream.Mode = if (opts.remote != null) .streamed else opts.store;
+        if (opts.remote) |src| {
+            // Shards come from the remote source: headers now, tensor bytes on demand.
+            for (src.shards) |n| try files.append(arena, try safetensors.File.openRemote(gpa, io, try src.openFile(n)));
+        } else {
             var names = std.ArrayList([]const u8).empty;
             var it = dir.iterate();
             while (try it.next(io)) |entry| {
@@ -565,10 +660,10 @@ pub const Model = struct {
                 std.log.err("no .safetensors files found in {s}", .{dir_path});
                 return error.MissingWeights;
             }
-            for (names.items) |n| try files.append(arena, try safetensors.File.openOptions(gpa, io, dir, n, .{ .map = opts.store == .mapped }));
+            for (names.items) |n| try files.append(arena, try safetensors.File.openOptions(gpa, io, dir, n, .{ .map = store_mode == .mapped }));
         }
         self.files = files.items;
-        self.store = stream.WeightStore.init(self.gpa, io, self.files, opts.store, .{ .budget = opts.budget, .prefetch = opts.prefetch });
+        self.store = stream.WeightStore.init(self.gpa, io, self.files, store_mode, .{ .budget = opts.budget, .prefetch = opts.prefetch });
         self.store.registerReclaim();
         errdefer self.store.deinit();
 
@@ -636,7 +731,7 @@ pub const Model = struct {
                 },
             };
             if (c.moe_layers[i]) {
-                layer.moe = try moe.loadLayer(self, arena, lp);
+                layer.moe = try moe.loadLayer(self, arena, i, lp);
                 layer.refs.router = layer.moe.?.router_ref;
             } else {
                 layer.gate = try self.loadMat(try cat(arena, lp, "mlp.gate_proj.weight"));
@@ -647,15 +742,77 @@ pub const Model = struct {
                 layer.refs.down = try self.ref(try cat(arena, lp, "mlp.down_proj.weight"));
             }
         }
+        // Warp mode: streamed mixture-of-experts models get an expert cache
+        // unless it was explicitly disabled (`expert_cache = 0`).
+        const use_cache = self.streamed() and self.isMoe() and (opts.expert_cache orelse 1) != 0;
         self.largest_layer_bytes = 0;
-        for (self.layers) |*layer| self.largest_layer_bytes = @max(self.largest_layer_bytes, layer.residentBytes());
+        self.largest_trunk_layer_bytes = 0;
+        self.largest_expert_bytes = 0;
+        self.total_expert_bytes = 0;
+        for (self.layers) |*layer| {
+            self.largest_layer_bytes = @max(self.largest_layer_bytes, layer.residentBytes(use_cache));
+            self.largest_trunk_layer_bytes = @max(self.largest_trunk_layer_bytes, layer.trunkBytes());
+            if (layer.moe) |*m| {
+                self.largest_expert_bytes = @max(self.largest_expert_bytes, m.maxExpertBytes());
+                for (m.experts) |*ex| self.total_expert_bytes += moe.expertBytes(ex);
+            }
+        }
         if (opts.budget) |b| {
             // Prefetching needs two layers resident; disable it up front when that cannot fit.
             if (b.limited() and b.limitBytes() < 2 * self.largest_layer_bytes + self.lm_head_ref.byteLen()) self.store.prefetch_enabled = false;
         }
+        if (use_cache) {
+            const cap = opts.expert_cache orelse self.defaultExpertCacheBytes();
+            const cache = try gpa.create(expert_cache.ExpertCache);
+            errdefer gpa.destroy(cache);
+            cache.* = expert_cache.ExpertCache.init(self.gpa, io, &self.store, cap);
+            if (opts.budget) |b| cache.registerReclaim(b);
+            self.expert_cache = cache;
+        }
+        errdefer if (self.expert_cache) |cache| {
+            cache.deinit();
+            gpa.destroy(cache);
+        };
 
         try self.buildRope();
         return self;
+    }
+
+    /// Automatic expert cache capacity: what the budget leaves after the
+    /// resident trunk (two layers when prefetching, or the LM head) and a
+    /// quarter of the limit reserved for workspaces, KV caches, deltas and
+    /// kernel scratch; at least the experts one token selects and at most
+    /// every expert of the model. Without a limit, a quarter of the
+    /// machine's memory (or 2GB when unknown).
+    pub fn defaultExpertCacheBytes(self: *const Model) u64 {
+        var top_k: u64 = 1;
+        for (self.layers) |l| if (l.moe) |m| {
+            top_k = @max(top_k, m.top_k);
+        };
+        const one_set = top_k * self.largest_expert_bytes;
+        var cap: u64 = 0;
+        var limited = false;
+        if (self.budget) |b| {
+            if (b.limited()) {
+                limited = true;
+                const limit = b.limitBytes();
+                const trunk = @max(if (self.store.prefetch_enabled) 2 * self.largest_trunk_layer_bytes else self.largest_trunk_layer_bytes, self.lm_head_ref.byteLen());
+                const reserve = trunk + limit / 4;
+                cap = if (limit > reserve) limit - reserve else 0;
+            }
+        }
+        if (!limited) {
+            const total = std.process.totalSystemMemory() catch (8 << 30);
+            cap = total / 4;
+        }
+        return @min(@max(cap, one_set), @max(self.total_expert_bytes, one_set));
+    }
+
+    /// Bytes that must be resident to compute one layer, without the routed experts.
+    pub fn trunkResidentNeed(self: *const Model) u64 {
+        if (!self.streamed()) return 0;
+        const layers = if (self.store.prefetch_enabled) 2 * self.largest_trunk_layer_bytes else self.largest_trunk_layer_bytes;
+        return @max(layers, self.lm_head_ref.byteLen());
     }
 
     /// Locates a tensor by name in the store.
@@ -713,8 +870,8 @@ pub const Model = struct {
     }
 
     /// Makes the down projection of expert `expert` of an MoE layer resident
-    /// (the shared expert, if any, is index `experts.len`); release with `self.store.release`.
-    pub fn acquireExpertDown(self: *const Model, layer: usize, expert: usize) !stream.Lease {
+    /// (the shared expert, if any, is index `experts.len`); release with `DownLease.release`.
+    pub fn acquireExpertDown(self: *const Model, layer: usize, expert: usize) !moe.DownLease {
         return self.layers[layer].moe.?.acquireDown(self, expert);
     }
 
@@ -989,7 +1146,7 @@ pub const KvCache = struct {
         if (model.spill_always) return initScratch(gpa, model.io, model.scratch_dir, model.budget, c.num_layers, batch, max_len, kvd);
         if (model.budget) |b| {
             const need = bytesFor(c.num_layers, batch, max_len, kvd) + model.residentWeightNeed();
-            if (b.limited() and !b.fits(need)) {
+            if (b.limited() and b.available() + model.expertCacheEvictable() < need) {
                 return initScratch(gpa, model.io, model.scratch_dir, b, c.num_layers, batch, max_len, kvd);
             }
         }
@@ -1205,6 +1362,7 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
         .budget = model.budget,
         .scratch_dir = model.scratch_dir,
         .reserve = model.residentWeightNeed(),
+        .evictable = model.expertCacheEvictable(),
         .force_scratch = model.spill_always,
     });
 
@@ -1353,7 +1511,7 @@ fn layerBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Workspac
     i = 0;
     while (i < n) : (i += 1) tensor.rmsnorm(h[i * hidden ..][0..hidden], x[i * hidden ..][0..hidden], ff_norm, c.rms_norm_eps, c.family.isGemma());
     if (layer.moe) |*m| {
-        try moe.forward(model, m, ws.o, h, n);
+        try moe.forward(model, m, li, ws.o, h, n);
     } else {
         try tensor.matmulT(model.pool, gpa, ws.gate, h, n, layer.gate.?, null);
         try tensor.matmulT(model.pool, gpa, ws.up, h, n, layer.up.?, null);
@@ -1498,6 +1656,8 @@ pub fn generate(model: *const Model, ws: *Workspace, cache: *KvCache, prompts: [
         try outputs[i].append(gpa, t);
         if (model.isEos(t) or max_new_tokens <= 1 or positions[i] >= cache.max_len) active[i] = false else n_active += 1;
     }
+    // Prefill misses are not decode misses.
+    if (model.expert_cache) |ec| ec.resetStep();
     var step: usize = 1;
     while (step < max_new_tokens and n_active > 0) : (step += 1) {
         var n: usize = 0;
@@ -1509,6 +1669,7 @@ pub fn generate(model: *const Model, ws: *Workspace, cache: *KvCache, prompts: [
             n += 1;
         }
         try forward(model, ws, cache, tokens[0..n], rows[0..n], .{ .logit_rows = logit_rows[0..n] });
+        if (model.expert_cache) |ec| ec.endDecodeStep();
         var j: usize = 0;
         for (0..b) |i| {
             if (!active[i]) continue;

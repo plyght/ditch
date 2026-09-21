@@ -2,10 +2,13 @@
 //! Files are memory-mapped for reading by default so weights are never copied
 //! unless needed; `File.openOptions` with `.map = false` parses only the header
 //! and leaves the tensor bytes on disk (see stream.zig for positional reads).
+//! `File.openRemote` does the same over a remote shard (remote.zig): the
+//! header comes through range requests and so do the tensor bytes later.
 
 const std = @import("std");
 const Io = std.Io;
 const tensor = @import("tensor.zig");
+const remote = @import("remote.zig");
 const DType = tensor.DType;
 
 pub const TensorInfo = struct {
@@ -47,9 +50,15 @@ pub const OpenOptions = struct {
     map: bool = true,
 };
 
+/// Where a file's bytes come from.
+pub const Source = union(enum) {
+    local: Io.File,
+    remote: *remote.RemoteFile,
+};
+
 pub const File = struct {
     path: []const u8,
-    file: Io.File,
+    source: Source,
     map: ?Io.File.MemoryMap,
     header_len: usize,
     /// Total file length in bytes.
@@ -66,7 +75,7 @@ pub const File = struct {
         errdefer gpa.destroy(self);
         self.* = .{
             .path = undefined,
-            .file = undefined,
+            .source = undefined,
             .map = null,
             .header_len = 0,
             .len = 0,
@@ -76,9 +85,10 @@ pub const File = struct {
         errdefer self.arena.deinit();
         const arena = self.arena.allocator();
         self.path = try arena.dupe(u8, sub_path);
-        self.file = try dir.openFile(io, sub_path, .{});
-        errdefer self.file.close(io);
-        const len: usize = @intCast(try self.file.length(io));
+        const file = try dir.openFile(io, sub_path, .{});
+        self.source = .{ .local = file };
+        errdefer file.close(io);
+        const len: usize = @intCast(try file.length(io));
         self.len = len;
         if (len < 8) return error.InvalidSafetensors;
         var header_owned: ?[]u8 = null;
@@ -86,7 +96,7 @@ pub const File = struct {
         var header: []const u8 = undefined;
         var data: []const u8 = &.{};
         if (options.map) {
-            self.map = try Io.File.MemoryMap.create(io, self.file, .{
+            self.map = try Io.File.MemoryMap.create(io, file, .{
                 .len = len,
                 .protection = .{ .read = true, .write = false },
                 .populate = false,
@@ -99,19 +109,59 @@ pub const File = struct {
             data = bytes[8 + self.header_len ..];
         } else {
             var len_buf: [8]u8 = undefined;
-            if (try self.file.readPositionalAll(io, &len_buf, 0) != 8) return error.InvalidSafetensors;
+            if (try file.readPositionalAll(io, &len_buf, 0) != 8) return error.InvalidSafetensors;
             const n = std.mem.readInt(u64, &len_buf, .little);
             if (n > len - 8) return error.InvalidSafetensors;
             self.header_len = @intCast(n);
             const h = try gpa.alloc(u8, self.header_len);
             header_owned = h;
-            if (try self.file.readPositionalAll(io, h, 8) != h.len) return error.InvalidSafetensors;
+            if (try file.readPositionalAll(io, h, 8) != h.len) return error.InvalidSafetensors;
             header = h;
         }
         errdefer if (self.map) |*m| m.destroy(io);
         const data_start: u64 = 8 + @as(u64, self.header_len);
         const data_len: usize = len - 8 - self.header_len;
+        try self.parseHeader(gpa, header, data, data_start, data_len);
+        return self;
+    }
 
+    /// Opens a remote shard: the 8-byte length and the JSON header are read
+    /// through range requests, tensor bytes stay remote until read. The
+    /// source keeps ownership of `rf`.
+    pub fn openRemote(gpa: std.mem.Allocator, io: Io, rf: *remote.RemoteFile) !*File {
+        const self = try gpa.create(File);
+        errdefer gpa.destroy(self);
+        self.* = .{
+            .path = undefined,
+            .source = .{ .remote = rf },
+            .map = null,
+            .header_len = 0,
+            .len = 0,
+            .tensors = .{},
+            .arena = std.heap.ArenaAllocator.init(gpa),
+        };
+        errdefer self.arena.deinit();
+        self.path = try self.arena.allocator().dupe(u8, rf.name);
+        var len_buf: [8]u8 = undefined;
+        try rf.readRange(io, 0, &len_buf);
+        const n = std.mem.readInt(u64, &len_buf, .little);
+        if (n == 0 or n > (1 << 30)) return error.InvalidSafetensors;
+        self.header_len = @intCast(n);
+        const header = try gpa.alloc(u8, self.header_len);
+        defer gpa.free(header);
+        try rf.readRange(io, 8, header);
+        const data_start: u64 = 8 + @as(u64, self.header_len);
+        // The total length is not known without a HEAD request; it is derived from the header.
+        try self.parseHeader(gpa, header, &.{}, data_start, std.math.maxInt(usize));
+        var end: u64 = data_start;
+        var it = self.tensors.iterator();
+        while (it.next()) |kv| end = @max(end, kv.value_ptr.offset + kv.value_ptr.byte_len);
+        self.len = end;
+        return self;
+    }
+
+    fn parseHeader(self: *File, gpa: std.mem.Allocator, header: []const u8, data: []const u8, data_start: u64, data_len: usize) !void {
+        const arena = self.arena.allocator();
         var parsed = try std.json.parseFromSlice(std.json.Value, gpa, header, .{});
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidSafetensors;
@@ -137,19 +187,25 @@ pub const File = struct {
                 .name = try arena.dupe(u8, name),
                 .dtype = dtype,
                 .shape = shape,
-                .data = if (options.map) data[start..end] else &.{},
+                .data = if (data.len > 0) data[start..end] else &.{},
                 .offset = data_start + start,
                 .byte_len = end - start,
             });
         }
-        return self;
     }
 
     pub fn close(self: *File, gpa: std.mem.Allocator, io: Io) void {
         if (self.map) |*m| m.destroy(io);
-        self.file.close(io);
+        switch (self.source) {
+            .local => |f| f.close(io),
+            .remote => {},
+        }
         self.arena.deinit();
         gpa.destroy(self);
+    }
+
+    pub fn isRemote(self: *const File) bool {
+        return self.source == .remote;
     }
 
     pub fn get(self: *const File, name: []const u8) ?TensorInfo {
@@ -171,8 +227,13 @@ pub const File = struct {
             @memcpy(out, m.memory[@intCast(offset)..][0..out.len]);
             return;
         }
-        const n = try self.file.readPositionalAll(io, out, offset);
-        if (n != out.len) return error.UnexpectedEndOfFile;
+        switch (self.source) {
+            .local => |f| {
+                const n = try f.readPositionalAll(io, out, offset);
+                if (n != out.len) return error.UnexpectedEndOfFile;
+            },
+            .remote => |rf| try rf.readRange(io, offset, out),
+        }
     }
 };
 
