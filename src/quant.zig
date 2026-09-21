@@ -356,7 +356,7 @@ fn quantQ5_1(x: []const f32, b: []u8) void {
 fn testValues(buf: []f32) void {
     var rng = std.Random.DefaultPrng.init(7);
     const r = rng.random();
-    for (buf) |*v| v.* = (r.float(f32) * 2.0 - 1.0) * 3.0;
+    for (buf) |*v| v.* = (r.float(f32) * 2.0 - 1.0) * 2.0;
     buf[0] = 0;
     buf[5] = 2.5;
     buf[17] = -2.5;

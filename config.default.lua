@@ -233,6 +233,18 @@ return {
   -- model_action = "save",            -- "save", "chat" or "exit"
   -- save_directory = "out/my-model",
   -- export_dtype = "bf16",            -- "bf16", "f16" or "f32" (default: as source)
+  -- Export format: "hf" (a Hugging Face directory, the default), "gguf" (one
+  -- llama.cpp model.gguf next to README.md and the manifest) or "both". A
+  -- model loaded from a GGUF file defaults to "gguf".
+  -- export_format = "gguf",
+  -- Storage type of the 2-D matrices in the GGUF file: "f16" (default for
+  -- Hugging Face inputs), "bf16", "f32", "q8_0" (32-element blocks with an f16
+  -- scale, exactly ggml's Q8_0), "q4_0", "q4_1", "q5_0", "q5_1", or "source"
+  -- (default for GGUF inputs: every tensor keeps its own type; edited tensors
+  -- of a type ditch cannot produce, such as Q4_K, become Q8_0). Norms, biases
+  -- and other 1-D tensors are always f32; the token embeddings and the output
+  -- projection stay f16 when a quantised type is chosen.
+  -- gguf_dtype = "q8_0",
 
   -- -------------------------------------------------------------------------
   -- Reproducing and benchmarking

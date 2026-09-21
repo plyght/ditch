@@ -243,6 +243,8 @@ pub fn isLocalFile(io: Io, path: []const u8) bool {
 pub fn resolveModel(arena: Allocator, http: *Http, cache_root: []const u8, model: []const u8, revision: ?[]const u8, out: *Io.Writer) ![]const u8 {
     const io = http.io;
     if (isLocalDir(io, model)) return model;
+    // A local GGUF file is a model on its own.
+    if (std.mem.endsWith(u8, model, ".gguf") and isLocalFile(io, model)) return model;
     if (std.mem.indexOfScalar(u8, model, '/') == null or std.mem.startsWith(u8, model, ".") or std.mem.startsWith(u8, model, "/")) {
         std.log.err("model directory not found: {s}", .{model});
         return error.ModelNotFound;

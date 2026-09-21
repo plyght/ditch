@@ -244,9 +244,11 @@ pub const TensorInfo = struct {
 const Cursor = struct {
     bytes: []const u8,
     pos: usize = 0,
+    /// `bytes` is a prefix of the file: running out means the prefix was too short.
+    partial: bool = false,
 
     fn need(self: *Cursor, n: usize) ![]const u8 {
-        if (self.pos + n > self.bytes.len) return error.InvalidGguf;
+        if (self.pos + n > self.bytes.len) return if (self.partial) error.HeaderTruncated else error.InvalidGguf;
         const s = self.bytes[self.pos..][0..n];
         self.pos += n;
         return s;
@@ -295,10 +297,19 @@ const Cursor = struct {
     }
 };
 
+pub const OpenOptions = struct {
+    /// Memory-map the whole file. When false only the header is read (with
+    /// positional reads) and `TensorInfo.data` stays empty; tensor bytes are
+    /// read with `readRange`.
+    map: bool = true,
+};
+
 pub const File = struct {
     path: []const u8,
     file: Io.File,
-    map: Io.File.MemoryMap,
+    map: ?Io.File.MemoryMap,
+    /// Total file length in bytes.
+    len: u64,
     arena: std.heap.ArenaAllocator,
     kv: std.StringArrayHashMapUnmanaged(Value),
     tensors: std.StringArrayHashMapUnmanaged(TensorInfo),
@@ -306,12 +317,17 @@ pub const File = struct {
     data_offset: usize,
 
     pub fn open(gpa: Allocator, io: Io, dir: Io.Dir, sub_path: []const u8) !*File {
+        return openOptions(gpa, io, dir, sub_path, .{});
+    }
+
+    pub fn openOptions(gpa: Allocator, io: Io, dir: Io.Dir, sub_path: []const u8, options: OpenOptions) !*File {
         const self = try gpa.create(File);
         errdefer gpa.destroy(self);
         self.* = .{
             .path = undefined,
             .file = undefined,
-            .map = undefined,
+            .map = null,
+            .len = 0,
             .arena = std.heap.ArenaAllocator.init(gpa),
             .kv = .{},
             .tensors = .{},
@@ -324,20 +340,57 @@ pub const File = struct {
         self.file = try dir.openFile(io, sub_path, .{});
         errdefer self.file.close(io);
         const len: usize = @intCast(try self.file.length(io));
+        self.len = len;
         if (len < 24) return error.InvalidGguf;
-        self.map = try Io.File.MemoryMap.create(io, self.file, .{
-            .len = len,
-            .protection = .{ .read = true, .write = false },
-            .populate = false,
-        });
-        errdefer self.map.destroy(io);
-        const bytes = self.map.memory[0..len];
-        try self.parse(arena, bytes);
+        if (options.map) {
+            self.map = try Io.File.MemoryMap.create(io, self.file, .{
+                .len = len,
+                .protection = .{ .read = true, .write = false },
+                .populate = false,
+            });
+            errdefer self.map.?.destroy(io);
+            try self.parse(arena, self.map.?.memory[0..len], true);
+        } else {
+            // The header length is not stored: read a growing prefix until it parses.
+            var want: usize = @min(len, 1 << 20);
+            while (true) {
+                const buf = try gpa.alloc(u8, want);
+                defer gpa.free(buf);
+                const n = try self.file.readPositionalAll(io, buf, 0);
+                if (n != want) return error.InvalidGguf;
+                self.parse(arena, buf[0..n], false) catch |err| switch (err) {
+                    error.HeaderTruncated => {
+                        if (want >= len) return error.InvalidGguf;
+                        self.kv = .{};
+                        self.tensors = .{};
+                        want = @min(len, want * 4);
+                        continue;
+                    },
+                    else => return err,
+                };
+                break;
+            }
+        }
         return self;
     }
 
-    fn parse(self: *File, arena: Allocator, bytes: []const u8) !void {
-        var c = Cursor{ .bytes = bytes };
+    /// Positional read of `out.len` bytes at absolute file `offset`.
+    pub fn readRange(self: *const File, io: Io, offset: u64, out: []u8) !void {
+        if (self.map) |m| {
+            @memcpy(out, m.memory[@intCast(offset)..][0..out.len]);
+            return;
+        }
+        const n = try self.file.readPositionalAll(io, out, offset);
+        if (n != out.len) return error.UnexpectedEndOfFile;
+    }
+
+    /// Absolute file offset of a tensor's first byte.
+    pub fn tensorOffset(self: *const File, t: TensorInfo) u64 {
+        return @as(u64, self.data_offset) + t.offset;
+    }
+
+    fn parse(self: *File, arena: Allocator, bytes: []const u8, whole: bool) !void {
+        var c = Cursor{ .bytes = bytes, .partial = !whole };
         if (!std.mem.eql(u8, try c.need(4), magic)) return error.InvalidGguf;
         const ver = try c.int(u32);
         if (ver != 2 and ver != 3) {
@@ -346,7 +399,7 @@ pub const File = struct {
         }
         const n_tensors = try c.int(u64);
         const n_kv = try c.int(u64);
-        if (n_tensors > bytes.len or n_kv > bytes.len) return error.InvalidGguf;
+        if (n_tensors > self.len or n_kv > self.len) return error.InvalidGguf;
         var i: usize = 0;
         while (i < n_kv) : (i += 1) {
             const key = try c.string(arena);
@@ -372,13 +425,13 @@ pub const File = struct {
             infos[i] = .{ .name = name, .dims = dims, .ggml_type = t, .offset = offset, .data = &.{} };
         }
         self.data_offset = alignOffset(c.pos, self.alignment);
-        if (self.data_offset > bytes.len) return error.InvalidGguf;
-        const data = bytes[self.data_offset..];
+        if (self.data_offset > self.len) return error.InvalidGguf;
+        const data_len: usize = @intCast(self.len - self.data_offset);
         for (infos) |*info| {
             const start: usize = @intCast(info.offset);
             if (info.byteLen()) |bl| {
-                if (start > data.len or bl > data.len - start) return error.InvalidGguf;
-                info.data = data[start..][0..bl];
+                if (start > data_len or bl > data_len - start) return error.InvalidGguf;
+                if (whole) info.data = bytes[self.data_offset + start ..][0..bl];
             } else {
                 std.log.warn("skipping tensor {s} with unsupported ggml type {d}", .{ info.name, @intFromEnum(info.ggml_type) });
                 continue;
@@ -388,7 +441,7 @@ pub const File = struct {
     }
 
     pub fn close(self: *File, gpa: Allocator, io: Io) void {
-        self.map.destroy(io);
+        if (self.map) |*m| m.destroy(io);
         self.file.close(io);
         self.arena.deinit();
         gpa.destroy(self);
@@ -727,4 +780,18 @@ test "gguf header and metadata round trip" {
     const shape = try dn.shape(gpa);
     defer gpa.free(shape);
     try std.testing.expectEqualSlices(usize, &.{ 3, 64 }, shape);
+
+    // Header-only open with positional reads sees the same metadata and bytes.
+    const h = try File.openOptions(gpa, io, tmp.dir, "t.gguf", .{ .map = false });
+    defer h.close(gpa, io);
+    try std.testing.expectEqualStrings("llama", h.architecture().?);
+    try std.testing.expectEqual(f.data_offset, h.data_offset);
+    const hq = h.getTensor("blk.0.attn_q.weight").?;
+    try std.testing.expectEqual(@as(usize, 0), hq.data.len);
+    var buf: [128]u8 = undefined;
+    try h.readRange(io, h.tensorOffset(hq), &buf);
+    try std.testing.expectEqualSlices(u8, &t0, &buf);
+    var buf2: [20]u8 = undefined;
+    try h.readRange(io, h.tensorOffset(h.getTensor("output_norm.weight").?), &buf2);
+    try std.testing.expectEqualSlices(u8, &t1, &buf2);
 }

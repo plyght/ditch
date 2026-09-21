@@ -1,11 +1,13 @@
 //! GGUF files as model input. Locates the file, rebuilds `config.json`,
 //! `tokenizer.json`, `tokenizer_config.json` and `generation_config.json`
 //! from the metadata (or takes the copies a ditch export embedded), and
-//! presents every tensor under its Hugging Face name, so `model.zig`,
-//! `moe.zig`, `export.zig` and the kernels work unchanged: llama.cpp's
-//! q/k permutation is undone, gemma norms lose their `+1`, stacked expert
-//! tensors are split into per-expert views and quantised tensors keep their
-//! block dtype (dequantised row by row by `tensor.Weight.row`).
+//! presents every tensor under its Hugging Face name through a synthetic
+//! `safetensors.File`, so the weight store, `model.zig`, `moe.zig`,
+//! `export.zig` and the kernels work unchanged in mapped and streamed mode:
+//! llama.cpp's q/k permutation is undone (an in-memory copy when mapped, a
+//! permuted-row overlay read positionally when streamed), gemma norms lose
+//! their `+1`, stacked expert tensors become per-expert views and quantised
+//! tensors keep their block dtype (dequantised row by row by `tensor.Weight.row`).
 
 const std = @import("std");
 const Io = std.Io;
@@ -36,14 +38,13 @@ pub const TokenType = enum(i32) {
 };
 
 pub const Source = struct {
+    /// Header-only handle (metadata; positional reads of pass-through tensors).
     file: *gguf.File,
     /// Directory holding the file, and the file name inside it.
     dir_path: []const u8,
     file_name: []const u8,
     arch: []const u8,
     family: Family,
-    /// Tensors under their Hugging Face names (expert entries are views into the stacked tensors).
-    tensors: std.StringArrayHashMapUnmanaged(safetensors.TensorInfo),
     /// GGUF tensors without a Hugging Face counterpart (`rope_freqs.weight`, ...), copied verbatim on GGUF export.
     extra: []const gguf.TensorInfo,
     /// Sum of all tensor bytes in the file.
@@ -54,7 +55,8 @@ pub const Source = struct {
 
     pub fn close(self: *Source, gpa: Allocator, io: Io) void {
         self.file.close(gpa, io);
-        // `self` and the tables live in the model arena.
+        // `self` and the tables live in the model arena; the synthetic
+        // safetensors file is closed with `model.files`.
     }
 };
 
@@ -138,20 +140,60 @@ fn modelTypeName(family: Family) []const u8 {
     };
 }
 
-/// Fills `model` (a freshly created, otherwise empty `Model`) from a GGUF file.
-pub fn attach(model: *Model, gguf_path: []const u8) !void {
-    return attachWithOptions(model, gguf_path, .{});
+/// Whether llama.cpp permutes q/k for this family.
+pub fn permutesQk(family: Family) bool {
+    return family == .llama or family == .mistral or family == .mixtral;
 }
 
-pub fn attachWithOptions(model: *Model, gguf_path: []const u8, opts: AttachOptions) !void {
-    const gpa = model.gpa;
+pub fn isGemma(family: Family) bool {
+    return family == .gemma2 or family == .gemma3;
+}
+
+/// The per-frequency rope factors llama.cpp derives from a llama3 rope scaling
+/// (`generate_extra_tensors` in its converter).
+pub fn llama3Factors(a: Allocator, theta: f32, head_dim: usize, s: anytype) ![]f32 {
+    const out = try a.alloc(f32, head_dim / 2);
+    const low_wavelen = s.original_max_position / s.low_freq_factor;
+    const high_wavelen = s.original_max_position / s.high_freq_factor;
+    for (out, 0..) |*o, i| {
+        const exponent: f64 = @as(f64, @floatFromInt(2 * i)) / @as(f64, @floatFromInt(head_dim));
+        const freq = 1.0 / std.math.pow(f64, theta, exponent);
+        const wavelen: f32 = @floatCast(2.0 * std.math.pi / freq);
+        if (wavelen < high_wavelen) {
+            o.* = 1;
+        } else if (wavelen > low_wavelen) {
+            o.* = s.factor;
+        } else {
+            const smooth = (s.original_max_position / wavelen - s.low_freq_factor) / (s.high_freq_factor - s.low_freq_factor);
+            o.* = 1.0 / ((1.0 - smooth) / s.factor + smooth);
+        }
+    }
+    return out;
+}
+
+/// Reads `rope_freqs.weight` as f32 factors, if present.
+fn readRopeFactors(a: Allocator, io: Io, f: *const gguf.File) !?[]f32 {
+    const rf = f.getTensor("rope_freqs.weight") orelse return null;
+    const dt = rf.dtype() orelse return null;
+    const raw = try a.alloc(u8, rf.byteLen().?);
+    try f.readRange(io, f.tensorOffset(rf), raw);
+    const factors = try a.alloc(f32, rf.numel());
+    tensor.convertToF32(dt, raw, factors);
+    return factors;
+}
+
+/// Fills `model` (a freshly created `Model` whose `arena`, `io` and
+/// allocators are set) from a GGUF file: metadata, tokenizer and one
+/// synthetic safetensors file in `model.files`.
+pub fn attach(model: *Model, gguf_path: []const u8, mapped: bool, opts: AttachOptions) !void {
+    const gpa = model.meta_gpa;
     const io = model.io;
     const arena = model.arena.allocator();
     const dir_path = std.fs.path.dirname(gguf_path) orelse ".";
     const file_name = std.fs.path.basename(gguf_path);
     var dir = try Io.Dir.cwd().openDir(io, dir_path, .{});
     defer dir.close(io);
-    const file = try gguf.File.open(gpa, io, dir, file_name);
+    const file = try gguf.File.openOptions(gpa, io, dir, file_name, .{ .map = false });
     errdefer file.close(gpa, io);
 
     const arch = file.architecture() orelse {
@@ -170,31 +212,23 @@ pub fn attachWithOptions(model: *Model, gguf_path: []const u8, opts: AttachOptio
         .file_name = try arena.dupe(u8, file_name),
         .arch = arch,
         .family = family,
-        .tensors = .{},
         .extra = &.{},
         .total_bytes = 0,
         .embedded_config = false,
         .embedded_tokenizer = false,
     };
     model.source_dir = src.dir_path;
-    model.files = &.{};
 
     // Configuration.
     if (!opts.ignore_embedded and file.getStr(key_hf_config) != null) {
         model.config_json = try arena.dupe(u8, file.getStr(key_hf_config).?);
         src.embedded_config = true;
     } else {
-        model.config_json = try buildConfigJson(arena, file, family);
+        model.config_json = try buildConfigJson(arena, io, file, family);
     }
     model.config = try model_mod.parseConfig(arena, model.config_json);
     if (model.config.rope_scaling == .none) {
-        if (file.getTensor("rope_freqs.weight")) |rf| {
-            if (rf.dtype()) |dt| {
-                const factors = try arena.alloc(f32, rf.numel());
-                tensor.convertToF32(dt, rf.data, factors);
-                model.config.rope_scaling = .{ .factors = factors };
-            }
-        }
+        if (try readRopeFactors(arena, io, file)) |factors| model.config.rope_scaling = .{ .factors = factors };
     }
 
     // Tokenizer.
@@ -230,7 +264,13 @@ pub fn attachWithOptions(model: *Model, gguf_path: []const u8, opts: AttachOptio
     model.eos_ids = eos.items;
     model.pad_id = if (file.getInt("tokenizer.ggml.padding_token_id")) |p| (if (p >= 0) @intCast(p) else 0) else if (eos.items.len > 0) eos.items[0] else 0;
 
-    try mapTensors(src, arena, &model.config);
+    // Weights: one synthetic safetensors file over the GGUF data section.
+    const weights = try safetensors.File.initSynthetic(gpa, io, dir, file_name, mapped);
+    errdefer weights.close(gpa, io);
+    try mapTensors(src, weights, arena, io, &model.config);
+    const files = try arena.alloc(*safetensors.File, 1);
+    files[0] = weights;
+    model.files = files;
     model.gguf = src;
 }
 
@@ -242,7 +282,7 @@ fn jsonStr(w: *Io.Writer, s: []const u8) !void {
     try std.json.Stringify.encodeJsonString(s, .{}, w);
 }
 
-fn buildConfigJson(a: Allocator, f: *const gguf.File, family: Family) ![]const u8 {
+fn buildConfigJson(a: Allocator, io: Io, f: *const gguf.File, family: Family) ![]const u8 {
     var out: Io.Writer.Allocating = .init(a);
     const w = &out.writer;
     const hidden = f.archInt("embedding_length") orelse return error.InvalidGguf;
@@ -257,14 +297,14 @@ fn buildConfigJson(a: Allocator, f: *const gguf.File, family: Family) ![]const u
     const theta = f.archFloat("rope.freq_base") orelse 10000.0;
     const ctx = f.archInt("context_length") orelse 4096;
     const tied = f.getTensor("output.weight") == null;
-    const is_gemma = family == .gemma2 or family == .gemma3;
+    const gemma = isGemma(family);
 
     try w.writeAll("{");
     try w.writeAll("\"model_type\":");
     try jsonStr(w, modelTypeName(family));
     try w.print(",\"hidden_size\":{d},\"intermediate_size\":{d},\"num_hidden_layers\":{d},\"num_attention_heads\":{d},\"num_key_value_heads\":{d},\"head_dim\":{d},\"vocab_size\":{d}", .{ hidden, inter, layers, heads, kv_heads, head_dim, vocab });
     try w.print(",\"rms_norm_eps\":{d},\"rope_theta\":{d},\"max_position_embeddings\":{d},\"tie_word_embeddings\":{s}", .{ eps, theta, ctx, if (tied) "true" else "false" });
-    try w.print(",\"hidden_act\":\"{s}\"", .{if (is_gemma) "gelu_pytorch_tanh" else "silu"});
+    try w.print(",\"hidden_act\":\"{s}\"", .{if (gemma) "gelu_pytorch_tanh" else "silu"});
     try w.print(",\"attention_bias\":{s}", .{if (f.getTensor("blk.0.attn_q.bias") != null) "true" else "false"});
     if (f.archStr("rope.scaling.type")) |t| {
         if (std.mem.eql(u8, t, "linear")) {
@@ -272,17 +312,40 @@ fn buildConfigJson(a: Allocator, f: *const gguf.File, family: Family) ![]const u
         } else if (!std.mem.eql(u8, t, "none")) {
             std.log.warn("rope scaling type '{s}' is not supported; using unscaled RoPE", .{t});
         }
+    } else if (try readRopeFactors(a, io, f)) |factors| {
+        // llama3 scaling stored as per-frequency factors. Llama 3 models use
+        // low_freq_factor 1, high_freq_factor 4 and 8192 original positions;
+        // when the factors match those exactly the standard entry is written,
+        // otherwise a ditch-specific one carrying the factors themselves.
+        var factor: f32 = 1;
+        for (factors) |x| factor = @max(factor, x);
+        const guess = .{ .factor = factor, .low_freq_factor = @as(f32, 1), .high_freq_factor = @as(f32, 4), .original_max_position = @as(f32, 8192) };
+        const expected = try llama3Factors(a, @floatCast(theta), @intCast(head_dim), guess);
+        var matches = expected.len == factors.len;
+        if (matches) for (expected, factors) |e, x| {
+            if (@abs(e - x) > 1e-4 * @max(1.0, @abs(e))) matches = false;
+        };
+        if (matches) {
+            try w.print(",\"rope_scaling\":{{\"rope_type\":\"llama3\",\"factor\":{d},\"low_freq_factor\":1.0,\"high_freq_factor\":4.0,\"original_max_position_embeddings\":8192}}", .{factor});
+        } else {
+            try w.writeAll(",\"rope_scaling\":{\"rope_type\":\"ditch_factors\",\"factors\":[");
+            for (factors, 0..) |x, i| {
+                if (i > 0) try w.writeAll(",");
+                try w.print("{d}", .{x});
+            }
+            try w.writeAll("]}");
+        }
     }
     if (f.archFloat("attn_logit_softcapping")) |v| try w.print(",\"attn_logit_softcapping\":{d}", .{v});
     if (f.archFloat("final_logit_softcapping")) |v| try w.print(",\"final_logit_softcapping\":{d}", .{v});
-    if (is_gemma or family == .mistral) {
+    if (gemma or family == .mistral) {
         if (f.archInt("attention.sliding_window")) |sw| try w.print(",\"sliding_window\":{d}", .{sw});
     }
     if (family == .gemma3) {
         try w.print(",\"sliding_window_pattern\":{d}", .{f.archInt("attention.sliding_window_pattern") orelse 6});
         try w.print(",\"rope_local_base_freq\":{d}", .{f.archFloat("rope.freq_base_swa") orelse 10000.0});
     }
-    if (is_gemma) {
+    if (gemma) {
         // llama.cpp derives the attention scale from the model size: the 27B
         // variants (46 / 62 blocks) use hidden / heads, every other one head_dim.
         const is_27b = (family == .gemma2 and layers == 46) or (family == .gemma3 and layers == 62);
@@ -324,7 +387,7 @@ pub const regex_gpt2 = "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L
 
 /// The regular expression behind a `tokenizer.ggml.pre` name.
 pub fn regexForPre(pre: []const u8) []const u8 {
-    if (std.mem.eql(u8, pre, "llama-bpe") or std.mem.eql(u8, pre, "llama3") or std.mem.eql(u8, pre, "llama-v3")) return regex_llama3;
+    if (isLlamaBpe(pre)) return regex_llama3;
     if (std.mem.eql(u8, pre, "qwen2") or std.mem.eql(u8, pre, "deepseek-r1-qwen")) return regex_qwen2;
     if (!std.mem.eql(u8, pre, "gpt-2") and !std.mem.eql(u8, pre, "default")) {
         std.log.warn("pre-tokenizer '{s}' is not known; using the GPT-2 pattern", .{pre});
@@ -579,33 +642,19 @@ fn buildGenerationConfigJson(a: Allocator, f: *const gguf.File) ![]const u8 {
 // Tensor names
 // ---------------------------------------------------------------------------
 
-/// llama.cpp's `permute` for the llama family: within every head the rows
-/// `[2][head_dim/2]` become `[head_dim/2][2]`. `forward` maps Hugging Face
-/// order to GGUF order; the inverse undoes it. Works on raw row bytes, so it
-/// applies to quantised rows too.
+/// llama.cpp's `permute` for the llama family on raw row bytes: `forward` maps
+/// Hugging Face row order to GGUF order, otherwise the inverse. Applies to
+/// quantised rows too, since a row is a whole number of blocks.
 pub fn permuteRows(out: []u8, in: []const u8, rows: usize, row_bytes: usize, n_head: usize, forward: bool) void {
     std.debug.assert(rows % (2 * n_head) == 0);
     const hd = rows / n_head;
-    const half = hd / 2;
-    var h: usize = 0;
-    while (h < n_head) : (h += 1) {
-        var i: usize = 0;
-        while (i < half) : (i += 1) {
-            var j: usize = 0;
-            while (j < 2) : (j += 1) {
-                const hf_row = h * hd + j * half + i;
-                const gguf_row = h * hd + 2 * i + j;
-                const src_row = if (forward) hf_row else gguf_row;
-                const dst_row = if (forward) gguf_row else hf_row;
-                @memcpy(out[dst_row * row_bytes ..][0..row_bytes], in[src_row * row_bytes ..][0..row_bytes]);
-            }
-        }
+    var hf_row: usize = 0;
+    while (hf_row < rows) : (hf_row += 1) {
+        const gguf_row = safetensors.llamaPermutedRow(hf_row, hd);
+        const src_row = if (forward) hf_row else gguf_row;
+        const dst_row = if (forward) gguf_row else hf_row;
+        @memcpy(out[dst_row * row_bytes ..][0..row_bytes], in[src_row * row_bytes ..][0..row_bytes]);
     }
-}
-
-/// Whether llama.cpp permutes q/k for this family.
-pub fn permutesQk(family: Family) bool {
-    return family == .llama or family == .mistral or family == .mixtral;
 }
 
 fn rowBytesOf(t: gguf.TensorInfo, dt: tensor.DType) !usize {
@@ -615,21 +664,34 @@ fn rowBytesOf(t: gguf.TensorInfo, dt: tensor.DType) !usize {
     return dt.blockBytes();
 }
 
-fn mapTensors(src: *Source, arena: Allocator, config: *const model_mod.Config) !void {
+/// Reads a tensor's raw bytes (from the mapping when available).
+fn rawBytes(src: *const Source, weights: *const safetensors.File, io: Io, arena: Allocator, t: gguf.TensorInfo) ![]const u8 {
+    const off = src.file.tensorOffset(t);
+    const len = t.byteLen().?;
+    if (weights.isMapped()) return weights.mappedSlice(off, len);
+    const buf = try arena.alloc(u8, len);
+    try src.file.readRange(io, off, buf);
+    return buf;
+}
+
+fn mapTensors(src: *Source, weights: *safetensors.File, arena: Allocator, io: Io, config: *const model_mod.Config) !void {
     const f = src.file;
     const family = src.family;
-    const is_gemma = family == .gemma2 or family == .gemma3;
+    const gemma = isGemma(family);
     const mixtral = family == .mixtral;
+    const mlp: []const u8 = if (mixtral) "block_sparse_moe." else "mlp.";
     var extra = std.ArrayList(gguf.TensorInfo).empty;
     var it = f.tensors.iterator();
     while (it.next()) |kv| {
         const t = kv.value_ptr.*;
-        src.total_bytes += t.data.len;
         const dt = t.dtype() orelse continue;
+        const byte_len = t.byteLen() orelse continue;
+        src.total_bytes += byte_len;
+        const base_off = f.tensorOffset(t);
         var hf: ?[]const u8 = null;
         var layer: ?usize = null;
         var permute_heads: ?usize = null;
-        var experts: ?struct { kind: []const u8 } = null;
+        var expert_kind: ?[]const u8 = null;
         if (std.mem.eql(u8, t.name, "token_embd.weight")) {
             hf = "model.embed_tokens.weight";
         } else if (std.mem.eql(u8, t.name, "output_norm.weight")) {
@@ -641,7 +703,6 @@ fn mapTensors(src: *Source, arena: Allocator, config: *const model_mod.Config) !
             const dot = std.mem.indexOfScalar(u8, rest, '.') orelse continue;
             layer = std.fmt.parseInt(usize, rest[0..dot], 10) catch continue;
             const tail = rest[dot + 1 ..];
-            const mlp: []const u8 = if (mixtral) "block_sparse_moe." else "mlp.";
             const Pair = struct { g: []const u8, h: []const u8 };
             const simple = [_]Pair{
                 .{ .g = "attn_norm.weight", .h = "input_layernorm.weight" },
@@ -676,32 +737,40 @@ fn mapTensors(src: *Source, arena: Allocator, config: *const model_mod.Config) !
                     suffix = if (tail[tail.len - 1] == 't') "self_attn.k_proj.weight" else "self_attn.k_proj.bias";
                     if (permutesQk(family)) permute_heads = config.num_kv_heads;
                 } else if (std.mem.eql(u8, tail, "ffn_norm.weight")) {
-                    suffix = if (is_gemma) "pre_feedforward_layernorm.weight" else "post_attention_layernorm.weight";
+                    suffix = if (gemma) "pre_feedforward_layernorm.weight" else "post_attention_layernorm.weight";
                 } else if (std.mem.eql(u8, tail, "ffn_gate_inp.weight")) {
                     suffix = try std.mem.concat(arena, u8, &.{ mlp, "gate.weight" });
                 } else if (std.mem.eql(u8, tail, "ffn_gate_exps.weight")) {
-                    experts = .{ .kind = if (mixtral) "w1" else "gate_proj" };
+                    expert_kind = if (mixtral) "w1" else "gate_proj";
                 } else if (std.mem.eql(u8, tail, "ffn_up_exps.weight")) {
-                    experts = .{ .kind = if (mixtral) "w3" else "up_proj" };
+                    expert_kind = if (mixtral) "w3" else "up_proj";
                 } else if (std.mem.eql(u8, tail, "ffn_down_exps.weight")) {
-                    experts = .{ .kind = if (mixtral) "w2" else "down_proj" };
+                    expert_kind = if (mixtral) "w2" else "down_proj";
                 }
             }
             if (suffix) |sfx| hf = try std.fmt.allocPrint(arena, "model.layers.{d}.{s}", .{ layer.?, sfx });
         }
 
-        if (experts) |ex| {
+        if (expert_kind) |kind| {
             if (t.dims.len != 3) return error.InvalidGguf;
             const n_exp: usize = @intCast(t.dims[2]);
             const rows: usize = @intCast(t.dims[1]);
             const cols: usize = @intCast(t.dims[0]);
             const rb = dt.rowBytes(cols);
             for (0..n_exp) |e| {
-                const name = try std.fmt.allocPrint(arena, "model.layers.{d}.{s}experts.{d}.{s}.weight", .{ layer.?, mlp_prefix(mixtral), e, ex.kind });
+                const name = try std.fmt.allocPrint(arena, "model.layers.{d}.{s}experts.{d}.{s}.weight", .{ layer.?, mlp, e, kind });
                 const shape = try arena.alloc(usize, 2);
                 shape[0] = rows;
                 shape[1] = cols;
-                try src.tensors.put(arena, name, .{ .name = name, .dtype = dt, .shape = shape, .data = t.data[e * rows * rb ..][0 .. rows * rb] });
+                const off = base_off + @as(u64, e) * rows * rb;
+                try weights.addTensor(.{
+                    .name = name,
+                    .dtype = dt,
+                    .shape = shape,
+                    .data = if (weights.isMapped()) weights.mappedSlice(off, rows * rb) else &.{},
+                    .offset = off,
+                    .byte_len = rows * rb,
+                });
             }
             continue;
         }
@@ -710,30 +779,31 @@ fn mapTensors(src: *Source, arena: Allocator, config: *const model_mod.Config) !
             continue;
         };
         const shape = try t.shape(arena);
-        var data = t.data;
-        var dtype = dt;
+        var info = safetensors.TensorInfo{ .name = name, .dtype = dt, .shape = shape, .data = &.{}, .offset = base_off, .byte_len = byte_len };
         if (permute_heads) |n_head| {
             const rows: usize = if (shape.len >= 2) shape[0] else t.numel();
             const rb = try rowBytesOf(t, dt);
-            const copy = try arena.alloc(u8, data.len);
-            permuteRows(copy, data, rows, rb, n_head, false);
-            data = copy;
+            if (weights.isMapped()) {
+                const copy = try arena.alloc(u8, byte_len);
+                permuteRows(copy, weights.mappedSlice(base_off, byte_len), rows, rb, n_head, false);
+                info.offset = try weights.addOverlayBytes(copy);
+            } else {
+                info.offset = try weights.addOverlayPermuted(base_off, rows, rb, n_head);
+            }
         }
-        if (is_gemma and std.mem.endsWith(u8, name, "norm.weight")) {
+        if (gemma and std.mem.endsWith(u8, name, "norm.weight")) {
             // llama.cpp stores gemma norms as (1 + w); Hugging Face stores w.
             const vals = try arena.alloc(f32, t.numel());
-            tensor.convertToF32(dt, data, vals);
+            tensor.convertToF32(dt, try rawBytes(src, weights, io, arena, t), vals);
             for (vals) |*v| v.* -= 1.0;
-            data = std.mem.sliceAsBytes(vals);
-            dtype = .f32;
+            info.dtype = .f32;
+            info.byte_len = vals.len * 4;
+            info.offset = try weights.addOverlayBytes(std.mem.sliceAsBytes(vals));
         }
-        try src.tensors.put(arena, name, .{ .name = name, .dtype = dtype, .shape = shape, .data = data });
+        if (weights.isMapped()) info.data = weights.mappedSlice(info.offset, info.byte_len);
+        try weights.addTensor(info);
     }
     src.extra = extra.items;
-}
-
-fn mlp_prefix(mixtral: bool) []const u8 {
-    return if (mixtral) "block_sparse_moe." else "mlp.";
 }
 
 // ---------------------------------------------------------------------------
@@ -748,10 +818,14 @@ test "llama q/k permutation round trip" {
     var perm: [rows * rb]u8 = undefined;
     var back: [rows * rb]u8 = undefined;
     permuteRows(&perm, &in, rows, rb, 2, true);
-    // head 0: HF rows [0,1,2,3] -> GGUF rows [0,2,1,3]
+    // head 0: HF rows [0,1,2,3] -> GGUF rows [0,2,1,3] (row 1 = second half's first element lands at row 2)
     try std.testing.expectEqualSlices(u8, in[2 * rb ..][0..rb], perm[1 * rb ..][0..rb]);
     try std.testing.expectEqualSlices(u8, in[1 * rb ..][0..rb], perm[2 * rb ..][0..rb]);
     try std.testing.expectEqualSlices(u8, in[6 * rb ..][0..rb], perm[5 * rb ..][0..rb]);
     permuteRows(&back, &perm, rows, rb, 2, false);
     try std.testing.expectEqualSlices(u8, &in, &back);
+    // Matches llama.cpp: reshape(n_head, 2, hd/2).swapaxes(1, 2): HF row (h, j, i) -> GGUF row (h, i, j).
+    try std.testing.expectEqual(@as(usize, 2), safetensors.llamaPermutedRow(1, 4));
+    try std.testing.expectEqual(@as(usize, 1), safetensors.llamaPermutedRow(2, 4));
+    try std.testing.expectEqual(@as(usize, 3), safetensors.llamaPermutedRow(3, 4));
 }
