@@ -142,7 +142,7 @@ pub const WeightStore = struct {
         }
     }
 
-    fn reclaimCb(ctx: *anyopaque) usize {
+    fn reclaimCb(ctx: *anyopaque, len: usize) usize {
         const self: *WeightStore = @ptrCast(@alignCast(ctx));
         var freed: usize = 0;
         {
@@ -151,7 +151,7 @@ pub const WeightStore = struct {
             freed = @intCast(self.pooled_bytes);
             self.drainPoolLocked();
         }
-        if (self.prev_reclaim) |r| freed += r.func(r.ctx);
+        if (self.prev_reclaim) |r| freed += r.func(r.ctx, len);
         return freed;
     }
 
@@ -521,6 +521,9 @@ pub const Activations = struct {
         scratch_dir: []const u8 = "scratch",
         /// Bytes that must remain available after allocating in RAM (e.g. for weights).
         reserve: u64 = 0,
+        /// Bytes the budget could reclaim on demand (unpinned expert-cache
+        /// entries), counted as available.
+        evictable: u64 = 0,
         force_scratch: bool = false,
     };
 
@@ -528,7 +531,7 @@ pub const Activations = struct {
         const bytes: u64 = @as(u64, rows) * hidden * 4;
         var use_ram = !opts.force_scratch;
         if (opts.budget) |b| {
-            if (b.limited() and b.available() < bytes + opts.reserve) use_ram = false;
+            if (b.limited() and b.available() + opts.evictable < bytes + opts.reserve) use_ram = false;
         }
         if (use_ram) {
             if (gpa.alloc(f32, rows * hidden)) |buf| {
@@ -605,7 +608,8 @@ pub fn workspaceRows(model: *const model_mod.Model, wanted: usize, logit_rows: u
     if (!b.limited()) return wanted;
     const c = &model.config;
     const per_row: u64 = (2 * c.hidden_size + 2 * c.num_heads * c.head_dim + 2 * c.num_kv_heads * c.head_dim + c.hidden_size + 2 * c.intermediate_size) * 4;
-    const avail = b.available();
+    // Unpinned expert-cache entries are given back on demand, so they count as available.
+    const avail = b.available() + model.expertCacheEvictable();
     // Weights, logits, KV cache, the residual-stream buffer for all rows and a
     // margin for kernel scratch / residual chunks / token arrays.
     const reserve = model.residentWeightNeed() + @as(u64, logit_rows) * c.vocab_size * 4 + kv_bytes + @as(u64, wanted) * c.hidden_size * 4 + b.limitBytes() / 8;
@@ -634,8 +638,9 @@ pub fn validateExport(gpa: Allocator, io: Io, pool: *const tensor.Pool, model: *
     const vocab = c.vocab_size;
     const ref = try firstTokenLogits(gpa, model, prompts);
     defer gpa.free(ref);
-    // Two models share the budget for a while: give back what the source model's store holds.
+    // Two models share the budget for a while: give back what the source model's store and expert cache hold.
     @constCast(&model.store).trim();
+    if (model.expert_cache) |ec| ec.trim();
     const reloaded = try model_mod.Model.loadWithOptions(gpa, io, pool, out_dir, .{
         .store = .streamed,
         .budget = budget,

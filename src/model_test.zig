@@ -96,6 +96,9 @@ test "qwen3_moe fixture (fused expert tensors)" {
 test "qwen3_moe fixture (transposed fused expert tensors)" {
     try checkFixture("qwen3_moe_fused_t");
 }
+test "qwen3_moe_big fixture (16 experts, 4 routed layers)" {
+    try checkFixture("qwen3_moe_big");
+}
 
 // Registry families (tools/make_fixture.py `SPECS`): each fixture exercises the
 // tensor names, layouts and config keys of one Hugging Face model_type.

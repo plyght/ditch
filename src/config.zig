@@ -112,6 +112,21 @@ pub const Settings = struct {
     /// Override of the memory reserved outside ditch-owned buffers (null = automatic:
     /// max(10% of max_ram, 256MB), at most half of max_ram).
     budget_headroom: ?u64 = null,
+    /// Warp mode (streamed mixture-of-experts models): expert cache capacity in
+    /// bytes. null = automatic (what the budget leaves after the trunk and a
+    /// reserve for workspaces), 0 = no expert cache (whole layers are streamed).
+    /// Setting it without max_ram switches to streamed weights as well.
+    expert_cache: ?u64 = null,
+    /// Score and edit only routed experts that calibration/evaluation prompts
+    /// routed to (null = on in warp mode, off otherwise).
+    visited_experts_only: ?bool = null,
+    /// Read the weights of a plain Hub id through range requests instead of
+    /// downloading the files (`hf://owner/name` ids always do).
+    remote_weights: bool = false,
+    /// Size of the chunks fetched and cached by the remote source.
+    remote_chunk_size: u64 = 8 << 20,
+    /// Write `<scratch_dir>/<model>.hotlist` at exit and warm the expert cache from it at start.
+    hotlist: bool = true,
     system_prompt: []const u8 = "You are a helpful assistant.",
     good_prompts: DatasetSpec = .{ .dataset = "mlabonne/harmless_alpaca", .split = "train[:400]", .column = "text" },
     bad_prompts: DatasetSpec = .{ .dataset = "mlabonne/harmful_behaviors", .split = "train[:400]", .column = "text" },
@@ -173,6 +188,21 @@ pub const help_text =
     \\  --time-limit <duration>        Stop cleanly after this long, e.g. 90m, 2h, 1h30m (default: none).
     \\  --budget-headroom <size>       Memory reserved for everything ditch does not allocate itself
     \\                                 (default: max(10% of --max-ram, 256MB), at most half of it).
+    \\
+    \\Warp mode (mixture-of-experts models bigger than RAM; on automatically with --max-ram):
+    \\  --expert-cache <size>          Bounded LRU cache of resident routed experts; the trunk streams
+    \\                                 per layer, experts are fetched when the router selects them
+    \\                                 (default: what --max-ram leaves after the trunk and workspaces;
+    \\                                 0 disables the cache; without --max-ram it enables streaming).
+    \\  --visited-experts-only <bool>  Score/edit only experts that calibration prompts routed to
+    \\                                 (default: on in warp mode). Exports always copy every expert.
+    \\  --hotlist <bool>, --no-hotlist Persist the hottest experts to <scratch-dir>/<model>.hotlist and
+    \\                                 warm the cache from it on the next run (default: on).
+    \\  hf://owner/name                Model id form that reads weights straight from the Hub with
+    \\                                 HTTP range requests (no full download); chunks are cached in
+    \\                                 <cache-dir>/models/<id>/<rev>/chunks. http(s)://host/path/ works too.
+    \\  --remote-weights               Treat a plain Hub id like hf://<id>.
+    \\  --remote-chunk-size <size>     Fetch/cache granularity of the remote source (default: 8MB).
     \\
     \\Abliteration:
     \\  --orthogonalize-direction <bool>      Project directions orthogonal to the good direction (default: true).
@@ -344,7 +374,7 @@ fn normalizeKey(a: Allocator, name: []const u8) ![]u8 {
 }
 
 fn isBoolKey(key: []const u8) bool {
-    const bools = [_][]const u8{ "print_debug_information", "print_residual_geometry", "orthogonalize_direction", "keyword_rate_print_responses", "ignore_mismatches", "early_stop", "no_early_stop", "help", "version" };
+    const bools = [_][]const u8{ "print_debug_information", "print_residual_geometry", "orthogonalize_direction", "keyword_rate_print_responses", "ignore_mismatches", "early_stop", "no_early_stop", "visited_experts_only", "remote_weights", "hotlist", "no_hotlist", "help", "version" };
     for (bools) |b| if (std.mem.eql(u8, b, key)) return true;
     return false;
 }
@@ -409,7 +439,7 @@ fn applyOption(a: Allocator, s: *Settings, key: []const u8, value: []const u8) !
     if (eql(u8, key, "model")) s.model = try a.dupe(u8, value) else if (eql(u8, key, "model_commit")) s.model_commit = try a.dupe(u8, value) else if (eql(u8, key, "evaluate_model")) s.evaluate_model = try a.dupe(u8, value) else if (eql(u8, key, "threads")) s.threads = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "cache_dir")) s.cache_dir = try a.dupe(u8, value) else if (eql(u8, key, "chat_template")) s.chat_template = try a.dupe(u8, value) else if (eql(u8, key, "batch_size")) s.batch_size = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "max_batch_size")) s.max_batch_size = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "max_response_length")) s.max_response_length = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "response_prefix")) s.response_prefix = try a.dupe(u8, value) else if (eql(u8, key, "system_prompt")) s.system_prompt = try a.dupe(u8, value) else if (eql(u8, key, "print_debug_information")) s.print_debug_information = try parseBool(value) else if (eql(u8, key, "print_residual_geometry")) s.print_residual_geometry = try parseBool(value) else if (eql(u8, key, "orthogonalize_direction")) s.orthogonalize_direction = try parseBool(value) else if (eql(u8, key, "row_normalization")) s.row_normalization = abliterate.RowNormalization.parse(value) orelse return error.InvalidEnum else if (eql(u8, key, "full_normalization_lora_rank")) s.full_normalization_lora_rank = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "expert_selection")) s.expert_selection = abliterate.ExpertSelection.parse(value) orelse return error.InvalidEnum else if (eql(u8, key, "winsorization_quantile")) s.winsorization_quantile = try std.fmt.parseFloat(f32, value) else if (eql(u8, key, "n_directions")) {
         s.n_directions = try std.fmt.parseInt(usize, value, 10);
         if (s.n_directions == 0) return error.InvalidValue;
-    } else if (eql(u8, key, "early_stop")) s.early_stop = try parseBool(value) else if (eql(u8, key, "no_early_stop")) s.early_stop = !(try parseBool(value)) else if (eql(u8, key, "warm_start")) s.warm_start = try a.dupe(u8, value) else if (eql(u8, key, "n_trials")) s.n_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_startup_trials")) s.n_startup_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "seed")) s.seed = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "study_checkpoint_dir")) s.study_checkpoint_dir = try a.dupe(u8, value) else if (eql(u8, key, "max_shard_size")) s.max_shard_size = try parseSize(value) else if (eql(u8, key, "max_ram")) s.max_ram = try parseSize(value) else if (eql(u8, key, "max_vram")) s.max_vram = try parseSize(value) else if (eql(u8, key, "scratch_dir")) s.scratch_dir = try a.dupe(u8, value) else if (eql(u8, key, "time_limit")) s.time_limit_seconds = try parseDuration(value) else if (eql(u8, key, "time_limit_seconds")) s.time_limit_seconds = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "budget_headroom")) s.budget_headroom = try parseSize(value) else if (eql(u8, key, "checkpoint_action")) s.checkpoint_action = try a.dupe(u8, value) else if (eql(u8, key, "trial_index")) s.trial_index = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_additional_trials")) s.n_additional_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "model_action")) s.model_action = try a.dupe(u8, value) else if (eql(u8, key, "save_directory")) s.save_directory = try a.dupe(u8, value) else if (eql(u8, key, "export_dtype")) s.export_dtype = try a.dupe(u8, value) else if (eql(u8, key, "export_format")) s.export_format = try a.dupe(u8, value) else if (eql(u8, key, "gguf_dtype")) s.gguf_dtype = try a.dupe(u8, value) else if (eql(u8, key, "config")) {
+    } else if (eql(u8, key, "early_stop")) s.early_stop = try parseBool(value) else if (eql(u8, key, "no_early_stop")) s.early_stop = !(try parseBool(value)) else if (eql(u8, key, "warm_start")) s.warm_start = try a.dupe(u8, value) else if (eql(u8, key, "n_trials")) s.n_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_startup_trials")) s.n_startup_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "seed")) s.seed = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "study_checkpoint_dir")) s.study_checkpoint_dir = try a.dupe(u8, value) else if (eql(u8, key, "max_shard_size")) s.max_shard_size = try parseSize(value) else if (eql(u8, key, "max_ram")) s.max_ram = try parseSize(value) else if (eql(u8, key, "max_vram")) s.max_vram = try parseSize(value) else if (eql(u8, key, "scratch_dir")) s.scratch_dir = try a.dupe(u8, value) else if (eql(u8, key, "time_limit")) s.time_limit_seconds = try parseDuration(value) else if (eql(u8, key, "time_limit_seconds")) s.time_limit_seconds = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "budget_headroom")) s.budget_headroom = try parseSize(value) else if (eql(u8, key, "expert_cache")) s.expert_cache = try parseSize(value) else if (eql(u8, key, "visited_experts_only")) s.visited_experts_only = try parseBool(value) else if (eql(u8, key, "remote_weights")) s.remote_weights = try parseBool(value) else if (eql(u8, key, "remote_chunk_size")) s.remote_chunk_size = try parseSize(value) else if (eql(u8, key, "hotlist")) s.hotlist = try parseBool(value) else if (eql(u8, key, "no_hotlist")) s.hotlist = !(try parseBool(value)) else if (eql(u8, key, "checkpoint_action")) s.checkpoint_action = try a.dupe(u8, value) else if (eql(u8, key, "trial_index")) s.trial_index = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_additional_trials")) s.n_additional_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "model_action")) s.model_action = try a.dupe(u8, value) else if (eql(u8, key, "save_directory")) s.save_directory = try a.dupe(u8, value) else if (eql(u8, key, "export_dtype")) s.export_dtype = try a.dupe(u8, value) else if (eql(u8, key, "export_format")) s.export_format = try a.dupe(u8, value) else if (eql(u8, key, "gguf_dtype")) s.gguf_dtype = try a.dupe(u8, value) else if (eql(u8, key, "config")) {
         // handled in the first pass
     } else if (eql(u8, key, "reproduce")) s.reproduce = try a.dupe(u8, value) else if (eql(u8, key, "ignore_mismatches")) s.ignore_mismatches = try parseBool(value) else if (eql(u8, key, "bench_prompts")) s.bench_prompts = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "bench_tokens")) s.bench_tokens = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "bench_output")) s.bench_output = try a.dupe(u8, value) else if (eql(u8, key, "help")) s.help = try parseBool(value) else if (eql(u8, key, "version")) s.version = try parseBool(value) else if (eql(u8, key, "keyword_rate_print_responses")) s.keyword_rate.print_responses = try parseBool(value) else if (eql(u8, key, "keyword_rate_score_name")) s.keyword_rate.score_name = try a.dupe(u8, value) else if (std.mem.startsWith(u8, key, "good_prompts_")) try applyDatasetOption(a, &s.good_prompts, key["good_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "bad_prompts_")) try applyDatasetOption(a, &s.bad_prompts, key["bad_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "keyword_rate_prompts_")) try applyDatasetOption(a, &s.keyword_rate.prompts, key["keyword_rate_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "kl_divergence_prompts_")) try applyDatasetOption(a, &s.kl_divergence.prompts, key["kl_divergence_prompts_".len..], value) else return error.UnknownOption;
 }
@@ -552,6 +582,24 @@ test "budget options" {
     try std.testing.expectEqual(@as(usize, 0), errors.items.len);
     try std.testing.expectEqual(@as(u64, 2 << 30), s.max_ram);
     try std.testing.expectEqual(@as(?u64, 7200), s.time_limit_seconds);
+}
+
+test "warp mode options" {
+    const gpa = std.testing.allocator;
+    const args = [_][]const u8{ "ditch", "--expert-cache", "512MB", "--visited-experts-only", "false", "--remote-weights", "--remote-chunk-size=1MB", "--no-hotlist", "hf://Qwen/Qwen3-30B-A3B" };
+    var r = try load(gpa, std.testing.io, &args);
+    defer r.deinit();
+    try std.testing.expectEqual(@as(usize, 0), r.errors.len);
+    try std.testing.expectEqual(@as(?u64, 512 << 20), r.settings.expert_cache);
+    try std.testing.expectEqual(@as(?bool, false), r.settings.visited_experts_only);
+    try std.testing.expect(r.settings.remote_weights);
+    try std.testing.expectEqual(@as(u64, 1 << 20), r.settings.remote_chunk_size);
+    try std.testing.expect(!r.settings.hotlist);
+    try std.testing.expectEqualStrings("hf://Qwen/Qwen3-30B-A3B", r.settings.model);
+    const defaults = Settings{};
+    try std.testing.expectEqual(@as(?u64, null), defaults.expert_cache);
+    try std.testing.expectEqual(@as(?bool, null), defaults.visited_experts_only);
+    try std.testing.expect(defaults.hotlist);
 }
 
 test "cli parsing" {

@@ -30,6 +30,7 @@ const stream = @import("stream.zig");
 const reproduce = @import("reproduce.zig");
 const bench = @import("bench.zig");
 const directions = @import("directions.zig");
+const remote = @import("remote.zig");
 
 const Model = model_mod.Model;
 const Engine = engine_mod.Engine;
@@ -191,6 +192,7 @@ const App = struct {
             .expert_selection = self.settings.expert_selection,
             .debug_writer = if (self.settings.print_debug_information) self.con.out else null,
             .n_directions = self.settings.n_directions,
+            .visited_experts_only = self.settings.visited_experts_only orelse self.model.warp(),
         };
     }
 
@@ -273,7 +275,10 @@ const App = struct {
         var buf: [64]u8 = undefined;
         try out.print("\nElapsed time: {s}\n", .{formatDuration(&buf, elapsed)});
         if (trial_index < n_trials) try out.print("Estimated remaining time: {s}\n", .{formatDuration(&buf, remaining)});
-        if (self.settings.print_debug_information) try self.budget.report().print(out, "Memory");
+        if (self.settings.print_debug_information) {
+            try self.budget.report().print(out, "Memory");
+            if (self.model.expert_cache) |c| try c.stats().print(out, "Expert cache");
+        }
         try out.flush();
 
         const losses = try self.evaluator.objectiveLosses(sa, scores);
@@ -464,8 +469,8 @@ const App = struct {
     fn modelCard(self: *App, a: Allocator, trial: *const study_mod.Trial) ![]const u8 {
         var w: Io.Writer.Allocating = .init(a);
         const o = &w.writer;
-        const model_id = self.settings.model;
-        const is_hf = std.mem.indexOfScalar(u8, model_id, '/') != null and !hf.isLocalDir(self.io, model_id);
+        const model_id = remote.hubId(self.settings.model);
+        const is_hf = std.mem.indexOfScalar(u8, model_id, '/') != null and !remote.isRemoteId(model_id) and !hf.isLocalDir(self.io, model_id);
         try o.writeAll("---\ntags:\n- ditch\n- heretic\n- uncensored\n- decensored\n- abliterated\n---\n\n");
         try o.writeAll("# This is a decensored version of ");
         if (is_hf) try o.print("[{s}](https://huggingface.co/{s})", .{ model_id, model_id }) else try o.writeAll("a model");
@@ -676,6 +681,7 @@ const App = struct {
             const rows = [_]model_mod.Row{.{ .b = 0, .pos = pos }};
             const lr = [_]usize{0};
             try model_mod.forward(model, &ws, &cache, &toks, &rows, .{ .logit_rows = &lr });
+            if (model.expert_cache) |ec| ec.endDecodeStep();
             pos += 1;
             token = argmax(ws.logits[0..c.vocab_size]);
         }
@@ -1030,7 +1036,9 @@ fn run(init: std.process.Init, con: *Console) !void {
     var budget = try budget_mod.Budget.fromSettings(gpa, io, settings);
     defer budget.deinit();
     const rt_gpa = budget.allocator();
-    const store_mode: stream.Mode = if (settings.max_ram > 0) .streamed else .mapped;
+    // Remote weights and an explicit expert cache imply streaming.
+    const is_remote = remote.isRemoteId(settings.model) or settings.remote_weights;
+    const store_mode: stream.Mode = if (settings.max_ram > 0 or settings.expert_cache != null or is_remote) .streamed else .mapped;
     if (budget.limited()) try out.print("Memory budget: {f} (headroom {f}, scratch directory {s})\n", .{ budget_mod.fmtBytes(budget.max_ram), budget_mod.fmtBytes(budget.headroom), budget.scratch_dir });
     if (budget.time_limit) |t| try out.print("Time limit: {f}\n", .{budget_mod.fmtDuration(t)});
     if (settings.max_vram > 0) try out.writeAll("Note: --max-vram is accepted for compatibility but unused (ditch runs on the CPU).\n");
@@ -1051,12 +1059,44 @@ fn run(init: std.process.Init, con: *Console) !void {
     }
     try out.print("\nLoading model {s}...\n", .{settings.model});
     try out.flush();
-    const model_dir = try hf.resolveModel(arena, &http, cache_root, settings.model, settings.model_commit, out);
-    const model = try Model.loadWithOptions(gpa, io, pool, model_dir, .{ .store = store_mode, .budget = &budget });
+    var remote_src: ?*remote.Source = null;
+    defer if (remote_src) |s| s.deinit();
+    const model_dir = if (is_remote) blk: {
+        remote_src = try remote.Source.open(gpa, io, &http, cache_root, settings.model, .{ .revision = settings.model_commit, .chunk_size = settings.remote_chunk_size }, out);
+        break :blk remote_src.?.dir_path;
+    } else try hf.resolveModel(arena, &http, cache_root, settings.model, settings.model_commit, out);
+    const model = try Model.loadWithOptions(gpa, io, pool, model_dir, .{ .store = store_mode, .budget = &budget, .expert_cache = settings.expert_cache, .remote = remote_src });
     defer model.deinit();
+    // Printed before the model goes away (and before the memory report).
+    defer {
+        if (remote_src) |s| {
+            const st = s.stats();
+            out.print("\nRemote source: fetched {d} ranges ({f}), {d} chunk reads served from the disk cache\n", .{ st.ranges_fetched, budget_mod.fmtBytes(st.bytes_fetched), st.chunks_from_disk }) catch {};
+        }
+        if (model.expert_cache) |ec| {
+            ec.stats().print(out, "\nExpert cache") catch {};
+            if (settings.hotlist) {
+                if (model.writeHotlist(gpa, settings.model)) |maybe| {
+                    if (maybe) |path| {
+                        out.print("Expert hotlist written to {s}\n", .{path}) catch {};
+                        gpa.free(path);
+                    }
+                } else |err| out.print("Could not write the expert hotlist: {s}\n", .{@errorName(err)}) catch {};
+            }
+        }
+        out.flush() catch {};
+    }
     const c = &model.config;
     try out.print("* Architecture: {s} ({d} layers, hidden size {d}, vocabulary {d}, {s} weights)\n", .{ c.model_type, c.num_layers, c.hidden_size, c.vocab_size, model.dtype.safetensorsName() });
-    try out.print("* Weights: {s}\n", .{if (model.streamed()) "streamed layer by layer from disk (memory budget)" else "memory-mapped"});
+    if (model.expert_cache) |ec| {
+        try out.print("* Weights: trunk streamed layer by layer from {s}, routed experts through an expert cache of {f} (warp mode)\n", .{ if (remote_src != null) "the remote source" else "disk", budget_mod.fmtBytes(ec.capacity) });
+        if (settings.hotlist) {
+            const warmed = try model.warmExpertCache(gpa, settings.model);
+            if (warmed > 0) try out.print("* hotlist: {d} experts warmed\n", .{warmed});
+        }
+    } else {
+        try out.print("* Weights: {s}\n", .{if (model.streamed()) "streamed layer by layer from disk (memory budget)" else "memory-mapped"});
+    }
     if (model.gguf) |g| try out.print("* Source: GGUF file {s} (architecture {s}, {s} tokenizer)\n", .{ g.file_name, g.arch, if (g.embedded_tokenizer) "embedded Hugging Face" else "rebuilt from the ggml vocabulary" });
     if (manifest) |*m| try reproduce.verifyModelFiles(arena, io, m, model, settings.ignore_mismatches, out);
     var template: chat.Template = undefined;

@@ -224,6 +224,39 @@ return {
   -- time_limit = "2h",
 
   -- -------------------------------------------------------------------------
+  -- Warp mode (mixture-of-experts models far bigger than RAM)
+  -- -------------------------------------------------------------------------
+  -- A streamed mixture-of-experts model (max_ram set, or expert_cache set, or
+  -- remote weights) keeps only the trunk of a layer resident (attention,
+  -- norms, router, shared expert) and fetches the routed experts a token
+  -- batch selects through a bounded LRU expert cache: hits cost nothing,
+  -- the misses of a layer are read as one group, evictions never touch an
+  -- expert being computed with. Capacity of that cache; unset = automatic
+  -- (what max_ram leaves after the trunk and a quarter reserved for
+  -- workspaces, KV caches and deltas; without max_ram a quarter of the
+  -- machine's memory), 0 = no expert cache (whole layers are streamed).
+  -- expert_cache = "6GB",
+  -- Score and edit only routed experts that a calibration or evaluation
+  -- prompt actually routed to; experts no prompt reached cannot have
+  -- influenced a refusal, and skipping them saves their reads. Default:
+  -- true in warp mode, false otherwise. Exports always copy every expert.
+  -- visited_experts_only = true,
+  -- Write <scratch_dir>/<model>.hotlist (a Lua table of { layer, expert,
+  -- uses }) at exit and load the hottest experts that fit into the cache
+  -- at the start of the next run on the same model.
+  hotlist = true,
+  -- Remote weights: a model id of the form "hf://owner/name" (or a plain id
+  -- with remote_weights = true, or an "http(s)://host/path/" base URL) reads
+  -- config.json, tokenizer files, the shard index and the safetensors
+  -- headers up front and fetches tensor bytes on demand with HTTP range
+  -- requests, in aligned chunks cached under
+  -- <cache_dir>/models/<id>/<revision>/chunks/<shard>/<index> (a later full
+  -- download reuses them). Implies streamed weights. Safetensors only: a
+  -- GGUF model must be local.
+  -- remote_weights = false,
+  -- remote_chunk_size = "8MB",
+
+  -- -------------------------------------------------------------------------
   -- Non-interactive use
   -- -------------------------------------------------------------------------
   -- These options answer the interactive menus so ditch can run unattended.

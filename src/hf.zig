@@ -42,53 +42,92 @@ pub const Http = struct {
 
     /// Fetches `url` into memory. Returns error.NotFound for 404.
     pub fn get(self: *Http, url: []const u8) ![]u8 {
+        return self.getRangeOpt(url, null);
+    }
+
+    /// Fetches bytes `[start, last]` (inclusive) of `url` with a `Range`
+    /// request; the server must answer 206 (a 200 with the whole body is
+    /// refused as `error.RangeNotSupported`). Redirects are followed; the
+    /// authorization header is not sent to another host (CDN).
+    pub fn getRange(self: *Http, url: []const u8, start: u64, last: u64) ![]u8 {
+        return self.getRangeOpt(url, .{ start, last });
+    }
+
+    fn getRangeOpt(self: *Http, url: []const u8, range: ?[2]u64) ![]u8 {
         if (self.native_ok) {
-            if (self.getNative(url)) |body| {
+            if (self.getNative(url, range)) |body| {
                 return body;
             } else |err| switch (err) {
-                error.NotFound, error.Forbidden, error.OutOfMemory => return err,
+                error.NotFound, error.Forbidden, error.OutOfMemory, error.RangeNotSupported => return err,
                 else => {
                     std.log.debug("native http failed for {s}: {s}; trying curl", .{ url, @errorName(err) });
                     self.native_ok = false;
                 },
             }
         }
-        return self.getCurl(url);
+        return self.getCurl(url, range);
     }
 
-    fn getNative(self: *Http, url: []const u8) ![]u8 {
+    fn getNative(self: *Http, url: []const u8, range: ?[2]u64) ![]u8 {
         var body: Io.Writer.Allocating = .init(self.gpa);
         errdefer body.deinit();
         var auth_buf: [512]u8 = undefined;
+        var range_buf: [64]u8 = undefined;
         var headers: [1]std.http.Header = undefined;
         var n_headers: usize = 0;
+        var privileged: [1]std.http.Header = undefined;
+        var n_privileged: usize = 0;
         if (self.authHeader(&auth_buf)) |h| {
-            headers[0] = h;
-            n_headers = 1;
+            if (range != null) {
+                privileged[0] = h;
+                n_privileged = 1;
+            } else {
+                headers[0] = h;
+                n_headers = 1;
+            }
+        }
+        if (range) |r| {
+            headers[n_headers] = .{ .name = "range", .value = try std.fmt.bufPrint(&range_buf, "bytes={d}-{d}", .{ r[0], r[1] }) };
+            n_headers += 1;
         }
         const res = try self.client.fetch(.{
             .location = .{ .url = url },
             .response_writer = &body.writer,
             .extra_headers = headers[0..n_headers],
+            .privileged_headers = privileged[0..n_privileged],
         });
         switch (res.status) {
-            .ok => return body.toOwnedSlice(),
+            .ok => {
+                if (range != null) return error.RangeNotSupported;
+                return body.toOwnedSlice();
+            },
+            .partial_content => {
+                if (range == null) return error.HttpError;
+                return body.toOwnedSlice();
+            },
             .not_found => return error.NotFound,
             .unauthorized, .forbidden => return error.Forbidden,
             else => return error.HttpError,
         }
     }
 
-    fn getCurl(self: *Http, url: []const u8) ![]u8 {
+    fn getCurl(self: *Http, url: []const u8, range: ?[2]u64) ![]u8 {
         var argv = std.ArrayList([]const u8).empty;
         defer argv.deinit(self.gpa);
         try argv.appendSlice(self.gpa, &.{ "curl", "-L", "-sS", "--fail-with-body", "-w", "\n%{http_code}" });
-        var auth_buf: [512]u8 = undefined;
-        if (self.authHeader(&auth_buf)) |h| {
-            try argv.append(self.gpa, "-H");
-            try argv.append(self.gpa, try std.fmt.allocPrint(self.gpa, "{s}: {s}", .{ h.name, h.value }));
+        var range_buf: [64]u8 = undefined;
+        if (range) |r| {
+            try argv.append(self.gpa, "-r");
+            try argv.append(self.gpa, try std.fmt.bufPrint(&range_buf, "{d}-{d}", .{ r[0], r[1] }));
         }
-        defer if (self.token != null and argv.items.len >= 2) self.gpa.free(argv.items[argv.items.len - 2]);
+        var auth_buf: [512]u8 = undefined;
+        var auth_line: ?[]u8 = null;
+        defer if (auth_line) |l| self.gpa.free(l);
+        if (self.authHeader(&auth_buf)) |h| {
+            auth_line = try std.fmt.allocPrint(self.gpa, "{s}: {s}", .{ h.name, h.value });
+            try argv.append(self.gpa, "-H");
+            try argv.append(self.gpa, auth_line.?);
+        }
         try argv.append(self.gpa, url);
         const result = std.process.run(self.gpa, self.io, .{ .argv = argv.items, .stdout_limit = .limited(1 << 30) }) catch |err| {
             std.log.err("could not run curl ({s}); install curl or fix the network configuration", .{@errorName(err)});
@@ -100,7 +139,8 @@ pub const Http = struct {
         const code = std.fmt.parseInt(u16, std.mem.trim(u8, result.stdout[nl + 1 ..], " \r\n"), 10) catch 0;
         if (code == 404) return error.NotFound;
         if (code == 401 or code == 403) return error.Forbidden;
-        if (code != 200) {
+        if (range != null and code == 200) return error.RangeNotSupported;
+        if (code != (if (range != null) @as(u16, 206) else @as(u16, 200))) {
             std.log.err("curl failed for {s}: {s}", .{ url, std.mem.trim(u8, result.stderr, "\n") });
             return error.HttpError;
         }
@@ -207,7 +247,7 @@ pub fn cacheDir(arena: Allocator, settings: *const config.Settings, environ: *st
     return "ditch-cache";
 }
 
-fn sanitizeRepoId(arena: Allocator, id: []const u8) ![]u8 {
+pub fn sanitizeRepoId(arena: Allocator, id: []const u8) ![]u8 {
     const out = try arena.dupe(u8, id);
     for (out) |*c| if (c.* == '/') {
         c.* = '-';
@@ -295,12 +335,80 @@ pub fn resolveModel(arena: Allocator, http: *Http, cache_root: []const u8, model
     if (wanted.items.len == 0) return error.ModelNotFound;
     for (wanted.items) |name| {
         if (isLocalFile(io, try std.fs.path.join(arena, &.{ model_dir, name }))) continue;
+        if (std.mem.endsWith(u8, name, ".safetensors")) {
+            // A previous `hf://` run may have cached parts of this shard in chunks.
+            if (try assembleFromChunks(http.gpa, io, dir, name)) {
+                try out.print("* Assembled {s} from cached chunks\n", .{name});
+                continue;
+            }
+        }
         try out.print("* Downloading {s}...\n", .{name});
         try out.flush();
         const url = try std.fmt.allocPrint(arena, "https://huggingface.co/{s}/resolve/{s}/{s}", .{ model, rev, name });
         try http.download(dir, name, url, null);
     }
     return model_dir;
+}
+
+/// Rebuilds `dir/name` from `dir/chunks/name/<index>` when every chunk of the
+/// shard is present (a run over the remote source read the whole file, e.g.
+/// during an export). Returns false when chunks are missing. The chunk size
+/// is that of the first chunk; the last one is shorter or equal.
+pub fn assembleFromChunks(gpa: Allocator, io: Io, dir: Io.Dir, name: []const u8) !bool {
+    const chunk_dir_path = try std.fs.path.join(gpa, &.{ "chunks", name });
+    defer gpa.free(chunk_dir_path);
+    var cdir = dir.openDir(io, chunk_dir_path, .{ .iterate = true }) catch return false;
+    defer cdir.close(io);
+    // Highest index and the chunk size.
+    var max_index: ?u64 = null;
+    var chunk_size: u64 = 0;
+    var it = cdir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        const idx = std.fmt.parseInt(u64, entry.name, 10) catch continue;
+        const st = try cdir.statFile(io, entry.name, .{});
+        if (idx == 0) chunk_size = st.size;
+        if (max_index == null or idx > max_index.?) max_index = idx;
+    }
+    const last = max_index orelse return false;
+    if (chunk_size == 0) return false;
+    // Every chunk before the last must have exactly chunk_size bytes, and the
+    // last one must not be a full chunk unless the file ends on a boundary; a
+    // file whose length is a multiple of the chunk size cannot be told apart
+    // from a truncated one here, so the header's declared size is verified
+    // by the reader when the file is opened.
+    var buf: [32]u8 = undefined;
+    var i: u64 = 0;
+    while (i <= last) : (i += 1) {
+        const n = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
+        const st = cdir.statFile(io, n, .{}) catch return false;
+        if (i < last and st.size != chunk_size) return false;
+    }
+    const tmp_name = try std.fmt.allocPrint(gpa, "{s}.part", .{name});
+    defer gpa.free(tmp_name);
+    const out_file = try dir.createFile(io, tmp_name, .{});
+    defer out_file.close(io);
+    var wbuf: [1 << 16]u8 = undefined;
+    var fw = out_file.writer(io, &wbuf);
+    const copy = try gpa.alloc(u8, @intCast(@min(chunk_size, 1 << 24)));
+    defer gpa.free(copy);
+    i = 0;
+    while (i <= last) : (i += 1) {
+        const n = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
+        const f = try cdir.openFile(io, n, .{});
+        defer f.close(io);
+        var off: u64 = 0;
+        while (true) {
+            const got = try f.readPositionalAll(io, copy, off);
+            if (got == 0) break;
+            try fw.interface.writeAll(copy[0..got]);
+            off += got;
+            if (got < copy.len) break;
+        }
+    }
+    try fw.interface.flush();
+    try dir.rename(tmp_name, dir, name, io);
+    return true;
 }
 
 // ---------------------------------------------------------------------------

@@ -37,14 +37,15 @@ pub const BudgetedAllocator = struct {
     pressure: u64 = 0,
     /// Cumulative bytes handed out (useful to spot churn).
     total_allocated: u64 = 0,
-    /// Called (outside the lock) when an allocation is refused; returns the
-    /// number of bytes it released so the allocation can be retried. Used by
-    /// the weight store to drop recycled buffers under pressure.
+    /// Called (outside the lock) when an allocation of `len` bytes is
+    /// refused; returns the number of bytes it released so the allocation can
+    /// be retried. Used by the weight store to drop recycled buffers and by
+    /// the expert cache to evict unpinned experts under pressure.
     reclaim: ?Reclaim = null,
 
     pub const Reclaim = struct {
         ctx: *anyopaque,
-        func: *const fn (*anyopaque) usize,
+        func: *const fn (*anyopaque, usize) usize,
     };
 
     pub fn init(child: Allocator, limit: u64) BudgetedAllocator {
@@ -59,7 +60,7 @@ pub const BudgetedAllocator = struct {
         self.unlock();
         const ok = blk: {
             const r = self.reclaim orelse break :blk false;
-            if (r.func(r.ctx) == 0) break :blk false;
+            if (r.func(r.ctx, len) == 0) break :blk false;
             break :blk self.reserve(len);
         };
         if (!ok) {
@@ -481,19 +482,48 @@ pub const Estimate = struct {
     streamed_bytes: u64,
     /// Mapped mode: all weights resident + everything else.
     mapped_bytes: u64,
+    /// Warp mode (streamed mixture of experts with an expert cache).
+    warp: bool = false,
+    /// Largest layer without its routed experts.
+    trunk_layer_bytes: u64 = 0,
+    /// One routed expert (largest).
+    expert_bytes: u64 = 0,
+    /// Routed experts per layer and how many a token selects.
+    num_experts: usize = 0,
+    top_k: usize = 0,
+    /// Every routed expert of the model.
+    total_expert_bytes: u64 = 0,
+    /// Configured expert cache capacity.
+    expert_cache_bytes: u64 = 0,
 
     pub fn print(self: Estimate, w: *Io.Writer) !void {
         try w.print("Memory estimate:\n", .{});
         try w.print("  weights total            {f} ({d} layers)\n", .{ fmtBytes(self.total_weight_bytes), self.num_layers });
         try w.print("  largest layer            {f}\n", .{fmtBytes(self.largest_layer_bytes)});
+        if (self.warp) {
+            try w.print("  trunk per layer          {f} (largest; routed experts excluded)\n", .{fmtBytes(self.trunk_layer_bytes)});
+            try w.print("  routed expert            {f} each, {d} per layer, top-{d} per token, {f} in total\n", .{ fmtBytes(self.expert_bytes), self.num_experts, self.top_k, fmtBytes(self.total_expert_bytes) });
+            const fits: u64 = if (self.expert_bytes == 0) 0 else self.expert_cache_bytes / self.expert_bytes;
+            try w.print("  expert cache             {f} (holds {d} of {d} experts)\n", .{ fmtBytes(self.expert_cache_bytes), fits, self.numExpertsTotal() });
+        }
         try w.print("  largest tensor           {f} ({s})\n", .{ fmtBytes(self.largest_tensor_bytes), self.largest_tensor_name });
         try w.print("  forward workspace        {f} (min {f})\n", .{ fmtBytes(self.workspace_bytes), fmtBytes(self.workspace_min_bytes) });
         try w.print("  KV cache per batch       {f}\n", .{fmtBytes(self.kv_cache_bytes)});
         try w.print("  kernel scratch           {f}\n", .{fmtBytes(self.kernel_scratch_bytes)});
         try w.print("  abliteration deltas      {f}\n", .{fmtBytes(self.delta_bytes)});
         try w.print("  export peak              {f}\n", .{fmtBytes(self.export_bytes)});
-        try w.print("  streamed mode: min {f}, with prefetch + RAM caches {f}\n", .{ fmtBytes(self.min_streamed_bytes), fmtBytes(self.streamed_bytes) });
+        if (self.warp) {
+            try w.print("  warp mode:     min {f} (trunk + top-{d} experts + workspace), with prefetch + expert cache + RAM caches {f}\n", .{ fmtBytes(self.min_streamed_bytes), self.top_k, fmtBytes(self.streamed_bytes) });
+        } else {
+            try w.print("  streamed mode: min {f}, with prefetch + RAM caches {f}\n", .{ fmtBytes(self.min_streamed_bytes), fmtBytes(self.streamed_bytes) });
+        }
         try w.print("  mapped mode:   {f}\n", .{fmtBytes(self.mapped_bytes)});
+    }
+
+    /// Routed experts in the whole model (0 for dense models).
+    pub fn numExpertsTotal(self: Estimate) u64 {
+        if (self.expert_bytes == 0) return 0;
+        return self.total_expert_bytes / self.expert_bytes;
     }
 };
 
@@ -544,7 +574,17 @@ pub fn estimate(model: *const model_mod.Model, p: EstimateParams) Estimate {
     const inter: u64 = c.intermediate_size;
     const delta = @as(u64, c.num_layers) * @as(u64, p.lora_rank) * ((hidden + hidden) + (hidden + inter)) * 4;
     const export_peak = export_mod.peakBytes(model, p.export_dtype);
-    const resident_weights = 2 * largest_layer;
+    const warp = model.warp();
+    var top_k: usize = 0;
+    var num_experts: usize = 0;
+    for (model.layers) |l| if (l.moe) |m| {
+        top_k = @max(top_k, m.top_k);
+        num_experts = @max(num_experts, m.experts.len);
+    };
+    const cache_bytes: u64 = if (model.expert_cache) |ec| ec.capacity else 0;
+    // In warp mode the "largest layer" is the trunk plus the experts one
+    // token selects; the comfortable working set adds the expert cache.
+    const resident_weights = if (warp) 2 * largest_layer + cache_bytes else 2 * largest_layer;
     const min_streamed = @max(largest_layer, largest) + ws_min + scratch + delta;
     const streamed = @max(resident_weights, largest) + ws + kv + scratch + delta;
     const mapped = total + ws + kv + scratch + delta;
@@ -564,6 +604,13 @@ pub fn estimate(model: *const model_mod.Model, p: EstimateParams) Estimate {
         .min_streamed_bytes = min_streamed,
         .streamed_bytes = streamed,
         .mapped_bytes = mapped,
+        .warp = warp,
+        .trunk_layer_bytes = model.largest_trunk_layer_bytes,
+        .expert_bytes = model.largest_expert_bytes,
+        .num_experts = num_experts,
+        .top_k = top_k,
+        .total_expert_bytes = model.total_expert_bytes,
+        .expert_cache_bytes = cache_bytes,
     };
 }
 
@@ -579,7 +626,11 @@ pub fn check(est: Estimate, budget: *const Budget, w: *Io.Writer) CheckError!voi
     const need = est.min_streamed_bytes;
     if (limit < need) {
         w.print("Memory budget too small: --max-ram {f} leaves {f} after {f} headroom, but the minimum resident set is {f}:\n", .{ fmtBytes(budget.max_ram), fmtBytes(limit), fmtBytes(budget.headroom), fmtBytes(need) }) catch return error.WriteFailed;
-        w.print("  largest layer {f}, largest tensor {f} (both must be resident one at a time)\n", .{ fmtBytes(est.largest_layer_bytes), fmtBytes(est.largest_tensor_bytes) }) catch return error.WriteFailed;
+        if (est.warp) {
+            w.print("  largest layer {f} = trunk {f} + top-{d} routed experts of {f}, largest tensor {f} (both must be resident one at a time)\n", .{ fmtBytes(est.largest_layer_bytes), fmtBytes(est.trunk_layer_bytes), est.top_k, fmtBytes(est.expert_bytes), fmtBytes(est.largest_tensor_bytes) }) catch return error.WriteFailed;
+        } else {
+            w.print("  largest layer {f}, largest tensor {f} (both must be resident one at a time)\n", .{ fmtBytes(est.largest_layer_bytes), fmtBytes(est.largest_tensor_bytes) }) catch return error.WriteFailed;
+        }
         w.print("  minimal forward workspace {f}, kernel scratch {f}, deltas {f}\n", .{ fmtBytes(est.workspace_min_bytes), fmtBytes(est.kernel_scratch_bytes), fmtBytes(est.delta_bytes) }) catch return error.WriteFailed;
         if (@max(est.largest_layer_bytes, est.largest_tensor_bytes) > limit) {
             w.print("  the largest layer/tensor alone ({f}) does not fit\n", .{fmtBytes(@max(est.largest_layer_bytes, est.largest_tensor_bytes))}) catch return error.WriteFailed;
@@ -593,6 +644,9 @@ pub fn check(est: Estimate, budget: *const Budget, w: *Io.Writer) CheckError!voi
     }
     if (limit < est.streamed_bytes) {
         w.print("Note: budget {f} < {f}; prefetch may be disabled and KV caches / activations may spill to scratch ({s}).\n", .{ fmtBytes(limit), fmtBytes(est.streamed_bytes), budget.scratch_dir }) catch return error.WriteFailed;
+    }
+    if (est.warp and est.expert_cache_bytes < @as(u64, est.num_experts) * est.expert_bytes) {
+        w.print("Note: the expert cache ({f}) holds fewer experts than one layer has ({d}); a prefill that routes to every expert re-reads experts from the store.\n", .{ fmtBytes(est.expert_cache_bytes), est.num_experts }) catch return error.WriteFailed;
     }
 }
 
@@ -618,7 +672,7 @@ test "budgeted allocator enforces limit and tracks peak" {
     const Hook = struct {
         alloc_: Allocator,
         held: ?[]u8,
-        fn release(ctx: *anyopaque) usize {
+        fn release(ctx: *anyopaque, _: usize) usize {
             const h: *@This() = @ptrCast(@alignCast(ctx));
             const held = h.held orelse return 0;
             h.alloc_.free(held);

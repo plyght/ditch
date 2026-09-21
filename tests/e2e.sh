@@ -319,7 +319,7 @@ MOE_BUDGET=(--max-ram 96KB --budget-headroom 0 --threads 4 --scratch-dir "$TMP/s
     --n-trials 2 --n-startup-trials 2 \
     --checkpoint-action restart --trial-index 1 --model-action save --save-directory "$TMP/moe_budget_out" \
     | tee "$TMP/moe_budget.log"
-grep -q "Weights: streamed layer by layer" "$TMP/moe_budget.log" || fail "budgeted MoE run did not stream the weights"
+grep -qE "Weights: (streamed layer by layer|trunk streamed layer by layer)" "$TMP/moe_budget.log" || fail "budgeted MoE run did not stream the weights"
 grep -q "experts.n_selected" "$TMP/moe_budget.log" || fail "budgeted MoE run lost expert selection"
 grep -q "argmax agreement 100%" "$TMP/moe_budget.log" || fail "streamed MoE export validation disagreed"
 [ ! -e "$TMP/moe_budget_out/.incomplete" ] || fail "MoE export still carries the .incomplete marker"
@@ -385,6 +385,104 @@ grep -q "Model saved to" "$TMP/gguf_both.log" || fail "budgeted GGUF run did not
 [ -f "$TMP/gguf_both_out/model.safetensors" ] || fail "--export-format both lacks model.safetensors"
 [ -f "$TMP/gguf_both_out/config.json" ] || fail "--export-format both lacks config.json"
 [ ! -e "$TMP/gguf_both_out/.incomplete" ] || fail "budgeted GGUF export still carries the .incomplete marker"
+
+echo "==> Warp mode: expert cache on the 16-expert MoE fixture (evictions), save, validate, evaluate"
+# The fixture routes every layer through 16 experts of 9 KB (590 KB of
+# experts, ~27 KB of trunk per layer). A 192 KB budget leaves an expert cache
+# of a few experts, so every prefill batch (which routes to most experts of a
+# layer) evicts, while the trunk plus one token's experts still fits.
+BIG_COMMON=("${COMMON[@]}")
+BIG_COMMON[0]=tests/fixtures/qwen3_moe_big
+WARP=(--max-ram 192KB --budget-headroom 0 --threads 4 --scratch-dir "$TMP/warp_scratch")
+"$DITCH" "${BIG_COMMON[@]}" "${WARP[@]}" --study-checkpoint-dir "$TMP/warp_checkpoints" \
+    --n-trials 2 --n-startup-trials 2 --print-debug-information \
+    --checkpoint-action restart --trial-index 1 --model-action save --save-directory "$TMP/warp_out" \
+    | tee "$TMP/warp.log"
+grep -q "routed experts through an expert cache of .* (warp mode)" "$TMP/warp.log" || fail "warp mode was not enabled"
+grep -q "^  expert cache " "$TMP/warp.log" || fail "memory estimate lacks the expert cache line"
+grep -q "^  warp mode:     min" "$TMP/warp.log" || fail "memory estimate lacks the warp-mode minimum"
+grep -q "Running trial 2 of 2" "$TMP/warp.log" || fail "warp-mode trials did not run"
+grep -q "^Expert cache: capacity" "$TMP/warp.log" || fail "expert cache report missing"
+cache_line=$(grep "^Expert cache: capacity" "$TMP/warp.log" | tail -1)
+hits=$(echo "$cache_line" | sed -E 's/.* hits ([0-9]+),.*/\1/')
+misses=$(echo "$cache_line" | sed -E 's/.* misses ([0-9]+) .*/\1/')
+evictions=$(echo "$cache_line" | sed -E 's/.* evictions ([0-9]+),.*/\1/')
+[ "$hits" -gt 0 ] || fail "expert cache saw no hits: $cache_line"
+[ "$misses" -gt 0 ] || fail "expert cache saw no misses: $cache_line"
+[ "$evictions" -gt 0 ] || fail "expert cache never evicted (budget too large for the test): $cache_line"
+echo "$cache_line" | grep -q "decode: [0-9]* steps, [0-9.]* misses/step" || fail "decode misses per step not reported: $cache_line"
+grep -q "Model saved to" "$TMP/warp.log" || fail "warp-mode model was not saved"
+grep -q "argmax agreement 100%" "$TMP/warp.log" || fail "warp-mode export validation disagreed"
+[ ! -e "$TMP/warp_out/.incomplete" ] || fail "warp-mode export still carries the .incomplete marker"
+HOTLIST="$TMP/warp_scratch/tests--fixtures--qwen3_moe_big.hotlist"
+[ -f "$HOTLIST" ] || fail "hotlist not written"
+grep -q "Expert hotlist written to $HOTLIST" "$TMP/warp.log" || fail "hotlist path not announced"
+grep -q "^return {" "$HOTLIST" || fail "hotlist is not a Lua table"
+# Every expert of the export is present (the exported model is complete).
+python3 - "$TMP/warp_out" <<'PY'
+import json, sys
+idx = json.load(open(sys.argv[1] + "/model.safetensors.index.json"))["weight_map"] if __import__("os").path.exists(sys.argv[1] + "/model.safetensors.index.json") else None
+import struct
+names = set()
+for f in __import__("glob").glob(sys.argv[1] + "/*.safetensors"):
+    with open(f, "rb") as fh:
+        n = struct.unpack("<Q", fh.read(8))[0]
+        names |= set(json.loads(fh.read(n)).keys())
+missing = [f"model.layers.{l}.mlp.experts.{e}.down_proj.weight" for l in range(4) for e in range(16) if f"model.layers.{l}.mlp.experts.{e}.down_proj.weight" not in names]
+sys.exit("missing experts in export: " + ", ".join(missing[:5]) if missing else 0)
+PY
+"$DITCH" "${BIG_COMMON[@]}" --evaluate-model "$TMP/warp_out" | tee "$TMP/warp_eval.log"
+kl=$(grep "  \* KL divergence:" "$TMP/warp_eval.log" | tail -1 | awk '{print $4}')
+awk -v kl="$kl" 'BEGIN { exit !(kl < 1.0) }' || fail "KL divergence of the warp-mode export is implausible: $kl"
+
+echo "==> Warp mode: second run warms the cache from the hotlist"
+"$DITCH" "${BIG_COMMON[@]}" "${WARP[@]}" --study-checkpoint-dir "$TMP/warp_checkpoints" \
+    --n-trials 1 --n-startup-trials 1 \
+    --checkpoint-action restart --trial-index 1 --model-action exit \
+    | tee "$TMP/warp2.log"
+grep -q "^\* hotlist: [1-9][0-9]* experts warmed" "$TMP/warp2.log" || fail "second run did not warm the cache from the hotlist"
+# --expert-cache 0 falls back to plain layer streaming (a whole layer of experts
+# must fit, hence the larger budget); --no-hotlist writes none.
+"$DITCH" "${BIG_COMMON[@]}" "${WARP[@]}" --max-ram 512KB --expert-cache 0 --no-hotlist --scratch-dir "$TMP/plain_scratch" \
+    --study-checkpoint-dir "$TMP/plain_checkpoints" --n-trials 1 --n-startup-trials 1 \
+    --checkpoint-action restart --trial-index 1 --model-action exit \
+    | tee "$TMP/plain.log"
+grep -q "Weights: streamed layer by layer from disk" "$TMP/plain.log" || fail "--expert-cache 0 did not fall back to layer streaming"
+if grep -q "^Expert cache:" "$TMP/plain.log"; then fail "--expert-cache 0 still used an expert cache"; fi
+[ ! -e "$TMP/plain_scratch/tests--fixtures--qwen3_moe_big.hotlist" ] || fail "--no-hotlist wrote a hotlist"
+
+echo "==> Remote weight source: hf://-style loading over a local HTTP range server"
+python3 tools/range_server.py tests/fixtures/qwen3_moe_big "$TMP/range.log" > "$TMP/range_port.txt" &
+RANGE_PID=$!
+trap 'kill $RANGE_PID 2>/dev/null; rm -rf "$TMP"' EXIT
+for _ in $(seq 1 100); do grep -q "^PORT " "$TMP/range_port.txt" 2>/dev/null && break; sleep 0.1; done
+PORT=$(awk '/^PORT/ {print $2}' "$TMP/range_port.txt")
+[ -n "$PORT" ] || fail "range server did not start"
+REMOTE_COMMON=("${COMMON[@]}")
+REMOTE_COMMON[0]="http://127.0.0.1:$PORT/"
+"$DITCH" "${REMOTE_COMMON[@]}" --cache-dir "$TMP/remote_cache" --remote-chunk-size 4KB --threads 4 \
+    --study-checkpoint-dir "$TMP/remote_checkpoints" --n-trials 1 --n-startup-trials 1 \
+    --checkpoint-action restart --trial-index 1 --model-action save --save-directory "$TMP/remote_out" \
+    | tee "$TMP/remote.log"
+grep -q "Remote weights from http://127.0.0.1:$PORT/" "$TMP/remote.log" || fail "remote source not used"
+grep -q "headers are fetched now, tensors on demand in 4.0KB chunks" "$TMP/remote.log" || fail "remote chunk size not applied"
+grep -q "routed experts through an expert cache of .* (warp mode)" "$TMP/remote.log" || fail "remote MoE run did not use warp mode"
+grep -q "^Remote source: fetched [1-9][0-9]* ranges" "$TMP/remote.log" || fail "remote run reported no fetched ranges"
+grep -q "Model saved to" "$TMP/remote.log" || fail "remote-source model was not saved"
+[ -d "$TMP/remote_cache/models/127.0.0.1_$PORT/main/chunks/model-00001-of-00002.safetensors" ] || fail "chunk cache directory missing"
+grep -c " 206 " "$TMP/range.log" | awk '{ exit !($1 > 0) }' || fail "server answered no range requests"
+if grep -q " 200 .*safetensors" "$TMP/range.log"; then fail "a shard was fetched whole instead of by ranges"; fi
+requests=$(wc -l < "$TMP/range.log")
+"$DITCH" "${REMOTE_COMMON[@]}" --cache-dir "$TMP/remote_cache" --remote-chunk-size 4KB --threads 4 \
+    --study-checkpoint-dir "$TMP/remote_checkpoints" --n-trials 1 --n-startup-trials 1 \
+    --checkpoint-action restart --trial-index 1 --model-action exit \
+    | tee "$TMP/remote2.log"
+grep -q "^Remote source: fetched 0 ranges" "$TMP/remote2.log" || fail "second remote run fetched ranges although the chunks were cached"
+[ "$(wc -l < "$TMP/range.log")" -eq "$requests" ] || fail "second remote run sent requests to the server"
+"$DITCH" "${BIG_COMMON[@]}" --evaluate-model "$TMP/remote_out" | tee "$TMP/remote_eval.log"
+kl=$(grep "  \* KL divergence:" "$TMP/remote_eval.log" | tail -1 | awk '{print $4}')
+awk -v kl="$kl" 'BEGIN { exit !(kl < 1.0) }' || fail "KL divergence of the remote-source export is implausible: $kl"
+kill $RANGE_PID 2>/dev/null || true
 
 echo
 echo "e2e: all checks passed"
