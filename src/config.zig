@@ -78,9 +78,11 @@ pub const Settings = struct {
     chain_of_thought_skips: []const [2][]const u8 = &default_cot_skips,
     print_debug_information: bool = false,
     print_residual_geometry: bool = false,
+    /// Scorers are evaluated in this order. The KL divergence comes first by
+    /// default so that early stopping can prune trials during refusal scoring.
     scorers: []const ScorerConfig = &.{
-        .{ .kind = .keyword_rate, .optimization = .minimize },
         .{ .kind = .kl_divergence, .optimization = .minimize },
+        .{ .kind = .keyword_rate, .optimization = .minimize },
     },
     orthogonalize_direction: bool = true,
     row_normalization: abliterate.RowNormalization = .full,
@@ -88,6 +90,12 @@ pub const Settings = struct {
     /// MoE models: how experts are chosen for the MLP edit (ranked | random | broad).
     expert_selection: abliterate.ExpertSelection = .ranked,
     winsorization_quantile: f32 = 1.0,
+    /// Number of orthonormal refusal directions removed per layer (1 = heretic).
+    n_directions: usize = 1,
+    /// Prune trials whose partial refusal count already guarantees Pareto domination.
+    early_stop: bool = true,
+    /// Journal of a previous study whose trials seed the sampler.
+    warm_start: ?[]const u8 = null,
     n_trials: usize = 200,
     n_startup_trials: usize = 60,
     seed: ?u64 = null,
@@ -116,6 +124,14 @@ pub const Settings = struct {
     save_directory: ?[]const u8 = null,
     export_dtype: ?[]const u8 = null,
     config_path: ?[]const u8 = null,
+    /// `--reproduce <manifest>`: re-derive an exported model from its ditch-reproduce.lua.
+    reproduce: ?[]const u8 = null,
+    ignore_mismatches: bool = false,
+    /// `ditch bench <model>`: run the benchmark harness instead of a study.
+    bench: bool = false,
+    bench_prompts: usize = 16,
+    bench_tokens: usize = 32,
+    bench_output: ?[]const u8 = null,
     help: bool = false,
     version: bool = false,
 };
@@ -158,6 +174,7 @@ pub const help_text =
     \\  --row-normalization <none|pre|full>   Row normalisation mode (default: full).
     \\  --full-normalization-lora-rank <n>    Rank of the "full" approximation (default: 3).
     \\  --winsorization-quantile <q>          Clamp residual magnitudes to this quantile (default: 1.0 = off).
+    \\  --n-directions <k>                    Orthonormal refusal directions removed per layer (default: 1).
     \\  --expert-selection <ranked|random|broad>  MoE models: edit the experts best aligned with the
     \\                                        refusal direction (ranked, default), a random subset of the
     \\                                        same size (baseline), or always every expert (broad).
@@ -168,6 +185,8 @@ pub const help_text =
     \\  --seed <n>                     Random seed.
     \\  --study-checkpoint-dir <path>  Where study progress is stored (default: checkpoints).
     \\  --checkpoint-action <continue|restart>  What to do with an existing checkpoint.
+    \\  --early-stop <bool>, --no-early-stop  Prune trials that can no longer reach the Pareto front (default: on).
+    \\  --warm-start <study.jsonl>     Seed the sampler with the trials of a previous study.
     \\
     \\Datasets (also for --keyword-rate-* and --kl-divergence-* scorer prompts):
     \\  --good-prompts-dataset <id|file>  --good-prompts-split <s>  --good-prompts-column <c>
@@ -181,6 +200,16 @@ pub const help_text =
     \\  --save-directory <path>        Where to save the model with --model-action save.
     \\  --export-dtype <bf16|f16|f32>  Storage dtype for exported weights (default: same as source).
     \\  --n-additional-trials <n>      Run more trials after a finished study.
+    \\
+    \\Reproducing and benchmarking:
+    \\  --reproduce <manifest.lua>     Re-derive an exported model from its ditch-reproduce.lua
+    \\                                 (verifies the model file and prompt hashes, applies the
+    \\                                 recorded trial, then shows the model menu; no search).
+    \\  --ignore-mismatches            Proceed with --reproduce even if hashes differ.
+    \\  ditch bench <model> [options]  Measure throughput, timings and memory (see README).
+    \\  --bench-prompts <n>            Prompts per benchmark batch (default: 16).
+    \\  --bench-tokens <n>             Tokens decoded per prompt in the benchmark (default: 32).
+    \\  --bench-output <file.md>       Also write the benchmark table to this file.
     \\
     \\Other:
     \\  --print-debug-information      Print extra diagnostics.
@@ -305,7 +334,7 @@ fn normalizeKey(a: Allocator, name: []const u8) ![]u8 {
 }
 
 fn isBoolKey(key: []const u8) bool {
-    const bools = [_][]const u8{ "print_debug_information", "print_residual_geometry", "orthogonalize_direction", "keyword_rate_print_responses", "help", "version" };
+    const bools = [_][]const u8{ "print_debug_information", "print_residual_geometry", "orthogonalize_direction", "keyword_rate_print_responses", "ignore_mismatches", "early_stop", "no_early_stop", "help", "version" };
     for (bools) |b| if (std.mem.eql(u8, b, key)) return true;
     return false;
 }
@@ -367,9 +396,12 @@ fn applyDatasetOption(a: Allocator, spec: *DatasetSpec, field: []const u8, value
 
 fn applyOption(a: Allocator, s: *Settings, key: []const u8, value: []const u8) !void {
     const eql = std.mem.eql;
-    if (eql(u8, key, "model")) s.model = try a.dupe(u8, value) else if (eql(u8, key, "model_commit")) s.model_commit = try a.dupe(u8, value) else if (eql(u8, key, "evaluate_model")) s.evaluate_model = try a.dupe(u8, value) else if (eql(u8, key, "threads")) s.threads = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "cache_dir")) s.cache_dir = try a.dupe(u8, value) else if (eql(u8, key, "chat_template")) s.chat_template = try a.dupe(u8, value) else if (eql(u8, key, "batch_size")) s.batch_size = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "max_batch_size")) s.max_batch_size = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "max_response_length")) s.max_response_length = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "response_prefix")) s.response_prefix = try a.dupe(u8, value) else if (eql(u8, key, "system_prompt")) s.system_prompt = try a.dupe(u8, value) else if (eql(u8, key, "print_debug_information")) s.print_debug_information = try parseBool(value) else if (eql(u8, key, "print_residual_geometry")) s.print_residual_geometry = try parseBool(value) else if (eql(u8, key, "orthogonalize_direction")) s.orthogonalize_direction = try parseBool(value) else if (eql(u8, key, "row_normalization")) s.row_normalization = abliterate.RowNormalization.parse(value) orelse return error.InvalidEnum else if (eql(u8, key, "full_normalization_lora_rank")) s.full_normalization_lora_rank = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "expert_selection")) s.expert_selection = abliterate.ExpertSelection.parse(value) orelse return error.InvalidEnum else if (eql(u8, key, "winsorization_quantile")) s.winsorization_quantile = try std.fmt.parseFloat(f32, value) else if (eql(u8, key, "n_trials")) s.n_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_startup_trials")) s.n_startup_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "seed")) s.seed = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "study_checkpoint_dir")) s.study_checkpoint_dir = try a.dupe(u8, value) else if (eql(u8, key, "max_shard_size")) s.max_shard_size = try parseSize(value) else if (eql(u8, key, "max_ram")) s.max_ram = try parseSize(value) else if (eql(u8, key, "max_vram")) s.max_vram = try parseSize(value) else if (eql(u8, key, "scratch_dir")) s.scratch_dir = try a.dupe(u8, value) else if (eql(u8, key, "time_limit")) s.time_limit_seconds = try parseDuration(value) else if (eql(u8, key, "time_limit_seconds")) s.time_limit_seconds = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "budget_headroom")) s.budget_headroom = try parseSize(value) else if (eql(u8, key, "checkpoint_action")) s.checkpoint_action = try a.dupe(u8, value) else if (eql(u8, key, "trial_index")) s.trial_index = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_additional_trials")) s.n_additional_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "model_action")) s.model_action = try a.dupe(u8, value) else if (eql(u8, key, "save_directory")) s.save_directory = try a.dupe(u8, value) else if (eql(u8, key, "export_dtype")) s.export_dtype = try a.dupe(u8, value) else if (eql(u8, key, "config")) {
+    if (eql(u8, key, "model")) s.model = try a.dupe(u8, value) else if (eql(u8, key, "model_commit")) s.model_commit = try a.dupe(u8, value) else if (eql(u8, key, "evaluate_model")) s.evaluate_model = try a.dupe(u8, value) else if (eql(u8, key, "threads")) s.threads = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "cache_dir")) s.cache_dir = try a.dupe(u8, value) else if (eql(u8, key, "chat_template")) s.chat_template = try a.dupe(u8, value) else if (eql(u8, key, "batch_size")) s.batch_size = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "max_batch_size")) s.max_batch_size = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "max_response_length")) s.max_response_length = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "response_prefix")) s.response_prefix = try a.dupe(u8, value) else if (eql(u8, key, "system_prompt")) s.system_prompt = try a.dupe(u8, value) else if (eql(u8, key, "print_debug_information")) s.print_debug_information = try parseBool(value) else if (eql(u8, key, "print_residual_geometry")) s.print_residual_geometry = try parseBool(value) else if (eql(u8, key, "orthogonalize_direction")) s.orthogonalize_direction = try parseBool(value) else if (eql(u8, key, "row_normalization")) s.row_normalization = abliterate.RowNormalization.parse(value) orelse return error.InvalidEnum else if (eql(u8, key, "full_normalization_lora_rank")) s.full_normalization_lora_rank = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "expert_selection")) s.expert_selection = abliterate.ExpertSelection.parse(value) orelse return error.InvalidEnum else if (eql(u8, key, "winsorization_quantile")) s.winsorization_quantile = try std.fmt.parseFloat(f32, value) else if (eql(u8, key, "n_directions")) {
+        s.n_directions = try std.fmt.parseInt(usize, value, 10);
+        if (s.n_directions == 0) return error.InvalidValue;
+    } else if (eql(u8, key, "early_stop")) s.early_stop = try parseBool(value) else if (eql(u8, key, "no_early_stop")) s.early_stop = !(try parseBool(value)) else if (eql(u8, key, "warm_start")) s.warm_start = try a.dupe(u8, value) else if (eql(u8, key, "n_trials")) s.n_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_startup_trials")) s.n_startup_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "seed")) s.seed = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "study_checkpoint_dir")) s.study_checkpoint_dir = try a.dupe(u8, value) else if (eql(u8, key, "max_shard_size")) s.max_shard_size = try parseSize(value) else if (eql(u8, key, "max_ram")) s.max_ram = try parseSize(value) else if (eql(u8, key, "max_vram")) s.max_vram = try parseSize(value) else if (eql(u8, key, "scratch_dir")) s.scratch_dir = try a.dupe(u8, value) else if (eql(u8, key, "time_limit")) s.time_limit_seconds = try parseDuration(value) else if (eql(u8, key, "time_limit_seconds")) s.time_limit_seconds = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "budget_headroom")) s.budget_headroom = try parseSize(value) else if (eql(u8, key, "checkpoint_action")) s.checkpoint_action = try a.dupe(u8, value) else if (eql(u8, key, "trial_index")) s.trial_index = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_additional_trials")) s.n_additional_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "model_action")) s.model_action = try a.dupe(u8, value) else if (eql(u8, key, "save_directory")) s.save_directory = try a.dupe(u8, value) else if (eql(u8, key, "export_dtype")) s.export_dtype = try a.dupe(u8, value) else if (eql(u8, key, "config")) {
         // handled in the first pass
-    } else if (eql(u8, key, "help")) s.help = try parseBool(value) else if (eql(u8, key, "version")) s.version = try parseBool(value) else if (eql(u8, key, "keyword_rate_print_responses")) s.keyword_rate.print_responses = try parseBool(value) else if (eql(u8, key, "keyword_rate_score_name")) s.keyword_rate.score_name = try a.dupe(u8, value) else if (std.mem.startsWith(u8, key, "good_prompts_")) try applyDatasetOption(a, &s.good_prompts, key["good_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "bad_prompts_")) try applyDatasetOption(a, &s.bad_prompts, key["bad_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "keyword_rate_prompts_")) try applyDatasetOption(a, &s.keyword_rate.prompts, key["keyword_rate_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "kl_divergence_prompts_")) try applyDatasetOption(a, &s.kl_divergence.prompts, key["kl_divergence_prompts_".len..], value) else return error.UnknownOption;
+    } else if (eql(u8, key, "reproduce")) s.reproduce = try a.dupe(u8, value) else if (eql(u8, key, "ignore_mismatches")) s.ignore_mismatches = try parseBool(value) else if (eql(u8, key, "bench_prompts")) s.bench_prompts = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "bench_tokens")) s.bench_tokens = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "bench_output")) s.bench_output = try a.dupe(u8, value) else if (eql(u8, key, "help")) s.help = try parseBool(value) else if (eql(u8, key, "version")) s.version = try parseBool(value) else if (eql(u8, key, "keyword_rate_print_responses")) s.keyword_rate.print_responses = try parseBool(value) else if (eql(u8, key, "keyword_rate_score_name")) s.keyword_rate.score_name = try a.dupe(u8, value) else if (std.mem.startsWith(u8, key, "good_prompts_")) try applyDatasetOption(a, &s.good_prompts, key["good_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "bad_prompts_")) try applyDatasetOption(a, &s.bad_prompts, key["bad_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "keyword_rate_prompts_")) try applyDatasetOption(a, &s.keyword_rate.prompts, key["keyword_rate_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "kl_divergence_prompts_")) try applyDatasetOption(a, &s.kl_divergence.prompts, key["kl_divergence_prompts_".len..], value) else return error.UnknownOption;
 }
 
 fn tomlString(a: Allocator, v: toml.Value) ![]const u8 {
@@ -514,7 +546,7 @@ test "budget options" {
 
 test "cli parsing" {
     const gpa = std.testing.allocator;
-    const args = [_][]const u8{ "ditch", "--n-trials", "5", "--row-normalization=pre", "--print-debug-information", "--expert-selection", "random", "--good-prompts-dataset", "good.txt", "Qwen/Qwen2.5-0.5B-Instruct" };
+    const args = [_][]const u8{ "ditch", "--n-trials", "5", "--row-normalization=pre", "--print-debug-information", "--expert-selection", "random", "--good-prompts-dataset", "good.txt", "--n-directions", "2", "--no-early-stop", "--warm-start", "old.jsonl", "Qwen/Qwen2.5-0.5B-Instruct" };
     var r = try load(gpa, std.testing.io, &args);
     defer r.deinit();
     try std.testing.expectEqual(@as(usize, 0), r.errors.len);
@@ -524,4 +556,8 @@ test "cli parsing" {
     try std.testing.expect(r.settings.print_debug_information);
     try std.testing.expectEqualStrings("good.txt", r.settings.good_prompts.dataset);
     try std.testing.expectEqualStrings("Qwen/Qwen2.5-0.5B-Instruct", r.settings.model);
+    try std.testing.expectEqual(@as(usize, 2), r.settings.n_directions);
+    try std.testing.expect(!r.settings.early_stop);
+    try std.testing.expectEqualStrings("old.jsonl", r.settings.warm_start.?);
+    try std.testing.expectEqual(ScorerKind.kl_divergence, r.settings.scorers[0].kind);
 }

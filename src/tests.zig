@@ -7,6 +7,7 @@ comptime {
     _ = @import("model_test.zig");
     _ = @import("moe.zig");
     _ = @import("abliterate.zig");
+    _ = @import("directions.zig");
     _ = @import("tpe.zig");
     _ = @import("toml.zig");
     _ = @import("config.zig");
@@ -21,4 +22,6 @@ comptime {
     _ = @import("budget.zig");
     _ = @import("stream.zig");
     _ = @import("stream_test.zig");
+    _ = @import("reproduce.zig");
+    _ = @import("bench.zig");
 }
