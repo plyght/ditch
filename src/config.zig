@@ -261,7 +261,7 @@ pub const help_text =
     \\
 ;
 
-pub const version = "0.1.0";
+pub const version = "0.2.0";
 
 pub const LoadResult = struct {
     settings: Settings,
