@@ -1,0 +1,1 @@
+{"chat_template": "{{ bos_token }}{% for message in messages %}{{ '<start_of_turn>' + message['role'] + '\n' + message['content'] | trim + '<end_of_turn>\n' }}{% endfor %}{% if add_generation_prompt %}{{'<start_of_turn>model\n'}}{% endif %}", "eos_token": "<eos>", "add_bos_token": true, "tokenizer_class": "PreTrainedTokenizerFast", "bos_token": "<bos>"}

@@ -1,0 +1,29 @@
+{
+  "model_type": "gemma3_text",
+  "architectures": [
+    "Gemma3ForCausalLM"
+  ],
+  "hidden_size": 32,
+  "intermediate_size": 48,
+  "num_hidden_layers": 3,
+  "num_attention_heads": 4,
+  "num_key_value_heads": 2,
+  "head_dim": 16,
+  "vocab_size": 370,
+  "rms_norm_eps": 1e-06,
+  "rope_theta": 1000000.0,
+  "max_position_embeddings": 512,
+  "tie_word_embeddings": true,
+  "torch_dtype": "bfloat16",
+  "hidden_activation": "gelu_pytorch_tanh",
+  "query_pre_attn_scalar": 16,
+  "sliding_window": 8,
+  "sliding_window_pattern": 2,
+  "rope_local_base_freq": 10000.0,
+  "rope_scaling": {
+    "rope_type": "linear",
+    "factor": 8.0
+  },
+  "final_logit_softcapping": null,
+  "attn_logit_softcapping": null
+}
