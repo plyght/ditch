@@ -104,5 +104,19 @@ grep -q "Show the results from the previous run" "$TMP/chat.log" || fail "checkp
 grep -q "Which trial do you want to use?" "$TMP/chat.log" || fail "trial menu not shown"
 grep -q "Assistant: " "$TMP/chat.log" || fail "chat did not produce a response"
 
+echo "==> MoE model: ranked expert selection, save and evaluate"
+MOE_COMMON=("${COMMON[@]}")
+MOE_COMMON[0]=tests/fixtures/qwen3_moe
+"$DITCH" "${MOE_COMMON[@]}" \
+    --n-trials 2 --n-startup-trials 2 --print-debug-information \
+    --checkpoint-action restart --trial-index 1 --model-action save --save-directory "$TMP/moe_out" \
+    | tee "$TMP/moe.log"
+grep -q "experts.n_selected" "$TMP/moe.log" || fail "MoE search space did not include expert selection"
+[ -f "$TMP/moe_out/model.safetensors" ] || fail "MoE model was not saved"
+"$DITCH" "${MOE_COMMON[@]}" --evaluate-model "$TMP/moe_out" | tee "$TMP/moe_eval.log"
+grep -q "  \* KL divergence: [0-9.]*" "$TMP/moe_eval.log" || fail "no KL divergence printed for MoE export"
+"$DITCH" "${MOE_COMMON[@]}" --n-trials 2 --expert-selection broad \
+    --checkpoint-action restart --trial-index 1 --model-action exit > "$TMP/moe_broad.log" || fail "broad expert selection run failed"
+
 echo
 echo "e2e: all checks passed"

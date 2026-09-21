@@ -171,6 +171,8 @@ const App = struct {
             .row_normalization = self.settings.row_normalization,
             .lora_rank = self.settings.full_normalization_lora_rank,
             .seed = self.settings.seed orelse 0,
+            .expert_selection = self.settings.expert_selection,
+            .debug_writer = if (self.settings.print_debug_information) self.con.out else null,
         };
     }
 
