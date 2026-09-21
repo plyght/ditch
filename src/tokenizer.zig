@@ -1,9 +1,12 @@
 //! A Hugging Face `tokenizer.json` compatible BPE tokenizer.
 //!
-//! Supports the tokenizer configurations used by Llama 2/3, Mistral, Qwen 2/3
-//! and Gemma 2/3: byte-level BPE with GPT-2 / Llama-3 style regex
-//! pre-tokenisation, and SentencePiece-derived BPE with Metaspace handling
-//! and byte fallback.
+//! Supports the tokenizer configurations shipped by decoder-only models:
+//! byte-level BPE with the GPT-2 / Qwen2 / Llama-3 / o200k / DeepSeek style
+//! regex pre-tokenisers (plus the `Digits`, `Punctuation`, `Whitespace` and
+//! `ByteLevel(add_prefix_space)` steps some families chain in a `Sequence`),
+//! and SentencePiece-derived BPE with Metaspace handling and byte fallback.
+//! Unicode normalisers (NFC/NFKC/Precompiled) are approximated by the
+//! identity with a warning.
 
 const std = @import("std");
 const uni = @import("unicode_tables.zig");
@@ -16,12 +19,41 @@ pub const AddedToken = struct {
     special: bool,
 };
 
-const RegexKind = enum { gpt2, qwen2, llama3 };
+/// The `Split` regular expressions the splitter implements natively.
+const RegexKind = enum {
+    gpt2,
+    qwen2,
+    llama3,
+    /// tiktoken o200k (gpt-oss): words split at lower→upper case changes, contractions as suffixes.
+    o200k,
+    /// DeepSeek V3 main pattern (`[\p{P}\p{S}]` classes; digits are split by an earlier `\p{N}{1,3}` step).
+    deepseek3,
+    /// `\p{N}{1,3}` alone.
+    digits3,
+    /// `[\r\n]`
+    newlines,
+    /// DeepSeek V2 letters: `\s?[A-Za-z...]+`
+    ds2_letters,
+    /// DeepSeek V2 punctuation: `\s?[!-/:-~！-／：-～‘-‟　-。]+`
+    ds2_punct,
+    /// `\s+$`
+    trailing_ws,
+    /// CJK runs `[一-龥ࠀ-一가-퟿]+`
+    cjk,
+};
 
-const PreTokenizer = union(enum) {
-    none,
-    byte_level_regex: RegexKind,
-    byte_level_plain,
+/// One pre-tokenisation step of a `Sequence`.
+const Step = union(enum) {
+    regex: RegexKind,
+    split_string: struct { pattern: []const u8, removed: bool },
+    /// `Digits(individual_digits)`
+    digits: bool,
+    /// `Punctuation` (true: contiguous runs stay together)
+    punctuation: bool,
+    whitespace,
+    whitespace_split,
+    /// `ByteLevel(add_prefix_space)`; the regex (when `use_regex`) is a separate step.
+    byte_level: bool,
     metaspace: struct { prepend: bool, split: bool },
 };
 
@@ -45,7 +77,11 @@ pub const Tokenizer = struct {
     prepend: ?[]const u8,
     replace_space: ?[]const u8, // replacement for " " (typically "▁")
     lowercase: bool,
-    pre: PreTokenizer,
+    /// Pre-tokenisation steps applied in order to every segment.
+    steps: []const Step,
+    /// Pieces are mapped through the GPT-2 byte→unicode table before BPE.
+    byte_level: bool,
+    has_metaspace: bool,
     decoder: Decoder,
     strip_leading_space: bool,
     bos_id: ?u32,
@@ -83,7 +119,9 @@ pub const Tokenizer = struct {
             .prepend = null,
             .replace_space = null,
             .lowercase = false,
-            .pre = .none,
+            .steps = &.{},
+            .byte_level = false,
+            .has_metaspace = false,
             .decoder = .plain,
             .strip_leading_space = false,
             .bos_id = null,
@@ -190,11 +228,19 @@ pub const Tokenizer = struct {
         if (root.get("normalizer")) |n| try self.parseNormalizer(n);
 
         // --- pre-tokenizer ---
-        if (root.get("pre_tokenizer")) |p| try self.parsePreTokenizer(p);
+        if (root.get("pre_tokenizer")) |p| {
+            var steps = std.ArrayList(Step).empty;
+            try self.parsePreTokenizer(p, &steps);
+            self.steps = steps.items;
+            for (self.steps) |st| {
+                if (st == .byte_level) self.byte_level = true;
+                if (st == .metaspace) self.has_metaspace = true;
+            }
+        }
 
         // --- decoder ---
         if (root.get("decoder")) |d| self.parseDecoder(d);
-        if (self.pre == .byte_level_regex or self.pre == .byte_level_plain) self.decoder = .byte_level;
+        if (self.byte_level) self.decoder = .byte_level;
 
         // --- post-processor (BOS) ---
         if (root.get("post_processor")) |pp| self.parsePostProcessor(pp);
@@ -244,40 +290,70 @@ pub const Tokenizer = struct {
             }
         } else if (std.mem.eql(u8, t, "Lowercase")) {
             self.lowercase = true;
+        } else if (std.mem.eql(u8, t, "Strip") or std.mem.eql(u8, t, "NFC")) {
+            // Whitespace stripping of the whole input and NFC are identities for the prompts ditch builds.
         } else {
-            // NFC/NFKC/NFD/Strip etc.: treated as identity.
+            std.log.warn("normalizer '{s}' is approximated by the identity (text that is not already normalised may tokenize differently)", .{t});
         }
     }
 
-    fn parsePreTokenizer(self: *Tokenizer, p: std.json.Value) !void {
+    fn parsePreTokenizer(self: *Tokenizer, p: std.json.Value, steps: *std.ArrayList(Step)) !void {
         if (p != .object) return;
+        const arena = self.arena.allocator();
         const obj = p.object;
         const t = (obj.get("type") orelse return).string;
         if (std.mem.eql(u8, t, "Sequence")) {
-            for (obj.get("pretokenizers").?.array.items) |sub| try self.parsePreTokenizer(sub);
+            for (obj.get("pretokenizers").?.array.items) |sub| try self.parsePreTokenizer(sub, steps);
         } else if (std.mem.eql(u8, t, "Split")) {
             const pattern = obj.get("pattern").?.object;
+            const behavior = if (obj.get("behavior")) |b| (if (b == .string) b.string else "isolated") else "isolated";
             if (pattern.get("Regex")) |r| {
-                self.pre = .{ .byte_level_regex = classifyRegex(r.string) };
+                try steps.append(arena, .{ .regex = classifyRegex(r.string) });
+            } else if (pattern.get("String")) |str| {
+                try steps.append(arena, .{ .split_string = .{ .pattern = try arena.dupe(u8, str.string), .removed = std.ascii.eqlIgnoreCase(behavior, "removed") } });
             }
         } else if (std.mem.eql(u8, t, "ByteLevel")) {
             const use_regex = if (obj.get("use_regex")) |u| u.bool else true;
-            if (self.pre == .none) {
-                self.pre = if (use_regex) .{ .byte_level_regex = .gpt2 } else .byte_level_plain;
-            }
+            const add_prefix_space = if (obj.get("add_prefix_space")) |u| u.bool else false;
+            try steps.append(arena, .{ .byte_level = add_prefix_space });
+            if (use_regex) try steps.append(arena, .{ .regex = .gpt2 });
         } else if (std.mem.eql(u8, t, "Metaspace")) {
             const scheme = if (obj.get("prepend_scheme")) |s| s.string else "always";
             const split = if (obj.get("split")) |s| s.bool else true;
-            self.pre = .{ .metaspace = .{ .prepend = !std.mem.eql(u8, scheme, "never"), .split = split } };
-            if (obj.get("replacement")) |r| self.replace_space = try self.arena.allocator().dupe(u8, r.string);
+            try steps.append(arena, .{ .metaspace = .{ .prepend = !std.mem.eql(u8, scheme, "never"), .split = split } });
+            if (obj.get("replacement")) |r| self.replace_space = try arena.dupe(u8, r.string);
+        } else if (std.mem.eql(u8, t, "Digits")) {
+            const individual = if (obj.get("individual_digits")) |v| v.bool else false;
+            try steps.append(arena, .{ .digits = individual });
+        } else if (std.mem.eql(u8, t, "Punctuation")) {
+            const behavior = if (obj.get("behavior")) |b| (if (b == .string) b.string else "isolated") else "isolated";
+            try steps.append(arena, .{ .punctuation = std.ascii.eqlIgnoreCase(behavior, "contiguous") });
+        } else if (std.mem.eql(u8, t, "Whitespace")) {
+            try steps.append(arena, .whitespace);
+        } else if (std.mem.eql(u8, t, "WhitespaceSplit")) {
+            try steps.append(arena, .whitespace_split);
         } else {
             std.log.warn("ignoring unsupported pre-tokenizer: {s}", .{t});
         }
     }
 
     fn classifyRegex(r: []const u8) RegexKind {
-        if (std.mem.indexOf(u8, r, "{1,3}") != null) return .llama3;
-        if (std.mem.indexOf(u8, r, "[^\\r\\n\\p{L}\\p{N}]?\\p{L}+") != null) return .qwen2;
+        const has = struct {
+            fn f(hay: []const u8, needle: []const u8) bool {
+                return std.mem.indexOf(u8, hay, needle) != null;
+            }
+        }.f;
+        if (std.mem.eql(u8, r, "\\p{N}{1,3}")) return .digits3;
+        if (std.mem.eql(u8, r, "[\\r\\n]")) return .newlines;
+        if (std.mem.eql(u8, r, "\\s+$")) return .trailing_ws;
+        if (std.mem.startsWith(u8, r, "\\s?[A-Za-z")) return .ds2_letters;
+        if (std.mem.startsWith(u8, r, "\\s?[!-/")) return .ds2_punct;
+        if (std.mem.startsWith(u8, r, "[\xe4\xb8\x80-")) return .cjk;
+        if (has(r, "\\p{Lu}")) return .o200k;
+        if (has(r, "\\p{P}\\p{S}")) return .deepseek3;
+        if (has(r, "{1,3}")) return .llama3;
+        if (has(r, "[^\\r\\n\\p{L}\\p{N}]?\\p{L}+")) return .qwen2;
+        if (!has(r, "'s|'t|'re")) std.log.warn("pre-tokenizer regex is not recognised; using the GPT-2 pattern: {s}", .{r});
         return .gpt2;
     }
 
@@ -317,6 +393,22 @@ pub const Tokenizer = struct {
         } else if (std.mem.eql(u8, t, "RobertaProcessing") or std.mem.eql(u8, t, "BertProcessing")) {
             // Not used by supported models.
         }
+    }
+
+    /// The llama.cpp `tokenizer.ggml.pre` name of the byte-level regex in use (null for SentencePiece-style tokenizers).
+    pub fn ggmlPreName(self: *const Tokenizer) ?[]const u8 {
+        if (!self.byte_level) return null;
+        for (self.steps) |st| {
+            if (st == .regex) return switch (st.regex) {
+                .qwen2 => "qwen2",
+                .llama3 => "llama-bpe",
+                .o200k => "gpt-4o",
+                .deepseek3, .digits3 => "deepseek-v3",
+                .ds2_letters, .newlines, .ds2_punct, .trailing_ws, .cjk => "deepseek-llm",
+                .gpt2 => "gpt-2",
+            };
+        }
+        return "gpt-2";
     }
 
     pub fn vocabSize(self: *const Tokenizer) usize {
@@ -372,60 +464,120 @@ pub const Tokenizer = struct {
     }
 
     fn encodeSegment(self: *Tokenizer, gpa: Allocator, raw: []const u8, out: *std.ArrayList(u32)) !void {
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        const a = scratch.allocator();
         // Normalise.
         var norm = std.ArrayList(u8).empty;
-        defer norm.deinit(gpa);
-        if (self.prepend) |p| try norm.appendSlice(gpa, p);
+        if (self.prepend) |p| try norm.appendSlice(a, p);
         for (raw) |c| {
-            if (c == ' ' and self.replace_space != null and self.pre != .metaspace) {
-                try norm.appendSlice(gpa, self.replace_space.?);
+            if (c == ' ' and self.replace_space != null and !self.has_metaspace) {
+                try norm.appendSlice(a, self.replace_space.?);
             } else if (self.lowercase) {
-                try norm.append(gpa, std.ascii.toLower(c));
+                try norm.append(a, std.ascii.toLower(c));
             } else {
-                try norm.append(gpa, c);
+                try norm.append(a, c);
             }
         }
-        const text = norm.items;
 
-        switch (self.pre) {
-            .none => try self.bpeWord(gpa, text, out),
-            .byte_level_plain => {
-                const mapped = try self.byteLevelEncode(gpa, text);
-                defer gpa.free(mapped);
+        // Pre-tokenise: every step splits (or rewrites) the pieces of the previous one.
+        var pieces = std.ArrayList([]const u8).empty;
+        try pieces.append(a, norm.items);
+        for (self.steps) |step| {
+            var next = std.ArrayList([]const u8).empty;
+            for (pieces.items) |piece| try self.applyStep(a, step, piece, &next);
+            pieces = next;
+        }
+        for (pieces.items) |piece| {
+            if (piece.len == 0) continue;
+            if (self.byte_level) {
+                const mapped = try self.byteLevelEncode(a, piece);
                 try self.bpeWord(gpa, mapped, out);
+            } else {
+                try self.bpeWord(gpa, piece, out);
+            }
+        }
+    }
+
+    fn applyStep(self: *Tokenizer, a: Allocator, step: Step, piece: []const u8, out: *std.ArrayList([]const u8)) !void {
+        switch (step) {
+            .regex => |kind| {
+                var it = RegexSplitter{ .text = piece, .kind = kind };
+                while (it.next()) |w| try out.append(a, w);
             },
-            .byte_level_regex => |kind| {
-                var it = RegexSplitter{ .text = text, .kind = kind };
-                while (it.next()) |word| {
-                    const mapped = try self.byteLevelEncode(gpa, word);
-                    defer gpa.free(mapped);
-                    try self.bpeWord(gpa, mapped, out);
+            .split_string => |sp| {
+                var start: usize = 0;
+                while (std.mem.indexOfPos(u8, piece, start, sp.pattern)) |idx| {
+                    if (idx > start) try out.append(a, piece[start..idx]);
+                    if (!sp.removed) try out.append(a, piece[idx .. idx + sp.pattern.len]);
+                    start = idx + sp.pattern.len;
+                }
+                if (start < piece.len) try out.append(a, piece[start..]);
+            },
+            .digits => |individual| try splitClass(a, piece, isNumber, individual, true, out),
+            .punctuation => |contiguous| try splitClass(a, piece, isPunctuation, !contiguous, true, out),
+            .whitespace => {
+                // `\w+|[^\w\s]+`: words, then runs of everything else; whitespace is dropped.
+                var i: usize = 0;
+                while (i < piece.len) {
+                    const c = cpAtSlice(piece, i);
+                    if (isWhitespace(c.cp)) {
+                        i += c.len;
+                        continue;
+                    }
+                    const word = isWordChar(c.cp);
+                    const start = i;
+                    while (i < piece.len) {
+                        const n = cpAtSlice(piece, i);
+                        if (isWhitespace(n.cp) or isWordChar(n.cp) != word) break;
+                        i += n.len;
+                    }
+                    try out.append(a, piece[start..i]);
+                }
+            },
+            .whitespace_split => {
+                var i: usize = 0;
+                while (i < piece.len) {
+                    const c = cpAtSlice(piece, i);
+                    if (isWhitespace(c.cp)) {
+                        i += c.len;
+                        continue;
+                    }
+                    const start = i;
+                    while (i < piece.len and !isWhitespace(cpAtSlice(piece, i).cp)) i += cpAtSlice(piece, i).len;
+                    try out.append(a, piece[start..i]);
+                }
+            },
+            .byte_level => |add_prefix_space| {
+                if (add_prefix_space and piece.len > 0 and piece[0] != ' ') {
+                    try out.append(a, try std.mem.concat(a, u8, &.{ " ", piece }));
+                } else {
+                    try out.append(a, piece);
                 }
             },
             .metaspace => |ms| {
                 const rep = self.replace_space orelse "\xe2\x96\x81";
                 var buf = std.ArrayList(u8).empty;
-                defer buf.deinit(gpa);
-                if (ms.prepend and (text.len == 0 or !std.mem.startsWith(u8, text, rep)) and (text.len == 0 or text[0] != ' ')) {
-                    try buf.appendSlice(gpa, rep);
+                if (ms.prepend and (piece.len == 0 or !std.mem.startsWith(u8, piece, rep)) and (piece.len == 0 or piece[0] != ' ')) {
+                    try buf.appendSlice(a, rep);
                 }
-                for (text) |c| {
-                    if (c == ' ') try buf.appendSlice(gpa, rep) else try buf.append(gpa, c);
+                for (piece) |c| {
+                    if (c == ' ') try buf.appendSlice(a, rep) else try buf.append(a, c);
                 }
                 if (!ms.split) {
-                    try self.bpeWord(gpa, buf.items, out);
+                    try out.append(a, buf.items);
                 } else {
                     // Split so each piece starts with the replacement (MergedWithNext).
                     var start: usize = 0;
                     var i: usize = 0;
                     while (i < buf.items.len) {
                         if (i > start and std.mem.startsWith(u8, buf.items[i..], rep)) {
-                            try self.bpeWord(gpa, buf.items[start..i], out);
+                            try out.append(a, buf.items[start..i]);
                             start = i;
                         }
                         i += std.unicode.utf8ByteSequenceLength(buf.items[i]) catch 1;
                     }
-                    if (start < buf.items.len) try self.bpeWord(gpa, buf.items[start..], out);
+                    if (start < buf.items.len) try out.append(a, buf.items[start..]);
                 }
             },
         }
@@ -608,33 +760,168 @@ pub fn isWhitespace(cp: u21) bool {
     return inRanges(cp, &uni.whitespace);
 }
 
+/// Unicode punctuation (approximated: ASCII punctuation, Latin-1 symbols and
+/// the general / CJK / full-width punctuation blocks).
+pub fn isPunctuation(cp: u21) bool {
+    if (cp < 128) return std.ascii.isPunctuation(@intCast(cp));
+    if (cp >= 0xA1 and cp <= 0xBF) return true;
+    if (cp == 0xD7 or cp == 0xF7) return true;
+    if (cp >= 0x2000 and cp <= 0x206F) return true;
+    if (cp >= 0x3000 and cp <= 0x303F) return true;
+    if (cp >= 0xFF00 and cp <= 0xFF0F) return true;
+    if (cp >= 0xFF1A and cp <= 0xFF20) return true;
+    if (cp >= 0xFF3B and cp <= 0xFF40) return true;
+    if (cp >= 0xFF5B and cp <= 0xFF65) return true;
+    return false;
+}
+
+fn isWordChar(cp: u21) bool {
+    return cp == '_' or isLetter(cp) or isNumber(cp);
+}
+
+const Cp = struct { cp: u21, len: usize };
+
+fn cpAtSlice(text: []const u8, i: usize) Cp {
+    const n = std.unicode.utf8ByteSequenceLength(text[i]) catch return .{ .cp = text[i], .len = 1 };
+    if (i + n > text.len) return .{ .cp = text[i], .len = 1 };
+    const cp = std.unicode.utf8Decode(text[i .. i + n]) catch return .{ .cp = text[i], .len = 1 };
+    return .{ .cp = cp, .len = n };
+}
+
+/// Splits `piece` around characters of a class: matching characters become
+/// pieces of their own (`individual`) or runs; the rest stays as runs.
+fn splitClass(a: Allocator, piece: []const u8, comptime pred: fn (u21) bool, individual: bool, keep: bool, out: *std.ArrayList([]const u8)) !void {
+    var i: usize = 0;
+    while (i < piece.len) {
+        const c = cpAtSlice(piece, i);
+        const start = i;
+        if (pred(c.cp)) {
+            i += c.len;
+            if (!individual) {
+                while (i < piece.len) {
+                    const n = cpAtSlice(piece, i);
+                    if (!pred(n.cp)) break;
+                    i += n.len;
+                }
+            }
+            if (keep) try out.append(a, piece[start..i]);
+        } else {
+            while (i < piece.len) {
+                const n = cpAtSlice(piece, i);
+                if (pred(n.cp)) break;
+                i += n.len;
+            }
+            try out.append(a, piece[start..i]);
+        }
+    }
+}
+
 const RegexSplitter = struct {
     text: []const u8,
     kind: RegexKind,
     pos: usize = 0,
 
-    fn cpAt(self: *const RegexSplitter, i: usize) ?struct { cp: u21, len: usize } {
+    fn cpAt(self: *const RegexSplitter, i: usize) ?Cp {
         if (i >= self.text.len) return null;
-        const n = std.unicode.utf8ByteSequenceLength(self.text[i]) catch return .{ .cp = self.text[i], .len = 1 };
-        if (i + n > self.text.len) return .{ .cp = self.text[i], .len = 1 };
-        const cp = std.unicode.utf8Decode(self.text[i .. i + n]) catch return .{ .cp = self.text[i], .len = 1 };
-        return .{ .cp = cp, .len = n };
+        return cpAtSlice(self.text, i);
     }
 
     fn isNewline(cp: u21) bool {
         return cp == '\r' or cp == '\n';
     }
 
+    /// The next piece: a match of the pattern, or the run of text before the
+    /// next match (`Isolated` behaviour) for patterns that do not cover every character.
     pub fn next(self: *RegexSplitter) ?[]const u8 {
         if (self.pos >= self.text.len) return null;
         const start = self.pos;
-        const end = self.matchOne(start);
-        self.pos = if (end > start) end else start + (self.cpAt(start).?.len);
-        return self.text[start..self.pos];
+        var i = start;
+        while (i < self.text.len) {
+            const end = self.matchOne(i);
+            if (end > i) {
+                if (i > start) {
+                    self.pos = i;
+                    return self.text[start..i];
+                }
+                self.pos = end;
+                return self.text[start..end];
+            }
+            i += self.cpAt(i).?.len;
+        }
+        self.pos = self.text.len;
+        return self.text[start..];
+    }
+
+    fn isUpperAscii(cp: u21) bool {
+        return cp >= 'A' and cp <= 'Z';
+    }
+
+    /// Optional English contraction (`'s`, `'ll`, ...) at `i`, case-insensitive; returns its end or `i`.
+    fn contractionAt(self: *const RegexSplitter, i: usize) usize {
+        const q = self.cpAt(i) orelse return i;
+        if (q.cp != '\'') return i;
+        const c1 = self.cpAt(i + 1) orelse return i;
+        const l1 = std.ascii.toLower(@as(u8, if (c1.cp < 128) @intCast(c1.cp) else 0));
+        if (l1 == 's' or l1 == 't' or l1 == 'm' or l1 == 'd') return i + 1 + c1.len;
+        const c2 = self.cpAt(i + 1 + c1.len) orelse return i;
+        const l2 = std.ascii.toLower(@as(u8, if (c2.cp < 128) @intCast(c2.cp) else 0));
+        if ((l1 == 'r' and l2 == 'e') or (l1 == 'v' and l2 == 'e') or (l1 == 'l' and l2 == 'l')) return i + 1 + c1.len + c2.len;
+        return i;
     }
 
     fn matchOne(self: *const RegexSplitter, start: usize) usize {
         const first = self.cpAt(start).?;
+        switch (self.kind) {
+            .gpt2, .qwen2, .llama3 => {},
+            .o200k => return self.matchO200k(start, first),
+            .deepseek3 => return self.matchDeepseek3(start, first),
+            .digits3 => {
+                if (!isNumber(first.cp)) return start;
+                var i = start;
+                var count: usize = 0;
+                while (self.cpAt(i)) |n| {
+                    if (!isNumber(n.cp) or count == 3) break;
+                    i += n.len;
+                    count += 1;
+                }
+                return i;
+            },
+            .newlines => return if (isNewline(first.cp)) start + first.len else start,
+            .ds2_letters, .ds2_punct => {
+                var i = start;
+                var c = first;
+                if (isWhitespace(c.cp)) {
+                    const n = self.cpAt(i + c.len) orelse return start;
+                    i += c.len;
+                    c = n;
+                }
+                const letters = self.kind == .ds2_letters;
+                if (!(if (letters) isLetter(c.cp) else isDs2Punct(c.cp))) return start;
+                while (self.cpAt(i)) |n| {
+                    if (!(if (letters) isLetter(n.cp) else isDs2Punct(n.cp))) break;
+                    i += n.len;
+                }
+                return i;
+            },
+            .trailing_ws => {
+                if (!isWhitespace(first.cp)) return start;
+                var i = start;
+                while (self.cpAt(i)) |n| {
+                    if (!isWhitespace(n.cp)) return start;
+                    i += n.len;
+                }
+                return i;
+            },
+            .cjk => {
+                if (!isCjk(first.cp)) return start;
+                var i = start;
+                while (self.cpAt(i)) |n| {
+                    if (!isCjk(n.cp)) break;
+                    i += n.len;
+                }
+                return i;
+            },
+        }
         // 1. Contractions: 's 't 're 've 'm 'll 'd (case-insensitive for qwen2/llama3)
         if (first.cp == '\'') {
             if (self.cpAt(start + 1)) |c1| {
@@ -707,6 +994,7 @@ const RegexSplitter = struct {
                 }
                 return self.matchWhitespace(start);
             },
+            .o200k, .deepseek3, .digits3, .newlines, .ds2_letters, .ds2_punct, .trailing_ws, .cjk => unreachable,
             .qwen2, .llama3 => {
                 // '[^\r\n\p{L}\p{N}]?\p{L}+'
                 var i = start;
@@ -778,6 +1066,153 @@ const RegexSplitter = struct {
         }
     }
 
+    /// o200k: `[^\r\n\p{L}\p{N}]?[Upper]*[Lower]+contraction? | [^\r\n\p{L}\p{N}]?[Upper]+[Lower]*contraction? |
+    /// \p{N}{1,3} | ?[^\s\p{L}\p{N}]+[\r\n/]* | \s*[\r\n]+ | \s+(?!\S) | \s+`. Non-ASCII letters count as
+    /// both cases (the pattern's Lm/Lo classes), so only ASCII case changes split a word.
+    fn matchO200k(self: *const RegexSplitter, start: usize, first: Cp) usize {
+        var i = start;
+        var c = first;
+        if (!isNewline(c.cp) and !isLetter(c.cp) and !isNumber(c.cp)) {
+            if (self.cpAt(i + c.len)) |n| {
+                if (isLetter(n.cp)) {
+                    i += c.len;
+                    c = n;
+                }
+            }
+        }
+        if (isLetter(c.cp)) {
+            // Upper run (ASCII capitals or case-less letters), then lower run (everything but ASCII capitals).
+            while (self.cpAt(i)) |n| {
+                if (!isLetter(n.cp) or (n.cp < 128 and !isUpperAscii(n.cp))) break;
+                i += n.len;
+            }
+            while (self.cpAt(i)) |n| {
+                if (!isLetter(n.cp) or isUpperAscii(n.cp)) break;
+                i += n.len;
+            }
+            return self.contractionAt(i);
+        }
+        if (isNumber(first.cp)) {
+            i = start;
+            var count: usize = 0;
+            while (self.cpAt(i)) |n| {
+                if (!isNumber(n.cp) or count == 3) break;
+                i += n.len;
+                count += 1;
+            }
+            return i;
+        }
+        // ` ?[^\s\p{L}\p{N}]+[\r\n/]*`
+        i = start;
+        c = first;
+        if (c.cp == ' ') {
+            if (self.cpAt(i + 1)) |n| {
+                if (!isWhitespace(n.cp) and !isLetter(n.cp) and !isNumber(n.cp)) {
+                    i += 1;
+                    c = n;
+                }
+            }
+        }
+        if (!isWhitespace(c.cp) and !isLetter(c.cp) and !isNumber(c.cp)) {
+            while (self.cpAt(i)) |n| {
+                if (isWhitespace(n.cp) or isLetter(n.cp) or isNumber(n.cp)) break;
+                i += n.len;
+            }
+            while (self.cpAt(i)) |n| {
+                if (!isNewline(n.cp) and n.cp != '/') break;
+                i += n.len;
+            }
+            return i;
+        }
+        return self.matchNewlinesOrWhitespace(start);
+    }
+
+    /// DeepSeek V3: `[ascii punct][A-Za-z]+ | [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+ | ?[\p{P}\p{S}]+[\r\n]* |
+    /// \s*[\r\n]+ | \s+(?!\S) | \s+` (symbols approximated as "neither letter, number nor whitespace").
+    fn matchDeepseek3(self: *const RegexSplitter, start: usize, first: Cp) usize {
+        var i = start;
+        var c = first;
+        if (first.cp < 128 and std.ascii.isPunctuation(@intCast(first.cp))) {
+            if (self.cpAt(i + 1)) |n| {
+                if (n.cp < 128 and std.ascii.isAlphabetic(@intCast(n.cp))) {
+                    i += 1;
+                    while (self.cpAt(i)) |m| {
+                        if (!(m.cp < 128 and std.ascii.isAlphabetic(@intCast(m.cp)))) break;
+                        i += m.len;
+                    }
+                    return i;
+                }
+            }
+        }
+        if (!isNewline(c.cp) and !isLetter(c.cp) and !isPunctOrSymbol(c.cp)) {
+            if (self.cpAt(i + c.len)) |n| {
+                if (isLetter(n.cp)) {
+                    i += c.len;
+                    c = n;
+                }
+            }
+        }
+        if (isLetter(c.cp)) {
+            while (self.cpAt(i)) |n| {
+                if (!isLetter(n.cp)) break;
+                i += n.len;
+            }
+            return i;
+        }
+        i = start;
+        c = first;
+        if (c.cp == ' ') {
+            if (self.cpAt(i + 1)) |n| {
+                if (isPunctOrSymbol(n.cp)) {
+                    i += 1;
+                    c = n;
+                }
+            }
+        }
+        if (isPunctOrSymbol(c.cp)) {
+            while (self.cpAt(i)) |n| {
+                if (!isPunctOrSymbol(n.cp)) break;
+                i += n.len;
+            }
+            while (self.cpAt(i)) |n| {
+                if (!isNewline(n.cp)) break;
+                i += n.len;
+            }
+            return i;
+        }
+        return self.matchNewlinesOrWhitespace(start);
+    }
+
+    /// `\s*[\r\n]+ | \s+(?!\S) | \s+`
+    fn matchNewlinesOrWhitespace(self: *const RegexSplitter, start: usize) usize {
+        var i = start;
+        var saw_nl = false;
+        var j = start;
+        while (self.cpAt(j)) |n| {
+            if (!isWhitespace(n.cp)) break;
+            j += n.len;
+            if (isNewline(n.cp)) {
+                saw_nl = true;
+                i = j;
+            }
+        }
+        if (saw_nl) return i;
+        return self.matchWhitespace(start);
+    }
+
+    fn isPunctOrSymbol(cp: u21) bool {
+        return !isWhitespace(cp) and !isLetter(cp) and !isNumber(cp) and !isNewline(cp);
+    }
+
+    fn isDs2Punct(cp: u21) bool {
+        return (cp >= 0x21 and cp <= 0x2F) or (cp >= 0x3A and cp <= 0x7E) or (cp >= 0xFF01 and cp <= 0xFF0F) or
+            (cp >= 0xFF1A and cp <= 0xFF5E) or (cp >= 0x2018 and cp <= 0x201F) or (cp >= 0x3000 and cp <= 0x3002);
+    }
+
+    fn isCjk(cp: u21) bool {
+        return (cp >= 0x4E00 and cp <= 0x9FA5) or (cp >= 0x0800 and cp < 0x4E00) or (cp >= 0xAC00 and cp <= 0xD7FF);
+    }
+
     /// '\s+(?!\S)|\s+'
     fn matchWhitespace(self: *const RegexSplitter, start: usize) usize {
         var i = start;
@@ -817,6 +1252,29 @@ test "regex splitter llama3 digits" {
     try std.testing.expectEqualStrings(" ", it.next().?);
     try std.testing.expectEqualStrings("123", it.next().?);
     try std.testing.expectEqualStrings("45", it.next().?);
+}
+
+test "pre-tokenizer steps" {
+    var it = RegexSplitter{ .text = "HelloWorld it's 2024/a", .kind = .o200k };
+    const expected = [_][]const u8{ "Hello", "World", " it's", " ", "202", "4", "/a" };
+    for (expected) |e| try std.testing.expectEqualStrings(e, it.next().?);
+    try std.testing.expect(it.next() == null);
+    var ds = RegexSplitter{ .text = "abc 12 é.x", .kind = .deepseek3 };
+    const exp2 = [_][]const u8{ "abc", " ", "12", " é", ".x" };
+    for (exp2) |e| try std.testing.expectEqualStrings(e, ds.next().?);
+    var nl = RegexSplitter{ .text = "a\nb", .kind = .newlines };
+    try std.testing.expectEqualStrings("a", nl.next().?);
+    try std.testing.expectEqualStrings("\n", nl.next().?);
+    try std.testing.expectEqualStrings("b", nl.next().?);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var out = std.ArrayList([]const u8).empty;
+    try splitClass(arena.allocator(), "ab12,c", isNumber, true, true, &out);
+    try std.testing.expectEqual(@as(usize, 4), out.items.len);
+    try std.testing.expectEqualStrings("1", out.items[1]);
+    out.clearRetainingCapacity();
+    try splitClass(arena.allocator(), "a,,b", isPunctuation, false, true, &out);
+    try std.testing.expectEqualStrings(",,", out.items[1]);
 }
 
 test "byte-level bpe round trip" {

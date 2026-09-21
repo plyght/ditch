@@ -320,18 +320,8 @@ fn isByteToken(s: []const u8) bool {
 
 fn addVocab(w: *gguf.Writer, a: Allocator, model: *const Model) !void {
     const tok = model.tokenizer;
-    const byte_level = switch (tok.pre) {
-        .byte_level_regex, .byte_level_plain => true,
-        else => false,
-    };
-    const pre: []const u8 = switch (tok.pre) {
-        .byte_level_regex => |kind| switch (kind) {
-            .qwen2 => "qwen2",
-            .llama3 => "llama-bpe",
-            .gpt2 => "gpt-2",
-        },
-        else => "default",
-    };
+    const byte_level = tok.byte_level;
+    const pre: []const u8 = tok.ggmlPreName() orelse "default";
     try w.addString("tokenizer.ggml.model", if (byte_level) "gpt2" else "llama");
     try w.addString("tokenizer.ggml.pre", pre);
 
