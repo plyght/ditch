@@ -260,6 +260,14 @@ pub const Study = struct {
         try js.beginObject();
         try js.objectField("type");
         try js.write("trial");
+        try writeTrialFields(&js, &copy);
+        try js.endObject();
+        try self.appendLine(buf.written());
+    }
+
+    /// Writes a trial's fields into an open JSON object (the journal record
+    /// and `--json-log` share this).
+    pub fn writeTrialFields(js: *std.json.Stringify, copy: *const Trial) !void {
         try js.objectField("index");
         try js.write(copy.index);
         try js.objectField("params");
@@ -293,8 +301,6 @@ pub const Study = struct {
             try js.endObject();
         }
         try js.endArray();
-        try js.endObject();
-        try self.appendLine(buf.written());
     }
 
     /// Replaces the trial's score of the same name or appends it (the trial's

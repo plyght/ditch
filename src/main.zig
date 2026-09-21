@@ -79,6 +79,8 @@ fn takeInterrupt() bool {
 const Console = struct {
     out: *Io.Writer,
     in: *Io.Reader,
+    /// Whether stdout is a terminal (progress lines are overwritten in place).
+    tty: bool = false,
 
     /// Reads one line from stdin (without the newline); null on end of input.
     fn readLine(self: *Console) !?[]const u8 {
@@ -255,18 +257,26 @@ const App = struct {
         }
         const cfg = search.decode(self.space, vector);
 
-        try out.print("\nRunning trial {d} of {d}...\n", .{ trial_index, n_trials });
-        if (resampled) try out.writeAll("* The proposed parameters repeated an evaluated trial; sampled a random point instead.\n");
-        try out.writeAll("* Parameters:\n");
-        try search.describe(self.space, vector, out);
-        try out.writeAll("* Resetting model...\n");
-        try out.flush();
+        const quiet = self.settings.quiet;
+        const trial_start = Io.Timestamp.now(self.io, .awake);
+        if (!quiet) {
+            try out.print("\nRunning trial {d} of {d}...\n", .{ trial_index, n_trials });
+            if (resampled) try out.writeAll("* The proposed parameters repeated an evaluated trial; sampled a random point instead.\n");
+            try out.writeAll("* Parameters:\n");
+            try search.describe(self.space, vector, out);
+            try out.writeAll("* Resetting model...\n");
+            try out.flush();
+        }
         self.model.resetDeltas();
-        try out.writeAll("* Abliterating...\n");
-        try out.flush();
+        if (!quiet) {
+            try out.writeAll("* Abliterating...\n");
+            try out.flush();
+        }
         try search.applyTrial(self.model, self.dirs, cfg, self.abliterateOptions());
-        try out.writeAll("* Evaluating...\n");
-        try out.flush();
+        if (!quiet) {
+            try out.writeAll("* Evaluating...\n");
+            try out.flush();
+        }
         var scratch = std.heap.ArenaAllocator.init(gpa);
         defer scratch.deinit();
         const sa = scratch.allocator();
@@ -275,14 +285,23 @@ const App = struct {
         if (self.settings.early_stop) front = try self.study.frontLosses(sa);
         const scores = try self.evaluator.evaluate(sa, self.engine, out, front);
         const pruned = scorers.Evaluator.prunedOf(scores);
-        try printScores(out, scores);
-
+        const trial_seconds = secondsSince(self.io, trial_start);
         const elapsed = secondsSince(self.io, self.optimization_start);
         const done: f64 = @floatFromInt(trial_index - self.start_index);
         const remaining = elapsed / done * @as(f64, @floatFromInt(n_trials - trial_index));
         var buf: [64]u8 = undefined;
-        try out.print("\nElapsed time: {s}\n", .{formatDuration(&buf, elapsed)});
-        if (trial_index < n_trials) try out.print("Estimated remaining time: {s}\n", .{formatDuration(&buf, remaining)});
+        if (quiet) {
+            // One line per trial: "trial 3/50: kl=0.0123 refusals=4/100 (12.3 s, 9 min left)".
+            try out.print("trial {d}/{d}:", .{ trial_index, n_trials });
+            for (scores) |s| try out.print(" {s}={s}", .{ s.name, s.score.display });
+            try out.print(" ({d:.1} s", .{trial_seconds});
+            if (trial_index < n_trials) try out.print(", {s} left", .{formatDuration(&buf, remaining)});
+            try out.writeAll(")\n");
+        } else {
+            try printScores(out, scores);
+            try out.print("\nElapsed time: {s}\n", .{formatDuration(&buf, elapsed)});
+            if (trial_index < n_trials) try out.print("Estimated remaining time: {s}\n", .{formatDuration(&buf, remaining)});
+        }
         if (self.settings.print_debug_information) {
             try self.budget.report().print(out, "Memory");
             if (self.model.expert_cache) |c| try c.stats().print(out, "Expert cache");
@@ -292,7 +311,7 @@ const App = struct {
         const losses = try self.evaluator.objectiveLosses(sa, scores);
         const records = try sa.alloc(study_mod.ScoreRecord, scores.len);
         for (scores, 0..) |s, i| records[i] = .{ .name = s.name, .value = s.score.value, .display = s.score.display };
-        try self.study.addTrial(gpa, .{
+        const trial = study_mod.Trial{
             .index = trial_index,
             .params = vector,
             .losses = losses,
@@ -300,7 +319,26 @@ const App = struct {
             .parameters = cfg.parameters,
             .scores = records,
             .state = if (pruned != null) .pruned else .complete,
-        });
+        };
+        try self.study.addTrial(gpa, trial);
+        if (self.settings.json_log) |path| try appendJsonLog(gpa, self.io, path, &trial, trial_seconds);
+    }
+
+    /// `--json-log`: appends the trial as one JSON object (the journal's fields
+    /// plus the wall-clock time of the trial) to `path`.
+    fn appendJsonLog(gpa: Allocator, io: Io, path: []const u8, trial: *const study_mod.Trial, seconds: f64) !void {
+        var buf: Io.Writer.Allocating = .init(gpa);
+        defer buf.deinit();
+        var js: std.json.Stringify = .{ .writer = &buf.writer };
+        try js.beginObject();
+        try study_mod.Study.writeTrialFields(&js, trial);
+        try js.objectField("seconds");
+        try js.write(seconds);
+        try js.endObject();
+        try buf.writer.writeAll("\n");
+        const file = try Io.Dir.cwd().createFile(io, path, .{ .truncate = false });
+        defer file.close(io);
+        try file.writePositionalAll(io, buf.written(), try file.length(io));
     }
 
     /// Prints the time-limit notice; the study journal holds every completed trial.
@@ -705,6 +743,7 @@ const App = struct {
         defer printed.deinit(gpa);
         var pos = ids.len;
         var token = argmax(logits);
+        const decode_start = Io.Timestamp.now(self.io, .awake);
         var step: usize = 0;
         while (step < max_new) : (step += 1) {
             if (model.isEos(token)) break;
@@ -745,6 +784,10 @@ const App = struct {
         if (full.len > printed.items.len and std.mem.startsWith(u8, full, printed.items)) {
             try out.writeAll(full[printed.items.len..]);
         }
+        const decode_seconds = secondsSince(self.io, decode_start);
+        if (generated.items.len > 0) {
+            try out.print("\n[{d} tokens, {d:.1} tokens/s]", .{ generated.items.len, @as(f64, @floatFromInt(generated.items.len)) / @max(decode_seconds, 1e-9) });
+        }
         try out.flush();
         return gpa.dupe(u8, full);
     }
@@ -759,7 +802,19 @@ fn detectBatchSize(gpa: Allocator, io: Io, engine: *Engine, settings: *config.Se
     var batch_size: usize = 1;
     var best_batch_size: usize = 1;
     var best_performance: f64 = -1;
+    const longest = try maxPromptTokens(gpa, engine, good_prompts);
     while (batch_size <= settings.max_batch_size) {
+        // Under a memory budget, stop before a batch whose KV cache and
+        // workspace could not be resident (it would only spill and slow down).
+        if (batch_size > 1) {
+            const c = &engine.model.config;
+            const kv = model_mod.KvCache.bytesFor(c.num_layers, batch_size, longest + settings.max_response_length + 1, c.num_kv_heads * c.head_dim);
+            const rows = batch_size * longest;
+            if (engine.workspaceRows(rows, batch_size, kv) < rows) {
+                try out.print("* Batch size {d} would exceed the memory budget; keeping {d}\n", .{ batch_size, best_batch_size });
+                break;
+            }
+        }
         try out.print("* Trying batch size {d}... ", .{batch_size});
         try out.flush();
         const prompts = try gpa.alloc(Prompt, batch_size);
@@ -1056,7 +1111,7 @@ pub fn main(init: std.process.Init) !void {
     defer out.flush() catch {};
     var in_buf: [4096]u8 = undefined;
     var fr = Io.File.stdin().readerStreaming(io, &in_buf);
-    var con = Console{ .out = out, .in = &fr.interface };
+    var con = Console{ .out = out, .in = &fr.interface, .tty = Io.File.stdout().isTty(io) catch false };
 
     run(init, &con) catch |err| {
         out.flush() catch {};
@@ -1099,9 +1154,6 @@ fn run(init: std.process.Init, con: *Console) !void {
     const io = init.io;
     const out = con.out;
 
-    try out.print("{s}  v{s}  ditches censorship.  https://github.com/plyght/ditch\n", .{ banner, config.version });
-    try out.writeAll("  Built on Heretic: https://github.com/p-e-w/heretic\n\n");
-
     // Settings.
     const raw_args = try init.minimal.args.toSlice(arena);
     var args = try arena.alloc([]const u8, raw_args.len);
@@ -1117,14 +1169,19 @@ fn run(init: std.process.Init, con: *Console) !void {
     defer loaded.deinit();
     const settings = &loaded.settings;
     settings.bench = is_bench;
+    if (settings.version) {
+        try out.print("ditch {s} (zig {s}, {s}-{s}, {s})\n", .{ config.version, builtin.zig_version_string, @tagName(builtin.cpu.arch), @tagName(builtin.os.tag), @tagName(builtin.mode) });
+        return;
+    }
+    if (!settings.quiet) {
+        try out.print("{s}  v{s}  ditches censorship.  https://github.com/plyght/ditch\n", .{ banner, config.version });
+        try out.writeAll("  Built on Heretic: https://github.com/p-e-w/heretic\n\n");
+    }
     if (settings.help) {
         try out.writeAll(config.help_text);
         return;
     }
-    if (settings.version) {
-        try out.print("ditch {s}\n", .{config.version});
-        return;
-    }
+    if (settings.quiet) engine_mod.progress_style = .off else if (con.tty) engine_mod.progress_style = .tty;
     if (loaded.errors.len > 0) {
         try out.print("Configuration contains {d} error(s):\n", .{loaded.errors.len});
         for (loaded.errors) |e| try out.print("  * {s}\n", .{e});
@@ -1281,6 +1338,14 @@ fn run(init: std.process.Init, con: *Console) !void {
         else => return err,
     };
     try out.flush();
+    if (settings.dry_run) {
+        if (!(budget.limited() or settings.print_debug_information)) {
+            try out.writeAll("\n");
+            try estimate.print(out);
+        }
+        try out.writeAll("\nDry run: the model, prompts and memory estimate are in order; stopping here.\n");
+        return;
+    }
 
     if (settings.batch_size == 0) {
         try detectBatchSize(gpa, io, &engine, settings, good_prompts, out);

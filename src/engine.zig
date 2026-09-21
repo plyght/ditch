@@ -16,6 +16,52 @@ const Allocator = std.mem.Allocator;
 const Model = model_mod.Model;
 const Prompt = hf.Prompt;
 
+/// How progress lines are shown: overwritten in place on a terminal, printed
+/// at most a few times per phase otherwise, or not at all (`--quiet`).
+pub const ProgressStyle = enum { tty, plain, off };
+pub var progress_style: ProgressStyle = .plain;
+
+/// A "done/total" progress line with elapsed and remaining time.
+pub const Progress = struct {
+    out: *Io.Writer,
+    io: Io,
+    label: []const u8,
+    total: usize,
+    start: Io.Timestamp,
+    last_quarter: usize = 0,
+
+    pub fn init(out: *Io.Writer, io: Io, label: []const u8, total: usize) Progress {
+        return .{ .out = out, .io = io, .label = label, .total = total, .start = Io.Timestamp.now(io, .awake) };
+    }
+
+    /// Reports `done` of `total` items complete.
+    pub fn update(self: *Progress, done: usize) void {
+        const elapsed = @as(f64, @floatFromInt(self.start.durationTo(Io.Timestamp.now(self.io, .awake)).nanoseconds)) / 1e9;
+        switch (progress_style) {
+            .off => return,
+            .tty => {},
+            .plain => {
+                // Without a terminal: one line per quarter, and only for phases that take a while.
+                const quarter = done * 4 / @max(self.total, 1);
+                if (quarter == self.last_quarter or elapsed < 2.0) return;
+                self.last_quarter = quarter;
+            },
+        }
+        const remaining = if (done > 0) elapsed / @as(f64, @floatFromInt(done)) * @as(f64, @floatFromInt(self.total - @min(done, self.total))) else 0;
+        if (progress_style == .tty) self.out.writeAll("\r") catch {};
+        self.out.print("  {d}/{d} {s} ({d:.0} s elapsed, {d:.0} s remaining)", .{ done, self.total, self.label, elapsed, remaining }) catch {};
+        if (progress_style == .tty) self.out.print("{s: <6}", .{""}) catch {} else self.out.writeAll("\n") catch {};
+        self.out.flush() catch {};
+    }
+
+    /// Clears the line on a terminal.
+    pub fn finish(self: *Progress) void {
+        if (progress_style != .tty) return;
+        self.out.print("\r{s: <72}\r", .{""}) catch {};
+        self.out.flush() catch {};
+    }
+};
+
 pub const Engine = struct {
     gpa: Allocator,
     model: *Model,
@@ -232,6 +278,7 @@ pub const Engine = struct {
     /// the winsorised residual, averaged over the last `window` prompt tokens.
     /// Returns the number of prompts seen.
     fn forEachResidual(self: *Engine, gpa: Allocator, prompts: []const Prompt, progress: ?*Io.Writer, window: usize, ctx: anytype) !usize {
+        var prog: ?Progress = if (progress) |pw| Progress.init(pw, self.model.io, "prompts", prompts.len) else null;
         const c = &self.model.config;
         const entries = c.num_layers + 1;
         const hidden = c.hidden_size;
@@ -294,16 +341,10 @@ pub const Engine = struct {
                 }
             }
             count += ids.len;
-            if (progress) |pw| {
-                pw.print("\r  {d}/{d} prompts", .{ count, prompts.len }) catch {};
-                pw.flush() catch {};
-            }
+            if (prog) |*pg| pg.update(count);
             start = end;
         }
-        if (progress) |pw| {
-            pw.writeAll("\r") catch {};
-            pw.print("{s: <40}\r", .{""}) catch {};
-        }
+        if (prog) |*pg| pg.finish();
         return count;
     }
 

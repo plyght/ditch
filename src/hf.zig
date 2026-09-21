@@ -298,7 +298,7 @@ pub fn resolveModel(arena: Allocator, http: *Http, cache_root: []const u8, model
     defer dir.close(io);
 
     // List repository files.
-    const api_url = try std.fmt.allocPrint(arena, "https://huggingface.co/api/models/{s}/revision/{s}", .{ model, rev });
+    const api_url = try std.fmt.allocPrint(arena, "https://huggingface.co/api/models/{s}/revision/{s}?blobs=true", .{ model, rev });
     const info_text = http.get(api_url) catch |err| switch (err) {
         error.NotFound => {
             std.log.err("model {s} not found on Hugging Face (revision {s})", .{ model, rev });
@@ -322,6 +322,8 @@ pub fn resolveModel(arena: Allocator, http: *Http, cache_root: []const u8, model
     defer parsed.deinit();
     const siblings = (parsed.value.object.get("siblings") orelse return error.InvalidResponse).array;
     var wanted = std.ArrayList([]const u8).empty;
+    var missing_files: usize = 0;
+    var missing_bytes: u64 = 0;
     for (siblings.items) |s| {
         const name = s.object.get("rfilename").?.string;
         if (std.mem.indexOfScalar(u8, name, '/') != null) continue; // nested (e.g. original/) files
@@ -330,9 +332,21 @@ pub fn resolveModel(arena: Allocator, http: *Http, cache_root: []const u8, model
             std.mem.eql(u8, name, "chat_template.jinja") or std.mem.eql(u8, name, "special_tokens_map.json") or
             std.mem.eql(u8, name, "model.safetensors.index.json") or
             (std.mem.endsWith(u8, name, ".safetensors") and !std.mem.startsWith(u8, name, "consolidated"));
-        if (keep) try wanted.append(arena, try arena.dupe(u8, name));
+        if (keep) {
+            try wanted.append(arena, try arena.dupe(u8, name));
+            if (!isLocalFile(io, try std.fs.path.join(arena, &.{ model_dir, name }))) {
+                missing_files += 1;
+                if (s.object.get("size")) |sz| if (sz == .integer) {
+                    missing_bytes += @intCast(@max(sz.integer, 0));
+                };
+            }
+        }
     }
     if (wanted.items.len == 0) return error.ModelNotFound;
+    if (missing_files > 0) {
+        try out.print("* {d} file(s) to download ({d:.2} GB) into {s}\n", .{ missing_files, @as(f64, @floatFromInt(missing_bytes)) / 1e9, model_dir });
+        try out.flush();
+    }
     for (wanted.items) |name| {
         if (isLocalFile(io, try std.fs.path.join(arena, &.{ model_dir, name }))) continue;
         if (std.mem.endsWith(u8, name, ".safetensors")) {
@@ -465,7 +479,10 @@ fn loadHfRows(arena: Allocator, http: *Http, cache_root: []const u8, spec: confi
         const text = cwd.readFileAlloc(io, splits_path, arena, .unlimited) catch blk: {
             const url = try std.fmt.allocPrint(arena, "https://datasets-server.huggingface.co/splits?dataset={s}", .{spec.dataset});
             const body = http.get(url) catch |err| {
-                std.log.err("could not query datasets-server for {s}: {s}", .{ spec.dataset, @errorName(err) });
+                switch (err) {
+                    error.NotFound, error.Forbidden => std.log.err("dataset {s} is not available through the datasets-server API ({s}); it must be public and viewable in the Hub's dataset viewer, or pass a local text file with one prompt per line", .{ spec.dataset, @errorName(err) }),
+                    else => std.log.err("could not query datasets-server for {s}: {s}", .{ spec.dataset, @errorName(err) }),
+                }
                 return err;
             };
             defer http.gpa.free(body);

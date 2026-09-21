@@ -393,7 +393,12 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         if (getStr(obj, "model_type")) |m| model_type = m;
     }
     const arch = lookup(model_type) orelse lookup(top_type) orelse {
-        std.log.err("unsupported model_type: {s}", .{model_type});
+        var names: std.Io.Writer.Allocating = .init(arena);
+        for (&registry, 0..) |*a, i| {
+            if (i > 0) try names.writer.writeAll(", ");
+            try names.writer.writeAll(a.model_type);
+        }
+        std.log.err("unsupported model_type: {s} (supported: {s})", .{ model_type, names.written() });
         return error.UnsupportedArchitecture;
     };
     // Nested attention config (MPT).
