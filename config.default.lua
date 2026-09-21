@@ -200,12 +200,27 @@ return {
   -- -------------------------------------------------------------------------
   -- Memory budget
   -- -------------------------------------------------------------------------
-  -- With max_ram set, weights are streamed from disk layer by layer, the KV
-  -- cache and activations spill to scratch_dir when they do not fit, and the
-  -- run stops cleanly when time_limit expires. Unset = load everything (the
-  -- weights are memory-mapped and resident memory is not bounded).
+  -- With max_ram set, weights are streamed from disk layer by layer (the
+  -- whole model is re-read for every generated token, so decoding is bound
+  -- by storage bandwidth), the KV cache and activations spill to scratch_dir
+  -- when they do not fit, and a feasibility estimate is printed and checked
+  -- before anything runs. Unset (or 0) = load everything: the weights are
+  -- memory-mapped and resident memory is not bounded. Sizes accept B, KB, MB
+  -- and GB; durations accept s, m, h, d and combinations such as "1h30m"
+  -- (a plain number is seconds).
   -- max_ram = "8GB",
+  -- Part of max_ram reserved for everything ditch does not allocate itself
+  -- (tokenizer, config, the runtime); default max(10% of max_ram, 256MB),
+  -- at most half of max_ram. "0" hands the whole budget to the model.
+  -- budget_headroom = "1GB",
+  -- Accepted for compatibility with heretic; unused (there is no GPU backend).
+  -- max_vram = "24GB",
+  -- Directory for spilled activations and KV caches
+  -- (default: <cache_dir>/scratch, else ./scratch).
   -- scratch_dir = home .. "/.cache/ditch/scratch",
+  -- Wall-clock limit for the whole run. When it expires the optimisation
+  -- stops cleanly (exit status 0) with the completed trials journaled, so
+  -- `ditch <model> --checkpoint-action continue` resumes it.
   -- time_limit = "2h",
 
   -- -------------------------------------------------------------------------

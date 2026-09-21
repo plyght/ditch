@@ -2,15 +2,33 @@
 
 **ditch** is a from-scratch Zig rebuild of [Heretic](https://github.com/p-e-w/heretic),
 Philipp Emanuel Weidmann's tool for fully automatic censorship removal
-("abliteration") of transformer language models. It runs the same algorithm,
-reads the same configuration format, produces the same kind of Hugging Face
-model directory, and needs nothing but a C-free static binary: no Python,
-no PyTorch, no GPU.
+("abliteration") of transformer language models. It runs Heretic's method
+(difference-of-means refusal directions, a per-layer weight kernel, and a
+multi-objective TPE that co-minimises refusals and KL divergence), produces
+the same kind of Hugging Face model directory, and ships as one dependency-free
+binary: no Python, no PyTorch, no GPU required.
 
-Everything that makes Heretic work is Heretic's idea; ditch only re-implements
-it. Please credit Heretic and its author if you use the results, and read the
-paper that underlies both tools: Arditi et al., *Refusal in Language Models Is
-Mediated by a Single Direction* (2024), <https://arxiv.org/abs/2406.11717>.
+The method is Heretic's; please credit Heretic and its author if you use the
+results, and read the paper that underlies both tools: Arditi et al., *Refusal
+in Language Models Is Mediated by a Single Direction* (2024),
+<https://arxiv.org/abs/2406.11717>.
+
+What ditch adds on top of the port:
+
+* **Runs where the weights do not fit.** A memory budget (`--max-ram`) streams
+  weights layer by layer, spills the KV cache to scratch storage, and stops
+  cleanly at a time limit, so the whole workflow finishes on machines that
+  cannot hold the model.
+* **Mixture-of-experts aware.** Per-expert edits, and expert-selective
+  abliteration that ranks experts by their alignment with the refusal
+  direction and searches over how many to touch, with Heretic's broad edit
+  kept as a candidate.
+* **A cheaper search.** Early stopping of dominated trials, warm starts from
+  earlier studies, and optional multi-direction ablation.
+* **Reproducible outputs.** Every export carries a Lua manifest with content
+  hashes and the exact parameters; `ditch --reproduce` rebuilds the model.
+* **Lua configuration** and a built-in `ditch bench` harness for honest
+  before/after numbers.
 
 ## Install
 
@@ -58,6 +76,8 @@ so an interrupted run (Ctrl+C) can be resumed.
 * Qwen2 / Qwen2.5
 * Qwen3
 * Gemma 2 / Gemma 3 (text only)
+* Qwen3-MoE, Qwen2-MoE and Mixtral (mixture-of-experts; separate and fused
+  expert tensor layouts)
 
 Weights are read from safetensors in F32, F16 or BF16. Sharded checkpoints are
 supported.
@@ -69,9 +89,55 @@ per-expert deltas and optional expert-selective abliteration: experts are
 ranked by how well their down projections align with the refusal direction, and
 the number of edited experts and the edit strength become part of the search
 (`--expert-selection ranked|random|broad`, the broad edit of every expert stays
-a candidate). Large models can run within a memory budget (`--max-ram`,
-`--scratch-dir`, `--time-limit`): weights are streamed layer by layer and the
-KV cache spills to scratch storage. Both are documented in `config.default.lua`.
+a candidate).
+
+Models that do not fit in RAM can run within a memory budget:
+
+```sh
+ditch Qwen/Qwen3-30B-A3B --max-ram 12GB --scratch-dir /fast/disk/scratch --time-limit 90m
+```
+
+* `--max-ram <size>` (Lua: `max_ram = "12GB"`) switches the weight store from
+  memory mapping to *streaming*: only the layer being computed (plus, when it
+  fits, the prefetched next one) is resident, and every large buffer ditch
+  allocates is counted against the budget. Abliteration touches one matrix at a
+  time, exports are written in row chunks (fused expert tensors one expert at a
+  time) and the KV cache and residual stream spill to scratch files when they
+  do not fit. Mixture-of-experts layers stream too: all expert matrices of a
+  layer are acquired together and released with the layer, including the
+  fused `[E, ...]` layouts, which are sliced (and transposed where needed)
+  straight out of the stacked tensor.
+* What streamed mode costs: a forward pass re-reads every layer and the LM
+  head from disk, so **the whole model is read once per generated token** and
+  decode speed is bound by storage bandwidth, not compute (a 15GB model on a
+  1GB/s SSD decodes at most ~1 token per 15 s per batch; prefill and scoring
+  batch many tokens per read and are far less affected). Spilled caches add
+  scratch traffic on top. Use the largest budget you can, and a fast local
+  disk for `--scratch-dir` (default `<cache-dir>/scratch`).
+* Before anything runs ditch prints a `Memory estimate` (weights, largest
+  layer, workspace, KV cache, export peak, and what streamed vs mapped mode
+  would need) and refuses with a `Memory budget too small` explanation and
+  exit status 2 when even the minimum resident set does not fit. Part of the
+  budget is reserved as headroom for allocations outside ditch's control
+  (default `max(10% of --max-ram, 256MB)`, at most half); `--budget-headroom
+  <size>` overrides it (`0` gives the whole budget to the model). A memory
+  report (budgeted peak, process RSS, weight and scratch traffic) is printed
+  after every trial with `--print-debug-information` and once at exit.
+* `--time-limit <duration>` (`90m`, `2h`, `1h30m`, plain seconds) stops the
+  optimisation cleanly when it expires: the completed trials are in the study
+  journal, the process exits with status 0 and `--checkpoint-action continue`
+  resumes the study. A limit that expires during an export leaves the output
+  directory marked incomplete (see below) and exits non-zero.
+* Exports write a `.incomplete` marker file before the first shard and delete
+  it only after every file was written; a directory still containing
+  `.incomplete` (export interrupted, out of disk, time limit) is refused by
+  ditch when loaded. After a successful save the export is reloaded through
+  the streamed path and its first-token logits compared with the in-memory
+  model (`max |Δ|` and argmax agreement are printed).
+* `--max-vram` is accepted for command-line compatibility with heretic and
+  ignored (there is no GPU backend).
+
+All of this is documented in `config.default.lua` as well.
 
 ### Datasets
 

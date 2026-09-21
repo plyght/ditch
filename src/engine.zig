@@ -9,6 +9,7 @@ const chat = @import("chat.zig");
 const config = @import("config.zig");
 const hf = @import("hf.zig");
 const tensor = @import("tensor.zig");
+const stream = @import("stream.zig");
 const directions = @import("directions.zig");
 
 const Allocator = std.mem.Allocator;
@@ -29,17 +30,35 @@ pub const Engine = struct {
     }
 
     pub fn deinit(self: *Engine) void {
-        if (self.ws) |*w| w.deinit();
+        self.releaseWorkspace();
     }
 
-    fn ensureWorkspace(self: *Engine, rows: usize, logit_rows: usize) !*model_mod.Workspace {
+    /// Frees the cached forward workspace (it is recreated on the next call);
+    /// used to give memory back to the budget before another model runs.
+    pub fn releaseWorkspace(self: *Engine) void {
+        if (self.ws) |*w| w.deinit();
+        self.ws = null;
+    }
+
+    /// Rows the forward workspace may hold under the memory budget (see `stream.workspaceRows`).
+    pub fn workspaceRows(self: *Engine, wanted: usize, logit_rows: usize, kv_bytes: u64) usize {
+        return stream.workspaceRows(self.model, wanted, logit_rows, kv_bytes);
+    }
+
+    fn ensureWorkspace(self: *Engine, rows: usize, logit_rows: usize, kv_bytes: u64) !*model_mod.Workspace {
         if (self.ws) |*w| {
             if (w.max_rows >= rows and w.max_logit_rows >= logit_rows) return w;
             w.deinit();
             self.ws = null;
         }
-        self.ws = try model_mod.Workspace.init(self.gpa, &self.model.config, rows, logit_rows);
+        const capped = self.workspaceRows(rows, logit_rows, kv_bytes);
+        self.ws = try model_mod.Workspace.init(self.gpa, &self.model.config, capped, logit_rows);
         return &self.ws.?;
+    }
+
+    fn kvBytes(self: *Engine, batch: usize, max_len: usize) u64 {
+        const c = &self.model.config;
+        return model_mod.KvCache.bytesFor(c.num_layers, batch, max_len, c.num_kv_heads * c.head_dim);
     }
 
     /// Renders the chat template and appends the response prefix.
@@ -108,9 +127,8 @@ pub const Engine = struct {
     /// slices are allocated with `self.model.gpa` (see `model_mod.generate`).
     pub fn generateBatch(self: *Engine, gpa: Allocator, ids: []const []u32, max_new_tokens: usize) ![][]u32 {
         const tm = totalAndMax(ids);
-        const c = &self.model.config;
-        const ws = try self.ensureWorkspace(@max(tm.total, 1), @max(ids.len, 1));
-        var cache = try model_mod.KvCache.init(gpa, c.num_layers, ids.len, tm.max + max_new_tokens + 1, c.num_kv_heads * c.head_dim);
+        const ws = try self.ensureWorkspace(@max(tm.total, 1), @max(ids.len, 1), self.kvBytes(ids.len, tm.max + max_new_tokens + 1));
+        var cache = try model_mod.KvCache.initFor(self.model, gpa, ids.len, tm.max + max_new_tokens + 1);
         defer cache.deinit();
         return model_mod.generate(self.model, ws, &cache, ids, max_new_tokens);
     }
@@ -126,8 +144,8 @@ pub const Engine = struct {
             const ids = try self.encodeBatch(gpa, prompts[start..end]);
             defer freeBatch(gpa, ids);
             const tm = totalAndMax(ids);
-            const ws = try self.ensureWorkspace(@max(tm.total, 1), @max(ids.len, 1));
-            var cache = try model_mod.KvCache.init(gpa, c.num_layers, ids.len, tm.max + 1, c.num_kv_heads * c.head_dim);
+            const ws = try self.ensureWorkspace(@max(tm.total, 1), @max(ids.len, 1), self.kvBytes(ids.len, tm.max + 1));
+            var cache = try model_mod.KvCache.initFor(self.model, gpa, ids.len, tm.max + 1);
             defer cache.deinit();
             try model_mod.prefill(self.model, ws, &cache, ids, out[start * c.vocab_size ..][0 .. ids.len * c.vocab_size], null);
             start = end;
@@ -157,8 +175,8 @@ pub const Engine = struct {
             const ids = try self.encodeBatch(gpa, prompts[start..end]);
             defer freeBatch(gpa, ids);
             const tm = totalAndMax(ids);
-            const ws = try self.ensureWorkspace(@max(tm.total, 1), @max(ids.len, 1));
-            var cache = try model_mod.KvCache.init(gpa, c.num_layers, ids.len, tm.max + 1, c.num_kv_heads * c.head_dim);
+            const ws = try self.ensureWorkspace(@max(tm.total, 1), @max(ids.len, 1), self.kvBytes(ids.len, tm.max + 1));
+            var cache = try model_mod.KvCache.initFor(self.model, gpa, ids.len, tm.max + 1);
             defer cache.deinit();
             const res = try gpa.alloc(f32, entries * ids.len * hidden);
             defer gpa.free(res);

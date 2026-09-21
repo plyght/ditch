@@ -1,5 +1,7 @@
 //! Reading and writing of the safetensors format (https://github.com/huggingface/safetensors).
-//! Files are memory-mapped for reading so weights are never copied unless needed.
+//! Files are memory-mapped for reading by default so weights are never copied
+//! unless needed; `File.openOptions` with `.map = false` parses only the header
+//! and leaves the tensor bytes on disk (see stream.zig for positional reads).
 
 const std = @import("std");
 const Io = std.Io;
@@ -10,8 +12,12 @@ pub const TensorInfo = struct {
     name: []const u8,
     dtype: DType,
     shape: []const usize,
-    /// Raw bytes inside the mapped file.
+    /// Raw bytes inside the mapped file (empty when the file was opened without mapping).
     data: []const u8,
+    /// Absolute byte offset of the tensor data within the file.
+    offset: u64,
+    /// Length of the tensor data in bytes.
+    byte_len: usize,
 
     pub fn numel(self: TensorInfo) usize {
         var n: usize = 1;
@@ -19,30 +25,51 @@ pub const TensorInfo = struct {
         return n;
     }
 
-    pub fn asWeight(self: TensorInfo) tensor.Weight {
+    pub fn rows(self: TensorInfo) usize {
         std.debug.assert(self.shape.len >= 1);
-        const rows = self.shape[0];
-        const cols = if (self.shape.len == 1) 1 else self.numel() / rows;
-        return .{ .data = self.data, .dtype = self.dtype, .rows = rows, .cols = cols };
+        return self.shape[0];
     }
+
+    pub fn cols(self: TensorInfo) usize {
+        return if (self.shape.len == 1) 1 else self.numel() / self.rows();
+    }
+
+    /// A view over the mapped bytes. Only valid for files opened with `.map = true`.
+    pub fn asWeight(self: TensorInfo) tensor.Weight {
+        std.debug.assert(self.data.len == self.byte_len);
+        return .{ .data = self.data, .dtype = self.dtype, .rows = self.rows(), .cols = self.cols() };
+    }
+};
+
+pub const OpenOptions = struct {
+    /// Memory-map the whole file. When false only the header is read and
+    /// `TensorInfo.data` is empty; tensor bytes must be read positionally.
+    map: bool = true,
 };
 
 pub const File = struct {
     path: []const u8,
     file: Io.File,
-    map: Io.File.MemoryMap,
+    map: ?Io.File.MemoryMap,
     header_len: usize,
+    /// Total file length in bytes.
+    len: u64,
     tensors: std.StringArrayHashMapUnmanaged(TensorInfo),
     arena: std.heap.ArenaAllocator,
 
     pub fn open(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, sub_path: []const u8) !*File {
+        return openOptions(gpa, io, dir, sub_path, .{});
+    }
+
+    pub fn openOptions(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, sub_path: []const u8, options: OpenOptions) !*File {
         const self = try gpa.create(File);
         errdefer gpa.destroy(self);
         self.* = .{
             .path = undefined,
             .file = undefined,
-            .map = undefined,
+            .map = null,
             .header_len = 0,
+            .len = 0,
             .tensors = .{},
             .arena = std.heap.ArenaAllocator.init(gpa),
         };
@@ -52,19 +79,38 @@ pub const File = struct {
         self.file = try dir.openFile(io, sub_path, .{});
         errdefer self.file.close(io);
         const len: usize = @intCast(try self.file.length(io));
+        self.len = len;
         if (len < 8) return error.InvalidSafetensors;
-        self.map = try Io.File.MemoryMap.create(io, self.file, .{
-            .len = len,
-            .protection = .{ .read = true, .write = false },
-            .populate = false,
-        });
-        errdefer self.map.destroy(io);
-        const bytes = self.map.memory[0..len];
-        const n = std.mem.readInt(u64, bytes[0..8], .little);
-        if (n > len - 8) return error.InvalidSafetensors;
-        self.header_len = @intCast(n);
-        const header = bytes[8 .. 8 + self.header_len];
-        const data = bytes[8 + self.header_len ..];
+        var header_owned: ?[]u8 = null;
+        defer if (header_owned) |h| gpa.free(h);
+        var header: []const u8 = undefined;
+        var data: []const u8 = &.{};
+        if (options.map) {
+            self.map = try Io.File.MemoryMap.create(io, self.file, .{
+                .len = len,
+                .protection = .{ .read = true, .write = false },
+                .populate = false,
+            });
+            const bytes = self.map.?.memory[0..len];
+            const n = std.mem.readInt(u64, bytes[0..8], .little);
+            if (n > len - 8) return error.InvalidSafetensors;
+            self.header_len = @intCast(n);
+            header = bytes[8 .. 8 + self.header_len];
+            data = bytes[8 + self.header_len ..];
+        } else {
+            var len_buf: [8]u8 = undefined;
+            if (try self.file.readPositionalAll(io, &len_buf, 0) != 8) return error.InvalidSafetensors;
+            const n = std.mem.readInt(u64, &len_buf, .little);
+            if (n > len - 8) return error.InvalidSafetensors;
+            self.header_len = @intCast(n);
+            const h = try gpa.alloc(u8, self.header_len);
+            header_owned = h;
+            if (try self.file.readPositionalAll(io, h, 8) != h.len) return error.InvalidSafetensors;
+            header = h;
+        }
+        errdefer if (self.map) |*m| m.destroy(io);
+        const data_start: u64 = 8 + @as(u64, self.header_len);
+        const data_len: usize = len - 8 - self.header_len;
 
         var parsed = try std.json.parseFromSlice(std.json.Value, gpa, header, .{});
         defer parsed.deinit();
@@ -86,19 +132,21 @@ pub const File = struct {
             const offs = (obj.object.get("data_offsets") orelse return error.InvalidSafetensors).array;
             const start: usize = @intCast(offs.items[0].integer);
             const end: usize = @intCast(offs.items[1].integer);
-            if (end > data.len or start > end) return error.InvalidSafetensors;
+            if (end > data_len or start > end) return error.InvalidSafetensors;
             try self.tensors.put(arena, try arena.dupe(u8, name), .{
                 .name = try arena.dupe(u8, name),
                 .dtype = dtype,
                 .shape = shape,
-                .data = data[start..end],
+                .data = if (options.map) data[start..end] else &.{},
+                .offset = data_start + start,
+                .byte_len = end - start,
             });
         }
         return self;
     }
 
     pub fn close(self: *File, gpa: std.mem.Allocator, io: Io) void {
-        self.map.destroy(io);
+        if (self.map) |*m| m.destroy(io);
         self.file.close(io);
         self.arena.deinit();
         gpa.destroy(self);
@@ -106,6 +154,25 @@ pub const File = struct {
 
     pub fn get(self: *const File, name: []const u8) ?TensorInfo {
         return self.tensors.get(name);
+    }
+
+    pub fn isMapped(self: *const File) bool {
+        return self.map != null;
+    }
+
+    /// Reads `info`'s bytes from disk into `out` (which must be at least `byte_len` long).
+    pub fn readTensor(self: *const File, io: Io, info: TensorInfo, out: []u8) !void {
+        try self.readRange(io, info.offset, out[0..info.byte_len]);
+    }
+
+    /// Positional read of `out.len` bytes at absolute file `offset`.
+    pub fn readRange(self: *const File, io: Io, offset: u64, out: []u8) !void {
+        if (self.map) |m| {
+            @memcpy(out, m.memory[@intCast(offset)..][0..out.len]);
+            return;
+        }
+        const n = try self.file.readPositionalAll(io, out, offset);
+        if (n != out.len) return error.UnexpectedEndOfFile;
     }
 };
 
@@ -184,4 +251,17 @@ test "safetensors round trip" {
     var row: [3]f32 = undefined;
     w.row(1, &row);
     try std.testing.expectEqual(@as(f32, 5), row[1]);
+
+    // Header-only open + positional read gives the same bytes.
+    const f2 = try File.openOptions(gpa, io, tmp.dir, "t.safetensors", .{ .map = false });
+    defer f2.close(gpa, io);
+    const t2 = f2.get("w").?;
+    try std.testing.expect(!f2.isMapped());
+    try std.testing.expectEqual(@as(usize, 0), t2.data.len);
+    try std.testing.expectEqual(t.byte_len, t2.byte_len);
+    try std.testing.expectEqual(t.offset, t2.offset);
+    const buf = try gpa.alloc(u8, t2.byte_len);
+    defer gpa.free(buf);
+    try f2.readTensor(io, t2, buf);
+    try std.testing.expectEqualSlices(u8, t.data, buf);
 }

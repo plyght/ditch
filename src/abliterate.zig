@@ -146,19 +146,26 @@ pub fn apply(model: *Model, dirs: []const f32, direction_index: ?f32, params: st
         for (Component.all) |comp| {
             const p = params.get(comp) orelse continue;
             const weight = kernelWeight(p, li) orelse continue;
+            if (model.budget) |b| try b.checkTime();
             const v = if (global_dir) |g| g else dirs[(li + 1) * stride ..][0..stride];
             if (comp == .mlp_down_proj and layer.moe != null) {
                 const m = &layer.moe.?;
                 var idx: usize = 0;
                 while (idx < m.numDown()) : (idx += 1) {
-                    const delta = try computeDelta(model.pool, gpa, m.downWeight(idx), v, weight, opts, opts.seed +% seed_counter);
+                    // One expert matrix resident at a time (streamed mode reads it from disk).
+                    const lease = try model.acquireExpertDown(li, idx);
+                    defer @constCast(&model.store).release(lease);
+                    const delta = try computeDelta(model.pool, gpa, lease.weight, v, weight, opts, opts.seed +% seed_counter);
                     seed_counter += 1;
                     model.setExpertDelta(li, idx, delta);
                 }
                 continue;
             }
-            const w = model.componentWeight(li, comp);
-            const delta = try computeDelta(model.pool, gpa, w, v, weight, opts, opts.seed +% seed_counter);
+            // The matrix stays resident for all passes of computeDelta (up to ~13
+            // in "full" mode) and is released before the next component is read.
+            const lease = try model.acquireComponent(li, comp);
+            defer @constCast(&model.store).release(lease);
+            const delta = try computeDelta(model.pool, gpa, lease.weight, v, weight, opts, opts.seed +% seed_counter);
             seed_counter += 1;
             model.setDelta(li, comp, delta);
         }
