@@ -2,15 +2,33 @@
 
 **ditch** is a from-scratch Zig rebuild of [Heretic](https://github.com/p-e-w/heretic),
 Philipp Emanuel Weidmann's tool for fully automatic censorship removal
-("abliteration") of transformer language models. It runs the same algorithm,
-reads the same configuration format, produces the same kind of Hugging Face
-model directory, and needs nothing but a C-free static binary: no Python,
-no PyTorch, no GPU.
+("abliteration") of transformer language models. It runs Heretic's method
+(difference-of-means refusal directions, a per-layer weight kernel, and a
+multi-objective TPE that co-minimises refusals and KL divergence), produces
+the same kind of Hugging Face model directory, and ships as one dependency-free
+binary: no Python, no PyTorch, no GPU required.
 
-Everything that makes Heretic work is Heretic's idea; ditch only re-implements
-it. Please credit Heretic and its author if you use the results, and read the
-paper that underlies both tools: Arditi et al., *Refusal in Language Models Is
-Mediated by a Single Direction* (2024), <https://arxiv.org/abs/2406.11717>.
+The method is Heretic's; please credit Heretic and its author if you use the
+results, and read the paper that underlies both tools: Arditi et al., *Refusal
+in Language Models Is Mediated by a Single Direction* (2024),
+<https://arxiv.org/abs/2406.11717>.
+
+What ditch adds on top of the port:
+
+* **Runs where the weights do not fit.** A memory budget (`--max-ram`) streams
+  weights layer by layer, spills the KV cache to scratch storage, and stops
+  cleanly at a time limit, so the whole workflow finishes on machines that
+  cannot hold the model.
+* **Mixture-of-experts aware.** Per-expert edits, and expert-selective
+  abliteration that ranks experts by their alignment with the refusal
+  direction and searches over how many to touch, with Heretic's broad edit
+  kept as a candidate.
+* **A cheaper search.** Early stopping of dominated trials, warm starts from
+  earlier studies, and optional multi-direction ablation.
+* **Reproducible outputs.** Every export carries a Lua manifest with content
+  hashes and the exact parameters; `ditch --reproduce` rebuilds the model.
+* **Lua configuration** and a built-in `ditch bench` harness for honest
+  before/after numbers.
 
 ## Install
 
@@ -58,6 +76,8 @@ so an interrupted run (Ctrl+C) can be resumed.
 * Qwen2 / Qwen2.5
 * Qwen3
 * Gemma 2 / Gemma 3 (text only)
+* Qwen3-MoE, Qwen2-MoE and Mixtral (mixture-of-experts; separate and fused
+  expert tensor layouts)
 
 Weights are read from safetensors in F32, F16 or BF16. Sharded checkpoints are
 supported.
