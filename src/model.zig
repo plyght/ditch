@@ -259,8 +259,11 @@ pub const Model = struct {
     layers: []Layer,
     eos_ids: []u32,
     pad_id: u32,
+    /// Directory the model was loaded from.
+    source_dir: []const u8,
     /// Raw JSON texts kept for export.
     config_json: []const u8,
+    tokenizer_json: []const u8,
     generation_config_json: ?[]const u8,
     tokenizer_config_json: ?[]const u8,
     chat_template: ?[]const u8,
@@ -272,6 +275,7 @@ pub const Model = struct {
     rope_len: usize,
 
     pub fn deinit(self: *Model) void {
+        self.resetDeltas();
         for (self.files) |f| f.close(self.gpa, self.io);
         self.tokenizer.deinit();
         self.arena.deinit();
@@ -293,6 +297,7 @@ pub const Model = struct {
         var dir = try Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
         defer dir.close(io);
 
+        self.source_dir = try arena.dupe(u8, dir_path);
         self.config_json = try dir.readFileAlloc(io, "config.json", arena, .unlimited);
         self.config = try parseConfig(arena, self.config_json);
         self.generation_config_json = dir.readFileAlloc(io, "generation_config.json", arena, .unlimited) catch null;
@@ -301,6 +306,7 @@ pub const Model = struct {
             std.log.err("tokenizer.json not found in {s} (only fast tokenizers are supported)", .{dir_path});
             return error.MissingTokenizer;
         };
+        self.tokenizer_json = tok_json;
         self.tokenizer = try Tokenizer.parse(gpa, tok_json, self.tokenizer_config_json);
         errdefer self.tokenizer.deinit();
         self.chat_template = null;
@@ -575,6 +581,18 @@ pub const Model = struct {
         }
     }
 
+    /// True for mixture-of-experts architectures (implemented in moe.zig).
+    pub fn isMoe(self: *const Model) bool {
+        _ = self;
+        return false;
+    }
+
+    /// Number of routed experts per layer (0 for dense models).
+    pub fn numExpertsPerLayer(self: *const Model) usize {
+        _ = self;
+        return 0;
+    }
+
     pub fn getDelta(self: *const Model, layer: usize, comp: Component) ?Delta {
         return switch (comp) {
             .attn_o_proj => self.layers[layer].o_delta,
@@ -692,8 +710,9 @@ pub const Workspace = struct {
     up: []f32,
     logits: []f32,
     max_rows: usize,
+    max_logit_rows: usize,
 
-    pub fn init(gpa: Allocator, c: *const Config, max_rows: usize) !Workspace {
+    pub fn init(gpa: Allocator, c: *const Config, max_rows: usize, max_logit_rows: usize) !Workspace {
         const hidden = c.hidden_size;
         const qd = c.num_heads * c.head_dim;
         const kvd = c.num_kv_heads * c.head_dim;
@@ -708,8 +727,9 @@ pub const Workspace = struct {
             .o = try gpa.alloc(f32, max_rows * hidden),
             .gate = try gpa.alloc(f32, max_rows * c.intermediate_size),
             .up = try gpa.alloc(f32, max_rows * c.intermediate_size),
-            .logits = try gpa.alloc(f32, max_rows * c.vocab_size),
+            .logits = try gpa.alloc(f32, max_logit_rows * c.vocab_size),
             .max_rows = max_rows,
+            .max_logit_rows = max_logit_rows,
         };
     }
 
@@ -854,6 +874,7 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
 
     // Final norm + logits for requested rows.
     if (opts.logit_rows.len > 0) {
+        std.debug.assert(opts.logit_rows.len <= ws.max_logit_rows);
         for (opts.logit_rows, 0..) |r, i| tensor.rmsnorm(h[i * hidden ..][0..hidden], x[r * hidden ..][0..hidden], model.final_norm, c.rms_norm_eps, c.family.isGemma());
         try tensor.matmulT(model.pool, gpa, ws.logits, h, opts.logit_rows.len, model.lm_head, null);
         if (c.final_logit_softcapping) |cap| tensor.softcap(ws.logits[0 .. opts.logit_rows.len * c.vocab_size], cap);
@@ -1009,4 +1030,13 @@ pub fn generate(model: *const Model, ws: *Workspace, cache: *KvCache, prompts: [
     const result = try gpa.alloc([]u32, b);
     for (outputs, 0..) |*o, i| result[i] = try o.toOwnedSlice(gpa);
     return result;
+}
+
+/// Expert-selective abliteration entry point; implemented for MoE models in moe.zig.
+pub fn applyExpertSelective(model: *Model, dirs: []const f32, cfg: anytype, opts: anytype) !void {
+    _ = model;
+    _ = dirs;
+    _ = cfg;
+    _ = opts;
+    return error.NotMoeModel;
 }

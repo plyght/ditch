@@ -266,8 +266,9 @@ pub fn matmulT(pool: *const Pool, gpa: std.mem.Allocator, out: []f32, x: []const
 }
 
 const MatvecTCtx = struct {
-    out: []f32, // slots * cols accumulators
-    y: []const f32,
+    out: []f32, // slots * q * cols accumulators
+    y: []const f32, // q * rows
+    q: usize,
     w: Weight,
     scratch: []f32,
     per: usize,
@@ -276,32 +277,69 @@ const MatvecTCtx = struct {
 fn matvecTWorker(ctx: *const MatvecTCtx, start: usize, end: usize) void {
     const slot = start / ctx.per;
     const cols = ctx.w.cols;
+    const rows = ctx.w.rows;
     const buf = ctx.scratch[slot * cols ..][0..cols];
-    const acc = ctx.out[slot * cols ..][0..cols];
+    const acc = ctx.out[slot * ctx.q * cols ..][0 .. ctx.q * cols];
     @memset(acc, 0);
     var r = start;
     while (r < end) : (r += 1) {
-        const yr = ctx.y[r];
-        if (yr == 0) continue;
+        var any = false;
+        var j: usize = 0;
+        while (j < ctx.q) : (j += 1) any = any or ctx.y[j * rows + r] != 0;
+        if (!any) continue;
         ctx.w.row(r, buf);
-        axpy(acc, yr, buf);
+        j = 0;
+        while (j < ctx.q) : (j += 1) {
+            const yr = ctx.y[j * rows + r];
+            if (yr != 0) axpy(acc[j * cols ..][0..cols], yr, buf);
+        }
     }
 }
 
-/// `out[cols] = W^T y` where `y` has `rows` elements.
-pub fn matvecT(pool: *const Pool, gpa: std.mem.Allocator, out: []f32, w: Weight, y: []const f32) !void {
+/// `out[q][cols] = y[q][rows] @ W`, i.e. each output row is `W^T y_j`.
+pub fn matvecTMulti(pool: *const Pool, gpa: std.mem.Allocator, out: []f32, w: Weight, y: []const f32, q: usize) !void {
+    std.debug.assert(y.len >= q * w.rows);
+    std.debug.assert(out.len >= q * w.cols);
     const chunks = @max(1, @min(pool.threads, w.rows));
     const per = (w.rows + chunks - 1) / chunks;
     const slots = (w.rows + per - 1) / per;
     const scratch = try gpa.alloc(f32, slots * w.cols);
     defer gpa.free(scratch);
-    const accs = try gpa.alloc(f32, slots * w.cols);
+    const accs = try gpa.alloc(f32, slots * q * w.cols);
     defer gpa.free(accs);
-    const ctx = MatvecTCtx{ .out = accs, .y = y, .w = w, .scratch = scratch, .per = per };
+    const ctx = MatvecTCtx{ .out = accs, .y = y, .q = q, .w = w, .scratch = scratch, .per = per };
     pool.parallelFor(w.rows, &ctx, matvecTWorker);
-    @memset(out[0..w.cols], 0);
+    @memset(out[0 .. q * w.cols], 0);
     var s: usize = 0;
-    while (s < slots) : (s += 1) axpy(out[0..w.cols], 1.0, accs[s * w.cols ..][0..w.cols]);
+    while (s < slots) : (s += 1) axpy(out[0 .. q * w.cols], 1.0, accs[s * q * w.cols ..][0 .. q * w.cols]);
+}
+
+/// `out[cols] = W^T y` where `y` has `rows` elements.
+pub fn matvecT(pool: *const Pool, gpa: std.mem.Allocator, out: []f32, w: Weight, y: []const f32) !void {
+    return matvecTMulti(pool, gpa, out, w, y, 1);
+}
+
+const RowNormCtx = struct { out: []f32, w: Weight, scratch: []f32, per: usize };
+
+fn rowNormWorker(ctx: *const RowNormCtx, start: usize, end: usize) void {
+    const slot = start / ctx.per;
+    const buf = ctx.scratch[slot * ctx.w.cols ..][0..ctx.w.cols];
+    var r = start;
+    while (r < end) : (r += 1) {
+        ctx.w.row(r, buf);
+        ctx.out[r] = norm2(buf);
+    }
+}
+
+/// `out[rows] = ||W_i||_2` for every row.
+pub fn rowNorms(pool: *const Pool, gpa: std.mem.Allocator, out: []f32, w: Weight) !void {
+    const chunks = @max(1, @min(pool.threads, w.rows));
+    const per = (w.rows + chunks - 1) / chunks;
+    const slots = (w.rows + per - 1) / per;
+    const scratch = try gpa.alloc(f32, slots * w.cols);
+    defer gpa.free(scratch);
+    const ctx = RowNormCtx{ .out = out, .w = w, .scratch = scratch, .per = per };
+    pool.parallelFor(w.rows, &ctx, rowNormWorker);
 }
 
 // ---------------------------------------------------------------------------
