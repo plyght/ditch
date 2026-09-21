@@ -193,6 +193,7 @@ const App = struct {
             .debug_writer = if (self.settings.print_debug_information) self.con.out else null,
             .n_directions = self.settings.n_directions,
             .visited_experts_only = self.settings.visited_experts_only orelse self.model.warp(),
+            .ablate_inputs = self.settings.ablate_inputs,
         };
     }
 
@@ -246,9 +247,16 @@ const App = struct {
         const observations = try self.allObservations(gpa);
         defer gpa.free(observations);
         try self.sampler.sample(gpa, observations, vector);
+        var resampled = false;
+        if (search.isRepeat(self.space, vector, observations)) {
+            // A repeat would cost a full evaluation and teach the sampler nothing.
+            self.sampler.sampleRandom(vector);
+            resampled = true;
+        }
         const cfg = search.decode(self.space, vector);
 
         try out.print("\nRunning trial {d} of {d}...\n", .{ trial_index, n_trials });
+        if (resampled) try out.writeAll("* The proposed parameters repeated an evaluated trial; sampled a random point instead.\n");
         try out.writeAll("* Parameters:\n");
         try search.describe(self.space, vector, out);
         try out.writeAll("* Resetting model...\n");
@@ -341,6 +349,17 @@ const App = struct {
             defer menu_arena.deinit();
             const ma = menu_arena.allocator();
             const best = try self.study.bestTrials(ma);
+            try self.rescoreDeferred(best);
+            var auto_pick: ?usize = null;
+            if (self.settings.select == .auto) {
+                auto_pick = self.study.selectScalarised(best, self.settings.keyword_rate.score_name, "Refusal mass", "KL divergence", self.settings.select_lambda);
+                // The chosen trial is listed first; the rest keep their order.
+                if (auto_pick) |p| if (p > 0) {
+                    const chosen = best[p];
+                    std.mem.copyBackwards(usize, best[1 .. p + 1], best[0..p]);
+                    best[0] = chosen;
+                };
+            }
             var options = std.ArrayList([]const u8).empty;
             for (best) |bi| try options.append(ma, try self.trialTitle(ma, &self.study.trials.items[bi]));
             try options.append(ma, "Run additional trials");
@@ -349,6 +368,13 @@ const App = struct {
             try out.writeAll("\nOptimization finished!\n");
             if (self.settings.trial_index == null) {
                 try out.writeAll("\nThe following trials resulted in Pareto optimal combinations of the optimization objectives. After selecting a trial, you will be able to save the model or chat with it to test how well it works. You can return to this menu later to select a different trial.\n");
+            }
+            if (self.settings.select == .auto) {
+                if (auto_pick != null) {
+                    try out.print("\nListed first: the trial minimising refusals + {d} x KL divergence (--select auto).\n", .{self.settings.select_lambda});
+                } else {
+                    try out.writeAll("\n--select auto needs a refusal score and a KL divergence per trial; none was found, keeping the Pareto order.\n");
+                }
             }
 
             var choice: usize = undefined;
@@ -400,6 +426,31 @@ const App = struct {
             try self.restoreTrial(trial);
             const back = try self.modelLoop(trial);
             if (!back) return;
+        }
+    }
+
+    /// `--fast-search`: runs the deferred keyword scorer on every Pareto
+    /// candidate that has not been scored by it yet, so the results menu
+    /// shows real refusal counts, and journals the scores.
+    fn rescoreDeferred(self: *App, best: []const usize) !void {
+        const deferred = self.evaluator.deferred orelse return;
+        const out = self.con.out;
+        var pending: usize = 0;
+        for (best) |bi| pending += @intFromBool(study_mod.Study.scoreOf(&self.study.trials.items[bi], deferred.name) == null);
+        if (pending == 0) return;
+        try out.print("\nScoring {d} Pareto-optimal trial(s) with the deferred {s} scorer (generation)...\n", .{ pending, deferred.name });
+        try out.flush();
+        for (best) |bi| {
+            const trial = &self.study.trials.items[bi];
+            if (study_mod.Study.scoreOf(trial, deferred.name) != null) continue;
+            try self.restoreTrial(trial);
+            var scratch = std.heap.ArenaAllocator.init(self.gpa);
+            defer scratch.deinit();
+            const sa = scratch.allocator();
+            const s = (try self.evaluator.deferredScore(sa, self.engine, out)) orelse return;
+            try out.print("  * {s}: {s}\n", .{ s.name, s.score.display });
+            try out.flush();
+            try self.study.addScores(self.gpa, trial.index, &.{.{ .name = s.name, .value = s.score.value, .display = s.score.display }});
         }
     }
 
@@ -478,6 +529,10 @@ const App = struct {
         try o.writeAll("## Abliteration parameters\n\n| Parameter | Value |\n| :-------- | :---: |\n");
         if (trial.direction_index) |di| try o.print("| **direction_index** | {d:.2} |\n", .{di}) else try o.writeAll("| **direction_index** | per layer |\n");
         if (self.settings.n_directions > 1) try o.print("| **n_directions** | {d} |\n", .{self.settings.n_directions});
+        if (self.settings.direction_method != .mean) try o.print("| **direction_method** | {s} |\n", .{@tagName(self.settings.direction_method)});
+        if (self.settings.direction_token_window > 1) try o.print("| **direction_token_window** | {d} |\n", .{self.settings.direction_token_window});
+        if (self.settings.ablate_inputs) try o.writeAll("| **ablate_inputs** | true |\n");
+        if (self.settings.kl_tokens > 1) try o.print("| **kl_tokens** | {d} |\n", .{self.settings.kl_tokens});
         for (model_mod.Component.all) |comp| {
             const p = trial.parameters.get(comp) orelse continue;
             try o.print("| **{s}.max_weight** | {d:.2} |\n", .{ comp.name(), p.max_weight });
@@ -822,9 +877,11 @@ fn detectResponsePrefix(gpa: Allocator, arena: Allocator, engine: *Engine, setti
     try out.flush();
 }
 
-fn printResidualGeometry(out: *Io.Writer, good: []const f32, bad: []const f32, entries: usize, hidden: usize) !void {
+fn printResidualGeometry(out: *Io.Writer, good: []const f32, bad: []const f32, entries: usize, hidden: usize, sep: ?directions.Separation) !void {
     try out.writeAll("\nResidual geometry (per layer entry; entry 0 = embeddings, entry L = output of layer L-1):\n");
-    try out.writeAll("  entry   cos(good,bad)     |good|      |bad|   |bad-good|\n");
+    try out.writeAll("  entry   cos(good,bad)     |good|      |bad|   |bad-good|");
+    if (sep != null) try out.writeAll("     AUROC        d'");
+    try out.writeAll("\n");
     for (0..entries) |e| {
         const g = good[e * hidden ..][0..hidden];
         const b = bad[e * hidden ..][0..hidden];
@@ -839,11 +896,34 @@ fn printResidualGeometry(out: *Io.Writer, good: []const f32, bad: []const f32, e
             dn += (@as(f64, y) - x) * (@as(f64, y) - x);
         }
         const cos = dot / @max(@sqrt(gn) * @sqrt(bn), 1e-12);
-        try out.print("  {d: >5}   {d: >13.4}   {d: >8.3}   {d: >8.3}   {d: >10.3}\n", .{ e, cos, @sqrt(gn), @sqrt(bn), @sqrt(dn) });
+        try out.print("  {d: >5}   {d: >13.4}   {d: >8.3}   {d: >8.3}   {d: >10.3}", .{ e, cos, @sqrt(gn), @sqrt(bn), @sqrt(dn) });
+        if (sep) |s| try out.print("   {d: >7.4}   {d: >7.3}", .{ s.auroc[e], s.dprime[e] });
+        try out.writeAll("\n");
     }
+    if (sep != null) try out.writeAll("  AUROC / d' = separation of the good and bad prompts by their projection onto the entry's direction.\n");
 }
 
-fn settingsSnapshot(a: Allocator, settings: *const config.Settings, model: *const Model) ![]const u8 {
+/// The resolved `direction_index` bounds: heretic's fractions of the last
+/// layer, or the layers whose separation is highest (`--direction-range auto`).
+fn resolveDirectionRange(settings: *const config.Settings, model: *const Model, sep: ?directions.Separation) search.IndexRange {
+    const last: f64 = @floatFromInt(model.config.num_layers - 1);
+    return switch (settings.direction_range) {
+        .fixed => |f| .{ .low = f.low * last, .high = f.high * last },
+        .auto => blk: {
+            const r = directions.autoRange(sep.?.auroc);
+            break :blk .{ .low = r.low, .high = r.high };
+        },
+    };
+}
+
+/// Names and optimisation directions of the scorers, e.g. "kl_divergence:minimize,keyword_rate:minimize".
+fn scorerSetString(a: Allocator, scorers_cfg: []const config.ScorerConfig) ![]const u8 {
+    var w: Io.Writer.Allocating = .init(a);
+    for (scorers_cfg, 0..) |sc, i| try w.writer.print("{s}{s}:{s}", .{ if (i == 0) "" else ",", @tagName(sc.kind), @tagName(sc.optimization) });
+    return w.toOwnedSlice();
+}
+
+fn settingsSnapshot(a: Allocator, settings: *const config.Settings, model: *const Model, range: search.IndexRange) ![]const u8 {
     var w: Io.Writer.Allocating = .init(a);
     var js: std.json.Stringify = .{ .writer = &w.writer };
     try js.beginObject();
@@ -859,6 +939,21 @@ fn settingsSnapshot(a: Allocator, settings: *const config.Settings, model: *cons
     try js.write(model_mod.Component.all.len);
     try js.objectField("n_directions");
     try js.write(settings.n_directions);
+    // Settings that change the objectives or the directions: `continue` refuses when they differ.
+    try js.objectField("scorers");
+    try js.write(try scorerSetString(a, settings.scorers));
+    try js.objectField("kl_tokens");
+    try js.write(settings.kl_tokens);
+    try js.objectField("direction_method");
+    try js.write(@tagName(settings.direction_method));
+    try js.objectField("direction_token_window");
+    try js.write(settings.direction_token_window);
+    try js.objectField("direction_index_low");
+    try js.write(range.low);
+    try js.objectField("direction_index_high");
+    try js.write(range.high);
+    try js.objectField("ablate_inputs");
+    try js.write(settings.ablate_inputs);
     try js.objectField("n_trials");
     try js.write(settings.n_trials);
     try js.objectField("n_startup_trials");
@@ -875,12 +970,48 @@ fn settingsSnapshot(a: Allocator, settings: *const config.Settings, model: *cons
     return w.toOwnedSlice();
 }
 
-/// Refuses to continue a study whose direction count differs from the settings.
-fn checkStudyDirections(study: *const study_mod.Study, settings: *const config.Settings) !void {
+/// Refuses to continue a study whose objectives or directions would differ
+/// from the recorded ones (its trials would not be comparable). Fields
+/// missing from an older journal are taken as the defaults.
+fn checkStudySettings(a: Allocator, study: *const study_mod.Study, settings: *const config.Settings, range: search.IndexRange) !void {
     const stored: usize = @intCast(study.settingInteger("n_directions") orelse 1);
     if (stored != settings.n_directions) {
         std.log.err("the checkpoint was created with n_directions = {d}, but n_directions = {d} was requested; pass --n-directions {d} or restart the study", .{ stored, settings.n_directions, stored });
         return error.StudyDirectionsMismatch;
+    }
+    const defaults = config.Settings{};
+    const stored_scorers = study.settingString("scorers") orelse try scorerSetString(a, defaults.scorers);
+    const wanted_scorers = try scorerSetString(a, settings.scorers);
+    if (!std.mem.eql(u8, stored_scorers, wanted_scorers)) {
+        std.log.err("the checkpoint was created with the scorers {s}, but {s} was requested (the objectives would differ); use the same scorers / --fast-search setting or restart the study", .{ stored_scorers, wanted_scorers });
+        return error.StudySettingsMismatch;
+    }
+    const kl_tokens: usize = @intCast(study.settingInteger("kl_tokens") orelse 1);
+    if (kl_tokens != settings.kl_tokens) {
+        std.log.err("the checkpoint was created with kl_tokens = {d}, but kl_tokens = {d} was requested; pass --kl-tokens {d} or restart the study", .{ kl_tokens, settings.kl_tokens, kl_tokens });
+        return error.StudySettingsMismatch;
+    }
+    const method = study.settingString("direction_method") orelse "mean";
+    if (!std.mem.eql(u8, method, @tagName(settings.direction_method))) {
+        std.log.err("the checkpoint was created with direction_method = {s}, but {s} was requested; pass --direction-method {s} or restart the study", .{ method, @tagName(settings.direction_method), method });
+        return error.StudySettingsMismatch;
+    }
+    const window: usize = @intCast(study.settingInteger("direction_token_window") orelse 1);
+    if (window != settings.direction_token_window) {
+        std.log.err("the checkpoint was created with direction_token_window = {d}, but {d} was requested; pass --direction-token-window {d} or restart the study", .{ window, settings.direction_token_window, window });
+        return error.StudySettingsMismatch;
+    }
+    const ablate_inputs = study.settingBool("ablate_inputs") orelse false;
+    if (ablate_inputs != settings.ablate_inputs) {
+        std.log.err("the checkpoint was created with ablate_inputs = {}, but {} was requested; restart the study or use --ablate-inputs {}", .{ ablate_inputs, settings.ablate_inputs, ablate_inputs });
+        return error.StudySettingsMismatch;
+    }
+    if (study.settingFloat("direction_index_low")) |low| {
+        const high = study.settingFloat("direction_index_high") orelse range.high;
+        if (@abs(low - range.low) > 1e-6 or @abs(high - range.high) > 1e-6) {
+            std.log.err("the checkpoint searched direction_index in [{d:.3}, {d:.3}], but the current settings give [{d:.3}, {d:.3}] (--direction-range); use the same range or restart the study", .{ low, high, range.low, range.high });
+            return error.StudySettingsMismatch;
+        }
     }
 }
 
@@ -1196,6 +1327,7 @@ fn run(init: std.process.Init, con: *Console) !void {
         try out.flush();
         const scores = try evaluator.scores(arena, &eval_engine, out);
         try printScores(out, scores);
+        if (try evaluator.deferredScore(arena, &eval_engine, out)) |d| try out.print("  * {s}: {s}\n", .{ d.name, d.score.display });
         return;
     }
 
@@ -1206,24 +1338,61 @@ fn run(init: std.process.Init, con: *Console) !void {
 
     // Residual directions.
     try out.writeAll("\nCalculating per-layer residual directions...\n");
+    const entries = c.num_layers + 1;
+    const window = settings.direction_token_window;
+    if (window > 1) try out.print("* Residuals are averaged over the last {d} prompt tokens\n", .{window});
+    // The "separating" method needs the per-coordinate variances of both sets.
+    var good_moments: ?directions.Moments = null;
+    defer if (good_moments) |*m| m.deinit();
+    var bad_moments: ?directions.Moments = null;
+    defer if (bad_moments) |*m| m.deinit();
+    if (settings.direction_method == .separating) {
+        good_moments = try directions.Moments.init(rt_gpa, entries, c.hidden_size);
+        bad_moments = try directions.Moments.init(rt_gpa, entries, c.hidden_size);
+    }
     try out.writeAll("* Obtaining residual mean for good prompts...\n");
     try out.flush();
-    const good_means = try engine.getResidualMean(rt_gpa, good_prompts, out);
+    const good_means = try engine.getResidualMeanObserved(rt_gpa, good_prompts, out, .{ .moments = if (good_moments) |*m| m else null, .window = window });
     defer rt_gpa.free(good_means);
     try out.writeAll("* Obtaining residual mean for bad prompts...\n");
     try out.flush();
-    const entries = c.num_layers + 1;
     // With several directions per layer, the same pass over the bad prompts
     // also accumulates the covariance sketch (see directions.zig).
     var sketch: ?directions.Sketch = null;
     defer if (sketch) |*s| s.deinit();
     if (settings.n_directions > 1) sketch = try directions.Sketch.init(rt_gpa, entries, c.hidden_size, settings.n_directions, good_means, settings.seed.?);
-    const bad_means = try engine.getResidualMeanSketched(rt_gpa, bad_prompts, out, if (sketch) |*s| s else null);
+    const bad_means = try engine.getResidualMeanObserved(rt_gpa, bad_prompts, out, .{ .sketch = if (sketch) |*s| s else null, .moments = if (bad_moments) |*m| m else null, .window = window });
     defer rt_gpa.free(bad_means);
-    if (settings.print_residual_geometry) try printResidualGeometry(out, good_means, bad_means, entries, c.hidden_size);
+    const first = switch (settings.direction_method) {
+        .mean => try abliterate.computeDirections(rt_gpa, good_means, bad_means, entries, c.hidden_size, settings.orthogonalize_direction),
+        .separating => blk: {
+            try out.print("* Whitening the difference of means by the per-coordinate variance (shrinkage {d})...\n", .{settings.direction_shrinkage});
+            break :blk try directions.computeSeparating(rt_gpa, good_means, bad_means, &good_moments.?, &bad_moments.?, entries, c.hidden_size, settings.direction_shrinkage, settings.orthogonalize_direction);
+        },
+    };
+    defer rt_gpa.free(first);
     if (settings.n_directions > 1) try out.print("* Extracting {d} orthonormal directions per layer...\n", .{settings.n_directions});
-    const dirs = try directions.computeBasis(rt_gpa, good_means, bad_means, entries, c.hidden_size, settings.n_directions, settings.orthogonalize_direction, if (sketch) |*s| s else null);
+    const dirs = try directions.computeBasisFrom(rt_gpa, first, good_means, entries, c.hidden_size, settings.n_directions, settings.orthogonalize_direction, if (sketch) |*s| s else null);
     defer rt_gpa.free(dirs);
+    // Separation scores need one more pass (the projections of every prompt
+    // onto the final directions); only when something uses them.
+    var sep: ?directions.Separation = null;
+    defer if (sep) |*s| s.deinit(rt_gpa);
+    if (settings.print_residual_geometry or (settings.direction_range == .auto and manifest == null)) {
+        try out.writeAll("* Projecting the prompts onto the directions for the separation scores...\n");
+        try out.flush();
+        const stride = settings.n_directions * c.hidden_size;
+        const good_proj = try engine.getProjections(rt_gpa, good_prompts, dirs, stride, window);
+        defer rt_gpa.free(good_proj);
+        const bad_proj = try engine.getProjections(rt_gpa, bad_prompts, dirs, stride, window);
+        defer rt_gpa.free(bad_proj);
+        sep = try directions.separation(rt_gpa, good_proj, bad_proj, entries);
+    }
+    if (settings.print_residual_geometry) try printResidualGeometry(out, good_means, bad_means, entries, c.hidden_size, sep);
+    const index_range = if (manifest != null and sep == null) search.defaultIndexRange(model) else resolveDirectionRange(settings, model, sep);
+    if (settings.direction_range == .auto and sep != null) {
+        try out.print("* direction_index range: {d:.2} to {d:.2} (layers whose projection AUROC is within {d} of the best; heretic: {d:.2} to {d:.2})\n", .{ index_range.low, index_range.high, directions.auto_range_tolerance, search.defaultIndexRange(model).low, search.defaultIndexRange(model).high });
+    }
     try out.flush();
 
     if (manifest) |*m| {
@@ -1261,9 +1430,9 @@ fn run(init: std.process.Init, con: *Console) !void {
             };
         }
         if (std.mem.eql(u8, action, "restart")) {
-            try study.reset(try settingsSnapshot(arena, settings, model));
+            try study.reset(try settingsSnapshot(arena, settings, model, index_range));
         } else if (std.mem.eql(u8, action, "continue")) {
-            try checkStudyDirections(&study, settings);
+            try checkStudySettings(arena, &study, settings, index_range);
             if (study.finished) show_results_only = true;
             if (study.trials.items.len > settings.n_trials) settings.n_trials = study.trials.items.len;
         } else if (std.mem.eql(u8, action, "exit")) {
@@ -1273,16 +1442,16 @@ fn run(init: std.process.Init, con: *Console) !void {
             return error.InvalidCheckpointAction;
         }
     } else {
-        try study.reset(try settingsSnapshot(arena, settings, model));
+        try study.reset(try settingsSnapshot(arena, settings, model, index_range));
     }
     try out.print("\nStudy checkpoint: {s}\n", .{checkpoint_path});
 
-    var space = try search.buildSpace(gpa, model);
+    var space = try search.buildSpaceWithRange(gpa, model, index_range);
     defer space.deinit();
     var sampler = tpe.Sampler.init(space.space, settings.n_startup_trials, settings.seed.?);
     var warm: []const tpe.Observation = &.{};
     if (settings.warm_start) |p| warm = try loadWarmStart(gpa, arena, io, p, model, space.dims(), evaluator.objectiveCount(), out);
-    if (settings.early_stop and evaluator.earlyStopEntry() == null) {
+    if (settings.early_stop and evaluator.earlyStopEntry() == null and !settings.fast_search) {
         try out.writeAll("\nEarly stopping is disabled: it requires a minimised keyword-rate scorer as the last objective (list kl_divergence before keyword_rate).\n");
     }
 
@@ -1395,7 +1564,13 @@ fn runReproduction(
     try search.applyTrial(model, dirs, cfg, app.abliterateOptions());
     try out.writeAll("* Evaluating...\n");
     try out.flush();
-    const scores = try evaluator.scores(arena, engine, out);
+    var scores = try evaluator.scores(arena, engine, out);
+    if (try evaluator.deferredScore(arena, engine, out)) |d| {
+        const grown = try arena.alloc(scorers.NamedScore, scores.len + 1);
+        @memcpy(grown[0..scores.len], scores);
+        grown[scores.len] = d;
+        scores = grown;
+    }
     _ = try reproduce.printComparison(m, scores, out);
     try out.flush();
 

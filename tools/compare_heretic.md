@@ -90,3 +90,34 @@ A trial is comparable only if both tools scored the same number of refusal
 prompts and KL prompts with the same response length. Quote the `Refusals` and
 `KL divergence` of the same Pareto-front trial (for example the one with the
 fewest refusals), and the baseline refusal count of the unmodified model.
+
+## 5. Validating ditch's algorithm options
+
+The options beyond Heretic's method (`--direction-method separating`,
+`--direction-token-window`, `--direction-range auto`, `--ablate-inputs`,
+`--kl-tokens`, `--fast-search`) are off by default and their benefit on real
+models has not been measured by the ditch project; they are justified by the
+literature and by synthetic tests only. To measure them on a model, keep one
+yardstick: score every exported candidate with the *default* scorers
+(generation-based `Refusals`, first-token `KL divergence`), whatever the
+study optimised.
+
+```sh
+# Reference: Heretic's method, N trials.
+ditch <model> --config config.toml --seed 42 --checkpoint-action restart \
+    --study-checkpoint-dir ck/base --trial-index 1 --model-action save --save-directory out/base
+# One option at a time, same seed, same trials, its own checkpoint directory.
+ditch <model> --config config.toml --seed 42 --checkpoint-action restart \
+    --study-checkpoint-dir ck/sep --direction-method separating --direction-range auto \
+    --trial-index 1 --model-action save --save-directory out/sep
+ditch <model> --config config.toml --seed 42 --checkpoint-action restart \
+    --study-checkpoint-dir ck/fast --fast-search --trial-index 1 --model-action save --save-directory out/fast
+# The yardstick: default scorers on every export.
+for d in out/*; do ditch <model> --config config.toml --evaluate-model "$d"; done
+```
+
+Compare the whole Pareto fronts (the results menu lists them), not only the
+first trial, and for `--fast-search` also the wall-clock time per trial that
+the study prints. `--print-residual-geometry` shows, per layer, how well the
+direction separates the harmful and harmless prompts (AUROC), which is the
+quantity `--direction-method separating` and `--direction-range auto` act on.

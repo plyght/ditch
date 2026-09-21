@@ -62,6 +62,7 @@ Useful flags (all also settable in `config.lua`; see `ditch --help`):
 | `--max-ram 12GB`, `--time-limit 90m`, `--scratch-dir DIR` | memory budget, clean stop, spill location |
 | `--expert-cache 6GB`, `--expert-selection ranked\|random\|broad` | warp mode and MoE editing |
 | `--n-directions K`, `--no-early-stop`, `--warm-start study.jsonl` | search extensions |
+| `--fast-search`, `--direction-method separating`, `--direction-range auto`, `--ablate-inputs`, `--kl-tokens T`, `--select auto` | algorithm options (see "How it works") |
 | `--export-format hf\|gguf\|both`, `--gguf-dtype f16\|q8_0\|...` | output format |
 | `--checkpoint-action`, `--trial-index`, `--model-action`, `--save-directory` | answer the menus non-interactively |
 | `--evaluate-model DIR`, `--reproduce FILE`, `ditch bench MODEL` | evaluate, reproduce, measure |
@@ -207,6 +208,18 @@ publish real-model numbers it has not measured.
    proposes kernel parameters, direction scope and, for MoE, how many ranked
    experts to edit. Trials score KL divergence first; a trial whose refusals
    already exceed a Pareto-front trial with no worse KL is pruned.
+4. **Options beyond Heretic**, all off by default so studies stay comparable
+   (the manifest records them; `continue` refuses a study whose objectives
+   or directions would change): `--direction-method separating` whitens the
+   mean difference by the per-coordinate variance, `--direction-token-window
+   W` averages the last W prompt tokens, `--direction-range auto` searches
+   only the layers with the highest projection AUROC (shown by
+   `--print-residual-geometry`), `--ablate-inputs` also removes the input
+   pattern that writes the direction, `--kl-tokens T` scores T teacher-forced
+   positions, `--fast-search` optimises a first-token refusal proxy and
+   generates only for the Pareto candidates, `--select auto` lists the trial
+   minimising refusals + λ·KL first. Expected, not measured, gains: validate
+   on your model with `--evaluate-model`.
 
 ## Development
 

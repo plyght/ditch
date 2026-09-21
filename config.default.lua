@@ -67,15 +67,58 @@ return {
 
   -- Scorers to evaluate, in evaluation order. Each entry is { plugin = <plugin>,
   -- optimization = <opt>, instance_name = <optional> } where <plugin> is
-  -- "keyword_rate" or "kl_divergence" (heretic's fully qualified plugin names
-  -- are accepted too) and <opt> is "minimize", "maximize" or "none" (do not
-  -- optimize). The cheap KL divergence comes first so that early stopping (see
-  -- early_stop below) can prune trials while the refusals are being scored;
-  -- heretic's order (keyword_rate first) works too but disables early stopping.
+  -- "keyword_rate", "kl_divergence" or "refusal_logit" (heretic's fully
+  -- qualified plugin names are accepted too) and <opt> is "minimize",
+  -- "maximize" or "none" (do not optimize). The cheap KL divergence comes
+  -- first so that early stopping (see early_stop below) can prune trials while
+  -- the refusals are being scored; heretic's order (keyword_rate first) works
+  -- too but disables early stopping.
+  --
+  -- "refusal_logit" is a proxy for the refusal rate that needs one prefill
+  -- instead of a generation: the probability mass the first-token distribution
+  -- puts on "refusal-start" tokens, averaged over the refusal prompts (0..1).
+  -- The token set is learned from the base model's own baseline responses
+  -- (every first token that started a keyword refusal, weighted by how often it
+  -- did so rather than starting a helpful answer); when the base model refuses
+  -- nothing, common openers ("I", "I'm", "Sorry", "As", "Unfortunately", ...)
+  -- are tokenised instead. It only sees whether a response *starts* like a
+  -- refusal, so use it for the search and keep the keyword scorer for the
+  -- result, e.g.
+  --   scorers = {
+  --     { plugin = "kl_divergence", optimization = "minimize" },
+  --     { plugin = "refusal_logit", optimization = "minimize" },
+  --     { plugin = "keyword_rate", optimization = "none" },
+  --   },
+  -- or simply fast_search = true (below).
   scorers = {
     { plugin = "kl_divergence", optimization = "minimize" },
     { plugin = "keyword_rate", optimization = "minimize" },
   },
+
+  -- Fast search: optimise the KL divergence and the refusal_logit proxy only
+  -- (two prefills per trial instead of a generation), then run the keyword
+  -- scorer on the Pareto-optimal trials before the results menu, so the menu,
+  -- the model card and the manifest show real refusal counts. It replaces the
+  -- scorers list above. Cheaper per trial by roughly the ratio of generated to
+  -- prompt tokens; the trade-off is that the search optimises a proxy, so the
+  -- final candidates may refuse more than the proxy suggested (they are always
+  -- validated by generation). Command line: --fast-search.
+  fast_search = false,
+
+  -- Positions the KL divergence is averaged over: 1 (heretic) compares the
+  -- first-token distributions only; T > 1 generates the base model's greedy
+  -- continuation of T - 1 tokens once and scores every trial teacher-forced at
+  -- the T positions predicting it, which reflects damage further into the
+  -- response. Costs T - 1 extra prompt tokens per prompt per trial and T times
+  -- the baseline memory ([prompts][T][vocab] floats). A study records it.
+  kl_tokens = 1,
+
+  -- Which trial the results menu lists first: "pareto" (heretic's order) or
+  -- "auto", the Pareto-front trial minimising refusals + select_lambda * KL
+  -- (refusals as a rate in 0..1; the keyword score when present, else the
+  -- refusal_logit proxy). The rest of the menu is unchanged.
+  select = "pareto",
+  select_lambda = 1.0,
 
   -- Whether to adjust the residual directions so that only the component that is
   -- orthogonal to the good direction is subtracted during abliteration.
@@ -106,6 +149,44 @@ return {
   -- prompts. All K directions are projected out at once (a rank-K edit), and
   -- a study records its K: it cannot be continued with a different value.
   n_directions = 1,
+
+  -- How the refusal direction of every layer is estimated from the residuals:
+  -- "mean" (heretic: the normalised difference of the mean bad and good
+  -- residuals) or "separating": the same difference divided, coordinate by
+  -- coordinate, by the pooled variance of the two sets plus a shrinkage term
+  -- (direction_shrinkage times the mean variance), then normalised. This is a
+  -- diagonal Fisher discriminant: coordinates that differ between the sets but
+  -- also vary a lot within them (massive-activation dimensions, position and
+  -- template features) are down-weighted, so the direction points where the
+  -- prompts are actually separable instead of where the residual is loudest.
+  -- It costs nothing extra (the variances are accumulated in the same pass);
+  -- its effect on real models is expected, not measured here: compare with
+  -- --print-residual-geometry (AUROC per layer) and --evaluate-model.
+  direction_method = "mean",
+  direction_shrinkage = 0.1,
+
+  -- Number of prompt tokens whose residuals are averaged for each prompt: 1
+  -- (heretic) uses the last prompt token only, which for chat templates is a
+  -- template token; a larger window also averages the tokens before it.
+  direction_token_window = 1,
+
+  -- Bounds of the search parameter direction_index (which layer's direction to
+  -- use in the "global" scope), as fractions of the last layer index: "0.4:0.9"
+  -- is heretic's range. "auto" projects every prompt onto its layer's direction
+  -- (one extra pass over the prompt sets), computes the AUROC of the good/bad
+  -- separation per layer and restricts the range to the layers within 0.01 of
+  -- the best AUROC. --print-residual-geometry prints the table (AUROC and d')
+  -- either way. A study records the resolved range.
+  direction_range = "0.4:0.9",
+
+  -- Also ablate the input side of every edited matrix: after the direction is
+  -- projected out of the outputs (heretic), the unit input pattern u that
+  -- writes it most strongly (u ~ W^T v) is removed from the columns, so that
+  -- input produces no output at all (W'' = W' - lambda (W' u) u^T; one more
+  -- rank per direction). In the spirit of the biprojected abliteration
+  -- described by Jim Lai; expected to remove refusals more thoroughly at a
+  -- higher KL divergence. Off by default; a study records it.
+  ablate_inputs = false,
 
   -- Early stopping of hopeless trials. Scorers run in the order listed above,
   -- so the KL divergence of a trial is known before its refusals are counted.

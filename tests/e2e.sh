@@ -238,6 +238,103 @@ if "$DITCH" "${COMMON[@]}" --study-checkpoint-dir "$TMP/k2_checkpoints" \
 fi
 grep -q "n_directions = 2" "$TMP/k2_mismatch.log" || fail "n_directions mismatch not reported"
 
+echo "==> Fast search: refusal-logit proxy, deferred keyword scoring, auto selection"
+# The byte marker of the pruning step gives the base model some "refusals" to
+# learn refusal-start tokens from (when it has none, the openers are used).
+cat > "$TMP/fast.lua" <<LUA
+return {
+  n_trials = 3, n_startup_trials = 2, max_response_length = 8, batch_size = 2, seed = 1,
+  study_checkpoint_dir = "$TMP/fast_checkpoints",
+  good_prompts = { dataset = "$TMP/good.txt" },
+  bad_prompts = { dataset = "$TMP/bad12.txt" },
+  scorer = {
+    KeywordRate = { prompts = { dataset = "$TMP/bad12.txt" }, keyword_markers = { "\190" } },
+    KLDivergence = { prompts = { dataset = "$TMP/good.txt" } },
+  },
+  fast_search = true, select = "auto",
+  checkpoint_action = "restart", trial_index = 1, model_action = "save", save_directory = "$TMP/fast_out",
+}
+LUA
+"$DITCH" --config "$TMP/fast.lua" tests/fixtures/qwen2 | tee "$TMP/fast.log"
+grep -q "Deferred: KeywordRate (Refusals) runs on the Pareto-optimal trials only" "$TMP/fast.log" || fail "keyword scorer was not deferred"
+grep -qE "refusal-start tokens learned from [0-9]+ baseline refusals|using [0-9]+ tokenised refusal openers" "$TMP/fast.log" || fail "refusal-start token set not reported"
+grep -q "Baseline Refusal mass: [0-9.]*" "$TMP/fast.log" || fail "no baseline refusal mass"
+[ "$(grep -c "^  \* Refusal mass: [0-9.]*" "$TMP/fast.log")" -ge 3 ] || fail "refusal mass was not scored for every trial"
+trial_refusals=$(sed -n '/Running trial 1 of 3/,/Scoring .* Pareto-optimal/p' "$TMP/fast.log" | grep -c "^  \* Refusals: ") || true
+[ "$trial_refusals" -eq 0 ] || fail "the keyword scorer ran during the fast search"
+grep -qE "Scoring [0-9]+ Pareto-optimal trial\(s\) with the deferred Refusals scorer" "$TMP/fast.log" || fail "Pareto candidates were not re-scored"
+grep -q "Listed first: the trial minimising refusals + 1 x KL divergence" "$TMP/fast.log" || fail "--select auto did not report its choice"
+grep -qE "Selected: \[Trial +[0-9]+\] KL divergence: [0-9.]+, Refusal mass: [0-9.]+, Refusals: [0-9]+/12" "$TMP/fast.log" || fail "results menu lacks the real refusal count"
+FAST_CKPT="$TMP/fast_checkpoints/tests--fixtures--qwen2.jsonl"
+grep -q '"type":"rescore"' "$FAST_CKPT" || fail "deferred scores not journaled"
+grep -q '"scorers":"kl_divergence:minimize,refusal_logit:minimize"' "$FAST_CKPT" || fail "scorer set missing from the study manifest"
+grep -q "fast_search = true" "$TMP/fast_out/ditch-reproduce.lua" || fail "manifest lacks fast_search"
+grep -q 'plugin = "refusal_logit"' "$TMP/fast_out/ditch-reproduce.lua" || fail "manifest lacks the refusal_logit scorer"
+grep -q "| \*\*Refusals\*\* | [0-9]*/12 |" "$TMP/fast_out/README.md" || fail "model card lacks the deferred refusal count"
+"$DITCH" --config "$TMP/fast.lua" tests/fixtures/qwen2 --evaluate-model "$TMP/fast_out" | tee "$TMP/fast_eval.log"
+grep -q "  \* Refusal mass: [0-9.]*" "$TMP/fast_eval.log" || fail "evaluation lacks the refusal mass"
+grep -q "  \* Refusals: [0-9]*/12" "$TMP/fast_eval.log" || fail "evaluation lacks the deferred refusal count"
+"$DITCH" --reproduce "$TMP/fast_out/ditch-reproduce.lua" --model-action exit | tee "$TMP/fast_repro.log"
+grep -q "All scores match the manifest" "$TMP/fast_repro.log" || fail "the fast-search export does not reproduce"
+# The objectives differ without --fast-search: the study cannot be continued.
+if "$DITCH" --config "$TMP/fast.lua" tests/fixtures/qwen2 --fast-search false --checkpoint-action continue --model-action exit > "$TMP/fast_mismatch.log" 2>&1; then
+    fail "a fast-search study was continued with the default scorers"
+fi
+grep -q "the checkpoint was created with the scorers" "$TMP/fast_mismatch.log" || fail "scorer mismatch not reported"
+
+echo "==> Separating directions, token window, auto direction range and the geometry table"
+"$DITCH" "${COMMON[@]}" --study-checkpoint-dir "$TMP/sep_checkpoints" \
+    --direction-method separating --direction-token-window 2 --direction-range auto --print-residual-geometry \
+    --n-trials 2 --n-startup-trials 2 \
+    --checkpoint-action restart --trial-index 1 --model-action save --save-directory "$TMP/sep_out" \
+    | tee "$TMP/sep.log"
+grep -q "Residuals are averaged over the last 2 prompt tokens" "$TMP/sep.log" || fail "token window not applied"
+grep -q "Whitening the difference of means by the per-coordinate variance" "$TMP/sep.log" || fail "separating method not used"
+grep -q "AUROC        d'" "$TMP/sep.log" || fail "geometry table lacks the separation columns"
+grep -qE "^      1   .* (0\.[0-9]+|1\.0000)   +-?[0-9.]+$" "$TMP/sep.log" || fail "geometry table lacks per-layer rows"
+grep -qE "direction_index range: [0-9.]+ to [0-9.]+ \(layers whose projection AUROC is within 0.01 of the best" "$TMP/sep.log" || fail "auto direction range not resolved"
+grep -q "Model saved to" "$TMP/sep.log" || fail "separating-direction model was not saved"
+SEP_CKPT="$TMP/sep_checkpoints/tests--fixtures--qwen2.jsonl"
+grep -q '"direction_method":"separating"' "$SEP_CKPT" || fail "direction method missing from the study manifest"
+grep -q '"direction_token_window":2' "$SEP_CKPT" || fail "token window missing from the study manifest"
+grep -q '"direction_index_low":' "$SEP_CKPT" || fail "resolved direction range missing from the study manifest"
+grep -q 'direction_method = "separating"' "$TMP/sep_out/ditch-reproduce.lua" || fail "manifest lacks direction_method"
+grep -q 'direction_range = "auto"' "$TMP/sep_out/ditch-reproduce.lua" || fail "manifest lacks direction_range"
+grep -q "direction_token_window = 2" "$TMP/sep_out/ditch-reproduce.lua" || fail "manifest lacks direction_token_window"
+grep -q "direction_method.*| separating |" "$TMP/sep_out/README.md" || fail "model card lacks direction_method"
+"$DITCH" "${COMMON[@]}" --evaluate-model "$TMP/sep_out" | tee "$TMP/sep_eval.log"
+kl=$(grep "  \* KL divergence:" "$TMP/sep_eval.log" | tail -1 | awk '{print $4}')
+awk -v kl="$kl" 'BEGIN { exit !(kl < 1.0) }' || fail "KL divergence of the separating-direction export is implausible: $kl"
+"$DITCH" --reproduce "$TMP/sep_out/ditch-reproduce.lua" --model-action exit | tee "$TMP/sep_repro.log"
+grep -q "All scores match the manifest" "$TMP/sep_repro.log" || fail "the separating-direction export does not reproduce"
+if "$DITCH" "${COMMON[@]}" --study-checkpoint-dir "$TMP/sep_checkpoints" --direction-token-window 2 --direction-range auto \
+    --checkpoint-action continue --trial-index 1 --model-action exit > "$TMP/sep_mismatch.log" 2>&1; then
+    fail "a separating-direction study was continued with the mean direction"
+fi
+grep -q "direction_method = separating" "$TMP/sep_mismatch.log" || fail "direction method mismatch not reported"
+
+echo "==> Input-side ablation and a 2-position KL divergence"
+"$DITCH" "${COMMON[@]}" --study-checkpoint-dir "$TMP/inputs_checkpoints" --ablate-inputs --kl-tokens 2 \
+    --n-trials 2 --n-startup-trials 2 \
+    --checkpoint-action restart --trial-index 1 --model-action save --save-directory "$TMP/inputs_out" \
+    | tee "$TMP/inputs.log"
+grep -q "Generating the baseline continuation (1 tokens)" "$TMP/inputs.log" || fail "multi-position KL baseline not generated"
+grep -q "Model saved to" "$TMP/inputs.log" || fail "input-ablated model was not saved"
+grep -q "argmax agreement 100%" "$TMP/inputs.log" || fail "input-ablated export validation disagreed"
+grep -q "ablate_inputs = true" "$TMP/inputs_out/ditch-reproduce.lua" || fail "manifest lacks ablate_inputs"
+grep -q "kl_tokens = 2" "$TMP/inputs_out/ditch-reproduce.lua" || fail "manifest lacks kl_tokens"
+grep -q "ablate_inputs.*| true |" "$TMP/inputs_out/README.md" || fail "model card lacks ablate_inputs"
+"$DITCH" "${COMMON[@]}" --kl-tokens 2 --evaluate-model "$TMP/inputs_out" | tee "$TMP/inputs_eval.log"
+kl=$(grep "  \* KL divergence:" "$TMP/inputs_eval.log" | tail -1 | awk '{print $4}')
+awk -v kl="$kl" 'BEGIN { exit !(kl < 1.0) }' || fail "KL divergence of the input-ablated export is implausible: $kl"
+"$DITCH" --reproduce "$TMP/inputs_out/ditch-reproduce.lua" --model-action exit | tee "$TMP/inputs_repro.log"
+grep -q "All scores match the manifest" "$TMP/inputs_repro.log" || fail "the input-ablated export does not reproduce"
+if "$DITCH" "${COMMON[@]}" --study-checkpoint-dir "$TMP/inputs_checkpoints" --ablate-inputs \
+    --checkpoint-action continue --trial-index 1 --model-action exit > "$TMP/inputs_mismatch.log" 2>&1; then
+    fail "a kl_tokens=2 study was continued with kl_tokens=1"
+fi
+grep -q "kl_tokens = 2" "$TMP/inputs_mismatch.log" || fail "kl_tokens mismatch not reported"
+
 echo "==> MoE model: ranked expert selection, save and evaluate"
 MOE_COMMON=("${COMMON[@]}")
 MOE_COMMON[0]=tests/fixtures/qwen3_moe

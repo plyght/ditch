@@ -49,8 +49,22 @@ pub const Space = struct {
     }
 };
 
+/// Bounds of `direction_index` in layer units (0 = output of the first layer).
+pub const IndexRange = struct { low: f64, high: f64 };
+
+/// Heretic's range: 0.4 to 0.9 of the last layer index.
+pub fn defaultIndexRange(model: *const Model) IndexRange {
+    const last: f64 = @floatFromInt(model.config.num_layers - 1);
+    return .{ .low = 0.4 * last, .high = 0.9 * last };
+}
+
 /// Builds the parameter space for `model`, mirroring heretic's ranges.
 pub fn buildSpace(gpa: Allocator, model: *const Model) !Space {
+    return buildSpaceWithRange(gpa, model, defaultIndexRange(model));
+}
+
+/// Like `buildSpace` with explicit `direction_index` bounds.
+pub fn buildSpaceWithRange(gpa: Allocator, model: *const Model, range: IndexRange) !Space {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -60,7 +74,7 @@ pub fn buildSpace(gpa: Allocator, model: *const Model) !Space {
     try names.append(a, "direction_scope");
     try specs.append(a, .{ .categorical = .{ .n = 2 } }); // 0 = global, 1 = per layer
     try names.append(a, "direction_index");
-    try specs.append(a, .{ .float = .{ .low = 0.4 * last, .high = 0.9 * last } });
+    try specs.append(a, .{ .float = .{ .low = range.low, .high = @max(range.high, range.low + 1e-6) } });
     const components = try a.dupe(Component, &Component.all);
     for (components) |comp| {
         const lower: f64 = if (comp == .mlp_down_proj) -0.25 else 0.8;
@@ -124,6 +138,31 @@ pub fn decode(space: *const Space, vector: []const f64) TrialConfig {
     };
 }
 
+/// Relative tolerance of `isRepeat`: the largest per-parameter distance, as a
+/// fraction of the parameter's range, below which two vectors count as the
+/// same trial.
+pub const repeat_epsilon = 1e-3;
+
+/// True when `vector` is within `repeat_epsilon` of an already evaluated
+/// parameter vector (categorical parameters must match exactly). Evaluating
+/// it again would cost a trial and teach the sampler nothing.
+pub fn isRepeat(space: *const Space, vector: []const f64, history: []const tpe.Observation) bool {
+    outer: for (history) |h| {
+        if (h.params.len != vector.len) continue;
+        for (space.space.specs, 0..) |spec, i| {
+            switch (spec) {
+                .categorical => if (@as(usize, @intFromFloat(h.params[i])) != @as(usize, @intFromFloat(vector[i]))) continue :outer,
+                .float => |f| {
+                    const width = @max(f.high - f.low, 1e-12);
+                    if (@abs(h.params[i] - vector[i]) / width > repeat_epsilon) continue :outer;
+                },
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
 /// Human-readable "name = value" lines for a parameter vector.
 pub fn describe(space: *const Space, vector: []const f64, out: *std.Io.Writer) !void {
     for (space.space.names, 0..) |name, i| {
@@ -166,6 +205,36 @@ test "space round trip (dense)" {
     v[0] = 1;
     try std.testing.expectEqual(@as(?f32, null), decode(&space, &v).direction_index);
     try std.testing.expectEqual(@as(?ExpertSelection, null), cfg.experts);
+}
+
+test "direction index range and repeat detection" {
+    const gpa = std.testing.allocator;
+    const pool = @import("tensor.zig").Pool.init(std.testing.io, 1);
+    const model = try Model.load(gpa, std.testing.io, &pool, "tests/fixtures/llama");
+    defer model.deinit();
+    const last: f64 = @floatFromInt(model.config.num_layers - 1);
+    var space = try buildSpace(gpa, model);
+    defer space.deinit();
+    try std.testing.expectApproxEqAbs(0.4 * last, space.space.specs[1].float.low, 1e-9);
+    try std.testing.expectApproxEqAbs(0.9 * last, space.space.specs[1].float.high, 1e-9);
+    var narrow = try buildSpaceWithRange(gpa, model, .{ .low = 1.0, .high = 1.5 });
+    defer narrow.deinit();
+    try std.testing.expectEqual(@as(f64, 1.0), narrow.space.specs[1].float.low);
+    try std.testing.expectEqual(@as(f64, 1.5), narrow.space.specs[1].float.high);
+    // Repeats: the same vector, a vector within tolerance, one that differs in
+    // a float by more than the tolerance, and one that differs categorically.
+    const a = [_]f64{ 0, 1.2, 1.0, 2.0, 0.5, 1.0, -0.1, 2.0, 0.5, 1.0 };
+    const history = [_]tpe.Observation{.{ .params = &a, .losses = &.{ 0, 0 } }};
+    try std.testing.expect(isRepeat(&space, &a, &history));
+    var b = a;
+    b[2] += 1e-5;
+    try std.testing.expect(isRepeat(&space, &b, &history));
+    b[2] += 0.05;
+    try std.testing.expect(!isRepeat(&space, &b, &history));
+    var d = a;
+    d[0] = 1;
+    try std.testing.expect(!isRepeat(&space, &d, &history));
+    try std.testing.expect(!isRepeat(&space, &a, &.{}));
 }
 
 test "space round trip (moe)" {
