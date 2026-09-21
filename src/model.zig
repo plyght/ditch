@@ -1543,6 +1543,15 @@ const AttnCtx = struct {
     out: []f32, // [n][heads*head_dim]; per head the first v_head_dim entries are written
     sliding: bool,
     sinks: ?[]const f32,
+    /// Tasks are `(row, head)` pairs; the pool's chunk `c` handles tasks
+    /// `c, c + chunks, c + 2 chunks, ...` so that a long causal prefix (many
+    /// keys for late rows) is spread over every thread.
+    n_tasks: usize,
+    chunks: usize,
+    per: usize,
+    /// One `max_keys` score buffer per chunk.
+    scores: []f32,
+    max_keys: usize,
 };
 
 fn attentionWorker(ctx: *const AttnCtx, start: usize, end: usize) void {
@@ -1551,9 +1560,15 @@ fn attentionWorker(ctx: *const AttnCtx, start: usize, end: usize) void {
     const hd = c.head_dim;
     const vd = c.v_head_dim;
     const groups = c.num_heads / c.num_kv_heads;
-    var scores_buf: [8192]f32 = undefined;
-    var task = start;
-    while (task < end) : (task += 1) {
+    const slot = start / ctx.per;
+    const scores_buf = ctx.scores[slot * ctx.max_keys ..][0..ctx.max_keys];
+    const stride = ctx.cache.kv_dim;
+    // The vector path needs whole vectors along the head dimension.
+    const vectorised = hd % tensor.VL == 0 and vd % tensor.VL == 0;
+    var i = start;
+    while (i < end) : (i += 1) {
+        const task = (i % ctx.per) * ctx.chunks + slot;
+        if (task >= ctx.n_tasks) continue;
         const r = task / c.num_heads;
         const h = task % c.num_heads;
         const row = ctx.rows[r];
@@ -1569,20 +1584,25 @@ fn attentionWorker(ctx: *const AttnCtx, start: usize, end: usize) void {
         const n_keys = row.pos + 1 - lo;
         const scores = scores_buf[0..n_keys];
         const slope: f32 = if (model.alibi_slopes.len > 0) model.alibi_slopes[h] else 0;
-        var p: usize = 0;
-        while (p < n_keys) : (p += 1) {
-            const k = ctx.cache.kSlot(ctx.layer, row.b, lo + p)[kvh * hd ..][0..hd];
-            var s = tensor.dot(q, k) * c.attention_scale;
-            if (c.attn_logit_softcapping) |cap| s = cap * std.math.tanh(s / cap);
-            if (slope != 0) s += slope * @as(f32, @floatFromInt(lo + p));
-            scores[p] = s;
+        const kbase = ctx.cache.kSlot(ctx.layer, row.b, lo).ptr + kvh * hd;
+        const vbase = ctx.cache.vSlot(ctx.layer, row.b, lo).ptr + kvh * hd;
+        if (vectorised) {
+            tensor.attentionScores(scores, q, kbase, stride, c.attention_scale);
+        } else {
+            for (scores, 0..) |*s, p| s.* = tensor.dot(q, kbase[p * stride ..][0..hd]) * c.attention_scale;
+        }
+        if (c.attn_logit_softcapping) |cap| {
+            for (scores) |*s| s.* = cap * std.math.tanh(s.* / cap);
+        }
+        if (slope != 0) {
+            for (scores, 0..) |*s, p| s.* += slope * @as(f32, @floatFromInt(lo + p));
         }
         if (ctx.sinks) |sk| softmaxWithSink(scores, sk[h]) else tensor.softmaxInPlace(scores);
-        @memset(out, 0);
-        p = 0;
-        while (p < n_keys) : (p += 1) {
-            const v = ctx.cache.vSlot(ctx.layer, row.b, lo + p)[kvh * hd ..][0..vd];
-            tensor.axpy(out, scores[p], v);
+        if (vectorised) {
+            tensor.attentionValues(out, scores, vbase, stride);
+        } else {
+            @memset(out, 0);
+            for (scores, 0..) |s, p| tensor.axpy(out, s, vbase[p * stride ..][0..vd]);
         }
     }
 }
@@ -1953,8 +1973,29 @@ fn attention(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace
         @memcpy(cache.vSlot(li, rows[i].b, rows[i].pos), ws.v[i * kvd ..][0..kvd]);
         cache.noteWrite(rows[i].pos);
     }
-    const actx = AttnCtx{ .model = model, .cache = cache, .layer = li, .rows = rows, .q = ws.q, .out = ws.attn, .sliding = sliding, .sinks = layer.sinks };
-    model.pool.parallelFor(n * c.num_heads, &actx, attentionWorker);
+    const n_tasks = n * c.num_heads;
+    const chunks = @max(1, @min(model.pool.threads, n_tasks));
+    const per = (n_tasks + chunks - 1) / chunks;
+    var max_keys: usize = 1;
+    for (rows) |row| max_keys = @max(max_keys, row.pos + 1);
+    const scores = try model.pool.allocScratch(gpa, chunks * max_keys);
+    defer model.pool.freeScratch(gpa, scores);
+    const actx = AttnCtx{
+        .model = model,
+        .cache = cache,
+        .layer = li,
+        .rows = rows,
+        .q = ws.q,
+        .out = ws.attn,
+        .sliding = sliding,
+        .sinks = layer.sinks,
+        .n_tasks = n_tasks,
+        .chunks = chunks,
+        .per = per,
+        .scores = scores,
+        .max_keys = max_keys,
+    };
+    model.pool.parallelFor(chunks * per, &actx, attentionWorker);
     const vd = c.v_head_dim;
     if (vd != hd) {
         // Compact `[n][heads][head_dim]` (v_head_dim valid per head) to `[n][heads * v_head_dim]`.
@@ -1983,22 +2024,18 @@ fn mlpBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace,
             try tensor.matmulT(model.pool, gpa, ws.up, h_in, n, layer.up.?, null);
             if (layer.gate_bias) |b| addBias(ws.gate, n, inter, b);
             if (layer.up_bias) |b| addBias(ws.up, n, inter, b);
-            for (ws.gate[0 .. n * inter], 0..) |*g, j| g.* = c.activation.apply(g.*) * ws.up[j];
+            tensor.gatedActivation(model.pool, c.activation, ws.gate, ws.gate, ws.up, n, inter, inter, inter);
         },
         .gated_fused => {
             const gu = layer.gate_up.?;
             try tensor.matmulT(model.pool, gpa, ws.gate_up, h_in, n, gu, null);
             if (layer.up_bias) |b| addBias(ws.gate_up, n, 2 * inter, b);
-            for (0..n) |i| {
-                const row = ws.gate_up[i * 2 * inter ..][0 .. 2 * inter];
-                const out = ws.gate[i * inter ..][0..inter];
-                for (out, 0..) |*g, j| g.* = c.activation.apply(row[j]) * row[inter + j];
-            }
+            tensor.gatedActivation(model.pool, c.activation, ws.gate, ws.gate_up, ws.gate_up[inter..], n, inter, 2 * inter, inter);
         },
         .dense => {
             try tensor.matmulT(model.pool, gpa, ws.up, h_in, n, layer.up.?, null);
             if (layer.up_bias) |b| addBias(ws.up, n, inter, b);
-            for (ws.up[0 .. n * inter]) |*u| u.* = c.activation.apply(u.*);
+            tensor.gatedActivation(model.pool, c.activation, ws.up, ws.up, null, n, inter, inter, inter);
             din = ws.up;
         },
     }

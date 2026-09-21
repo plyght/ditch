@@ -12,6 +12,7 @@ const tensor = @import("tensor.zig");
 const safetensors = @import("safetensors.zig");
 const model_mod = @import("model.zig");
 const stream = @import("stream.zig");
+const budget_mod = @import("budget.zig");
 
 const Allocator = std.mem.Allocator;
 const Model = model_mod.Model;
@@ -154,7 +155,10 @@ fn writeShard(gpa: Allocator, io: Io, model: *const Model, dir: Io.Dir, name: []
     std.mem.writeInt(u64, &len_buf, hb.len, .little);
     try out.writeAll(&len_buf);
     try out.writeAll(hb);
-    for (entries) |e| try writeTensor(gpa, model, out, e);
+    for (entries) |e| {
+        if (budget_mod.interrupted()) return error.Interrupted;
+        try writeTensor(gpa, model, out, e);
+    }
     try out.flush();
 }
 

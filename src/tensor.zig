@@ -100,15 +100,71 @@ pub const DType = enum {
 // Thread pool
 // ---------------------------------------------------------------------------
 
-/// A minimal fork-join helper on top of `std.Io`. Every parallel kernel splits
-/// its range into `threads` chunks and runs them as async tasks in a group.
+/// A minimal fork-join helper. Every parallel kernel splits its range into
+/// `threads` chunks; with `initPersistent` they run on a set of resident
+/// worker threads that spin briefly and then sleep on a futex between jobs
+/// (a job dispatch costs a few microseconds), otherwise as async tasks in an
+/// `std.Io` group.
 pub const Pool = struct {
     io: Io,
     threads: usize,
+    workers: ?*Workers = null,
+    /// Kernel scratch that is reused across calls (persistent pools only).
+    scratch: ?*Scratch = null,
 
     pub fn init(io: Io, threads: ?usize) Pool {
         const n = threads orelse (std.Thread.getCpuCount() catch 1);
         return .{ .io = io, .threads = @max(1, n) };
+    }
+
+    /// A pool with `threads - 1` resident worker threads (the calling thread
+    /// works too). Falls back to the `std.Io` path if threads cannot be spawned.
+    pub fn initPersistent(gpa: std.mem.Allocator, io: Io, threads: ?usize) Pool {
+        var pool = init(io, threads);
+        if (pool.threads > 1) pool.workers = Workers.spawn(gpa, io, pool.threads - 1) catch null;
+        if (gpa.create(Scratch)) |sc| {
+            sc.* = .{ .gpa = gpa };
+            pool.scratch = sc;
+        } else |_| {}
+        return pool;
+    }
+
+    pub fn deinit(self: *Pool) void {
+        if (self.workers) |w| w.shutdown();
+        self.workers = null;
+        if (self.scratch) |sc| {
+            sc.gpa.free(sc.buf);
+            sc.gpa.destroy(sc);
+        }
+        self.scratch = null;
+    }
+
+    /// `n` floats of kernel scratch: the pool's reusable buffer when it is
+    /// free and the request is modest, otherwise a fresh allocation. Release
+    /// with `freeScratch`. Kernels never nest, so one buffer suffices.
+    pub fn allocScratch(self: *const Pool, gpa: std.mem.Allocator, n: usize) ![]f32 {
+        if (self.scratch) |sc| {
+            if (!sc.in_use and n <= Scratch.max_floats) {
+                if (sc.buf.len < n) {
+                    const grown = try sc.gpa.alloc(f32, n);
+                    sc.gpa.free(sc.buf);
+                    sc.buf = grown;
+                }
+                sc.in_use = true;
+                return sc.buf[0..n];
+            }
+        }
+        return gpa.alloc(f32, n);
+    }
+
+    pub fn freeScratch(self: *const Pool, gpa: std.mem.Allocator, s: []f32) void {
+        if (self.scratch) |sc| {
+            if (sc.in_use and s.ptr == sc.buf.ptr) {
+                sc.in_use = false;
+                return;
+            }
+        }
+        gpa.free(s);
     }
 
     /// Runs `func(ctx, start, end)` over `[0, n)` split across the pool.
@@ -120,6 +176,16 @@ pub const Pool = struct {
             return;
         }
         const Ctx = @TypeOf(ctx);
+        if (self.workers) |w| {
+            const Tramp = struct {
+                fn run(p: *const anyopaque, s: usize, e: usize) void {
+                    const c: Ctx = @ptrCast(@alignCast(p));
+                    func(c, s, e);
+                }
+            };
+            w.run(.{ .func = Tramp.run, .ctx = @ptrCast(ctx), .n = n, .chunks = chunks });
+            return;
+        }
         const Task = struct {
             fn run(c: Ctx, s: usize, e: usize) Io.Cancelable!void {
                 func(c, s, e);
@@ -133,6 +199,123 @@ pub const Pool = struct {
             group.async(self.io, Task.run, .{ ctx, start, end });
         }
         group.await(self.io) catch {};
+    }
+};
+
+const Scratch = struct {
+    gpa: std.mem.Allocator,
+    buf: []f32 = &.{},
+    in_use: bool = false,
+
+    /// Requests above this (64 MiB) are served by the caller's allocator.
+    const max_floats = 16 << 20;
+};
+
+const Job = struct {
+    func: *const fn (*const anyopaque, usize, usize) void,
+    ctx: *const anyopaque,
+    n: usize,
+    chunks: usize,
+};
+
+/// Resident worker threads for `Pool`. A job is published by bumping
+/// `generation`; every thread (workers and the caller) then claims chunks
+/// through `next` until the job is exhausted, and the caller returns when
+/// `remaining` reaches zero.
+const Workers = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    threads: []std.Thread,
+    generation: std.atomic.Value(u32) = .init(0),
+    remaining: std.atomic.Value(u32) = .init(0),
+    next: std.atomic.Value(usize) = .init(0),
+    stop: std.atomic.Value(bool) = .init(false),
+    job: Job = undefined,
+
+    /// Iterations of the wake-up spin before a worker sleeps on the futex.
+    const spin_iterations = 1000;
+
+    fn spawn(gpa: std.mem.Allocator, io: Io, count: usize) !*Workers {
+        const self = try gpa.create(Workers);
+        errdefer gpa.destroy(self);
+        self.* = .{ .gpa = gpa, .io = io, .threads = &.{} };
+        const threads = try gpa.alloc(std.Thread, count);
+        errdefer gpa.free(threads);
+        var spawned: usize = 0;
+        errdefer {
+            self.stop.store(true, .release);
+            _ = self.generation.fetchAdd(1, .release);
+            self.io.futexWake(u32, &self.generation.raw, std.math.maxInt(u32));
+            for (threads[0..spawned]) |t| t.join();
+        }
+        for (threads) |*t| {
+            t.* = try std.Thread.spawn(.{}, workerMain, .{self});
+            spawned += 1;
+        }
+        self.threads = threads;
+        return self;
+    }
+
+    fn shutdown(self: *Workers) void {
+        self.stop.store(true, .release);
+        _ = self.generation.fetchAdd(1, .release);
+        self.io.futexWake(u32, &self.generation.raw, std.math.maxInt(u32));
+        for (self.threads) |t| t.join();
+        self.gpa.free(self.threads);
+        self.gpa.destroy(self);
+    }
+
+    fn run(self: *Workers, job: Job) void {
+        self.job = job;
+        self.next.store(0, .monotonic);
+        self.remaining.store(@intCast(self.threads.len), .monotonic);
+        _ = self.generation.fetchAdd(1, .release);
+        self.io.futexWake(u32, &self.generation.raw, std.math.maxInt(u32));
+        self.work();
+        // Wait for the workers: spin first, then sleep.
+        var spins: usize = 0;
+        while (self.remaining.load(.acquire) != 0) {
+            if (spins < spin_iterations) {
+                spins += 1;
+                std.atomic.spinLoopHint();
+            } else {
+                const r = self.remaining.load(.acquire);
+                if (r != 0) self.io.futexWaitUncancelable(u32, &self.remaining.raw, r);
+            }
+        }
+    }
+
+    /// Claims and runs chunks of the current job until none are left.
+    fn work(self: *Workers) void {
+        const job = self.job;
+        const per = (job.n + job.chunks - 1) / job.chunks;
+        while (true) {
+            const c = self.next.fetchAdd(1, .monotonic);
+            if (c >= job.chunks) break;
+            const start = c * per;
+            if (start >= job.n) break;
+            job.func(job.ctx, start, @min(job.n, start + per));
+        }
+    }
+
+    fn workerMain(self: *Workers) void {
+        var seen = self.generation.load(.acquire);
+        while (true) {
+            // Wait for a new generation.
+            var spins: usize = 0;
+            while (self.generation.load(.acquire) == seen) {
+                if (spins < spin_iterations) {
+                    spins += 1;
+                    std.atomic.spinLoopHint();
+                } else {
+                    self.io.futexWaitUncancelable(u32, &self.generation.raw, seen);
+                }
+            }
+            seen = self.generation.load(.acquire);
+            if (self.stop.load(.acquire)) return;
+            self.work();
+            if (self.remaining.fetchSub(1, .release) == 1) self.io.futexWake(u32, &self.remaining.raw, 1);
+        }
     }
 };
 
@@ -183,7 +366,13 @@ pub fn convertToF32(dtype: DType, bytes: []const u8, out: []f32) void {
         },
         .f16 => {
             const src = std.mem.bytesAsSlice(u16, bytes[0 .. out.len * 2]);
-            for (out, 0..) |*o, i| o.* = f16ToF32(src[i]);
+            var i: usize = 0;
+            while (i + 16 <= out.len) : (i += 16) {
+                const v: @Vector(16, u16) = src[i..][0..16].*;
+                const h: @Vector(16, f16) = @bitCast(v);
+                out[i..][0..16].* = @as(@Vector(16, f32), @floatCast(h));
+            }
+            while (i < out.len) : (i += 1) out[i] = f16ToF32(src[i]);
         },
         else => quant.dequantize(dtype, bytes, out),
     }
@@ -239,18 +428,17 @@ pub const Weight = struct {
 // Dot products and matrix products
 // ---------------------------------------------------------------------------
 
+/// Every dot-product kernel in this file accumulates lane-wise with fused
+/// multiply-adds over 16-wide blocks, reduces once and finishes the tail
+/// with scalar fused multiply-adds, so an output element is bit-identical
+/// whichever kernel or thread split computes it.
 pub fn dot(a: []const f32, b: []const f32) f32 {
-    const V = @Vector(16, f32);
-    var acc: V = @splat(0);
+    var acc: VF = @splat(0);
     var i: usize = 0;
     const n = a.len;
-    while (i + 16 <= n) : (i += 16) {
-        const va: V = a[i..][0..16].*;
-        const vb: V = b[i..][0..16].*;
-        acc += va * vb;
-    }
+    while (i + VL <= n) : (i += VL) acc = @mulAdd(VF, a[i..][0..VL].*, b[i..][0..VL].*, acc);
     var s = @reduce(.Add, acc);
-    while (i < n) : (i += 1) s += a[i] * b[i];
+    while (i < n) : (i += 1) s = @mulAdd(f32, a[i], b[i], s);
     return s;
 }
 
@@ -289,42 +477,75 @@ pub const Delta = struct {
     b: []f32, // rows * rank
 };
 
+/// Vector width of the matmul kernels (one AVX-512 register, two AVX2 ones).
+pub const VL = 16;
+pub const VF = @Vector(VL, f32);
+/// Weight rows converted per tile: the f32 tile (`tile * cols * 4` bytes)
+/// stays in L2 while every input row streams past it once. Prefill-sized
+/// calls take a large tile so `x` is streamed fewer times; small batches a
+/// small one so the converted tile and the inputs share L1/L2.
+fn tileRowsFor(n: usize) usize {
+    return if (n > 64) 64 else 16;
+}
+
 const MatmulCtx = struct {
     out: []f32,
     x: []const f32,
     n: usize,
     w: Weight,
     delta: ?*const Delta,
-    scratch: []f32, // one slot of 4 converted weight rows per task
-    scratch_per_task: usize,
+    /// `[n][rank]`: `dot(a_k, x_i)` for the delta, computed once per call.
+    xa: []const f32,
+    scratch: []f32, // one tile of `tile` converted weight rows per task
+    tile: usize,
+    per: usize,
 };
 
 fn matmulWorker(ctx: *const MatmulCtx, start: usize, end: usize) void {
-    const slot = start / ctx.scratch_per_task;
+    const slot = start / ctx.per;
     const cols = ctx.w.cols;
     const n = ctx.n;
     const rows = ctx.w.rows;
-    // Scratch holds 4 converted weight rows.
-    const buf = ctx.scratch[slot * (4 * cols + 1) ..][0 .. 4 * cols];
+    const tile = ctx.tile;
+    const buf = ctx.scratch[slot * tile * cols ..][0 .. tile * cols];
     var r = start;
     while (r < end) {
-        const nr = @min(4, end - r);
+        const nr = @min(tile, end - r);
         for (0..nr) |k| ctx.w.row(r + k, buf[k * cols ..][0..cols]);
         var i: usize = 0;
-        while (i < n) : (i += 1) {
-            const xi = ctx.x[i * cols ..][0..cols];
-            if (nr == 4) {
-                const d = dot4(buf[0..cols], buf[cols .. 2 * cols], buf[2 * cols .. 3 * cols], buf[3 * cols .. 4 * cols], xi);
-                inline for (0..4) |k| ctx.out[i * rows + r + k] = d[k];
-            } else {
-                for (0..nr) |k| ctx.out[i * rows + r + k] = dot(buf[k * cols ..][0..cols], xi);
+        while (i < n) {
+            const ni = @min(4, n - i);
+            var k: usize = 0;
+            while (k < nr) {
+                const nk = @min(4, nr - k);
+                const wr = buf[k * cols ..];
+                const xr = ctx.x[i * cols ..];
+                if (nk == 4 and ni == 4) {
+                    const d = dot4x4(wr.ptr, xr.ptr, cols);
+                    inline for (0..4) |ii| {
+                        inline for (0..4) |kk| ctx.out[(i + ii) * rows + r + k + kk] = d[ii][kk];
+                    }
+                } else if (nk == 4) {
+                    for (0..ni) |ii| {
+                        const d = dot4(wr[0..cols], wr[cols .. 2 * cols], wr[2 * cols .. 3 * cols], wr[3 * cols .. 4 * cols], xr[ii * cols ..][0..cols]);
+                        inline for (0..4) |kk| ctx.out[(i + ii) * rows + r + k + kk] = d[kk];
+                    }
+                } else {
+                    for (0..ni) |ii| {
+                        for (0..nk) |kk| ctx.out[(i + ii) * rows + r + k + kk] = dot(wr[kk * cols ..][0..cols], xr[ii * cols ..][0..cols]);
+                    }
+                }
+                k += nk;
             }
-            if (ctx.delta) |dl| {
-                for (0..nr) |k| {
+            i += ni;
+        }
+        if (ctx.delta) |dl| {
+            for (0..n) |ii| {
+                const xa = ctx.xa[ii * dl.rank ..][0..dl.rank];
+                for (0..nr) |kk| {
                     var v: f32 = 0;
-                    var kk: usize = 0;
-                    while (kk < dl.rank) : (kk += 1) v += dl.b[(r + k) * dl.rank + kk] * dot(dl.a[kk * cols ..][0..cols], xi);
-                    ctx.out[i * rows + r + k] += v;
+                    for (0..dl.rank) |j| v += dl.b[(r + kk) * dl.rank + j] * xa[j];
+                    ctx.out[ii * rows + r + kk] += v;
                 }
             }
         }
@@ -334,41 +555,176 @@ fn matmulWorker(ctx: *const MatmulCtx, start: usize, end: usize) void {
 
 /// Four dot products sharing the loads of `x`.
 inline fn dot4(a0: []const f32, a1: []const f32, a2: []const f32, a3: []const f32, x: []const f32) [4]f32 {
-    const V = @Vector(16, f32);
-    var c0: V = @splat(0);
-    var c1: V = @splat(0);
-    var c2: V = @splat(0);
-    var c3: V = @splat(0);
+    var c0: VF = @splat(0);
+    var c1: VF = @splat(0);
+    var c2: VF = @splat(0);
+    var c3: VF = @splat(0);
     var i: usize = 0;
     const n = x.len;
-    while (i + 16 <= n) : (i += 16) {
-        const vx: V = x[i..][0..16].*;
-        c0 += @as(V, a0[i..][0..16].*) * vx;
-        c1 += @as(V, a1[i..][0..16].*) * vx;
-        c2 += @as(V, a2[i..][0..16].*) * vx;
-        c3 += @as(V, a3[i..][0..16].*) * vx;
+    while (i + VL <= n) : (i += VL) {
+        const vx: VF = x[i..][0..VL].*;
+        c0 = @mulAdd(VF, a0[i..][0..VL].*, vx, c0);
+        c1 = @mulAdd(VF, a1[i..][0..VL].*, vx, c1);
+        c2 = @mulAdd(VF, a2[i..][0..VL].*, vx, c2);
+        c3 = @mulAdd(VF, a3[i..][0..VL].*, vx, c3);
     }
     var r = [4]f32{ @reduce(.Add, c0), @reduce(.Add, c1), @reduce(.Add, c2), @reduce(.Add, c3) };
     while (i < n) : (i += 1) {
-        r[0] += a0[i] * x[i];
-        r[1] += a1[i] * x[i];
-        r[2] += a2[i] * x[i];
-        r[3] += a3[i] * x[i];
+        r[0] = @mulAdd(f32, a0[i], x[i], r[0]);
+        r[1] = @mulAdd(f32, a1[i], x[i], r[1]);
+        r[2] = @mulAdd(f32, a2[i], x[i], r[2]);
+        r[3] = @mulAdd(f32, a3[i], x[i], r[3]);
     }
     return r;
+}
+
+/// Sixteen dot products of four weight rows (`w`, stride `cols`) with four
+/// input rows (`x`, stride `cols`): `out[input][row]`. Eight vector loads
+/// feed sixteen fused multiply-adds, so the kernel is bound by the FMA
+/// units rather than by loads.
+inline fn dot4x4(w: [*]const f32, x: [*]const f32, cols: usize) [4][4]f32 {
+    var acc: [4][4]VF = undefined;
+    inline for (0..4) |ii| {
+        inline for (0..4) |kk| acc[ii][kk] = @splat(0);
+    }
+    var i: usize = 0;
+    while (i + VL <= cols) : (i += VL) {
+        var wv: [4]VF = undefined;
+        inline for (0..4) |kk| wv[kk] = w[kk * cols + i ..][0..VL].*;
+        inline for (0..4) |ii| {
+            const xv: VF = x[ii * cols + i ..][0..VL].*;
+            inline for (0..4) |kk| acc[ii][kk] = @mulAdd(VF, wv[kk], xv, acc[ii][kk]);
+        }
+    }
+    var r: [4][4]f32 = undefined;
+    inline for (0..4) |ii| {
+        inline for (0..4) |kk| r[ii][kk] = @reduce(.Add, acc[ii][kk]);
+    }
+    while (i < cols) : (i += 1) {
+        inline for (0..4) |ii| {
+            inline for (0..4) |kk| r[ii][kk] = @mulAdd(f32, w[kk * cols + i], x[ii * cols + i], r[ii][kk]);
+        }
+    }
+    return r;
+}
+
+/// Inputs per call up to which the half-precision decode path is used: the
+/// weight rows are converted in registers and never written to scratch,
+/// so the call streams each weight byte from memory exactly once.
+const fused_max_inputs = 4;
+
+fn usesFusedPath(w: Weight, n: usize) bool {
+    return n <= fused_max_inputs and (w.dtype == .bf16 or w.dtype == .f16);
+}
+
+/// Loads sixteen half-precision weights as f32.
+inline fn loadHalf(comptime dtype: DType, p: [*]align(1) const u16) VF {
+    const v: @Vector(VL, u16) = p[0..VL].*;
+    return switch (dtype) {
+        .bf16 => @bitCast(@as(@Vector(VL, u32), @intCast(v)) << @splat(16)),
+        .f16 => @floatCast(@as(@Vector(VL, f16), @bitCast(v))),
+        else => unreachable,
+    };
+}
+
+inline fn loadHalfScalar(comptime dtype: DType, v: u16) f32 {
+    return switch (dtype) {
+        .bf16 => bf16ToF32(v),
+        .f16 => f16ToF32(v),
+        else => unreachable,
+    };
+}
+
+/// `NK` raw half-precision weight rows (`w`, stride `cols` elements) against
+/// `NI` input rows: `out[input][row]`. Four independent accumulator chains
+/// per input keep the loads flowing on the memory-bound decode path.
+inline fn dotHalf(comptime dtype: DType, comptime NK: usize, comptime NI: usize, w: [*]align(1) const u16, x: [*]const f32, cols: usize) [NI][NK]f32 {
+    var acc: [NI][NK]VF = undefined;
+    inline for (0..NI) |ii| {
+        inline for (0..NK) |kk| acc[ii][kk] = @splat(0);
+    }
+    var i: usize = 0;
+    while (i + VL <= cols) : (i += VL) {
+        var wv: [NK]VF = undefined;
+        inline for (0..NK) |kk| wv[kk] = loadHalf(dtype, w + kk * cols + i);
+        inline for (0..NI) |ii| {
+            const xv: VF = x[ii * cols + i ..][0..VL].*;
+            inline for (0..NK) |kk| acc[ii][kk] = @mulAdd(VF, wv[kk], xv, acc[ii][kk]);
+        }
+    }
+    var r: [NI][NK]f32 = undefined;
+    inline for (0..NI) |ii| {
+        inline for (0..NK) |kk| r[ii][kk] = @reduce(.Add, acc[ii][kk]);
+    }
+    while (i < cols) : (i += 1) {
+        inline for (0..NI) |ii| {
+            inline for (0..NK) |kk| r[ii][kk] = @mulAdd(f32, loadHalfScalar(dtype, w[kk * cols + i]), x[ii * cols + i], r[ii][kk]);
+        }
+    }
+    return r;
+}
+
+fn fusedRows(comptime dtype: DType, comptime NI: usize, ctx: *const MatmulCtx, start: usize, end: usize) void {
+    const cols = ctx.w.cols;
+    const rows = ctx.w.rows;
+    const data: [*]align(1) const u16 = @ptrCast(ctx.w.data.ptr);
+    var r = start;
+    while (r + 4 <= end) : (r += 4) {
+        const d = dotHalf(dtype, 4, NI, data + r * cols, ctx.x.ptr, cols);
+        inline for (0..NI) |ii| {
+            inline for (0..4) |kk| ctx.out[ii * rows + r + kk] = d[ii][kk];
+        }
+    }
+    while (r < end) : (r += 1) {
+        const d = dotHalf(dtype, 1, NI, data + r * cols, ctx.x.ptr, cols);
+        inline for (0..NI) |ii| ctx.out[ii * rows + r] = d[ii][0];
+    }
+}
+
+fn fusedWorker(ctx: *const MatmulCtx, start: usize, end: usize) void {
+    switch (ctx.w.dtype) {
+        inline .bf16, .f16 => |dt| switch (ctx.n) {
+            inline 1, 2, 3, 4 => |ni| fusedRows(dt, ni, ctx, start, end),
+            else => unreachable,
+        },
+        else => unreachable,
+    }
+    if (ctx.delta) |dl| {
+        const rows = ctx.w.rows;
+        for (0..ctx.n) |ii| {
+            const xa = ctx.xa[ii * dl.rank ..][0..dl.rank];
+            for (start..end) |rr| {
+                var v: f32 = 0;
+                for (0..dl.rank) |j| v += dl.b[rr * dl.rank + j] * xa[j];
+                ctx.out[ii * rows + rr] += v;
+            }
+        }
+    }
 }
 
 /// `out[n][rows] = x[n][cols] @ W^T (+ x @ (B A)^T)`.
 pub fn matmulT(pool: *const Pool, gpa: std.mem.Allocator, out: []f32, x: []const f32, n: usize, w: Weight, delta: ?*const Delta) !void {
     std.debug.assert(x.len >= n * w.cols);
     std.debug.assert(out.len >= n * w.rows);
+    if (w.rows == 0 or n == 0) return;
+    const fused = usesFusedPath(w, n);
     const chunks = @max(1, @min(pool.threads, w.rows));
     const per = (w.rows + chunks - 1) / chunks;
     const slots = (w.rows + per - 1) / per;
-    const scratch = try gpa.alloc(f32, slots * (4 * w.cols + 1));
-    defer gpa.free(scratch);
-    const ctx = MatmulCtx{ .out = out, .x = x, .n = n, .w = w, .delta = delta, .scratch = scratch, .scratch_per_task = per };
-    pool.parallelFor(w.rows, &ctx, matmulWorker);
+    const tile = tileRowsFor(n);
+    const scratch = try pool.allocScratch(gpa, if (fused) 0 else slots * tile * w.cols);
+    defer pool.freeScratch(gpa, scratch);
+    var xa: []f32 = &.{};
+    defer if (xa.len > 0) gpa.free(xa);
+    if (delta) |dl| {
+        xa = try gpa.alloc(f32, n * dl.rank);
+        for (0..n) |i| {
+            const xi = x[i * w.cols ..][0..w.cols];
+            for (0..dl.rank) |j| xa[i * dl.rank + j] = dot(dl.a[j * w.cols ..][0..w.cols], xi);
+        }
+    }
+    const ctx = MatmulCtx{ .out = out, .x = x, .n = n, .w = w, .delta = delta, .xa = xa, .scratch = scratch, .tile = tile, .per = per };
+    if (fused) pool.parallelFor(w.rows, &ctx, fusedWorker) else pool.parallelFor(w.rows, &ctx, matmulWorker);
 }
 
 const MatvecTCtx = struct {
@@ -448,6 +804,44 @@ pub fn rowNorms(pool: *const Pool, gpa: std.mem.Allocator, out: []f32, w: Weight
     pool.parallelFor(w.rows, &ctx, rowNormWorker);
 }
 
+/// `scores[p] = scale * dot(q, k[p * stride ..][0..hd])` for every key,
+/// four keys at a time; `hd = q.len` must be a multiple of `VL`.
+pub fn attentionScores(scores: []f32, q: []const f32, k: [*]const f32, stride: usize, scale_: f32) void {
+    const hd = q.len;
+    var p: usize = 0;
+    while (p + 4 <= scores.len) : (p += 4) {
+        var a: [4]VF = .{ @splat(0), @splat(0), @splat(0), @splat(0) };
+        var d: usize = 0;
+        while (d < hd) : (d += VL) {
+            const qv: VF = q[d..][0..VL].*;
+            inline for (0..4) |kk| a[kk] = @mulAdd(VF, k[(p + kk) * stride + d ..][0..VL].*, qv, a[kk]);
+        }
+        inline for (0..4) |kk| scores[p + kk] = @reduce(.Add, a[kk]) * scale_;
+    }
+    while (p < scores.len) : (p += 1) {
+        var a: VF = @splat(0);
+        var d: usize = 0;
+        while (d < hd) : (d += VL) a = @mulAdd(VF, k[p * stride + d ..][0..VL].*, @as(VF, q[d..][0..VL].*), a);
+        scores[p] = @reduce(.Add, a) * scale_;
+    }
+}
+
+/// `out = sum_p scores[p] * v[p * stride ..][0..vd]` with the accumulators
+/// held in registers; `vd = out.len` must be a multiple of `VL`.
+pub fn attentionValues(out: []f32, scores: []const f32, v: [*]const f32, stride: usize) void {
+    const vd = out.len;
+    var j: usize = 0;
+    while (j < vd) : (j += VL) {
+        var a: [4]VF = .{ @splat(0), @splat(0), @splat(0), @splat(0) };
+        var p: usize = 0;
+        while (p + 4 <= scores.len) : (p += 4) {
+            inline for (0..4) |kk| a[kk] = @mulAdd(VF, v[(p + kk) * stride + j ..][0..VL].*, @as(VF, @splat(scores[p + kk])), a[kk]);
+        }
+        while (p < scores.len) : (p += 1) a[0] = @mulAdd(VF, v[p * stride + j ..][0..VL].*, @as(VF, @splat(scores[p])), a[0]);
+        out[j..][0..VL].* = (a[0] + a[1]) + (a[2] + a[3]);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Element-wise kernels
 // ---------------------------------------------------------------------------
@@ -465,15 +859,24 @@ pub fn rmsnorm(out: []f32, x: []const f32, weight: []const f32, eps: f32, gemma_
 }
 
 pub fn softmaxInPlace(x: []f32) void {
-    var m: f32 = -std.math.inf(f32);
-    for (x) |v| m = @max(m, v);
-    var s: f32 = 0;
-    for (x) |*v| {
-        v.* = @exp(v.* - m);
-        s += v.*;
+    var mv: VF = @splat(-std.math.inf(f32));
+    var i: usize = 0;
+    while (i + VL <= x.len) : (i += VL) mv = @max(mv, @as(VF, x[i..][0..VL].*));
+    var m = @reduce(.Max, mv);
+    while (i < x.len) : (i += 1) m = @max(m, x[i]);
+    var sv: VF = @splat(0);
+    i = 0;
+    while (i + VL <= x.len) : (i += VL) {
+        const e = expVec(@as(VF, x[i..][0..VL].*) - @as(VF, @splat(m)));
+        x[i..][0..VL].* = e;
+        sv += e;
     }
-    const inv = 1.0 / s;
-    for (x) |*v| v.* *= inv;
+    var s = @reduce(.Add, sv);
+    while (i < x.len) : (i += 1) {
+        x[i] = @exp(x[i] - m);
+        s += x[i];
+    }
+    scale(x, 1.0 / s);
 }
 
 /// Computes log-softmax of `x` into `out`.
@@ -529,7 +932,89 @@ pub const Activation = enum {
             .quick_gelu => x / (1.0 + @exp(-1.702 * x)),
         };
     }
+
+    /// Vector form of `apply` (`.gelu` has no vector form and uses `apply`).
+    pub inline fn applyVec(self: Activation, x: VF) VF {
+        const one: VF = @splat(1.0);
+        return switch (self) {
+            .silu => x / (one + expVec(-x)),
+            .gelu_tanh => blk: {
+                const u = @as(VF, @splat(0.7978845608028654)) * (x + @as(VF, @splat(0.044715)) * x * x * x);
+                const t = one - @as(VF, @splat(2.0)) / (expVec(u + u) + one);
+                break :blk @as(VF, @splat(0.5)) * x * (one + t);
+            },
+            .gelu => unreachable,
+            .relu => @max(x, @as(VF, @splat(0))),
+            .relu2 => blk: {
+                const r = @max(x, @as(VF, @splat(0)));
+                break :blk r * r;
+            },
+            .quick_gelu => x / (one + expVec(@as(VF, @splat(-1.702)) * x)),
+        };
+    }
 };
+
+/// Vectorised `exp` (Cephes `expf`: range reduction by `ln 2`, a degree-6
+/// polynomial and an exponent-field scale), about 2 ulp over the finite
+/// range; the input is clamped so the result never becomes NaN.
+pub inline fn expVec(x_in: VF) VF {
+    const x = @min(@max(x_in, @as(VF, @splat(-87.3))), @as(VF, @splat(88.0)));
+    const fx = @round(x * @as(VF, @splat(1.44269504088896341)));
+    const r = @mulAdd(VF, fx, @splat(2.12194440e-4), @mulAdd(VF, fx, @splat(-0.693359375), x));
+    var y: VF = @splat(1.9875691500e-4);
+    y = @mulAdd(VF, y, r, @splat(1.3981999507e-3));
+    y = @mulAdd(VF, y, r, @splat(8.3334519073e-3));
+    y = @mulAdd(VF, y, r, @splat(4.1665795894e-2));
+    y = @mulAdd(VF, y, r, @splat(1.6666665459e-1));
+    y = @mulAdd(VF, y, r, @splat(5.0000001201e-1));
+    y = @mulAdd(VF, y, r * r, r + @as(VF, @splat(1.0)));
+    const e: @Vector(VL, i32) = @intFromFloat(fx);
+    const bits = (e + @as(@Vector(VL, i32), @splat(127))) << @splat(23);
+    return y * @as(VF, @bitCast(bits));
+}
+
+const ActCtx = struct {
+    act: Activation,
+    out: [*]f32,
+    gate: [*]const f32,
+    up: ?[*]const f32,
+    len: usize,
+    in_stride: usize,
+    out_stride: usize,
+};
+
+/// Work is split in `VL`-element blocks aligned to the start of each row,
+/// so an element is computed by the same (vector or scalar) code whatever
+/// the thread split.
+fn activationWorker(ctx: *const ActCtx, start: usize, end: usize) void {
+    const blocks_per_row = (ctx.len + VL - 1) / VL;
+    var i = start;
+    while (i < end) : (i += 1) {
+        const row = i / blocks_per_row;
+        const j = (i % blocks_per_row) * VL;
+        const g = ctx.gate[row * ctx.in_stride + j ..];
+        const o = ctx.out[row * ctx.out_stride + j ..];
+        const u: ?[*]const f32 = if (ctx.up) |u| u + row * ctx.in_stride + j else null;
+        if (j + VL <= ctx.len and ctx.act != .gelu) {
+            var v = ctx.act.applyVec(g[0..VL].*);
+            if (u) |up| v *= @as(VF, up[0..VL].*);
+            o[0..VL].* = v;
+        } else {
+            for (0..@min(VL, ctx.len - j)) |k| {
+                var v = ctx.act.apply(g[k]);
+                if (u) |up| v *= up[k];
+                o[k] = v;
+            }
+        }
+    }
+}
+
+/// `out[i][j] = act(gate[i][j]) * up[i][j]` (or just `act(gate)` without `up`)
+/// for `n` rows of `len` elements, in parallel; `out` may alias `gate`.
+pub fn gatedActivation(pool: *const Pool, act: Activation, out: []f32, gate: []const f32, up: ?[]const f32, n: usize, len: usize, in_stride: usize, out_stride: usize) void {
+    const ctx = ActCtx{ .act = act, .out = out.ptr, .gate = gate.ptr, .up = if (up) |u| u.ptr else null, .len = len, .in_stride = in_stride, .out_stride = out_stride };
+    pool.parallelFor(n * ((len + VL - 1) / VL), &ctx, activationWorker);
+}
 
 /// LayerNorm over `x` with optional bias; `one_plus` scales by `(1 + w)`
 /// (Nemotron). An empty `weight` means the non-parametric form (OLMo).

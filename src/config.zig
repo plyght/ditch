@@ -226,42 +226,101 @@ pub const Settings = struct {
     bench_output: ?[]const u8 = null,
     help: bool = false,
     version: bool = false,
+    /// Print only trial results, scores, menus and errors: no banner and no progress lines.
+    quiet: bool = false,
+    /// Append one JSON object per completed trial to this file.
+    json_log: ?[]const u8 = null,
+    /// Stop after loading the model and printing the memory estimate.
+    dry_run: bool = false,
+    /// Never prompt: fail with the flag to pass instead.
+    no_input: bool = false,
+    /// Prompt even when stdin is not a terminal (scripted answers).
+    interactive: bool = false,
+    /// Overwrite a non-empty save directory without asking.
+    force: bool = false,
+    /// Results, evaluation or benchmark as one JSON document on stdout.
+    json: bool = false,
+    /// No tables and no colour on stdout.
+    plain: bool = false,
+    /// Never use ANSI colour.
+    no_color: bool = false,
+    /// File holding the Hugging Face token (default: HF_TOKEN, then ~/.cache/huggingface/token).
+    token_file: ?[]const u8 = null,
+    /// Connect / stall timeout of downloads in seconds.
+    http_timeout_seconds: u64 = 30,
+    /// `ditch help <topic>`.
+    help_topic: ?[]const u8 = null,
 };
 
-pub const help_text =
-    \\Usage: ditch [OPTIONS] <MODEL>
+/// One heading and its body of the help text; `writeHelp` renders the
+/// headings in bold on a terminal.
+pub const HelpSection = struct { title: []const u8, body: []const u8 };
+
+pub const tagline = "ditch censorship: fully automatic refusal removal for open-weight language models, on a CPU.";
+pub const issues_url = "https://github.com/plyght/ditch/issues";
+
+pub const usage_text =
+    \\  ditch [OPTIONS] <MODEL>          run the abliteration study on a model
+    \\  ditch bench [OPTIONS] <MODEL>    measure throughput, timings and memory
+    \\  ditch help [bench]               this help (or the benchmark options)
     \\
-    \\ditch censorship: fully automatic refusal removal for language models, in Zig.
-    \\<MODEL> is a Hugging Face model ID (e.g. Qwen/Qwen2.5-0.5B-Instruct) or a local directory.
+    \\<MODEL> is a Hugging Face model id (Qwen/Qwen2.5-0.5B-Instruct), a local directory, a .gguf
+    \\file or hf://owner/name (weights fetched on demand). A local directory named like a
+    \\subcommand must be given as a path, e.g. ./bench.
     \\
-    \\Options can also be set in config.lua (see config.default.lua); a heretic-style
-    \\config.toml is accepted too. Command-line options take precedence. Every option
-    \\accepts --name value or --name=value.
+;
+
+pub const examples_text =
+    \\  ditch Qwen/Qwen2.5-0.5B-Instruct
+    \\      Full run: download, calibrate, search 200 trials, then choose a trial to save or chat with.
+    \\  ditch Qwen/Qwen2.5-0.5B-Instruct --n-trials 40 --trial-index 1 --model-action save -o out/
+    \\      Non-interactive: 40 trials, save the best Pareto trial to out/.
+    \\  ditch hf://Qwen/Qwen3-30B-A3B --max-ram 12GB --expert-cache 6GB --time-limit 4h
+    \\      A model bigger than RAM: stream weights, keep a bounded expert cache, stop cleanly after 4 h.
+    \\  ditch bench Qwen/Qwen2.5-0.5B-Instruct --json > bench.json
+    \\      Benchmark, machine-readable.
     \\
-    \\Model & runtime:
+;
+
+pub const help_sections = [_]HelpSection{
+    .{ .title = "Common options", .body =
+    \\  --n-trials <n>                 Total trials (default: 200; use far fewer on a CPU).
+    \\  --batch-size <n>               Prompts per batch (0 = auto-detect, the default).
+    \\  --max-ram <size>               Keep resident memory under this budget, e.g. 8GB.
+    \\  -o, --output <path>            Where to save the model (= --save-directory).
+    \\  --trial-index <n>, --model-action <save|chat|exit>   Answer the result menus non-interactively.
+    \\  -n, --dry-run                  Stop after loading the model and printing the memory estimate.
+    \\  -q, --quiet                    Only trial results, scores and errors (no banner, no progress).
+    \\  --json                         Results, evaluation or benchmark as one JSON document on stdout.
+    \\  --config <path>                Configuration file, .lua or .toml (default: ./config.lua).
+    \\
+    },
+    .{ .title = "Model and runtime", .body =
     \\  --model <id|path>              Model to process (positional argument is equivalent).
     \\  --model-commit <sha>           Pin the model to a specific revision.
     \\  --evaluate-model <id|path>     Only evaluate this model against the base model's scorers.
-    \\  --threads <n>                  Worker threads (default: number of CPUs).
+    \\  --threads <n>                  Worker threads (default: number of CPUs; also DITCH_THREADS).
     \\  --cache-dir <path>             Download cache (default: $DITCH_CACHE or ~/.cache/ditch).
     \\  --chat-template <name>         Force a chat template: chatml, llama3, llama2, mistral, gemma, raw.
-    \\  --batch-size <n>               Prompts per batch (0 = auto-detect, the default).
-    \\  --max-batch-size <n>           Upper bound for auto-detection (default: 32).
+    \\  --max-batch-size <n>           Upper bound for batch-size auto-detection (default: 32).
     \\  --max-response-length <n>      Tokens generated per response (default: 100).
     \\  --response-prefix <text>       Text appended to every prompt (default: auto-detect).
     \\  --system-prompt <text>         System prompt for all prompts.
     \\
-    \\Resource budget:
+    },
+    .{ .title = "Resource budget", .body =
     \\  --max-ram <size>               Keep resident memory under this budget, e.g. 8GB (default: unlimited;
     \\                                 weights are memory-mapped). With a budget, weights are streamed layer
     \\                                 by layer from disk and caches spill to --scratch-dir when needed.
+    \\                                 Also DITCH_MAX_RAM.
     \\  --max-vram <size>              Accepted for compatibility; unused (CPU-only, no GPU backend).
-    \\  --scratch-dir <path>           Spill directory (default: <cache-dir>/scratch or ./scratch).
+    \\  --scratch-dir <path>           Spill directory (default: <cache-dir>/scratch, else $TMPDIR/ditch-scratch).
     \\  --time-limit <duration>        Stop cleanly after this long, e.g. 90m, 2h, 1h30m (default: none).
     \\  --budget-headroom <size>       Memory reserved for everything ditch does not allocate itself
     \\                                 (default: max(10% of --max-ram, 256MB), at most half of it).
     \\
-    \\Warp mode (mixture-of-experts models bigger than RAM; on automatically with --max-ram):
+    },
+    .{ .title = "Warp mode (mixture-of-experts models bigger than RAM; on automatically with --max-ram)", .body =
     \\  --expert-cache <size>          Bounded LRU cache of resident routed experts; the trunk streams
     \\                                 per layer, experts are fetched when the router selects them
     \\                                 (default: what --max-ram leaves after the trunk and workspaces;
@@ -276,7 +335,8 @@ pub const help_text =
     \\  --remote-weights               Treat a plain Hub id like hf://<id>.
     \\  --remote-chunk-size <size>     Fetch/cache granularity of the remote source (default: 8MB).
     \\
-    \\Abliteration:
+    },
+    .{ .title = "Abliteration", .body =
     \\  --orthogonalize-direction <bool>      Project directions orthogonal to the good direction (default: true).
     \\  --row-normalization <none|pre|full>   Row normalisation mode (default: full).
     \\  --full-normalization-lora-rank <n>    Rank of the "full" approximation (default: 3).
@@ -295,7 +355,8 @@ pub const help_text =
     \\                                        refusal direction (ranked, default), a random subset of the
     \\                                        same size (baseline), or always every expert (broad).
     \\
-    \\Optimisation:
+    },
+    .{ .title = "Optimisation", .body =
     \\  --n-trials <n>                 Total trials (default: 200).
     \\  --n-startup-trials <n>         Random exploration trials (default: 60).
     \\  --seed <n>                     Random seed.
@@ -310,16 +371,19 @@ pub const help_text =
     \\  --select <pareto|auto>         List the front trial minimising refusals + lambda * KL first (auto).
     \\  --select-lambda <f>            The lambda of --select auto (default: 1).
     \\
-    \\Datasets (also for --keyword-rate-* and --kl-divergence-* scorer prompts):
+    },
+    .{ .title = "Datasets (also for --keyword-rate-* and --kl-divergence-* scorer prompts)", .body =
     \\  --good-prompts-dataset <id|file>  --good-prompts-split <s>  --good-prompts-column <c>
     \\  --bad-prompts-dataset <id|file>   --bad-prompts-split <s>   --bad-prompts-column <c>
     \\  A dataset is a Hugging Face dataset ID (rows are fetched through the datasets-server
     \\  API) or a text file with one prompt per line.
     \\
-    \\Results (non-interactive use):
+    },
+    .{ .title = "Results (non-interactive use)", .body =
     \\  --trial-index <n>              Select this trial instead of asking.
     \\  --model-action <save|chat|exit>  What to do with the selected trial.
-    \\  --save-directory <path>        Where to save the model with --model-action save.
+    \\  --save-directory <path>        Where to save the model with --model-action save (also -o, --output).
+    \\  -f, --force                    Overwrite a non-empty save directory without asking.
     \\  --export-dtype <bf16|f16|f32>  Storage dtype for exported weights (default: same as source).
     \\  --export-format <hf|gguf|both> Export format: Hugging Face directory (default), a llama.cpp
     \\                                 GGUF file, or both (GGUF inputs default to gguf).
@@ -328,7 +392,8 @@ pub const help_text =
     \\                                 source types for a GGUF input). Norms stay f32.
     \\  --n-additional-trials <n>      Run more trials after a finished study.
     \\
-    \\Reproducing and benchmarking:
+    },
+    .{ .title = "Reproducing and benchmarking", .body =
     \\  --reproduce <manifest.lua>     Re-derive an exported model from its ditch-reproduce.lua
     \\                                 (verifies the model file and prompt hashes, applies the
     \\                                 recorded trial, then shows the model menu; no search).
@@ -338,15 +403,168 @@ pub const help_text =
     \\  --bench-tokens <n>             Tokens decoded per prompt in the benchmark (default: 32).
     \\  --bench-output <file.md>       Also write the benchmark table to this file.
     \\
-    \\Other:
-    \\  --print-debug-information      Print extra diagnostics.
+    },
+    .{ .title = "Output and interaction", .body =
+    \\  -q, --quiet                    Only trial results, scores and errors (no banner, no progress).
+    \\  --json                         Print the results, evaluation or benchmark as one JSON document on
+    \\                                 stdout; everything else goes to stderr.
+    \\  --json-log <file>              Append one JSON object per trial (parameters, scores, losses, timing).
+    \\  --plain                        No tables, no colour: one "key: value" or one trial per line.
+    \\  --no-color                     Never use ANSI colour (also NO_COLOR, DITCH_NO_COLOR, TERM=dumb;
+    \\                                 FORCE_COLOR turns it on).
+    \\  --no-input                     Never prompt; fail with the flag to pass instead.
+    \\  --interactive                  Prompt even when stdin is not a terminal (scripted answers).
+    \\  -d, --debug                    Print extra diagnostics (= --print-debug-information).
     \\  --print-residual-geometry      Print per-layer residual geometry statistics.
     \\  --keyword-rate-print-responses Print every evaluated prompt/response pair.
-    \\  --config <path>                Configuration file, .lua or .toml (default: ./config.lua, else ./config.toml).
-    \\  -h, --help                     Show this help.
-    \\  --version                      Print the version.
+    \\
+    },
+    .{ .title = "Network and secrets", .body =
+    \\  --token-file <path>            Read the Hugging Face token from this file (default: HF_TOKEN,
+    \\                                 then ~/.cache/huggingface/token). A token is never taken as a
+    \\                                 flag value and never printed.
+    \\  --http-timeout <duration>      Connect / stall timeout of downloads (default: 30s); transient
+    \\                                 failures are retried three times and downloads resume .part files.
+    \\
+    },
+    .{ .title = "Configuration", .body =
+    \\  --config <path>                Configuration file, .lua or .toml (default: ./config.lua, else
+    \\                                 ./config.toml). See config.default.lua for every option.
+    \\  Precedence: flags > DITCH_* environment variables (DITCH_THREADS, DITCH_MAX_RAM, DITCH_CACHE,
+    \\  DITCH_NO_COLOR) > ./config.lua > $XDG_CONFIG_HOME/ditch/config.lua (~/.config/ditch/config.lua).
+    \\  Every option accepts --name value or --name=value; flags and subcommands may come in any order.
+    \\
+    },
+    .{ .title = "Exit codes", .body =
+    \\  0  success (also --dry-run and a clean stop at --time-limit)
+    \\  1  failure
+    \\  2  usage error, or the memory budget is too small for the model
+    \\
+    },
+    .{ .title = "Other", .body =
+    \\  -h, --help                     Show this help (ditch help bench: the benchmark options).
+    \\  --version                      Print the version, the Zig version and the target.
+    \\
+    },
+};
+
+pub const bench_help_text =
+    \\  ditch bench [OPTIONS] <MODEL>
+    \\
+    \\Measures prefill and decode throughput, the residual-mean pass, the abliteration apply time
+    \\and one full trial with the same model loading, prompt datasets and scorers as a study.
+    \\
+    \\  --bench-prompts <n>            Prompts per benchmark batch (default: 16).
+    \\  --bench-tokens <n>             Tokens decoded per prompt in the benchmark (default: 32).
+    \\  --bench-output <file.md>       Also write the benchmark table to this file.
+    \\  --json                         Print the results as one JSON document on stdout.
+    \\  --plain                        One "metric: value" line per row instead of a Markdown table.
+    \\  --threads <n>, --batch-size <n>, --max-ram <size>, --expert-cache <size> and the dataset
+    \\  options apply as for a study; see ditch --help.
     \\
 ;
+
+/// The whole help as plain text (the option table for suggestions is scanned from it).
+pub const help_text = "Usage:\n" ++ usage_text ++ "\n" ++ tagline ++ "\n\nExamples:\n" ++ examples_text ++ blk: {
+    var t: []const u8 = "";
+    for (help_sections) |s| t = t ++ "\n" ++ s.title ++ ":\n" ++ s.body;
+    break :blk t;
+} ++ "\nReport issues at " ++ issues_url ++ "\n";
+
+const ansi_bold = "\x1b[1m";
+const ansi_reset = "\x1b[0m";
+
+fn writeHeading(w: *std.Io.Writer, title: []const u8, bold: bool) !void {
+    if (bold) try w.writeAll(ansi_bold);
+    try w.writeAll(title);
+    try w.writeAll(":");
+    if (bold) try w.writeAll(ansi_reset);
+    try w.writeAll("\n");
+}
+
+/// The full help; `bold` renders headings with ANSI bold.
+pub fn writeHelp(w: *std.Io.Writer, bold: bool) !void {
+    try writeHeading(w, "Usage", bold);
+    try w.writeAll(usage_text);
+    try w.print("\n{s}\n\n", .{tagline});
+    try writeHeading(w, "Examples", bold);
+    try w.writeAll(examples_text);
+    for (help_sections) |s| {
+        try w.writeAll("\n");
+        try writeHeading(w, s.title, bold);
+        try w.writeAll(s.body);
+    }
+    try w.print("\nReport issues at {s}\n", .{issues_url});
+}
+
+/// The short help printed when ditch is run without arguments.
+pub fn writeConciseHelp(w: *std.Io.Writer, bold: bool) !void {
+    try w.print("ditch {s}: {s}\n\n", .{ version, tagline });
+    try writeHeading(w, "Usage", bold);
+    try w.writeAll(usage_text);
+    try w.writeAll("\n");
+    try writeHeading(w, "Examples", bold);
+    try w.writeAll(examples_text);
+    try w.writeAll("\n");
+    try writeHeading(w, help_sections[0].title, bold);
+    try w.writeAll(help_sections[0].body);
+    try w.writeAll("\nRun ditch --help for all options.\n");
+}
+
+pub fn writeBenchHelp(w: *std.Io.Writer, bold: bool) !void {
+    try writeHeading(w, "Usage", bold);
+    try w.writeAll(bench_help_text);
+}
+
+/// Every `--option` named in the help text, in order of appearance (with repeats).
+pub fn knownOptions(a: Allocator) ![][]const u8 {
+    var list = std.ArrayList([]const u8).empty;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, help_text, i, "--")) |p| {
+        var e = p + 2;
+        while (e < help_text.len and (std.ascii.isAlphanumeric(help_text[e]) or help_text[e] == '-')) e += 1;
+        if (e > p + 2) try list.append(a, help_text[p + 2 .. e]);
+        i = e;
+    }
+    return list.toOwnedSlice(a);
+}
+
+/// Levenshtein distance.
+pub fn editDistance(a: []const u8, b: []const u8) usize {
+    var prev: [128]usize = undefined;
+    var cur: [128]usize = undefined;
+    if (a.len >= prev.len or b.len >= prev.len) return @max(a.len, b.len);
+    for (0..b.len + 1) |j| prev[j] = j;
+    for (a, 0..) |ca, i| {
+        cur[0] = i + 1;
+        for (b, 0..) |cb, j| {
+            const cost: usize = if (ca == cb) 0 else 1;
+            cur[j + 1] = @min(@min(prev[j + 1] + 1, cur[j] + 1), prev[j] + cost);
+        }
+        @memcpy(prev[0 .. b.len + 1], cur[0 .. b.len + 1]);
+    }
+    return prev[b.len];
+}
+
+/// The closest known option to a misspelt `--name` (without dashes), if any is close.
+pub fn suggestOption(a: Allocator, name: []const u8) !?[]const u8 {
+    const options = try knownOptions(a);
+    var best: ?[]const u8 = null;
+    var best_d: usize = std.math.maxInt(usize);
+    const limit = @max(2, name.len / 3);
+    for (options) |o| {
+        const d = editDistance(name, o);
+        if (d < best_d) {
+            best_d = d;
+            best = o;
+        }
+        if (d == 0) break;
+    }
+    if (best_d <= limit) return best;
+    // A prefix of a longer option (--good-prompts for --good-prompts-dataset).
+    for (options) |o| if (std.mem.startsWith(u8, o, name)) return o;
+    return null;
+}
 
 pub const version = "0.2.0";
 
@@ -361,14 +579,48 @@ pub const LoadResult = struct {
 };
 
 /// Loads settings from the config file and command line.
-pub fn load(gpa: Allocator, io: std.Io, args: []const []const u8) !LoadResult {
+/// Applies one configuration file (`.lua`, or `.toml` for heretic
+/// compatibility); a missing file is only an error when it was named explicitly.
+fn applyConfigFile(gpa: Allocator, io: std.Io, a: Allocator, settings: *Settings, errors: *std.ArrayList([]const u8), path: []const u8, explicit: bool) !bool {
+    const cwd = std.Io.Dir.cwd();
+    const text = cwd.readFileAlloc(io, path, a, .unlimited) catch |err| {
+        if (explicit) try errors.append(a, try std.fmt.allocPrint(a, "could not read {s}: {s}", .{ path, @errorName(err) }));
+        return true;
+    };
+    settings.config_path = try a.dupe(u8, path);
+    if (std.mem.endsWith(u8, path, ".toml")) {
+        var parsed = toml.parse(gpa, text) catch |err| {
+            try errors.append(a, try std.fmt.allocPrint(a, "could not parse {s}: {s}", .{ path, @errorName(err) }));
+            return false;
+        };
+        defer parsed.deinit();
+        try applyToml(a, settings, parsed.root, errors);
+    } else {
+        var result = try lua.parse(gpa, text, path);
+        defer result.parsed.deinit();
+        if (result.err) |e| {
+            try errors.append(a, try std.fmt.allocPrint(a, "could not load {s}: {s}", .{ path, e }));
+            return false;
+        }
+        try applyToml(a, settings, result.parsed.root, errors);
+    }
+    return true;
+}
+
+pub const subcommands = [_][]const u8{ "bench", "help" };
+
+/// Parses the configuration: the user file ($XDG_CONFIG_HOME/ditch/config.lua),
+/// the project file (./config.lua, ./config.toml or --config), the DITCH_*
+/// environment variables and finally the command line, later sources taking
+/// precedence. `-h`/`--help` anywhere wins over every error.
+pub fn load(gpa: Allocator, io: std.Io, args: []const []const u8, environ: ?*std.process.Environ.Map) !LoadResult {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
     var settings = Settings{};
     var errors = std.ArrayList([]const u8).empty;
 
-    // First pass: find --config.
+    // First pass: --config and --help anywhere.
     var config_path: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -376,39 +628,45 @@ pub fn load(gpa: Allocator, io: std.Io, args: []const []const u8) !LoadResult {
             config_path = args[i + 1];
         } else if (std.mem.startsWith(u8, args[i], "--config=")) {
             config_path = args[i]["--config=".len..];
+        } else if (std.mem.eql(u8, args[i], "-h") or std.mem.eql(u8, args[i], "--help")) {
+            settings.help = true;
         }
     }
-    // Default: config.lua, falling back to config.toml (heretic compatibility).
+    // User configuration, then the project's config.lua (falling back to
+    // config.toml for heretic compatibility).
     const cwd = std.Io.Dir.cwd();
+    if (config_path == null) {
+        if (environ) |env| {
+            const base: ?[]const u8 = if (env.get("XDG_CONFIG_HOME")) |x| x else if (env.get("HOME")) |h| try std.fs.path.join(a, &.{ h, ".config" }) else null;
+            if (base) |bdir| {
+                const user_path = try std.fs.path.join(a, &.{ bdir, "ditch", "config.lua" });
+                if (!try applyConfigFile(gpa, io, a, &settings, &errors, user_path, false)) return .{ .settings = settings, .arena = arena, .errors = try errors.toOwnedSlice(a) };
+            }
+        }
+    }
     var path: []const u8 = config_path orelse "config.lua";
     if (config_path == null) {
         if (cwd.access(io, "config.lua", .{})) |_| {} else |_| {
             if (cwd.access(io, "config.toml", .{})) |_| path = "config.toml" else |_| {}
         }
     }
-    if (cwd.readFileAlloc(io, path, a, .unlimited)) |text| {
-        settings.config_path = try a.dupe(u8, path);
-        if (std.mem.endsWith(u8, path, ".toml")) {
-            var parsed = toml.parse(gpa, text) catch |err| {
-                try errors.append(a, try std.fmt.allocPrint(a, "could not parse {s}: {s}", .{ path, @errorName(err) }));
-                return .{ .settings = settings, .arena = arena, .errors = try errors.toOwnedSlice(a) };
+    if (!try applyConfigFile(gpa, io, a, &settings, &errors, path, config_path != null)) return .{ .settings = settings, .arena = arena, .errors = try errors.toOwnedSlice(a) };
+
+    // Environment variables.
+    if (environ) |env| {
+        const vars = [_][2][]const u8{ .{ "DITCH_THREADS", "threads" }, .{ "DITCH_MAX_RAM", "max_ram" } };
+        for (vars) |v| if (env.get(v[0])) |value| {
+            applyOption(a, &settings, v[1], value) catch |err| {
+                try errors.append(a, try std.fmt.allocPrint(a, "invalid value for {s}: {s}", .{ v[0], @errorName(err) }));
             };
-            defer parsed.deinit();
-            try applyToml(a, &settings, parsed.root, &errors);
-        } else {
-            var result = try lua.parse(gpa, text, path);
-            defer result.parsed.deinit();
-            if (result.err) |e| {
-                try errors.append(a, try std.fmt.allocPrint(a, "could not load {s}: {s}", .{ path, e }));
-                return .{ .settings = settings, .arena = arena, .errors = try errors.toOwnedSlice(a) };
-            }
-            try applyToml(a, &settings, result.parsed.root, &errors);
-        }
-    } else |err| {
-        if (config_path != null) try errors.append(a, try std.fmt.allocPrint(a, "could not read {s}: {s}", .{ path, @errorName(err) }));
+        };
+        if (env.get("DITCH_NO_COLOR")) |v| if (v.len > 0) {
+            settings.no_color = true;
+        };
     }
 
     // Second pass: command-line options.
+    var expect_help_topic = false;
     i = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -416,8 +674,53 @@ pub fn load(gpa: Allocator, io: std.Io, args: []const []const u8) !LoadResult {
             settings.help = true;
             continue;
         }
+        if (arg.len == 2 and arg[0] == '-' and arg[1] != '-') {
+            // Short aliases.
+            switch (arg[1]) {
+                'q' => settings.quiet = true,
+                'n' => settings.dry_run = true,
+                'd' => settings.print_debug_information = true,
+                'f' => settings.force = true,
+                'o' => {
+                    if (i + 1 < args.len) {
+                        i += 1;
+                        settings.save_directory = try a.dupe(u8, args[i]);
+                    } else try errors.append(a, try std.fmt.allocPrint(a, "option -o requires a value", .{}));
+                },
+                else => try errors.append(a, try std.fmt.allocPrint(a, "unknown option {s} (run ditch --help)", .{arg})),
+            }
+            continue;
+        }
         if (!std.mem.startsWith(u8, arg, "--")) {
-            // Positional model.
+            // Subcommands (anywhere), the help topic, or the positional model.
+            if (expect_help_topic) {
+                expect_help_topic = false;
+                settings.help_topic = try a.dupe(u8, arg);
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "bench")) {
+                settings.bench = true;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "help")) {
+                settings.help = true;
+                expect_help_topic = true;
+                continue;
+            }
+            if (settings.model.len > 0) {
+                try errors.append(a, try std.fmt.allocPrint(a, "unexpected argument {s} (the model is already {s}; quote values containing spaces)", .{ arg, settings.model }));
+                continue;
+            }
+            // A near miss of a subcommand that is not a path is a typo, not a model.
+            var is_path = false;
+            if (cwd.access(io, arg, .{})) |_| is_path = true else |_| {}
+            if (!is_path and std.mem.indexOfScalar(u8, arg, '/') == null) {
+                for (subcommands) |sc| if (editDistance(arg, sc) <= 2) {
+                    try errors.append(a, try std.fmt.allocPrint(a, "unknown command {s}; did you mean {s}? (a local model directory of that name: ./{s})", .{ arg, sc, arg }));
+                    break;
+                };
+                if (errors.items.len > 0 and std.mem.startsWith(u8, errors.items[errors.items.len - 1], "unknown command")) continue;
+            }
             settings.model = try a.dupe(u8, arg);
             continue;
         }
@@ -445,10 +748,19 @@ pub fn load(gpa: Allocator, io: std.Io, args: []const []const u8) !LoadResult {
                 value = args[i];
             } else value = "true";
         }
-        applyOption(a, &settings, key, value.?) catch |err| {
-            try errors.append(a, try std.fmt.allocPrint(a, "invalid value for --{s}: {s}", .{ name, @errorName(err) }));
+        applyOption(a, &settings, key, value.?) catch |err| switch (err) {
+            error.UnknownOption => {
+                if (try suggestOption(a, name)) |sug| {
+                    try errors.append(a, try std.fmt.allocPrint(a, "unknown option --{s}; did you mean --{s}?", .{ name, sug }));
+                } else {
+                    try errors.append(a, try std.fmt.allocPrint(a, "unknown option --{s} (run ditch --help)", .{name}));
+                }
+            },
+            error.TokenAsFlag => try errors.append(a, try std.fmt.allocPrint(a, "a token is never taken as a flag value: set HF_TOKEN or use --token-file <path>", .{})),
+            else => try errors.append(a, try std.fmt.allocPrint(a, "invalid value for --{s}: {s}", .{ name, @errorName(err) })),
         };
     }
+    if (expect_help_topic) settings.help_topic = null;
     // The fast search fixes the objective set; the keyword scorer is deferred.
     if (settings.fast_search) settings.scorers = &fast_search_scorers;
     return .{ .settings = settings, .arena = arena, .errors = try errors.toOwnedSlice(a) };
@@ -463,7 +775,7 @@ fn normalizeKey(a: Allocator, name: []const u8) ![]u8 {
 }
 
 fn isBoolKey(key: []const u8) bool {
-    const bools = [_][]const u8{ "print_debug_information", "print_residual_geometry", "orthogonalize_direction", "keyword_rate_print_responses", "ignore_mismatches", "early_stop", "no_early_stop", "visited_experts_only", "remote_weights", "hotlist", "no_hotlist", "ablate_inputs", "fast_search", "help", "version" };
+    const bools = [_][]const u8{ "print_debug_information", "print_residual_geometry", "orthogonalize_direction", "keyword_rate_print_responses", "ignore_mismatches", "early_stop", "no_early_stop", "visited_experts_only", "remote_weights", "hotlist", "no_hotlist", "ablate_inputs", "fast_search", "help", "version", "quiet", "dry_run", "no_input", "interactive", "force", "json", "plain", "no_color", "debug", "token" };
     for (bools) |b| if (std.mem.eql(u8, b, key)) return true;
     return false;
 }
@@ -542,7 +854,7 @@ fn applyOption(a: Allocator, s: *Settings, key: []const u8, value: []const u8) !
         if (!(s.select_lambda >= 0)) return error.InvalidValue;
     } else if (eql(u8, key, "early_stop")) s.early_stop = try parseBool(value) else if (eql(u8, key, "no_early_stop")) s.early_stop = !(try parseBool(value)) else if (eql(u8, key, "warm_start")) s.warm_start = try a.dupe(u8, value) else if (eql(u8, key, "n_trials")) s.n_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_startup_trials")) s.n_startup_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "seed")) s.seed = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "study_checkpoint_dir")) s.study_checkpoint_dir = try a.dupe(u8, value) else if (eql(u8, key, "max_shard_size")) s.max_shard_size = try parseSize(value) else if (eql(u8, key, "max_ram")) s.max_ram = try parseSize(value) else if (eql(u8, key, "max_vram")) s.max_vram = try parseSize(value) else if (eql(u8, key, "scratch_dir")) s.scratch_dir = try a.dupe(u8, value) else if (eql(u8, key, "time_limit")) s.time_limit_seconds = try parseDuration(value) else if (eql(u8, key, "time_limit_seconds")) s.time_limit_seconds = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "budget_headroom")) s.budget_headroom = try parseSize(value) else if (eql(u8, key, "expert_cache")) s.expert_cache = try parseSize(value) else if (eql(u8, key, "visited_experts_only")) s.visited_experts_only = try parseBool(value) else if (eql(u8, key, "remote_weights")) s.remote_weights = try parseBool(value) else if (eql(u8, key, "remote_chunk_size")) s.remote_chunk_size = try parseSize(value) else if (eql(u8, key, "hotlist")) s.hotlist = try parseBool(value) else if (eql(u8, key, "no_hotlist")) s.hotlist = !(try parseBool(value)) else if (eql(u8, key, "checkpoint_action")) s.checkpoint_action = try a.dupe(u8, value) else if (eql(u8, key, "trial_index")) s.trial_index = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_additional_trials")) s.n_additional_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "model_action")) s.model_action = try a.dupe(u8, value) else if (eql(u8, key, "save_directory")) s.save_directory = try a.dupe(u8, value) else if (eql(u8, key, "export_dtype")) s.export_dtype = try a.dupe(u8, value) else if (eql(u8, key, "export_format")) s.export_format = try a.dupe(u8, value) else if (eql(u8, key, "gguf_dtype")) s.gguf_dtype = try a.dupe(u8, value) else if (eql(u8, key, "config")) {
         // handled in the first pass
-    } else if (eql(u8, key, "reproduce")) s.reproduce = try a.dupe(u8, value) else if (eql(u8, key, "ignore_mismatches")) s.ignore_mismatches = try parseBool(value) else if (eql(u8, key, "bench_prompts")) s.bench_prompts = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "bench_tokens")) s.bench_tokens = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "bench_output")) s.bench_output = try a.dupe(u8, value) else if (eql(u8, key, "help")) s.help = try parseBool(value) else if (eql(u8, key, "version")) s.version = try parseBool(value) else if (eql(u8, key, "keyword_rate_print_responses")) s.keyword_rate.print_responses = try parseBool(value) else if (eql(u8, key, "keyword_rate_score_name")) s.keyword_rate.score_name = try a.dupe(u8, value) else if (std.mem.startsWith(u8, key, "good_prompts_")) try applyDatasetOption(a, &s.good_prompts, key["good_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "bad_prompts_")) try applyDatasetOption(a, &s.bad_prompts, key["bad_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "keyword_rate_prompts_")) try applyDatasetOption(a, &s.keyword_rate.prompts, key["keyword_rate_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "kl_divergence_prompts_")) try applyDatasetOption(a, &s.kl_divergence.prompts, key["kl_divergence_prompts_".len..], value) else return error.UnknownOption;
+    } else if (eql(u8, key, "reproduce")) s.reproduce = try a.dupe(u8, value) else if (eql(u8, key, "ignore_mismatches")) s.ignore_mismatches = try parseBool(value) else if (eql(u8, key, "bench_prompts")) s.bench_prompts = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "bench_tokens")) s.bench_tokens = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "bench_output")) s.bench_output = try a.dupe(u8, value) else if (eql(u8, key, "help")) s.help = try parseBool(value) else if (eql(u8, key, "version")) s.version = try parseBool(value) else if (eql(u8, key, "quiet")) s.quiet = try parseBool(value) else if (eql(u8, key, "json_log")) s.json_log = try a.dupe(u8, value) else if (eql(u8, key, "dry_run")) s.dry_run = try parseBool(value) else if (eql(u8, key, "no_input")) s.no_input = try parseBool(value) else if (eql(u8, key, "interactive")) s.interactive = try parseBool(value) else if (eql(u8, key, "force")) s.force = try parseBool(value) else if (eql(u8, key, "json")) s.json = try parseBool(value) else if (eql(u8, key, "plain")) s.plain = try parseBool(value) else if (eql(u8, key, "no_color")) s.no_color = try parseBool(value) else if (eql(u8, key, "debug")) s.print_debug_information = try parseBool(value) else if (eql(u8, key, "output")) s.save_directory = try a.dupe(u8, value) else if (eql(u8, key, "token_file")) s.token_file = try a.dupe(u8, value) else if (eql(u8, key, "http_timeout")) s.http_timeout_seconds = try parseDuration(value) else if (eql(u8, key, "token")) return error.TokenAsFlag else if (eql(u8, key, "keyword_rate_print_responses")) s.keyword_rate.print_responses = try parseBool(value) else if (eql(u8, key, "keyword_rate_score_name")) s.keyword_rate.score_name = try a.dupe(u8, value) else if (std.mem.startsWith(u8, key, "good_prompts_")) try applyDatasetOption(a, &s.good_prompts, key["good_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "bad_prompts_")) try applyDatasetOption(a, &s.bad_prompts, key["bad_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "keyword_rate_prompts_")) try applyDatasetOption(a, &s.keyword_rate.prompts, key["keyword_rate_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "kl_divergence_prompts_")) try applyDatasetOption(a, &s.kl_divergence.prompts, key["kl_divergence_prompts_".len..], value) else return error.UnknownOption;
 }
 
 fn tomlString(a: Allocator, v: toml.Value) ![]const u8 {
@@ -664,7 +976,7 @@ test "parse duration" {
 test "budget options" {
     const gpa = std.testing.allocator;
     const args = [_][]const u8{ "ditch", "--max-ram", "8GB", "--max-vram=24GB", "--time-limit", "90m", "--scratch-dir", "/tmp/x", "--budget-headroom", "0", "m" };
-    var r = try load(gpa, std.testing.io, &args);
+    var r = try load(gpa, std.testing.io, &args, null);
     defer r.deinit();
     try std.testing.expectEqual(@as(usize, 0), r.errors.len);
     try std.testing.expectEqual(@as(u64, 8 << 30), r.settings.max_ram);
@@ -688,7 +1000,7 @@ test "budget options" {
 test "warp mode options" {
     const gpa = std.testing.allocator;
     const args = [_][]const u8{ "ditch", "--expert-cache", "512MB", "--visited-experts-only", "false", "--remote-weights", "--remote-chunk-size=1MB", "--no-hotlist", "hf://Qwen/Qwen3-30B-A3B" };
-    var r = try load(gpa, std.testing.io, &args);
+    var r = try load(gpa, std.testing.io, &args, null);
     defer r.deinit();
     try std.testing.expectEqual(@as(usize, 0), r.errors.len);
     try std.testing.expectEqual(@as(?u64, 512 << 20), r.settings.expert_cache);
@@ -706,7 +1018,7 @@ test "warp mode options" {
 test "cli parsing" {
     const gpa = std.testing.allocator;
     const args = [_][]const u8{ "ditch", "--n-trials", "5", "--row-normalization=pre", "--print-debug-information", "--expert-selection", "random", "--good-prompts-dataset", "good.txt", "--n-directions", "2", "--no-early-stop", "--warm-start", "old.jsonl", "Qwen/Qwen2.5-0.5B-Instruct" };
-    var r = try load(gpa, std.testing.io, &args);
+    var r = try load(gpa, std.testing.io, &args, null);
     defer r.deinit();
     try std.testing.expectEqual(@as(usize, 0), r.errors.len);
     try std.testing.expectEqual(@as(usize, 5), r.settings.n_trials);
@@ -724,7 +1036,7 @@ test "cli parsing" {
 test "algorithm options" {
     const gpa = std.testing.allocator;
     const args = [_][]const u8{ "ditch", "--direction-method", "separating", "--direction-token-window=3", "--direction-range", "auto", "--ablate-inputs", "--kl-tokens", "2", "--select", "auto", "--select-lambda", "0.5", "--fast-search", "m" };
-    var r = try load(gpa, std.testing.io, &args);
+    var r = try load(gpa, std.testing.io, &args, null);
     defer r.deinit();
     try std.testing.expectEqual(@as(usize, 0), r.errors.len);
     try std.testing.expectEqual(directions.Method.separating, r.settings.direction_method);
@@ -749,7 +1061,7 @@ test "algorithm options" {
     try std.testing.expect(DirectionRange.parse("0.9:0.4") == null);
     try std.testing.expect(DirectionRange.parse("half") == null);
     const bad = [_][]const u8{ "ditch", "--kl-tokens", "0", "m" };
-    var rb = try load(gpa, std.testing.io, &bad);
+    var rb = try load(gpa, std.testing.io, &bad, null);
     defer rb.deinit();
     try std.testing.expectEqual(@as(usize, 1), rb.errors.len);
     // A Lua config selects the scorer by plugin name.
@@ -764,4 +1076,57 @@ test "algorithm options" {
     try std.testing.expectEqual(@as(usize, 0), errors.items.len);
     try std.testing.expectEqual(ScorerKind.refusal_logit, s.scorers[0].kind);
     try std.testing.expectEqual(DirectionRange.auto, s.direction_range);
+}
+
+test "cli aliases, subcommands, order and suggestions" {
+    const gpa = std.testing.allocator;
+    // Short aliases, =-form, subcommand after the model, -o.
+    const args = [_][]const u8{ "ditch", "tests/fixtures/qwen2", "bench", "-q", "-n", "-d", "-f", "-o", "out", "--bench-tokens=3", "--json", "--no-input", "--debug=false", "--http-timeout", "1m" };
+    var r = try load(gpa, std.testing.io, &args, null);
+    defer r.deinit();
+    try std.testing.expectEqual(@as(usize, 0), r.errors.len);
+    try std.testing.expect(r.settings.bench);
+    try std.testing.expectEqualStrings("tests/fixtures/qwen2", r.settings.model);
+    try std.testing.expect(r.settings.quiet and r.settings.dry_run and r.settings.force and r.settings.json and r.settings.no_input);
+    try std.testing.expect(!r.settings.print_debug_information);
+    try std.testing.expectEqualStrings("out", r.settings.save_directory.?);
+    try std.testing.expectEqual(@as(usize, 3), r.settings.bench_tokens);
+    try std.testing.expectEqual(@as(u64, 60), r.settings.http_timeout_seconds);
+
+    // `bench` first is the same command.
+    const args2 = [_][]const u8{ "ditch", "bench", "--output", "o2", "m" };
+    var r2 = try load(gpa, std.testing.io, &args2, null);
+    defer r2.deinit();
+    try std.testing.expect(r2.settings.bench);
+    try std.testing.expectEqualStrings("m", r2.settings.model);
+    try std.testing.expectEqualStrings("o2", r2.settings.save_directory.?);
+
+    // Unknown options are usage errors with a suggestion; --help still wins.
+    const args3 = [_][]const u8{ "ditch", "--n-trails", "5", "--token=abc", "-x", "m" };
+    var r3 = try load(gpa, std.testing.io, &args3, null);
+    defer r3.deinit();
+    try std.testing.expectEqual(@as(usize, 3), r3.errors.len);
+    try std.testing.expectEqualStrings("unknown option --n-trails; did you mean --n-trials?", r3.errors[0]);
+    try std.testing.expect(std.mem.indexOf(u8, r3.errors[1], "never taken as a flag value") != null);
+    try std.testing.expect(std.mem.startsWith(u8, r3.errors[2], "unknown option -x"));
+    const args4 = [_][]const u8{ "ditch", "--n-trails", "5", "--help" };
+    var r4 = try load(gpa, std.testing.io, &args4, null);
+    defer r4.deinit();
+    try std.testing.expect(r4.settings.help);
+
+    // Help topics and misspelt subcommands.
+    const args5 = [_][]const u8{ "ditch", "help", "bench" };
+    var r5 = try load(gpa, std.testing.io, &args5, null);
+    defer r5.deinit();
+    try std.testing.expect(r5.settings.help);
+    try std.testing.expectEqualStrings("bench", r5.settings.help_topic.?);
+    const args6 = [_][]const u8{ "ditch", "bnech", "m" };
+    var r6 = try load(gpa, std.testing.io, &args6, null);
+    defer r6.deinit();
+    try std.testing.expectEqual(@as(usize, 1), r6.errors.len);
+    try std.testing.expect(std.mem.startsWith(u8, r6.errors[0], "unknown command bnech; did you mean bench?"));
+
+    try std.testing.expectEqual(@as(usize, 2), editDistance("bench", "bnech"));
+    try std.testing.expectEqualStrings("n-trials", (try suggestOption(r6.arena.allocator(), "ntrials")).?);
+    try std.testing.expect(std.mem.indexOf(u8, help_text, "Exit codes:") != null);
 }

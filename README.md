@@ -38,6 +38,10 @@ git clone https://github.com/plyght/ditch && cd ditch
 zig build -Doptimize=ReleaseFast   # binary: zig-out/bin/ditch
 ```
 
+Uninstall: delete the `ditch` binary and its cache, `~/.cache/ditch` (or
+`$DITCH_CACHE`). A local model directory named like a subcommand (`bench`,
+`help`) must be given as a path, e.g. `./bench`.
+
 ## Usage
 
 ```sh
@@ -119,7 +123,12 @@ line. Defaults are Heretic's (`mlabonne/harmless_alpaca`,
 Settings live in `config.lua` (or `--config FILE`), a sandboxed Lua 5.4
 script that returns a table; every option is documented in
 [`config.default.lua`](config.default.lua). Heretic `config.toml` files are
-accepted too.
+accepted too. Precedence, highest first: flags, `DITCH_*` environment
+variables (`DITCH_THREADS`, `DITCH_MAX_RAM`, `DITCH_CACHE`, `DITCH_NO_COLOR`),
+`./config.lua`, then the user file `$XDG_CONFIG_HOME/ditch/config.lua`
+(`~/.config/ditch/config.lua`). Messages go to stderr and results to stdout
+(`--json` for one JSON document, `--plain` for grep-friendly lines); `--no-input`
+turns every prompt into an error naming the flag to pass instead.
 
 ```lua
 local trials = tonumber(os.getenv("DITCH_TRIALS")) or 50
@@ -226,6 +235,10 @@ zig build test --summary all   # unit tests (NumPy-generated fixtures in tests/f
 bash tests/e2e.sh              # end-to-end run of every feature on the fixtures
 zig fmt --check src build.zig
 ```
+
+Exit codes: 0 success (including `--dry-run` and a clean stop at
+`--time-limit`), 1 failure, 2 usage error or a memory budget too small for
+the model.
 
 Releases are built by `.github/workflows/release.yml` (dispatch it with a
 version, or push a `v*` tag) and cross-compiled for Linux, macOS and Windows.

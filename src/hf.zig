@@ -7,6 +7,7 @@
 const std = @import("std");
 const Io = std.Io;
 const config = @import("config.zig");
+const budget_mod = @import("budget.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -22,12 +23,69 @@ pub const Http = struct {
     token: ?[]const u8,
     environ: *std.process.Environ.Map,
     native_ok: bool = true,
+    timeout_seconds: u64 = 30,
+
+    pub const Options = struct {
+        /// File holding the Hugging Face token (overrides the environment).
+        token_file: ?[]const u8 = null,
+        /// Connect / stall timeout of transfers; transient failures are retried.
+        timeout_seconds: u64 = 30,
+    };
 
     pub fn init(gpa: Allocator, io: Io, arena: Allocator, environ: *std.process.Environ.Map) !Http {
+        return initWithOptions(gpa, io, arena, environ, .{});
+    }
+
+    /// The token comes from `--token-file`, else HF_TOKEN / HUGGING_FACE_HUB_TOKEN,
+    /// else the Hub CLI's `$HF_HOME/token` or `~/.cache/huggingface/token`. It is
+    /// only ever sent as an authorization header, never printed.
+    pub fn initWithOptions(gpa: Allocator, io: Io, arena: Allocator, environ: *std.process.Environ.Map, opts: Options) !Http {
         var client: std.http.Client = .{ .allocator = gpa, .io = io };
         client.initDefaultProxies(arena, environ) catch {};
-        const token = environ.get("HF_TOKEN") orelse environ.get("HUGGING_FACE_HUB_TOKEN");
-        return .{ .gpa = gpa, .io = io, .client = client, .token = token, .environ = environ };
+        var token: ?[]const u8 = null;
+        if (opts.token_file) |path| {
+            const text = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4096)) catch |err| {
+                std.log.err("could not read the token file {s}: {s}", .{ path, @errorName(err) });
+                return err;
+            };
+            token = std.mem.trim(u8, text, " \t\r\n");
+        } else if (environ.get("HF_TOKEN") orelse environ.get("HUGGING_FACE_HUB_TOKEN")) |t| {
+            token = t;
+        } else {
+            const home: ?[]const u8 = if (environ.get("HF_HOME")) |h| h else if (environ.get("HOME")) |h| try std.fs.path.join(arena, &.{ h, ".cache", "huggingface" }) else null;
+            if (home) |h| {
+                const path = try std.fs.path.join(arena, &.{ h, "token" });
+                if (Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4096))) |text| {
+                    const t = std.mem.trim(u8, text, " \t\r\n");
+                    if (t.len > 0) token = t;
+                } else |_| {}
+            }
+        }
+        if (token) |t| if (t.len == 0) {
+            token = null;
+        };
+        return .{ .gpa = gpa, .io = io, .client = client, .token = token, .environ = environ, .timeout_seconds = opts.timeout_seconds };
+    }
+
+    /// Transient failures (anything but 401/403/404 and out of memory) are
+    /// retried this many times with a growing pause.
+    const attempts = 3;
+
+    fn transient(err: anyerror) bool {
+        return switch (err) {
+            error.NotFound, error.Forbidden, error.OutOfMemory, error.RangeNotSupported, error.Interrupted => false,
+            else => true,
+        };
+    }
+
+    fn pause(self: *Http, attempt: usize) void {
+        self.io.sleep(Io.Duration.fromSeconds(@intCast(attempt * 2)), .awake) catch {};
+    }
+
+    fn curlTimeoutArgs(self: *Http, buf: []u8) ![]const []const u8 {
+        // Connect timeout, and abort a transfer that stalls (< 1 B/s) for that long.
+        const t = try std.fmt.bufPrint(buf, "{d}", .{@max(self.timeout_seconds, 1)});
+        return &.{ "--connect-timeout", t, "--speed-time", t, "--speed-limit", "1" };
     }
 
     pub fn deinit(self: *Http) void {
@@ -54,6 +112,19 @@ pub const Http = struct {
     }
 
     fn getRangeOpt(self: *Http, url: []const u8, range: ?[2]u64) ![]u8 {
+        var attempt: usize = 1;
+        while (true) : (attempt += 1) {
+            return self.getRangeOnce(url, range) catch |err| {
+                if (budget_mod.interrupted()) return error.Interrupted;
+                if (attempt >= attempts or !transient(err)) return err;
+                std.log.warn("{s}: {s}; retrying ({d}/{d})", .{ url, @errorName(err), attempt + 1, attempts });
+                self.pause(attempt);
+                continue;
+            };
+        }
+    }
+
+    fn getRangeOnce(self: *Http, url: []const u8, range: ?[2]u64) ![]u8 {
         if (self.native_ok) {
             if (self.getNative(url, range)) |body| {
                 return body;
@@ -115,6 +186,8 @@ pub const Http = struct {
         var argv = std.ArrayList([]const u8).empty;
         defer argv.deinit(self.gpa);
         try argv.appendSlice(self.gpa, &.{ "curl", "-L", "-sS", "--fail-with-body", "-w", "\n%{http_code}" });
+        var tbuf: [32]u8 = undefined;
+        try argv.appendSlice(self.gpa, try self.curlTimeoutArgs(&tbuf));
         var range_buf: [64]u8 = undefined;
         if (range) |r| {
             try argv.append(self.gpa, "-r");
@@ -147,23 +220,23 @@ pub const Http = struct {
         return self.gpa.dupe(u8, result.stdout[0..nl]);
     }
 
-    /// Downloads `url` to `dir/sub_path`, writing to a temporary file first.
+    /// Downloads `url` to `dir/sub_path`, writing to `<sub_path>.part` first.
+    /// A leftover `.part` file is resumed (curl `-C -`); transient failures
+    /// are retried, so an interrupted download picks up where it stopped.
     pub fn download(self: *Http, dir: Io.Dir, sub_path: []const u8, url: []const u8, expected_size: ?u64) !void {
         const tmp_name = try std.fmt.allocPrint(self.gpa, "{s}.part", .{sub_path});
         defer self.gpa.free(tmp_name);
-        var ok = false;
-        if (self.native_ok) {
-            if (self.downloadNative(dir, tmp_name, url)) {
-                ok = true;
-            } else |err| switch (err) {
-                error.NotFound, error.Forbidden => return err,
-                else => {
-                    std.log.debug("native download failed ({s}); trying curl", .{@errorName(err)});
-                    self.native_ok = false;
-                },
-            }
+        var attempt: usize = 1;
+        while (true) : (attempt += 1) {
+            self.downloadOnce(dir, tmp_name, url) catch |err| {
+                if (budget_mod.interrupted()) return error.Interrupted;
+                if (attempt >= attempts or !transient(err)) return err;
+                std.log.warn("download of {s} failed: {s}; retrying ({d}/{d})", .{ sub_path, @errorName(err), attempt + 1, attempts });
+                self.pause(attempt);
+                continue;
+            };
+            break;
         }
-        if (!ok) try self.downloadCurl(dir, tmp_name, url);
         if (expected_size) |sz| {
             const st = try dir.statFile(self.io, tmp_name, .{});
             if (st.size != sz) {
@@ -172,6 +245,23 @@ pub const Http = struct {
             }
         }
         try dir.rename(tmp_name, dir, sub_path, self.io);
+    }
+
+    fn downloadOnce(self: *Http, dir: Io.Dir, tmp_name: []const u8, url: []const u8) !void {
+        var partial: u64 = 0;
+        if (dir.statFile(self.io, tmp_name, .{})) |st| partial = st.size else |_| {}
+        if (self.native_ok and partial == 0) {
+            if (self.downloadNative(dir, tmp_name, url)) {
+                return;
+            } else |err| switch (err) {
+                error.NotFound, error.Forbidden => return err,
+                else => {
+                    std.log.debug("native download failed ({s}); trying curl", .{@errorName(err)});
+                    self.native_ok = false;
+                },
+            }
+        }
+        try self.downloadCurl(dir, tmp_name, url, partial > 0);
     }
 
     fn downloadNative(self: *Http, dir: Io.Dir, sub_path: []const u8, url: []const u8) !void {
@@ -200,7 +290,7 @@ pub const Http = struct {
         }
     }
 
-    fn downloadCurl(self: *Http, dir: Io.Dir, sub_path: []const u8, url: []const u8) !void {
+    fn downloadCurl(self: *Http, dir: Io.Dir, sub_path: []const u8, url: []const u8, continue_partial: bool) !void {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const dir_path = try dir.realPath(self.io, &path_buf);
         const full = try std.fs.path.join(self.gpa, &.{ path_buf[0..dir_path], sub_path });
@@ -208,6 +298,9 @@ pub const Http = struct {
         var argv = std.ArrayList([]const u8).empty;
         defer argv.deinit(self.gpa);
         try argv.appendSlice(self.gpa, &.{ "curl", "-L", "-sS", "--fail", "-o", full });
+        var tbuf: [32]u8 = undefined;
+        try argv.appendSlice(self.gpa, try self.curlTimeoutArgs(&tbuf));
+        if (continue_partial) try argv.appendSlice(self.gpa, &.{ "-C", "-" });
         var auth_buf: [512]u8 = undefined;
         var auth_line: ?[]u8 = null;
         defer if (auth_line) |l| self.gpa.free(l);
@@ -298,7 +391,7 @@ pub fn resolveModel(arena: Allocator, http: *Http, cache_root: []const u8, model
     defer dir.close(io);
 
     // List repository files.
-    const api_url = try std.fmt.allocPrint(arena, "https://huggingface.co/api/models/{s}/revision/{s}", .{ model, rev });
+    const api_url = try std.fmt.allocPrint(arena, "https://huggingface.co/api/models/{s}/revision/{s}?blobs=true", .{ model, rev });
     const info_text = http.get(api_url) catch |err| switch (err) {
         error.NotFound => {
             std.log.err("model {s} not found on Hugging Face (revision {s})", .{ model, rev });
@@ -322,6 +415,8 @@ pub fn resolveModel(arena: Allocator, http: *Http, cache_root: []const u8, model
     defer parsed.deinit();
     const siblings = (parsed.value.object.get("siblings") orelse return error.InvalidResponse).array;
     var wanted = std.ArrayList([]const u8).empty;
+    var missing_files: usize = 0;
+    var missing_bytes: u64 = 0;
     for (siblings.items) |s| {
         const name = s.object.get("rfilename").?.string;
         if (std.mem.indexOfScalar(u8, name, '/') != null) continue; // nested (e.g. original/) files
@@ -330,9 +425,21 @@ pub fn resolveModel(arena: Allocator, http: *Http, cache_root: []const u8, model
             std.mem.eql(u8, name, "chat_template.jinja") or std.mem.eql(u8, name, "special_tokens_map.json") or
             std.mem.eql(u8, name, "model.safetensors.index.json") or
             (std.mem.endsWith(u8, name, ".safetensors") and !std.mem.startsWith(u8, name, "consolidated"));
-        if (keep) try wanted.append(arena, try arena.dupe(u8, name));
+        if (keep) {
+            try wanted.append(arena, try arena.dupe(u8, name));
+            if (!isLocalFile(io, try std.fs.path.join(arena, &.{ model_dir, name }))) {
+                missing_files += 1;
+                if (s.object.get("size")) |sz| if (sz == .integer) {
+                    missing_bytes += @intCast(@max(sz.integer, 0));
+                };
+            }
+        }
     }
     if (wanted.items.len == 0) return error.ModelNotFound;
+    if (missing_files > 0) {
+        try out.print("* {d} file(s) to download ({d:.2} GB) into {s}\n", .{ missing_files, @as(f64, @floatFromInt(missing_bytes)) / 1e9, model_dir });
+        try out.flush();
+    }
     for (wanted.items) |name| {
         if (isLocalFile(io, try std.fs.path.join(arena, &.{ model_dir, name }))) continue;
         if (std.mem.endsWith(u8, name, ".safetensors")) {
@@ -342,6 +449,7 @@ pub fn resolveModel(arena: Allocator, http: *Http, cache_root: []const u8, model
                 continue;
             }
         }
+        if (budget_mod.interrupted()) return error.Interrupted;
         try out.print("* Downloading {s}...\n", .{name});
         try out.flush();
         const url = try std.fmt.allocPrint(arena, "https://huggingface.co/{s}/resolve/{s}/{s}", .{ model, rev, name });
@@ -465,7 +573,10 @@ fn loadHfRows(arena: Allocator, http: *Http, cache_root: []const u8, spec: confi
         const text = cwd.readFileAlloc(io, splits_path, arena, .unlimited) catch blk: {
             const url = try std.fmt.allocPrint(arena, "https://datasets-server.huggingface.co/splits?dataset={s}", .{spec.dataset});
             const body = http.get(url) catch |err| {
-                std.log.err("could not query datasets-server for {s}: {s}", .{ spec.dataset, @errorName(err) });
+                switch (err) {
+                    error.NotFound, error.Forbidden => std.log.err("dataset {s} is not available through the datasets-server API ({s}); it must be public and viewable in the Hub's dataset viewer, or pass a local text file with one prompt per line", .{ spec.dataset, @errorName(err) }),
+                    else => std.log.err("could not query datasets-server for {s}: {s}", .{ spec.dataset, @errorName(err) }),
+                }
                 return err;
             };
             defer http.gpa.free(body);

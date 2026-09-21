@@ -137,8 +137,33 @@ fn cycle(a: Allocator, prompts: []const Prompt, n: usize) ![]Prompt {
     return out;
 }
 
-/// Runs the benchmark and prints the table (also to `settings.bench_output` when set).
-pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings, http: *hf.Http, cache_root: []const u8, pool: *const tensor.Pool, out: *Io.Writer) !void {
+/// Writes the results as one JSON object.
+pub fn writeJson(r: *const Result, w: *Io.Writer) !void {
+    var js: std.json.Stringify = .{ .writer = w };
+    try js.beginObject();
+    inline for (std.meta.fields(Result)) |f| {
+        try js.objectField(f.name);
+        try js.write(@field(r, f.name));
+    }
+    try js.objectField("prefill_tokens_per_second");
+    try js.write(r.prefillTokensPerSecond());
+    try js.objectField("decode_tokens_per_second");
+    try js.write(r.decodeTokensPerSecond());
+    try js.endObject();
+    try w.writeAll("\n");
+}
+
+/// Writes the results as `key: value` lines (--plain).
+pub fn writePlain(r: *const Result, w: *Io.Writer) !void {
+    try w.print("model: {s}\narchitecture: {s}\nlayers: {d}\ndtype: {s}\nthreads: {d}\nbatch_size: {d}\n", .{ r.model, r.architecture, r.num_layers, r.dtype, r.threads, r.batch_size });
+    try w.print("prefill_tokens_per_second: {d:.1}\ndecode_tokens_per_second: {d:.1}\nresidual_seconds: {d:.3}\n", .{ r.prefillTokensPerSecond(), r.decodeTokensPerSecond(), r.residual_seconds });
+    for (r.apply_seconds, 0..) |s, i| try w.print("apply_seconds_{s}: {d:.4}\n", .{ @tagName(@as(abliterate.RowNormalization, @enumFromInt(i))), s });
+    try w.print("trial_seconds: {d:.3}\npeak_rss_bytes: {?d}\nweight_bytes: {d}\n", .{ r.trial_seconds, r.peak_rss_bytes, r.weight_bytes });
+}
+
+/// Runs the benchmark: messages go to `out`, the table (or JSON / plain
+/// lines) to `result`, and also to `settings.bench_output` when set.
+pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings, http: *hf.Http, cache_root: []const u8, pool: *const tensor.Pool, out: *Io.Writer, result_out: *Io.Writer) !void {
     try out.print("\nBenchmarking {s}...\n", .{settings.model});
     try out.flush();
     const model_dir = try hf.resolveModel(arena, http, cache_root, settings.model, settings.model_commit, out);
@@ -305,9 +330,9 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings,
 
     result.peak_rss_bytes = peakRss(io);
 
-    try out.writeAll("\n");
-    try writeTable(&result, out);
     try out.flush();
+    if (settings.json) try writeJson(&result, result_out) else if (settings.plain) try writePlain(&result, result_out) else try writeTable(&result, result_out);
+    try result_out.flush();
     if (settings.bench_output) |path| {
         var buf: Io.Writer.Allocating = .init(gpa);
         defer buf.deinit();

@@ -9,6 +9,14 @@
 //! reserved `headroom`.
 
 const std = @import("std");
+
+/// Set by the Ctrl+C handler; long non-trial steps (downloads, exports)
+/// poll it and stop with `error.Interrupted`, leaving their markers behind.
+pub var interrupt_requested = std.atomic.Value(bool).init(false);
+
+pub fn interrupted() bool {
+    return interrupt_requested.load(.seq_cst);
+}
 const Io = std.Io;
 const builtin = @import("builtin");
 const config = @import("config.zig");
@@ -268,8 +276,12 @@ pub const Budget = struct {
 
     /// Builds a budget from settings (`--max-ram`, `--time-limit`, `--scratch-dir`).
     /// The scratch directory defaults to `<cache_dir>/scratch` when `cache_dir` is
-    /// set, otherwise `<cwd>/scratch`.
+    /// set, else `$TMPDIR/ditch-scratch` when TMPDIR is set, otherwise `<cwd>/scratch`.
     pub fn fromSettings(gpa: Allocator, io: Io, settings: *const config.Settings) !Budget {
+        return fromSettingsEnv(gpa, io, settings, null);
+    }
+
+    pub fn fromSettingsEnv(gpa: Allocator, io: Io, settings: *const config.Settings, environ: ?*std.process.Environ.Map) !Budget {
         var scratch_owned: ?[]u8 = null;
         defer if (scratch_owned) |s| gpa.free(s);
         var scratch: ?[]const u8 = settings.scratch_dir;
@@ -277,7 +289,10 @@ pub const Budget = struct {
             if (settings.cache_dir) |c| {
                 scratch_owned = try std.fs.path.join(gpa, &.{ c, "scratch" });
                 scratch = scratch_owned;
-            }
+            } else if (environ) |env| if (env.get("TMPDIR")) |t| if (t.len > 0) {
+                scratch_owned = try std.fs.path.join(gpa, &.{ t, "ditch-scratch" });
+                scratch = scratch_owned;
+            };
         }
         return init(gpa, io, .{
             .max_ram = settings.max_ram,

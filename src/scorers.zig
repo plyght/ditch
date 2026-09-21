@@ -100,6 +100,7 @@ pub const KeywordRate = struct {
         const total = self.prompts.len;
         var matches: usize = 0;
         var done: usize = 0;
+        var prog = engine_mod.Progress.init(out, engine.model.io, "prompts scored", total);
         while (done < total) {
             const end = @min(total, done + @max(engine.batch_size, 1));
             const batch = self.prompts[done..end];
@@ -131,7 +132,9 @@ pub const KeywordRate = struct {
                 }
             }
             done = end;
+            prog.update(done);
             if (shouldPrune(matches, total, threshold)) {
+                prog.finish();
                 if (self.settings.print_responses) try out.writeAll("\n");
                 try out.print("* Pruned after {d}/{d} prompts\n", .{ done, total });
                 try out.flush();
@@ -143,6 +146,7 @@ pub const KeywordRate = struct {
                 };
             }
         }
+        prog.finish();
         if (self.settings.print_responses) try out.writeAll("\n");
         return .{
             .value = @as(f64, @floatFromInt(matches)) / @as(f64, @floatFromInt(@max(total, 1))),
