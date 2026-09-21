@@ -459,8 +459,9 @@ pub const Model = struct {
             }
         }
         if (lm == null) {
-            // Some multimodal exports keep the head next to the language model.
-            const trimmed = std.mem.trimEnd(u8, self.prefix, "model.");
+            // Some multimodal exports keep the head next to the language model
+            // (`language_model.lm_head.weight` beside `language_model.model.`).
+            const trimmed = if (std.mem.endsWith(u8, self.prefix, "model.")) self.prefix[0 .. self.prefix.len - "model.".len] else self.prefix;
             if (self.store.lookup(try std.fmt.allocPrint(arena, "{s}lm_head.weight", .{trimmed}))) |r| lm = r;
         }
         self.lm_head_ref = lm orelse self.embed_ref;
@@ -477,10 +478,10 @@ pub const Model = struct {
             const lp = try resolveName(arena, names.layer, self.prefix, i, 0);
             layer.* = .{
                 .input_norm = null,
-                .post_attn_norm = if (names.post_attn_norm) |t| try self.loadNorm(try cat(arena, lp, t)) else null,
-                .pre_ff_norm = if (names.pre_ff_norm) |t| try self.loadNorm(try cat(arena, lp, t)) else null,
-                .post_ff_norm = if (names.post_ff_norm) |t| try self.loadNorm(try cat(arena, lp, t)) else null,
-                .mlp_norm = if (names.mlp_norm) |t| try self.loadNormOpt(try cat(arena, lp, t)) else null,
+                .post_attn_norm = try self.normSlot(lp, names.post_attn_norm, true),
+                .pre_ff_norm = try self.normSlot(lp, names.pre_ff_norm, !c.parallel_residual),
+                .post_ff_norm = try self.normSlot(lp, names.post_ff_norm, true),
+                .mlp_norm = try self.normSlot(lp, names.mlp_norm, false),
                 .q_norm = if (names.q_norm) |t| try self.loadNormOpt(try cat(arena, lp, t)) else null,
                 .k_norm = if (names.k_norm) |t| try self.loadNormOpt(try cat(arena, lp, t)) else null,
                 .q = null,
@@ -506,7 +507,6 @@ pub const Model = struct {
             };
             if (c.norm == .none) {
                 if (names.input_norm.len > 0) layer.input_norm = Norm{ .w = &.{} };
-                if (names.pre_ff_norm != null) layer.pre_ff_norm = Norm{ .w = &.{} };
             } else {
                 for (names.input_norm) |t| {
                     if (try self.loadNormOpt(try cat(arena, lp, t))) |nm| {
@@ -898,6 +898,16 @@ pub const Model = struct {
     pub fn loadVecOpt(self: *Model, name_: []const u8) ?[]f32 {
         const r = self.store.lookup(name_) orelse return null;
         return self.store.readVecF32(self.arena.allocator(), r) catch null;
+    }
+
+    /// A layer norm at `lp ++ template`: null when the family has no such
+    /// norm, a weightless slot for the non-parametric family, otherwise the
+    /// loaded parameters (`required` decides whether absence is an error).
+    fn normSlot(self: *Model, lp: []const u8, template: ?[]const u8, required: bool) !?Norm {
+        const t = template orelse return null;
+        if (self.config.norm == .none) return Norm{ .w = &.{} };
+        const name_ = try cat(self.arena.allocator(), lp, t);
+        return if (required) try self.loadNorm(name_) else try self.loadNormOpt(name_);
     }
 
     fn loadNormOpt(self: *Model, name_: []const u8) !?Norm {

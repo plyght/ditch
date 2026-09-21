@@ -96,3 +96,99 @@ test "qwen3_moe fixture (fused expert tensors)" {
 test "qwen3_moe fixture (transposed fused expert tensors)" {
     try checkFixture("qwen3_moe_fused_t");
 }
+
+// Registry families (tools/make_fixture.py `SPECS`): each fixture exercises the
+// tensor names, layouts and config keys of one Hugging Face model_type.
+test "phi3 fixture" {
+    try checkFixture("phi3");
+}
+test "phi fixture" {
+    try checkFixture("phi");
+}
+test "gpt_neox fixture" {
+    try checkFixture("gpt_neox");
+}
+test "gpt2 fixture" {
+    try checkFixture("gpt2");
+}
+test "falcon fixture" {
+    try checkFixture("falcon");
+}
+test "stablelm fixture" {
+    try checkFixture("stablelm");
+}
+test "internlm2 fixture" {
+    try checkFixture("internlm2");
+}
+test "olmo2 fixture" {
+    try checkFixture("olmo2");
+}
+test "olmo fixture" {
+    try checkFixture("olmo");
+}
+test "cohere fixture" {
+    try checkFixture("cohere");
+}
+test "glm4 fixture" {
+    try checkFixture("glm4");
+}
+test "chatglm fixture" {
+    try checkFixture("chatglm");
+}
+test "granite fixture" {
+    try checkFixture("granite");
+}
+test "deepseek_v2 fixture" {
+    try checkFixture("deepseek_v2");
+}
+test "deepseek_v3 fixture" {
+    try checkFixture("deepseek_v3");
+}
+test "llama4 fixture" {
+    try checkFixture("llama4");
+}
+test "gpt_oss fixture" {
+    try checkFixture("gpt_oss");
+}
+test "minicpm fixture" {
+    try checkFixture("minicpm");
+}
+test "exaone fixture" {
+    try checkFixture("exaone");
+}
+test "exaone4 fixture" {
+    try checkFixture("exaone4");
+}
+test "nemotron fixture" {
+    try checkFixture("nemotron");
+}
+test "smollm3 fixture" {
+    try checkFixture("smollm3");
+}
+test "bloom fixture" {
+    try checkFixture("bloom");
+}
+test "opt fixture" {
+    try checkFixture("opt");
+}
+test "mpt fixture" {
+    try checkFixture("mpt");
+}
+test "starcoder2 fixture" {
+    try checkFixture("starcoder2");
+}
+test "gpt_bigcode fixture" {
+    try checkFixture("gpt_bigcode");
+}
+test "baichuan fixture" {
+    try checkFixture("baichuan");
+}
+test "mistral fixture" {
+    try checkFixture("mistral");
+}
+test "mixtral fixture" {
+    try checkFixture("mixtral");
+}
+test "qwen2_moe fixture" {
+    try checkFixture("qwen2_moe");
+}

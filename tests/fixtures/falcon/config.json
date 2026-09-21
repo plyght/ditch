@@ -1,0 +1,17 @@
+{
+ "model_type": "falcon",
+ "hidden_size": 32,
+ "num_hidden_layers": 2,
+ "num_attention_heads": 4,
+ "layer_norm_epsilon": 1e-05,
+ "ffn_hidden_size": 64,
+ "multi_query": true,
+ "parallel_attn": true,
+ "new_decoder_architecture": false,
+ "bias": false,
+ "alibi": false,
+ "rope_theta": 10000.0,
+ "max_position_embeddings": 128,
+ "tie_word_embeddings": true,
+ "vocab_size": 275
+}

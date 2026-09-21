@@ -1,0 +1,15 @@
+{
+ "model_type": "opt",
+ "hidden_size": 32,
+ "ffn_dim": 32,
+ "num_hidden_layers": 2,
+ "num_attention_heads": 4,
+ "max_position_embeddings": 64,
+ "word_embed_proj_dim": 32,
+ "do_layer_norm_before": true,
+ "activation_function": "relu",
+ "enable_bias": true,
+ "layer_norm_elementwise_affine": true,
+ "vocab_size": 275,
+ "tie_word_embeddings": true
+}

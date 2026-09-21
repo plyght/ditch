@@ -1,0 +1,18 @@
+{
+ "model_type": "stablelm",
+ "hidden_size": 32,
+ "intermediate_size": 32,
+ "num_hidden_layers": 2,
+ "num_attention_heads": 4,
+ "num_key_value_heads": 2,
+ "layer_norm_eps": 1e-05,
+ "partial_rotary_factor": 0.25,
+ "rope_theta": 10000.0,
+ "use_qkv_bias": true,
+ "use_parallel_residual": false,
+ "qk_layernorm": false,
+ "hidden_act": "silu",
+ "max_position_embeddings": 128,
+ "tie_word_embeddings": true,
+ "vocab_size": 275
+}

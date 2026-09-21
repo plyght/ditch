@@ -576,7 +576,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         .head_dim = head_dim,
         .v_head_dim = v_head_dim,
         .vocab_size = getIntAny(obj, &.{ "vocab_size", "padded_vocab_size" }, 0),
-        .rms_norm_eps = getF32Any(obj, &.{ "rms_norm_eps", "layer_norm_eps", "layer_norm_epsilon", "layernorm_epsilon", "norm_eps" }, if (arch.norm == .layer or arch.norm == .layer_1p) 1e-5 else 1e-6),
+        .rms_norm_eps = getF32Any(obj, &.{ "rms_norm_eps", "layer_norm_eps", "layer_norm_epsilon", "layernorm_epsilon", "norm_eps", "norm_epsilon" }, if (arch.norm == .rms or arch.norm == .rms_gemma) 1e-6 else 1e-5),
         .rope_theta = rope_theta,
         .rope_local_theta = getF32(obj, "rope_local_base_freq", 10000.0),
         .rope_scaling = rope_scaling,
@@ -805,8 +805,15 @@ fn extraMiniCpm(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
 fn extraExaone4(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
     // Sliding (local) layers use RoPE; global layers have no positional encoding.
     if (c.sliding_window != null and obj.get("layer_types") == null) {
-        const pattern = getInt(obj, "sliding_window_pattern", 4);
-        for (c.sliding_layers, 0..) |*s, i| s.* = ((i + 1) % pattern != 0);
+        if (getStr(obj, "sliding_window_pattern")) |pat| {
+            // e.g. "LLLG": L = local (sliding), G = global.
+            if (pat.len > 0) for (c.sliding_layers, 0..) |*s, i| {
+                s.* = pat[i % pat.len] == 'L';
+            };
+        } else {
+            const pattern = getInt(obj, "sliding_window_pattern", 4);
+            for (c.sliding_layers, 0..) |*s, i| s.* = ((i + 1) % pattern != 0);
+        }
     }
     if (c.sliding_window != null) {
         for (c.rope_layers, 0..) |*r, i| r.* = c.sliding_layers[i];
@@ -1093,7 +1100,7 @@ pub const registry = [_]Arch{
             .layer = "{p}h.{i}.",
             .input_norm = &.{ "input_layernorm.weight", "ln_attn.weight" },
             .mlp_norm = "ln_mlp.weight",
-            .pre_ff_norm = "post_attention_layernorm.weight",
+            .pre_ff_norm = null,
             .q = null,
             .k = null,
             .v = null,
@@ -1162,8 +1169,7 @@ pub const registry = [_]Arch{
         .chat = "olmo",
         .verified = true,
         .norm = .none,
-        .names = .{ .input_norm = &.{}, .pre_ff_norm = null, .final_norm = "" },
-        .notes = "fixture: non-parametric LayerNorm, clip_qkv.",
+        .notes = "fixture: non-parametric LayerNorm (the default norm names exist only as slots), clip_qkv.",
     },
     .{
         .model_type = "cohere",

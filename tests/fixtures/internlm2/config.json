@@ -1,0 +1,19 @@
+{
+ "model_type": "internlm2",
+ "hidden_size": 32,
+ "intermediate_size": 32,
+ "num_hidden_layers": 2,
+ "num_attention_heads": 4,
+ "num_key_value_heads": 2,
+ "rms_norm_eps": 1e-06,
+ "rope_theta": 10000.0,
+ "rope_scaling": {
+  "type": "dynamic",
+  "factor": 2.0
+ },
+ "hidden_act": "silu",
+ "bias": false,
+ "max_position_embeddings": 128,
+ "tie_word_embeddings": false,
+ "vocab_size": 374
+}

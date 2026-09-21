@@ -1,0 +1,13 @@
+{
+ "model_type": "gpt_bigcode",
+ "n_embd": 32,
+ "n_layer": 2,
+ "n_head": 4,
+ "n_positions": 64,
+ "n_inner": 64,
+ "multi_query": true,
+ "layer_norm_epsilon": 1e-05,
+ "activation_function": "gelu_pytorch_tanh",
+ "vocab_size": 275,
+ "tie_word_embeddings": true
+}
