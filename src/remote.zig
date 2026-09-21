@@ -143,15 +143,24 @@ pub const Source = struct {
 
     fn fetchSmall(self: *Source, dir: Io.Dir, name: []const u8, required: bool, out: *Io.Writer) !void {
         if (dir.access(self.io, name, .{})) |_| return else |_| {}
+        // An optional file that was not there is remembered so later runs do not ask again.
+        const missing_marker = try std.fmt.allocPrint(self.gpa, "{s}.missing", .{name});
+        defer self.gpa.free(missing_marker);
+        if (!required) {
+            if (dir.access(self.io, missing_marker, .{})) |_| return else |_| {}
+        }
         const url = try std.fmt.allocPrint(self.gpa, "{s}{s}", .{ self.base_url, name });
         defer self.gpa.free(url);
         try out.print("* Fetching {s}...\n", .{name});
         try out.flush();
         self.http.download(dir, name, url, null) catch |err| switch (err) {
             error.NotFound => if (required) {
-                std.log.err("{s} not found at {s}", .{ name, self.base_url });
+                std.log.warn("{s} not found at {s}; check the model id (owner/name) and revision", .{ name, self.base_url });
                 return error.ModelNotFound;
-            } else return,
+            } else {
+                dir.writeFile(self.io, .{ .sub_path = missing_marker, .data = "" }) catch {};
+                return;
+            },
             error.Forbidden => {
                 std.log.err("access to {s} denied; gated models require HF_TOKEN to be set", .{self.base_url});
                 return error.ModelNotFound;

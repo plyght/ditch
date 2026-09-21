@@ -56,6 +56,31 @@ pub const Source = union(enum) {
     remote: *remote.RemoteFile,
 };
 
+/// Data served in place of a file range: a synthetic file (see
+/// `File.initSynthetic`, used for GGUF sources) addresses tensors that are not
+/// stored verbatim on disk (llama.cpp's permuted q/k undone, gemma norms
+/// without their `+1`) through virtual offsets beyond the file length.
+pub const Overlay = struct {
+    /// Virtual byte offset (>= `File.len`) of the first byte.
+    offset: u64,
+    byte_len: usize,
+    kind: union(enum) {
+        bytes: []const u8,
+        /// Rows `[rows][row_bytes]` at `src_offset`, stored in llama.cpp's
+        /// permuted order and read back in Hugging Face order (streamed mode).
+        permuted_rows: struct { src_offset: u64, rows: usize, row_bytes: usize, n_head: usize },
+    },
+};
+
+/// Row `hf_row` of a Hugging Face q/k matrix with `head_dim` rows per head is
+/// stored at this row by llama.cpp (`permute`: `[2][head_dim/2]` -> `[head_dim/2][2]` per head).
+pub fn llamaPermutedRow(hf_row: usize, head_dim: usize) usize {
+    const half = head_dim / 2;
+    const h = hf_row / head_dim;
+    const r = hf_row % head_dim;
+    return h * head_dim + 2 * (r % half) + (r / half);
+}
+
 pub const File = struct {
     path: []const u8,
     source: Source,
@@ -65,6 +90,9 @@ pub const File = struct {
     len: u64,
     tensors: std.StringArrayHashMapUnmanaged(TensorInfo),
     arena: std.heap.ArenaAllocator,
+    /// Synthetic data (see `Overlay`), addressed above `len`.
+    overlays: std.ArrayList(Overlay) = .empty,
+    next_virtual: u64 = 0,
 
     pub fn open(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, sub_path: []const u8) !*File {
         return openOptions(gpa, io, dir, sub_path, .{});
@@ -194,6 +222,79 @@ pub const File = struct {
         }
     }
 
+    /// Opens `sub_path` as an empty tensor container (no header is parsed);
+    /// tensors are registered with `addTensor` at explicit file offsets or as
+    /// overlays. Used to present a GGUF file to the weight store.
+    pub fn initSynthetic(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, sub_path: []const u8, map: bool) !*File {
+        const self = try gpa.create(File);
+        errdefer gpa.destroy(self);
+        self.* = .{
+            .path = undefined,
+            .source = undefined,
+            .map = null,
+            .header_len = 0,
+            .len = 0,
+            .tensors = .{},
+            .arena = std.heap.ArenaAllocator.init(gpa),
+        };
+        errdefer self.arena.deinit();
+        self.path = try self.arena.allocator().dupe(u8, sub_path);
+        const file = try dir.openFile(io, sub_path, .{});
+        self.source = .{ .local = file };
+        errdefer file.close(io);
+        self.len = try file.length(io);
+        if (map) {
+            self.map = try Io.File.MemoryMap.create(io, file, .{
+                .len = @intCast(self.len),
+                .protection = .{ .read = true, .write = false },
+                .populate = false,
+            });
+        }
+        self.next_virtual = (self.len + 63) / 64 * 64;
+        return self;
+    }
+
+    /// Registers a tensor of a synthetic file (`info.name` is the key).
+    pub fn addTensor(self: *File, info: TensorInfo) !void {
+        try self.tensors.put(self.arena.allocator(), info.name, info);
+    }
+
+    /// Registers in-memory bytes (owned by the caller for the file's lifetime)
+    /// and returns the virtual offset under which they are read.
+    pub fn addOverlayBytes(self: *File, bytes: []const u8) !u64 {
+        const off = self.next_virtual;
+        try self.overlays.append(self.arena.allocator(), .{ .offset = off, .byte_len = bytes.len, .kind = .{ .bytes = bytes } });
+        self.next_virtual += (bytes.len + 63) / 64 * 64;
+        return off;
+    }
+
+    /// Registers a permuted-row view over the file range at `src_offset`.
+    pub fn addOverlayPermuted(self: *File, src_offset: u64, rows: usize, row_bytes: usize, n_head: usize) !u64 {
+        const off = self.next_virtual;
+        const byte_len = rows * row_bytes;
+        try self.overlays.append(self.arena.allocator(), .{ .offset = off, .byte_len = byte_len, .kind = .{ .permuted_rows = .{ .src_offset = src_offset, .rows = rows, .row_bytes = row_bytes, .n_head = n_head } } });
+        self.next_virtual += (byte_len + 63) / 64 * 64;
+        return off;
+    }
+
+    fn overlayAt(self: *const File, offset: u64) ?*const Overlay {
+        for (self.overlays.items) |*o| {
+            if (offset >= o.offset and offset < o.offset + o.byte_len) return o;
+        }
+        return null;
+    }
+
+    /// Bytes `[offset, offset + len)` of a mapped file (or of a byte overlay).
+    pub fn mappedSlice(self: *const File, offset: u64, len: usize) []const u8 {
+        if (offset < self.len) return self.map.?.memory[@intCast(offset)..][0..len];
+        const o = self.overlayAt(offset).?;
+        const rel: usize = @intCast(offset - o.offset);
+        return switch (o.kind) {
+            .bytes => |b| b[rel..][0..len],
+            .permuted_rows => unreachable, // only registered for unmapped files
+        };
+    }
+
     pub fn close(self: *File, gpa: std.mem.Allocator, io: Io) void {
         if (self.map) |*m| m.destroy(io);
         switch (self.source) {
@@ -223,6 +324,35 @@ pub const File = struct {
 
     /// Positional read of `out.len` bytes at absolute file `offset`.
     pub fn readRange(self: *const File, io: Io, offset: u64, out: []u8) !void {
+        if (offset >= self.len) {
+            const o = self.overlayAt(offset) orelse return error.UnexpectedEndOfFile;
+            const rel: usize = @intCast(offset - o.offset);
+            if (rel + out.len > o.byte_len) return error.UnexpectedEndOfFile;
+            switch (o.kind) {
+                .bytes => |b| @memcpy(out, b[rel..][0..out.len]),
+                .permuted_rows => |p| {
+                    // Whole rows only: the store reads row slices.
+                    if (rel % p.row_bytes != 0 or out.len % p.row_bytes != 0) return error.UnexpectedEndOfFile;
+                    const head_dim = p.rows / p.n_head;
+                    var r = rel / p.row_bytes;
+                    var done: usize = 0;
+                    while (done < out.len) : ({
+                        done += p.row_bytes;
+                        r += 1;
+                    }) {
+                        const src_row = llamaPermutedRow(r, head_dim);
+                        // Permuted views are only registered for local (GGUF) files.
+                        const local = switch (self.source) {
+                            .local => |f| f,
+                            .remote => return error.UnexpectedEndOfFile,
+                        };
+                        const n = try local.readPositionalAll(io, out[done..][0..p.row_bytes], p.src_offset + @as(u64, src_row) * p.row_bytes);
+                        if (n != p.row_bytes) return error.UnexpectedEndOfFile;
+                    }
+                },
+            }
+            return;
+        }
         if (self.map) |m| {
             @memcpy(out, m.memory[@intCast(offset)..][0..out.len]);
             return;

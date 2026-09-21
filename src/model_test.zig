@@ -12,7 +12,7 @@ const Case = struct {
 };
 const Reference = struct { family: []const u8, cases: []Case };
 
-fn checkFixture(comptime family: []const u8) !void {
+pub fn checkFixture(comptime family: []const u8) !void {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const dir = "tests/fixtures/" ++ family;

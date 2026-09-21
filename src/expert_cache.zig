@@ -666,18 +666,19 @@ test "LRU semantics: hits, misses, eviction order and pinning" {
 
     // A pinned entry is never evicted, even when it is the LRU one.
     const pinned = try cache.acquire(0, m, 2);
-    // Order now: 0, 3, 2(pinned). Load two more: 0 and 3 go, 2 stays.
+    // Order now: 0, 3, 2(pinned). Load two more (kept pinned): 0 and 3 go, 2 stays.
     const a = try cache.acquire(1, m, 5);
-    cache.release(a);
     const b = try cache.acquire(1, m, 6);
-    cache.release(b);
     try std.testing.expect(cache.map.get(Key.init(0, 2).int()) != null);
     try std.testing.expect(cache.map.get(Key.init(0, 0).int()) == null);
     try std.testing.expect(cache.map.get(Key.init(0, 3).int()) == null);
+    try std.testing.expectEqual(@as(u64, 0), cache.evictable());
     // Pinned set larger than the capacity: still served (soft bound).
     const c = try cache.acquire(1, m, 7);
     try std.testing.expect(cache.stats().resident_bytes > cache.capacity);
     cache.release(c);
+    cache.release(b);
+    cache.release(a);
     cache.release(pinned);
     try std.testing.expectEqual(@as(u64, 4 * per), cache.evictable());
     // The weights of an entry are the same bytes the store reads directly.

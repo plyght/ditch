@@ -35,14 +35,14 @@ pub const WeightRef = struct {
     dtype: tensor.DType,
 
     pub fn byteLen(self: WeightRef) usize {
-        return self.rows * self.cols * self.dtype.size();
+        return self.rows * self.dtype.rowBytes(self.cols);
     }
 
     /// A ref covering rows `[r0, r0 + n)` of this matrix.
     pub fn rowSlice(self: WeightRef, r0: usize, n: usize) WeightRef {
         std.debug.assert(r0 + n <= self.rows);
         var out = self;
-        out.offset += @as(u64, r0) * self.cols * self.dtype.size();
+        out.offset += @as(u64, r0) * self.dtype.rowBytes(self.cols);
         out.rows = n;
         return out;
     }
@@ -246,8 +246,7 @@ pub const WeightStore = struct {
 
     fn mappedView(self: *const WeightStore, ref: WeightRef) Weight {
         const f = self.files[ref.file];
-        const m = f.map.?;
-        return .{ .data = m.memory[@intCast(ref.offset)..][0..ref.byteLen()], .dtype = ref.dtype, .rows = ref.rows, .cols = ref.cols };
+        return .{ .data = f.mappedSlice(ref.offset, ref.byteLen()), .dtype = ref.dtype, .rows = ref.rows, .cols = ref.cols };
     }
 
     /// Makes `ref` resident. In mapped mode this is a view; in streamed mode a
@@ -389,8 +388,7 @@ pub const WeightStore = struct {
 
     /// Reads one row of `ref` as f32 without making the whole matrix resident.
     pub fn readRow(self: *WeightStore, ref: WeightRef, r: usize, out: []f32) !void {
-        const es = ref.dtype.size();
-        const row_bytes = ref.cols * es;
+        const row_bytes = ref.dtype.rowBytes(ref.cols);
         switch (self.mode) {
             .mapped => self.mappedView(ref).row(r, out),
             .streamed => {

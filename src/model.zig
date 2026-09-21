@@ -17,6 +17,7 @@ const tensor = @import("tensor.zig");
 const safetensors = @import("safetensors.zig");
 const stream = @import("stream.zig");
 const budget_mod = @import("budget.zig");
+const gguf_model = @import("gguf_model.zig");
 const Tokenizer = @import("tokenizer.zig").Tokenizer;
 const moe = @import("moe.zig");
 const abliterate = @import("abliterate.zig");
@@ -49,6 +50,9 @@ pub const RopeScaling = union(enum) {
     none,
     linear: f32,
     llama3: struct { factor: f32, low_freq_factor: f32, high_freq_factor: f32, original_max_position: f32 },
+    /// Per-frequency divisors (`rope_freqs.weight` of a GGUF file, llama.cpp's
+    /// precomputed llama3 scaling): `inv_freq[i] /= factors[i]`.
+    factors: []const f32,
 };
 
 pub const Config = struct {
@@ -169,6 +173,20 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
                 } };
             } else if (std.mem.eql(u8, t, "linear")) {
                 rope_scaling = .{ .linear = getF32(rs.object, "factor", 1) };
+            } else if (std.mem.eql(u8, t, "ditch_factors")) {
+                // Per-frequency divisors (a GGUF `rope_freqs.weight` that is not a
+                // standard llama3 scaling); written by gguf_model.zig, read only by ditch.
+                if (rs.object.get("factors")) |fa| {
+                    if (fa == .array) {
+                        const factors = try arena.alloc(f32, fa.array.items.len);
+                        for (fa.array.items, 0..) |v, i| factors[i] = switch (v) {
+                            .float => |x| @floatCast(x),
+                            .integer => |x| @floatFromInt(x),
+                            else => 1.0,
+                        };
+                        rope_scaling = .{ .factors = factors };
+                    }
+                }
             } else if (t.len > 0 and !std.mem.eql(u8, t, "default")) {
                 std.log.warn("rope scaling type '{s}' is not supported; using unscaled RoPE", .{t});
             }
@@ -382,6 +400,9 @@ pub const LoadOptions = struct {
     /// (config, tokenizer) and the shards are read through the source. Implies
     /// streamed mode.
     remote: ?*remote.Source = null,
+    /// GGUF input: ignore the embedded Hugging Face config/tokenizer copies
+    /// and rebuild them from the ggml metadata (testing aid).
+    gguf_ignore_embedded: bool = false,
 };
 
 /// The two abliterable components, named as in heretic.
@@ -416,6 +437,9 @@ pub const Model = struct {
     config: Config,
     tokenizer: *Tokenizer,
     files: []*safetensors.File,
+    /// Set when the model was loaded from a GGUF file (see gguf_model.zig);
+    /// `files` then holds one synthetic file over it.
+    gguf: ?*gguf_model.Source,
     /// Weight access (mapped or streamed) over `files`. The forward pass takes
     /// `*const Model` but acquiring weights mutates the store (buffer pool,
     /// prefetch state); since a `Model` always lives on the heap this is done
@@ -469,6 +493,7 @@ pub const Model = struct {
         }
         self.store.deinit();
         for (self.files) |f| f.close(self.meta_gpa, self.io);
+        if (self.gguf) |g| g.close(self.meta_gpa, self.io);
         self.tokenizer.deinit();
         self.arena.deinit();
         self.meta_gpa.destroy(self);
@@ -562,107 +587,25 @@ pub const Model = struct {
         errdefer self.arena.deinit();
         const arena = self.arena.allocator();
 
-        var dir = try Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+        self.scratch_dir = try arena.dupe(u8, opts.scratch_dir orelse (if (opts.budget) |b| b.scratch_dir else "scratch"));
+        // A GGUF file (or a directory holding one) is loaded through gguf_model.zig.
+        self.gguf = null;
+        const gguf_path = try gguf_model.locate(io, arena, dir_path);
+        const dir_name = if (gguf_path) |p| (std.fs.path.dirname(p) orelse ".") else dir_path;
+        var dir = try Io.Dir.cwd().openDir(io, dir_name, .{ .iterate = true });
         defer dir.close(io);
         if (dir.access(io, export_incomplete_marker, .{})) |_| {
             std.log.warn("{s} contains {s}: the export did not finish; refusing to load it", .{ dir_path, export_incomplete_marker });
             return error.IncompleteModel;
         } else |_| {}
-
-        self.source_dir = try arena.dupe(u8, dir_path);
-        self.scratch_dir = try arena.dupe(u8, opts.scratch_dir orelse (if (opts.budget) |b| b.scratch_dir else "scratch"));
-        self.config_json = try dir.readFileAlloc(io, "config.json", arena, .unlimited);
-        self.config = try parseConfig(arena, self.config_json);
-        self.generation_config_json = dir.readFileAlloc(io, "generation_config.json", arena, .unlimited) catch null;
-        self.tokenizer_config_json = dir.readFileAlloc(io, "tokenizer_config.json", arena, .unlimited) catch null;
-        const tok_json = dir.readFileAlloc(io, "tokenizer.json", arena, .unlimited) catch {
-            std.log.err("tokenizer.json not found in {s} (only fast tokenizers are supported)", .{dir_path});
-            return error.MissingTokenizer;
-        };
-        self.tokenizer_json = tok_json;
-        self.tokenizer = try Tokenizer.parse(gpa, tok_json, self.tokenizer_config_json);
+        if (gguf_path) |p| {
+            try gguf_model.attach(self, p, opts.store == .mapped, .{ .ignore_embedded = opts.gguf_ignore_embedded });
+        } else try self.loadHfFiles(dir, dir_path, opts);
         errdefer self.tokenizer.deinit();
-        self.chat_template = null;
-        if (self.tokenizer_config_json) |tc| {
-            var parsed = try std.json.parseFromSlice(std.json.Value, gpa, tc, .{});
-            defer parsed.deinit();
-            if (parsed.value == .object) {
-                if (parsed.value.object.get("chat_template")) |ct| {
-                    switch (ct) {
-                        .string => |s| self.chat_template = try arena.dupe(u8, s),
-                        .array => |a| {
-                            for (a.items) |item| {
-                                if (item == .object) {
-                                    if (item.object.get("template")) |t| {
-                                        if (t == .string) self.chat_template = try arena.dupe(u8, t.string);
-                                    }
-                                    if (item.object.get("name")) |n| {
-                                        if (n == .string and std.mem.eql(u8, n.string, "default")) break;
-                                    }
-                                }
-                            }
-                        },
-                        else => {},
-                    }
-                }
-            }
-        }
-        if (self.chat_template == null) {
-            const ct = dir.readFileAlloc(io, "chat_template.jinja", arena, .unlimited) catch null;
-            self.chat_template = ct;
-        }
+        errdefer for (self.files) |f| f.close(gpa, io);
+        errdefer if (self.gguf) |g| g.close(gpa, io);
 
-        // EOS ids: generation_config eos_token_id (int or list) + tokenizer eos.
-        var eos = std.ArrayList(u32).empty;
-        if (self.generation_config_json) |gc| {
-            var parsed = try std.json.parseFromSlice(std.json.Value, gpa, gc, .{});
-            defer parsed.deinit();
-            if (parsed.value == .object) {
-                if (parsed.value.object.get("eos_token_id")) |e| {
-                    switch (e) {
-                        .integer => |i| try eos.append(arena, @intCast(i)),
-                        .array => |a| for (a.items) |x| {
-                            if (x == .integer) try eos.append(arena, @intCast(x.integer));
-                        },
-                        else => {},
-                    }
-                }
-            }
-        }
-        if (self.tokenizer.eos_id) |e| {
-            var found = false;
-            for (eos.items) |x| found = found or x == e;
-            if (!found) try eos.append(arena, e);
-        }
-        self.eos_ids = eos.items;
-        self.pad_id = if (eos.items.len > 0) eos.items[0] else 0;
-
-        // Safetensors files.
-        var files = std.ArrayList(*safetensors.File).empty;
-        errdefer for (files.items) |f| f.close(gpa, io);
         const store_mode: stream.Mode = if (opts.remote != null) .streamed else opts.store;
-        if (opts.remote) |src| {
-            // Shards come from the remote source: headers now, tensor bytes on demand.
-            for (src.shards) |n| try files.append(arena, try safetensors.File.openRemote(gpa, io, try src.openFile(n)));
-        } else {
-            var names = std.ArrayList([]const u8).empty;
-            var it = dir.iterate();
-            while (try it.next(io)) |entry| {
-                if (entry.kind != .file) continue;
-                if (std.mem.endsWith(u8, entry.name, ".safetensors")) try names.append(arena, try arena.dupe(u8, entry.name));
-            }
-            std.mem.sort([]const u8, names.items, {}, struct {
-                fn lt(_: void, a: []const u8, b: []const u8) bool {
-                    return std.mem.lessThan(u8, a, b);
-                }
-            }.lt);
-            if (names.items.len == 0) {
-                std.log.err("no .safetensors files found in {s}", .{dir_path});
-                return error.MissingWeights;
-            }
-            for (names.items) |n| try files.append(arena, try safetensors.File.openOptions(gpa, io, dir, n, .{ .map = store_mode == .mapped }));
-        }
-        self.files = files.items;
         self.store = stream.WeightStore.init(self.gpa, io, self.files, store_mode, .{ .budget = opts.budget, .prefetch = opts.prefetch });
         self.store.registerReclaim();
         errdefer self.store.deinit();
@@ -886,6 +829,106 @@ pub const Model = struct {
         try store.readRow(self.embed_ref, @min(t, self.embed_ref.rows - 1), out);
     }
 
+    /// Reads config.json, tokenizer files and opens the safetensors files of a
+    /// Hugging Face model directory.
+    fn loadHfFiles(self: *Model, dir: Io.Dir, dir_path: []const u8, opts: LoadOptions) !void {
+        const gpa = self.meta_gpa;
+        const io = self.io;
+        const arena = self.arena.allocator();
+        self.source_dir = try arena.dupe(u8, dir_path);
+        self.config_json = try dir.readFileAlloc(io, "config.json", arena, .unlimited);
+        self.config = try parseConfig(arena, self.config_json);
+        self.generation_config_json = dir.readFileAlloc(io, "generation_config.json", arena, .unlimited) catch null;
+        self.tokenizer_config_json = dir.readFileAlloc(io, "tokenizer_config.json", arena, .unlimited) catch null;
+        const tok_json = dir.readFileAlloc(io, "tokenizer.json", arena, .unlimited) catch {
+            std.log.err("tokenizer.json not found in {s} (only fast tokenizers are supported)", .{dir_path});
+            return error.MissingTokenizer;
+        };
+        self.tokenizer_json = tok_json;
+        self.tokenizer = try Tokenizer.parse(gpa, tok_json, self.tokenizer_config_json);
+        errdefer self.tokenizer.deinit();
+        self.chat_template = null;
+        if (self.tokenizer_config_json) |tc| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, gpa, tc, .{});
+            defer parsed.deinit();
+            if (parsed.value == .object) {
+                if (parsed.value.object.get("chat_template")) |ct| {
+                    switch (ct) {
+                        .string => |s| self.chat_template = try arena.dupe(u8, s),
+                        .array => |a| {
+                            for (a.items) |item| {
+                                if (item == .object) {
+                                    if (item.object.get("template")) |t| {
+                                        if (t == .string) self.chat_template = try arena.dupe(u8, t.string);
+                                    }
+                                    if (item.object.get("name")) |n| {
+                                        if (n == .string and std.mem.eql(u8, n.string, "default")) break;
+                                    }
+                                }
+                            }
+                        },
+                        else => {},
+                    }
+                }
+            }
+        }
+        if (self.chat_template == null) {
+            const ct = dir.readFileAlloc(io, "chat_template.jinja", arena, .unlimited) catch null;
+            self.chat_template = ct;
+        }
+
+        // EOS ids: generation_config eos_token_id (int or list) + tokenizer eos.
+        var eos = std.ArrayList(u32).empty;
+        if (self.generation_config_json) |gc| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, gpa, gc, .{});
+            defer parsed.deinit();
+            if (parsed.value == .object) {
+                if (parsed.value.object.get("eos_token_id")) |e| {
+                    switch (e) {
+                        .integer => |i| try eos.append(arena, @intCast(i)),
+                        .array => |a| for (a.items) |x| {
+                            if (x == .integer) try eos.append(arena, @intCast(x.integer));
+                        },
+                        else => {},
+                    }
+                }
+            }
+        }
+        if (self.tokenizer.eos_id) |e| {
+            var found = false;
+            for (eos.items) |x| found = found or x == e;
+            if (!found) try eos.append(arena, e);
+        }
+        self.eos_ids = eos.items;
+        self.pad_id = if (eos.items.len > 0) eos.items[0] else 0;
+
+        // Safetensors files.
+        var files = std.ArrayList(*safetensors.File).empty;
+        errdefer for (files.items) |f| f.close(gpa, io);
+        if (opts.remote) |src| {
+            // Shards come from the remote source: headers now, tensor bytes on demand.
+            for (src.shards) |n| try files.append(arena, try safetensors.File.openRemote(gpa, io, try src.openFile(n)));
+        } else {
+            var names = std.ArrayList([]const u8).empty;
+            var it = dir.iterate();
+            while (try it.next(io)) |entry| {
+                if (entry.kind != .file) continue;
+                if (std.mem.endsWith(u8, entry.name, ".safetensors")) try names.append(arena, try arena.dupe(u8, entry.name));
+            }
+            std.mem.sort([]const u8, names.items, {}, struct {
+                fn lt(_: void, a: []const u8, b: []const u8) bool {
+                    return std.mem.lessThan(u8, a, b);
+                }
+            }.lt);
+            if (names.items.len == 0) {
+                std.log.err("no .safetensors files found in {s}", .{dir_path});
+                return error.MissingWeights;
+            }
+            for (names.items) |n| try files.append(arena, try safetensors.File.openOptions(gpa, io, dir, n, .{ .map = opts.store == .mapped }));
+        }
+        self.files = files.items;
+    }
+
     fn cat(arena: Allocator, a: []const u8, b: []const u8) ![]const u8 {
         return std.fmt.allocPrint(arena, "{s}{s}", .{ a, b });
     }
@@ -951,6 +994,9 @@ pub const Model = struct {
             .none => {},
             .linear => |factor| for (inv_freq) |*f| {
                 f.* /= factor;
+            },
+            .factors => |factors| for (inv_freq, 0..) |*f, i| {
+                if (i < factors.len) f.* /= factors[i];
             },
             .llama3 => |s| {
                 const low_wavelen = s.original_max_position / s.low_freq_factor;

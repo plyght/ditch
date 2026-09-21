@@ -2,22 +2,50 @@
 
 **ditch** is a from-scratch Zig rebuild of [Heretic](https://github.com/p-e-w/heretic),
 Philipp Emanuel Weidmann's tool for fully automatic censorship removal
-("abliteration") of transformer language models. It runs the same algorithm,
-reads the same configuration format, produces the same kind of Hugging Face
-model directory, and needs nothing but a C-free static binary: no Python,
-no PyTorch, no GPU.
+("abliteration") of transformer language models. It runs Heretic's method
+(difference-of-means refusal directions, a per-layer weight kernel, and a
+multi-objective TPE that co-minimises refusals and KL divergence), produces
+the same kind of Hugging Face model directory, and ships as one dependency-free
+binary: no Python, no PyTorch, no GPU required.
 
-Everything that makes Heretic work is Heretic's idea; ditch only re-implements
-it. Please credit Heretic and its author if you use the results, and read the
-paper that underlies both tools: Arditi et al., *Refusal in Language Models Is
-Mediated by a Single Direction* (2024), <https://arxiv.org/abs/2406.11717>.
+The method is Heretic's; please credit Heretic and its author if you use the
+results, and read the paper that underlies both tools: Arditi et al., *Refusal
+in Language Models Is Mediated by a Single Direction* (2024),
+<https://arxiv.org/abs/2406.11717>.
+
+What ditch adds on top of the port:
+
+* **Runs where the weights do not fit.** A memory budget (`--max-ram`) streams
+  weights layer by layer, spills the KV cache to scratch storage, and stops
+  cleanly at a time limit, so the whole workflow finishes on machines that
+  cannot hold the model.
+* **Mixture-of-experts aware.** Per-expert edits, and expert-selective
+  abliteration that ranks experts by their alignment with the refusal
+  direction and searches over how many to touch, with Heretic's broad edit
+  kept as a candidate.
+* **Warp mode for MoE models bigger than RAM (and than the disk).** The
+  trunk streams per layer while routed experts go through a bounded LRU
+  expert cache with a persisted hotlist, and `hf://owner/name` reads the
+  weights straight from the Hub with range requests, caching chunks locally.
+* **A cheaper search.** Early stopping of dominated trials, warm starts from
+  earlier studies, and optional multi-direction ablation.
+* **Reproducible outputs.** Every export carries a Lua manifest with content
+  hashes and the exact parameters; `ditch --reproduce` rebuilds the model.
+* **Lua configuration** and a built-in `ditch bench` harness for honest
+  before/after numbers.
 
 ## Install
 
-ditch needs Zig 0.16.0.
+Prebuilt binaries for Linux (x86_64, aarch64), macOS (Intel, Apple silicon)
+and Windows (x86_64) are attached to every
+[release](https://github.com/plyght/ditch/releases); download the archive for
+your platform, unpack it and put `ditch` on your `PATH`. Every release ships
+with a `SHA256SUMS` file.
+
+To build from source you need Zig 0.16.0:
 
 ```sh
-git clone <this repository> ditch
+git clone https://github.com/plyght/ditch
 cd ditch
 zig build -Doptimize=ReleaseFast
 ```
@@ -58,9 +86,12 @@ so an interrupted run (Ctrl+C) can be resumed.
 * Qwen2 / Qwen2.5
 * Qwen3
 * Gemma 2 / Gemma 3 (text only)
+* Qwen3-MoE, Qwen2-MoE and Mixtral (mixture-of-experts; separate and fused
+  expert tensor layouts)
 
-Weights are read from safetensors in F32, F16 or BF16. Sharded checkpoints are
-supported.
+Weights are read from safetensors in F32, F16 or BF16 (sharded checkpoints
+are supported; also straight from the Hub with `hf://owner/name`, see "Warp
+mode" below) or from a llama.cpp GGUF file (see "GGUF" below).
 
 ### MoE and memory budgets
 
@@ -118,6 +149,165 @@ ditch Qwen/Qwen3-30B-A3B --max-ram 12GB --scratch-dir /fast/disk/scratch --time-
   ignored (there is no GPU backend).
 
 All of this is documented in `config.default.lua` as well.
+
+### Warp mode
+
+Mixture-of-experts models are mostly experts: in Qwen3-30B-A3B the routed
+experts are about 90% of the weights, but a token only touches 8 of the 128
+experts of each layer. Plain streamed mode ignores that and re-reads every
+expert of a layer for every forward pass. *Warp mode* keeps the trunk
+resident and streams only the experts that are actually selected, through a
+bounded cache, so a model far bigger than RAM (or than the local disk, with
+the remote source below) can be calibrated, searched and exported. The idea
+follows [WARP](https://github.com/sqliteai/warp) (trunk resident, experts
+streamed from NVMe into a bounded expert cache); ditch implements it natively
+on top of its budget and weight-store machinery, so everything else (budget
+accounting, spilling, exports, validation, manifests) works unchanged.
+
+Warp mode is on automatically for a streamed mixture-of-experts model, i.e.
+whenever `--max-ram` is set, `--expert-cache` is set, or the weights come
+from a remote source. `--expert-cache 0` turns it off (whole layers are
+streamed as before); mapped mode and dense models are untouched.
+
+```sh
+ditch hf://Qwen/Qwen3-30B-A3B --max-ram 12GB --expert-cache 6GB \
+    --scratch-dir /fast/disk/scratch --time-limit 4h
+```
+
+**Memory model.** Three parts share the budget:
+
+* the *trunk* (attention, norms, router, shared experts, embeddings, LM head)
+  is acquired per layer and prefetched exactly like plain streamed mode;
+* the *expert cache* (`src/expert_cache.zig`) is an LRU cache keyed by
+  (layer, expert) that holds all three matrices of an expert (gate, up, down,
+  or the slices of a fused `[E, ...]` block). After the router has picked the
+  top-k experts of a token batch, the union of the selected experts of that
+  layer is requested: hits are free, the misses are read from the store as
+  one group on background tasks, and each expert is pinned only while it is
+  being multiplied with, so a layer whose union does not fit still runs, one
+  expert resident at a time (older entries of other layers are evicted
+  first). The capacity is what `--max-ram` leaves after the trunk (two layers
+  when prefetching) and a quarter reserved for workspaces, KV caches and
+  deltas; `--expert-cache <size>` overrides it. The budget's allocator can
+  also reclaim unpinned experts when another allocation is refused, so the
+  cache never starves the workspaces;
+* *workspaces*, KV caches and deltas as before (spilled to scratch when they
+  do not fit).
+
+The hard minimum is therefore the trunk plus the experts one token selects,
+which the `Memory estimate` prints as `warp mode: min ...`, together with a
+`trunk per layer`, `routed expert` and `expert cache` line (how many experts
+the cache holds). The `Expert cache:` report (after every trial with
+`--print-debug-information`, and at exit) gives hits, misses, hit rate, bytes
+read, evictions, how many experts were warmed from the hotlist, how many
+distinct experts were visited, and for decoding the number of steps and the
+average and maximum misses per step.
+
+**Hotlist.** Every access is counted per (layer, expert). At exit the counts
+are written to `<scratch-dir>/<model>.hotlist`, a small Lua table
+(`{ layer, expert, uses }` entries, hottest first), and the next run on the
+same model loads the hottest experts that fit into the cache before anything
+else runs (`* hotlist: N experts warmed`). `--no-hotlist` disables both.
+
+**Expert-selective abliteration.** Scoring and editing experts goes through
+the same cache, so a trial never reads an expert twice, and in warp mode
+only experts that a calibration or evaluation prompt actually routed to are
+scored and edited (`--visited-experts-only`, default on in warp mode): an
+expert no prompt reached cannot have influenced a refusal, and skipping it
+saves its read. Exports still copy every expert, edited or not, so the
+output model is complete.
+
+**Remote weights (`hf://`).** A model id of the form `hf://owner/name` (or a
+plain id with `--remote-weights`, or an `http(s)://host/path/` base URL)
+runs the model without downloading it first: `config.json`, the tokenizer
+files, `generation_config.json`, `model.safetensors.index.json` and the
+8-byte length plus JSON header of every shard are fetched up front; tensor
+bytes are fetched on demand with HTTP `Range` requests (206 responses,
+redirects to the CDN followed, `HF_TOKEN` honoured, `curl -r` as the fallback
+when the built-in client cannot be used) in aligned chunks of
+`--remote-chunk-size` (default 8 MB). Chunks are cached on disk under
+`<cache-dir>/models/<id>/<revision>/chunks/<shard>/<index>`, so nothing is
+fetched twice across runs, up to four chunks are in flight at once (the
+trunk prefetch and the expert cache read on background tasks), and a later
+plain `ditch owner/name` run assembles a shard from its chunks instead of
+downloading it when every chunk is present (an export reads every tensor,
+so after a save the whole model is cached). Remote weights imply streamed
+mode. The source is safetensors only: a GGUF model must be local.
+
+**What it costs, honestly.** Prefill is cheap: the union of experts a batch
+routes to is read once per layer and the whole batch is computed against it.
+Decode is bound by expert reads per token: every step needs the trunk (read
+once per step, as in streamed mode) plus, per layer, whatever selected
+experts are not in the cache, and with a cache much smaller than the working
+set that is close to top-k expert reads per layer per token. With a fast
+NVMe and a cache that holds the hot experts the hit rate climbs quickly
+(the hotlist makes the second run start warm), but a decode step still costs
+milliseconds to seconds of I/O, not microseconds. Measured on the synthetic
+16-expert fixture (`tests/fixtures/qwen3_moe_big`: 4 routed layers, top-2,
+9 KB experts, 590 KB of experts in 732 KB of weights) in the e2e test with a
+192 KB budget: the cache held 92.0KB (10 experts of 64), the run saw 35057 hits and 8894 misses (79.8% hit rate) with 8894 evictions and 78.2MB of expert reads over calibration, two trials, validation and one export; decoding ran 105 batch steps of 2 sequences at 11.97 misses per step on average (max 16, out of 16 expert selections per step: top-2 in 4 layers for 2 sequences) and the second run warmed 10 experts from the hotlist before its first forward pass. Over the remote source with 4 KB chunks, a
+two-token prefill of that fixture fetched 20 ranges (78 KB: both shard headers and the norms the loader reads; the small files are plain downloads) at load and 85 ranges (337 KB, 47% of the 715 KB model) after the prefill, with bitwise the same logits as the memory-mapped model, and a second
+run fetched 0 ranges. These numbers only show that the machinery works;
+real-model numbers must be measured with `ditch bench` on your own storage.
+
+### GGUF
+
+Most abliterated models end up in llama.cpp, so ditch reads and writes
+[GGUF](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md) directly.
+
+**Output.** `--export-format gguf` (or `both`; `hf`, the safetensors directory,
+is the default for Hugging Face inputs) writes a single `model.gguf` next to
+the model card and the reproducibility manifest. `--gguf-dtype` selects the
+storage type of the 2-D matrices: `f16` (default), `bf16`, `f32`, `q8_0`
+(ggml's Q8_0: blocks of 32 values with an f16 scale), `q4_0`, `q4_1`, `q5_0`
+or `q5_1`; norms, biases and other 1-D tensors are always f32, and the token
+embeddings and the output projection stay f16 when a quantised type is
+chosen. The writer follows the conventions of llama.cpp's
+`convert_hf_to_gguf.py`: its tensor names (`token_embd`, `blk.N.attn_q`,
+`ffn_gate_exps`, ...), the q/k row permutation of the llama family, gemma norms
+stored as `1 + w`, stacked `[n_expert][...]` expert tensors, the architecture
+keys llama.cpp reads (context and embedding length, head counts, RMS epsilon,
+RoPE base and scaling, llama3 scaling as `rope_freqs.weight`, sliding window,
+soft-capping, expert counts) and the tokenizer (`gpt2` byte-level vocabularies
+with merges and the `qwen2` / `llama-bpe` / `gpt-2` pre-tokenizer name, or a
+`llama` SentencePiece-style vocabulary with scores) plus the chat template.
+The abliteration deltas are merged into the affected tensors exactly as in
+the safetensors export, tensor by tensor, so the whole model is never held in
+memory. The file also embeds the original `config.json` and `tokenizer.json`
+(`tokenizer.huggingface.json`) so a later Hugging Face export is exact.
+The format is spec-conformant (v3, little endian, 32-byte alignment) and is
+tested by round trip in ditch's own reader; it has not been run through
+llama.cpp itself here.
+
+**Input.** `ditch path/to/model.gguf` (or a directory holding one `.gguf`)
+loads a llama.cpp model of any supported architecture (`llama` including
+Mistral and Mixtral, `qwen2`, `qwen3`, `qwen2moe`, `qwen3moe`, `gemma2`,
+`gemma3`). The configuration is rebuilt from the metadata, the tokenizer from
+the ggml vocabulary (merges for `gpt2` vocabularies, scores for `llama` ones,
+the pre-tokenizer name mapped to the matching regular expression), the
+permutation and norm conventions above are undone, stacked expert tensors are
+split into per-expert views, and quantised tensors are dequantised row by row
+inside the kernels. Everything else (`--max-ram` streaming, `--evaluate-model`,
+`--reproduce`, MoE expert selection) works unchanged. A GGUF input defaults to
+a GGUF export (`--gguf-dtype source`): untouched tensors are copied
+byte-for-byte, edited tensors are re-quantised to their own type (Q8_0 stays
+Q8_0; K-quants, which ditch cannot produce, become Q8_0), and
+`--export-format hf` writes a safetensors model with quantised tensors
+dequantised to f16.
+
+| ggml type | read | written |
+| :--- | :---: | :---: |
+| F32, F16, BF16 | yes | yes |
+| Q8_0 | yes | yes |
+| Q4_0, Q4_1, Q5_0, Q5_1 | yes | yes |
+| Q4_K, Q6_K, Q8_K | yes | no (edited tensors become Q8_0) |
+| other K-/IQ-quants | no | no |
+
+`tools/make_fixture.py <family> --gguf` writes the synthetic test models as
+GGUF (with Q8_0 feed-forward matrices) for the unit tests, which check the
+NumPy reference logits, the tokenizer rebuilt from the vocabulary, HF-to-GGUF
+round trips for every family (f16 within 1e-2 and Q8_0 within 5e-2 of the
+largest logit) and the llama q/k permutation.
 
 ### Datasets
 
@@ -276,11 +466,17 @@ The interactive menus can be answered from the command line:
 | `--model-action save\|chat\|exit` | what to do with the selected model |
 | `--save-directory DIR` | where to save it |
 | `--export-dtype bf16\|f16\|f32` | storage dtype of the exported weights |
+| `--export-format hf\|gguf\|both` | Hugging Face directory (default), a llama.cpp GGUF file, or both |
+| `--gguf-dtype f16\|bf16\|f32\|q8_0\|...\|source` | storage type of the GGUF matrices (see "GGUF") |
 | `--reproduce FILE` | re-derive a model from its `ditch-reproduce.lua` (no search) |
 | `--ignore-mismatches` | proceed with `--reproduce` even if file or prompt hashes differ |
 | `--warm-start FILE` | seed the sampler with the trials of a previous study |
 | `--no-early-stop` | score every trial completely |
 | `--n-directions K` | remove K orthonormal directions per layer |
+| `--expert-cache SIZE` | warp mode: capacity of the expert cache (`0` = off) |
+| `--visited-experts-only` | warp mode: edit only experts the prompts routed to (default on) |
+| `--no-hotlist` | do not write/read `<scratch-dir>/<model>.hotlist` |
+| `--remote-weights`, `--remote-chunk-size SIZE` | read a plain Hub id like `hf://`; chunk size of the range cache |
 
 For example, a fully unattended run:
 
