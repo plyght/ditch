@@ -162,12 +162,86 @@ pub const Engine = struct {
     /// Like `getResidualMean`; every (winsorised) per-prompt residual is also
     /// fed to `sketch` (see `directions.Sketch`) in the same pass.
     pub fn getResidualMeanSketched(self: *Engine, gpa: Allocator, prompts: []const Prompt, progress: ?*Io.Writer, sketch: ?*directions.Sketch) ![]f32 {
+        return self.getResidualMeanObserved(gpa, prompts, progress, .{ .sketch = sketch });
+    }
+
+    /// What else the residual pass feeds, and which prompt positions it reads.
+    pub const ResidualObservers = struct {
+        sketch: ?*directions.Sketch = null,
+        moments: ?*directions.Moments = null,
+        /// The per-prompt residual is the mean over the last `window` prompt
+        /// tokens (1 = the last token only, as in heretic).
+        window: usize = 1,
+    };
+
+    /// Mean residual `[num_layers + 1][hidden]` over `prompts`; the same
+    /// per-prompt residuals also feed the observers.
+    pub fn getResidualMeanObserved(self: *Engine, gpa: Allocator, prompts: []const Prompt, progress: ?*Io.Writer, obs: ResidualObservers) ![]f32 {
         const c = &self.model.config;
         const entries = c.num_layers + 1;
         const hidden = c.hidden_size;
+        const Acc = struct {
+            sum: []f64,
+            hidden: usize,
+            obs: ResidualObservers,
+            fn add(ctx: *@This(), entry: usize, v: []const f32) void {
+                const acc = ctx.sum[entry * ctx.hidden ..][0..ctx.hidden];
+                for (v, 0..) |x, i| acc[i] += x;
+                if (ctx.obs.sketch) |s| s.add(entry, v);
+                if (ctx.obs.moments) |m| m.add(entry, v);
+            }
+        };
         const sum = try gpa.alloc(f64, entries * hidden);
         defer gpa.free(sum);
         @memset(sum, 0);
+        var acc = Acc{ .sum = sum, .hidden = hidden, .obs = obs };
+        const count = try self.forEachResidual(gpa, prompts, progress, obs.window, &acc);
+        const mean = try gpa.alloc(f32, entries * hidden);
+        for (mean, 0..) |*m, i| m.* = @floatCast(sum[i] / @as(f64, @floatFromInt(@max(count, 1))));
+        return mean;
+    }
+
+    /// Projection of every prompt's residual onto its entry's first direction:
+    /// `[prompts][entries]`. `dirs` is `[entries][k][hidden]` (`stride = k * hidden`).
+    pub fn getProjections(self: *Engine, gpa: Allocator, prompts: []const Prompt, dirs: []const f32, stride: usize, window: usize) ![]f32 {
+        const c = &self.model.config;
+        const entries = c.num_layers + 1;
+        const hidden = c.hidden_size;
+        std.debug.assert(dirs.len >= entries * stride);
+        const Proj = struct {
+            out: []f32,
+            dirs: []const f32,
+            stride: usize,
+            hidden: usize,
+            entries: usize,
+            prompt: usize = 0,
+            fn add(ctx: *@This(), entry: usize, v: []const f32) void {
+                ctx.out[ctx.prompt * ctx.entries + entry] = tensor.dot(v, ctx.dirs[entry * ctx.stride ..][0..ctx.hidden]);
+                if (entry + 1 == ctx.entries) ctx.prompt += 1;
+            }
+        };
+        const out = try gpa.alloc(f32, prompts.len * entries);
+        errdefer gpa.free(out);
+        var proj = Proj{ .out = out, .dirs = dirs, .stride = stride, .hidden = hidden, .entries = entries };
+        _ = try self.forEachResidual(gpa, prompts, null, window, &proj);
+        return out;
+    }
+
+    /// Runs the model over `prompts` and calls `ctx.add(entry, residual)` for
+    /// every prompt and layer entry (entries in order for each prompt) with
+    /// the winsorised residual, averaged over the last `window` prompt tokens.
+    /// Returns the number of prompts seen.
+    fn forEachResidual(self: *Engine, gpa: Allocator, prompts: []const Prompt, progress: ?*Io.Writer, window: usize, ctx: anytype) !usize {
+        const c = &self.model.config;
+        const entries = c.num_layers + 1;
+        const hidden = c.hidden_size;
+        const w = @max(window, 1);
+        const q = self.settings.winsorization_quantile;
+        var sorted: ?[]f32 = null;
+        defer if (sorted) |s| gpa.free(s);
+        if (q >= 0 and q < 1) sorted = try gpa.alloc(f32, hidden);
+        const v = try gpa.alloc(f32, hidden);
+        defer gpa.free(v);
         var count: usize = 0;
         var start: usize = 0;
         while (start < prompts.len) {
@@ -178,41 +252,109 @@ pub const Engine = struct {
             const ws = try self.ensureWorkspace(@max(tm.total, 1), @max(ids.len, 1), self.kvBytes(ids.len, tm.max + 1));
             var cache = try model_mod.KvCache.initFor(self.model, gpa, ids.len, tm.max + 1);
             defer cache.deinit();
-            const res = try gpa.alloc(f32, entries * ids.len * hidden);
+            // Flatten the batch; capture the last `w` rows of every prompt.
+            const tokens = try gpa.alloc(u32, tm.total);
+            defer gpa.free(tokens);
+            const rows = try gpa.alloc(model_mod.Row, tm.total);
+            defer gpa.free(rows);
+            var capture = std.ArrayList(usize).empty;
+            defer capture.deinit(gpa);
+            const first_capture = try gpa.alloc(usize, ids.len);
+            defer gpa.free(first_capture);
+            var idx: usize = 0;
+            for (ids, 0..) |p, b| {
+                const take = @min(w, p.len);
+                first_capture[b] = capture.items.len;
+                for (p, 0..) |t, pos| {
+                    tokens[idx] = t;
+                    rows[idx] = .{ .b = b, .pos = pos };
+                    if (pos + take >= p.len) try capture.append(gpa, idx);
+                    idx += 1;
+                }
+            }
+            const res = try gpa.alloc(f32, entries * capture.items.len * hidden);
             defer gpa.free(res);
-            try model_mod.prefill(self.model, ws, &cache, ids, null, res);
-            const q = self.settings.winsorization_quantile;
-            var sorted: ?[]f32 = null;
-            defer if (sorted) |s| gpa.free(s);
-            if (q >= 0 and q < 1) sorted = try gpa.alloc(f32, hidden);
-            for (0..entries) |l| {
-                for (0..ids.len) |b| {
-                    const v = res[(l * ids.len + b) * hidden ..][0..hidden];
+            try model_mod.forward(self.model, ws, &cache, tokens, rows, .{ .capture_rows = capture.items, .residuals = res });
+            for (ids, 0..) |p, b| {
+                const take = @min(w, p.len);
+                const inv: f32 = 1.0 / @as(f32, @floatFromInt(@max(take, 1)));
+                for (0..entries) |l| {
+                    @memset(v, 0);
+                    for (0..take) |t| {
+                        const ci = first_capture[b] + t;
+                        tensor.axpy(v, inv, res[(l * capture.items.len + ci) * hidden ..][0..hidden]);
+                    }
                     if (sorted) |s| {
                         for (s, 0..) |*x, i| x.* = @abs(v[i]);
                         std.mem.sort(f32, s, {}, std.sort.asc(f32));
                         const thr = quantile(s, q);
                         for (v) |*x| x.* = std.math.clamp(x.*, -thr, thr);
                     }
-                    const acc = sum[l * hidden ..][0..hidden];
-                    for (v, 0..) |x, i| acc[i] += x;
-                    if (sketch) |s| s.add(l, v);
+                    ctx.add(l, v);
                 }
             }
             count += ids.len;
-            if (progress) |w| {
-                w.print("\r  {d}/{d} prompts", .{ count, prompts.len }) catch {};
-                w.flush() catch {};
+            if (progress) |pw| {
+                pw.print("\r  {d}/{d} prompts", .{ count, prompts.len }) catch {};
+                pw.flush() catch {};
             }
             start = end;
         }
-        if (progress) |w| {
-            w.writeAll("\r") catch {};
-            w.print("{s: <40}\r", .{""}) catch {};
+        if (progress) |pw| {
+            pw.writeAll("\r") catch {};
+            pw.print("{s: <40}\r", .{""}) catch {};
         }
-        const mean = try gpa.alloc(f32, entries * hidden);
-        for (mean, 0..) |*m, i| m.* = @floatCast(sum[i] / @as(f64, @floatFromInt(@max(count, 1))));
-        return mean;
+        return count;
+    }
+
+    /// Logits at the last `tails[i]` positions of every token sequence
+    /// `seqs[i]`, packed in order: `[Σ tails][vocab]`. One prefill per batch.
+    pub fn getLogitsAt(self: *Engine, gpa: Allocator, seqs: []const []const u32, tails: []const usize) ![]f32 {
+        const c = &self.model.config;
+        std.debug.assert(seqs.len == tails.len);
+        var total_rows: usize = 0;
+        for (tails) |t| total_rows += t;
+        const out = try gpa.alloc(f32, total_rows * c.vocab_size);
+        errdefer gpa.free(out);
+        var written: usize = 0;
+        var start: usize = 0;
+        while (start < seqs.len) {
+            const end = @min(seqs.len, start + self.batch_size);
+            const ids = seqs[start..end];
+            const tm = totalAndMax(ids);
+            var n_logits: usize = 0;
+            for (tails[start..end]) |t| n_logits += t;
+            const ws = try self.ensureWorkspace(@max(tm.total, 1), @max(n_logits, 1), self.kvBytes(ids.len, tm.max + 1));
+            var cache = try model_mod.KvCache.initFor(self.model, gpa, ids.len, tm.max + 1);
+            defer cache.deinit();
+            const tokens = try gpa.alloc(u32, tm.total);
+            defer gpa.free(tokens);
+            const rows = try gpa.alloc(model_mod.Row, tm.total);
+            defer gpa.free(rows);
+            const logit_rows = try gpa.alloc(usize, n_logits);
+            defer gpa.free(logit_rows);
+            var idx: usize = 0;
+            var li: usize = 0;
+            for (ids, 0..) |p, b| {
+                const take = @min(tails[start + b], p.len);
+                for (p, 0..) |t, pos| {
+                    tokens[idx] = t;
+                    rows[idx] = .{ .b = b, .pos = pos };
+                    if (pos + take >= p.len) {
+                        logit_rows[li] = idx;
+                        li += 1;
+                    }
+                    idx += 1;
+                }
+            }
+            try model_mod.forward(self.model, ws, &cache, tokens, rows, .{ .logit_rows = logit_rows[0..li] });
+            @memcpy(out[written * c.vocab_size ..][0 .. li * c.vocab_size], ws.logits[0 .. li * c.vocab_size]);
+            written += li;
+            start = end;
+        }
+        // Every tail must fit its sequence (callers build them that way).
+        std.debug.assert(written == total_rows);
+        return out;
     }
 };
 

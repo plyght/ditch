@@ -75,6 +75,11 @@ pub const Options = struct {
     /// have influenced any refusal); their reads are skipped. Ignored when
     /// no expert cache tracks uses.
     visited_experts_only: bool = false,
+    /// Also ablate the input side of every edited matrix (see `computeDelta`):
+    /// the input pattern `u ∝ Wᵀv` that writes the refusal direction is
+    /// removed from the columns, `W'' = W' − λ (W' u) uᵀ`. Rank-K more per
+    /// matrix; a stronger edit (expected: fewer refusals at a higher KL).
+    ablate_inputs: bool = false,
 };
 
 /// Computes unit residual directions `[entries][hidden]` from per-entry means.
@@ -183,7 +188,56 @@ pub fn apply(model: *Model, dirs: []const f32, direction_index: ?f32, params: st
 /// Computes the LoRA delta for one matrix. `v` holds `K` orthonormal
 /// directions of length `rows` (`v.len == K * rows`); K = 1 is heretic's
 /// single-direction edit.
+///
+/// With `opts.ablate_inputs` the output-side edit `W'` is followed by an
+/// input-side one. The unit input patterns `u_j` are the orthonormalised
+/// `Wᵀ v_j`: the inputs whose output is most aligned with the refusal
+/// directions (the "read" side of the same matrix, in the spirit of the
+/// biprojected abliteration described by Lai). `W'' = W' − λ (W' U) Uᵀ`
+/// removes their entire output, not only its refusal component, which the
+/// output-side edit has already zeroed. The result is a rank-(r + K) delta.
 pub fn computeDelta(pool: *const tensor.Pool, gpa: Allocator, w: Weight, v: []const f32, weight: f32, opts: Options, seed: u64) !Delta {
+    const primary = try computeOutputDelta(pool, gpa, w, v, weight, opts, seed);
+    if (!opts.ablate_inputs) return primary;
+    errdefer {
+        gpa.free(primary.a);
+        gpa.free(primary.b);
+    }
+    return ablateInputs(pool, gpa, w, v, weight, primary);
+}
+
+/// Extends `primary` (`W' = W + B A`) by the input-side edit of `computeDelta`.
+fn ablateInputs(pool: *const tensor.Pool, gpa: Allocator, w: Weight, v: []const f32, weight: f32, primary: Delta) !Delta {
+    const rows = w.rows;
+    const cols = w.cols;
+    const k = v.len / rows;
+    // U = orth(Wᵀ V)  ([K][cols]).
+    const u = try gpa.alloc(f32, k * cols);
+    defer gpa.free(u);
+    try tensor.matvecTMulti(pool, gpa, u, w, v, k);
+    orthonormalize(u, k, cols);
+    // W' U  ([K][rows]) through the primary delta.
+    const wu = try gpa.alloc(f32, k * rows);
+    defer gpa.free(wu);
+    try tensor.matmulT(pool, gpa, wu, u, k, w, &primary);
+    const r = primary.rank;
+    const rank = r + k;
+    const a = try gpa.alloc(f32, rank * cols);
+    errdefer gpa.free(a);
+    @memcpy(a[0 .. r * cols], primary.a);
+    @memcpy(a[r * cols ..], u);
+    const b = try gpa.alloc(f32, rows * rank);
+    for (0..rows) |i| {
+        @memcpy(b[i * rank ..][0..r], primary.b[i * r ..][0..r]);
+        for (0..k) |j| b[i * rank + r + j] = -weight * wu[j * rows + i];
+    }
+    gpa.free(primary.a);
+    gpa.free(primary.b);
+    return .{ .rank = rank, .a = a, .b = b };
+}
+
+/// The output-side edit (heretic's): `W' = W − λ V (Vᵀ W)` in the chosen row-normalisation mode.
+fn computeOutputDelta(pool: *const tensor.Pool, gpa: Allocator, w: Weight, v: []const f32, weight: f32, opts: Options, seed: u64) !Delta {
     const rows = w.rows;
     const cols = w.cols;
     std.debug.assert(v.len > 0 and v.len % rows == 0);
@@ -542,6 +596,89 @@ test "abliteration removes the direction (none / pre / full)" {
                 }
             }
         }
+    }
+}
+
+test "input-side ablation removes the read pattern as well as the direction" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const pool = tensor.Pool.init(threaded.io(), 1);
+    const rows = 6;
+    const cols = 5;
+    var prng = std.Random.DefaultPrng.init(3);
+    const rand = prng.random();
+    var wf: [rows * cols]f32 = undefined;
+    for (&wf) |*x| x.* = rand.floatNorm(f32);
+    const w = Weight{ .data = std.mem.sliceAsBytes(&wf), .dtype = .f32, .rows = rows, .cols = cols };
+    var v: [rows]f32 = undefined;
+    for (&v) |*x| x.* = rand.floatNorm(f32);
+    tensor.normalize(&v);
+    // u ∝ Wᵀ v, the input pattern whose output is most aligned with v.
+    var u: [cols]f32 = undefined;
+    for (0..cols) |j| {
+        var acc: f32 = 0;
+        for (0..rows) |i| acc += v[i] * wf[i * cols + j];
+        u[j] = acc;
+    }
+    tensor.normalize(&u);
+    for ([_]RowNormalization{ .none, .pre }) |mode| {
+        const delta = try computeDelta(&pool, gpa, w, &v, 1.0, .{ .row_normalization = mode, .ablate_inputs = true }, 1);
+        defer {
+            gpa.free(delta.a);
+            gpa.free(delta.b);
+        }
+        try std.testing.expectEqual(@as(usize, 2), delta.rank);
+        const wp = try materialize(gpa, w, delta);
+        defer gpa.free(wp);
+        // The direction is gone from the (row-normalised) output side ...
+        for (0..cols) |j| {
+            var acc: f32 = 0;
+            for (0..rows) |i| {
+                const n = if (mode == .none) 1.0 else tensor.norm2(wf[i * cols ..][0..cols]);
+                acc += v[i] / n * wp[i * cols + j];
+            }
+            try std.testing.expect(@abs(acc) < 1e-4);
+        }
+        // ... and the read pattern u produces no output at all.
+        for (0..rows) |i| {
+            var acc: f32 = 0;
+            for (0..cols) |j| acc += wp[i * cols + j] * u[j];
+            try std.testing.expect(@abs(acc) < 1e-4);
+        }
+        // Inputs orthogonal to u are affected only by the output-side edit.
+        var x: [cols]f32 = undefined;
+        for (&x) |*e| e.* = rand.floatNorm(f32);
+        tensor.axpy(&x, -tensor.dot(&x, &u), &u);
+        const single = try computeDelta(&pool, gpa, w, &v, 1.0, .{ .row_normalization = mode }, 1);
+        defer {
+            gpa.free(single.a);
+            gpa.free(single.b);
+        }
+        const ws = try materialize(gpa, w, single);
+        defer gpa.free(ws);
+        for (0..rows) |i| {
+            var yp: f32 = 0;
+            var ys: f32 = 0;
+            for (0..cols) |j| {
+                yp += wp[i * cols + j] * x[j];
+                ys += ws[i * cols + j] * x[j];
+            }
+            try std.testing.expectApproxEqAbs(ys, yp, 1e-4);
+        }
+    }
+    // Full mode: the rank grows by one and the read pattern is still removed.
+    const full = try computeDelta(&pool, gpa, w, &v, 1.0, .{ .row_normalization = .full, .lora_rank = 5, .ablate_inputs = true }, 1);
+    defer {
+        gpa.free(full.a);
+        gpa.free(full.b);
+    }
+    try std.testing.expectEqual(@as(usize, 6), full.rank);
+    const wfull = try materialize(gpa, w, full);
+    defer gpa.free(wfull);
+    for (0..rows) |i| {
+        var acc: f32 = 0;
+        for (0..cols) |j| acc += wfull[i * cols + j] * u[j];
+        try std.testing.expect(@abs(acc) < 1e-3);
     }
 }
 
