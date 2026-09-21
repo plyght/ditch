@@ -88,10 +88,11 @@ pub const Engine = struct {
             const end = @min(prompts.len, start + self.batch_size);
             const ids = try self.encodeBatch(gpa, prompts[start..end]);
             defer freeBatch(gpa, ids);
+            // `model.generate` allocates its result with the model's allocator.
             const tokens = try self.generateBatch(gpa, ids, self.settings.max_response_length);
             defer {
-                for (tokens) |t| gpa.free(t);
-                gpa.free(tokens);
+                for (tokens) |t| self.model.gpa.free(t);
+                self.model.gpa.free(tokens);
             }
             for (tokens, 0..) |t, i| {
                 out[start + i] = try self.model.tokenizer.decode(gpa, t, skip_special);
@@ -102,7 +103,8 @@ pub const Engine = struct {
         return out;
     }
 
-    /// Generates tokens for one batch of tokenised prompts.
+    /// Generates tokens for one batch of tokenised prompts. The returned
+    /// slices are allocated with `self.model.gpa` (see `model_mod.generate`).
     pub fn generateBatch(self: *Engine, gpa: Allocator, ids: []const []u32, max_new_tokens: usize) ![][]u32 {
         const tm = totalAndMax(ids);
         const c = &self.model.config;
