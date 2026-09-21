@@ -40,10 +40,30 @@ pub const Params = struct {
     min_weight_distance: f32,
 };
 
+/// How experts of an MoE layer are chosen for the edit (see moe.zig).
+pub const ExpertSelection = enum {
+    /// The `n_selected` experts best aligned with the refusal direction.
+    ranked,
+    /// `n_selected` random experts (validation baseline).
+    random,
+    /// Ignore the selection parameters and always edit every expert.
+    broad,
+
+    pub fn parse(s: []const u8) ?ExpertSelection {
+        inline for (@typeInfo(ExpertSelection).@"enum".fields) |f| {
+            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        }
+        return null;
+    }
+};
+
 pub const Options = struct {
     row_normalization: RowNormalization = .full,
     lora_rank: usize = 3,
     seed: u64 = 0,
+    expert_selection: ExpertSelection = .ranked,
+    /// If set, expert-selective edits print their ranking tables here.
+    debug_writer: ?*std.Io.Writer = null,
 };
 
 /// Computes unit residual directions `[entries][hidden]` from per-entry means.
@@ -96,6 +116,8 @@ pub fn kernelWeight(p: Params, layer: usize) ?f32 {
 }
 
 /// Applies abliteration to every layer of `model`. `direction_index == null` means "per layer".
+/// On MoE layers the `mlp.down_proj` kernel weight is applied to every expert's
+/// down projection (routed and shared), as heretic does (broad edit).
 pub fn apply(model: *Model, dirs: []const f32, direction_index: ?f32, params: std.EnumMap(Component, Params), opts: Options) !void {
     const gpa = model.gpa;
     const hidden = model.config.hidden_size;
@@ -105,11 +127,21 @@ pub fn apply(model: *Model, dirs: []const f32, direction_index: ?f32, params: st
 
     model.resetDeltas();
     var seed_counter: u64 = 0;
-    for (model.layers, 0..) |_, li| {
+    for (model.layers, 0..) |*layer, li| {
         for (Component.all) |comp| {
             const p = params.get(comp) orelse continue;
             const weight = kernelWeight(p, li) orelse continue;
             const v = if (global_dir) |g| g else dirs[(li + 1) * hidden ..][0..hidden];
+            if (comp == .mlp_down_proj and layer.moe != null) {
+                const m = &layer.moe.?;
+                var idx: usize = 0;
+                while (idx < m.numDown()) : (idx += 1) {
+                    const delta = try computeDelta(model.pool, gpa, m.downWeight(idx), v, weight, opts, opts.seed +% seed_counter);
+                    seed_counter += 1;
+                    model.setExpertDelta(li, idx, delta);
+                }
+                continue;
+            }
             const w = model.componentWeight(li, comp);
             const delta = try computeDelta(model.pool, gpa, w, v, weight, opts, opts.seed +% seed_counter);
             seed_counter += 1;
