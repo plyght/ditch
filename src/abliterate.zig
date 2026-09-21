@@ -7,6 +7,10 @@
 //!
 //!     W' = W - λ v (vᵀ W)
 //!
+//! With several directions per layer (`Options.n_directions = K`, see
+//! `directions.zig`) the orthonormal basis `V = [v₁ .. v_K]` is projected out
+//! at once, `W' = W - λ V (Vᵀ W)`, a rank-K delta.
+//!
 //! The change is stored as a low-rank delta (`B @ A`) so that the base weights
 //! are never modified and resetting the model is free.
 
@@ -64,6 +68,8 @@ pub const Options = struct {
     expert_selection: ExpertSelection = .ranked,
     /// If set, expert-selective edits print their ranking tables here.
     debug_writer: ?*std.Io.Writer = null,
+    /// Directions per layer entry: `dirs` is laid out `[entries][n_directions][hidden]`.
+    n_directions: usize = 1,
 };
 
 /// Computes unit residual directions `[entries][hidden]` from per-entry means.
@@ -94,15 +100,23 @@ pub fn computeDirections(gpa: Allocator, good_means: []const f32, bad_means: []c
 
 /// Interpolates the direction for a fractional `direction_index` (index 0 = first layer output).
 pub fn interpolateDirection(gpa: Allocator, dirs: []const f32, hidden: usize, direction_index: f32) ![]f32 {
+    return interpolateBasis(gpa, dirs, 1, hidden, direction_index);
+}
+
+/// Interpolates a whole `[k][hidden]` basis between layer entries for a
+/// fractional `direction_index` and re-orthonormalises it (for `k == 1` this
+/// is heretic's normalised linear interpolation).
+pub fn interpolateBasis(gpa: Allocator, dirs: []const f32, k: usize, hidden: usize, direction_index: f32) ![]f32 {
     const shifted = direction_index + 1.0;
     const idx: usize = @intFromFloat(@floor(shifted));
     const frac: f32 = shifted - @floor(shifted);
-    const entries = dirs.len / hidden;
-    const a = dirs[@min(idx, entries - 1) * hidden ..][0..hidden];
-    const b = dirs[@min(idx + 1, entries - 1) * hidden ..][0..hidden];
-    const out = try gpa.alloc(f32, hidden);
+    const stride = k * hidden;
+    const entries = dirs.len / stride;
+    const a = dirs[@min(idx, entries - 1) * stride ..][0..stride];
+    const b = dirs[@min(idx + 1, entries - 1) * stride ..][0..stride];
+    const out = try gpa.alloc(f32, stride);
     for (out, 0..) |*o, i| o.* = a[i] + frac * (b[i] - a[i]);
-    tensor.normalize(out);
+    orthonormalize(out, k, hidden);
     return out;
 }
 
@@ -121,9 +135,10 @@ pub fn kernelWeight(p: Params, layer: usize) ?f32 {
 pub fn apply(model: *Model, dirs: []const f32, direction_index: ?f32, params: std.EnumMap(Component, Params), opts: Options) !void {
     const gpa = model.gpa;
     const hidden = model.config.hidden_size;
+    const stride = opts.n_directions * hidden;
     var global_dir: ?[]f32 = null;
     defer if (global_dir) |g| gpa.free(g);
-    if (direction_index) |di| global_dir = try interpolateDirection(gpa, dirs, hidden, di);
+    if (direction_index) |di| global_dir = try interpolateBasis(gpa, dirs, opts.n_directions, hidden, di);
 
     model.resetDeltas();
     var seed_counter: u64 = 0;
@@ -131,7 +146,7 @@ pub fn apply(model: *Model, dirs: []const f32, direction_index: ?f32, params: st
         for (Component.all) |comp| {
             const p = params.get(comp) orelse continue;
             const weight = kernelWeight(p, li) orelse continue;
-            const v = if (global_dir) |g| g else dirs[(li + 1) * hidden ..][0..hidden];
+            const v = if (global_dir) |g| g else dirs[(li + 1) * stride ..][0..stride];
             if (comp == .mlp_down_proj and layer.moe != null) {
                 const m = &layer.moe.?;
                 var idx: usize = 0;
@@ -150,65 +165,82 @@ pub fn apply(model: *Model, dirs: []const f32, direction_index: ?f32, params: st
     }
 }
 
-/// Computes the LoRA delta for one matrix.
+/// Computes the LoRA delta for one matrix. `v` holds `K` orthonormal
+/// directions of length `rows` (`v.len == K * rows`); K = 1 is heretic's
+/// single-direction edit.
 pub fn computeDelta(pool: *const tensor.Pool, gpa: Allocator, w: Weight, v: []const f32, weight: f32, opts: Options, seed: u64) !Delta {
     const rows = w.rows;
     const cols = w.cols;
-    std.debug.assert(v.len == rows);
+    std.debug.assert(v.len > 0 and v.len % rows == 0);
+    const k = v.len / rows;
 
     if (opts.row_normalization == .none) {
-        // A = vᵀ W, B = -λ v
-        const a = try gpa.alloc(f32, cols);
+        // A = Vᵀ W  ([K][cols]),  B = -λ V  ([rows][K])
+        const a = try gpa.alloc(f32, k * cols);
         errdefer gpa.free(a);
-        try tensor.matvecT(pool, gpa, a, w, v);
-        const b = try gpa.alloc(f32, rows);
-        for (b, 0..) |*x, i| x.* = -weight * v[i];
-        return .{ .rank = 1, .a = a, .b = b };
+        try tensor.matvecTMulti(pool, gpa, a, w, v, k);
+        const b = try gpa.alloc(f32, rows * k);
+        for (0..rows) |i| for (0..k) |j| {
+            b[i * k + j] = -weight * v[j * rows + i];
+        };
+        return .{ .rank = k, .a = a, .b = b };
     }
 
-    // Row norms and the normalised projection a = vᵀ Wn = Σ_i (v_i / n_i) W_i.
+    // Row norms and the normalised projections a_j = v_jᵀ Wn = Σ_i (v_ji / n_i) W_i.
     const norms = try gpa.alloc(f32, rows);
     defer gpa.free(norms);
     try tensor.rowNorms(pool, gpa, norms, w);
-    const vn = try gpa.alloc(f32, rows);
+    const vn = try gpa.alloc(f32, k * rows);
     defer gpa.free(vn);
-    for (vn, 0..) |*x, i| x.* = if (norms[i] > 0) v[i] / norms[i] else 0;
-    const a = try gpa.alloc(f32, cols);
+    for (0..k) |j| for (0..rows) |i| {
+        vn[j * rows + i] = if (norms[i] > 0) v[j * rows + i] / norms[i] else 0;
+    };
+    const a = try gpa.alloc(f32, k * cols);
     errdefer gpa.free(a);
-    try tensor.matvecT(pool, gpa, a, w, vn);
+    try tensor.matvecTMulti(pool, gpa, a, w, vn, k);
 
     if (opts.row_normalization == .pre) {
-        // B = n ⊙ (-λ v)
-        const b = try gpa.alloc(f32, rows);
-        for (b, 0..) |*x, i| x.* = -weight * v[i] * norms[i];
-        return .{ .rank = 1, .a = a, .b = b };
+        // B = n ⊙ (-λ V)
+        const b = try gpa.alloc(f32, rows * k);
+        for (0..rows) |i| for (0..k) |j| {
+            b[i * k + j] = -weight * v[j * rows + i] * norms[i];
+        };
+        return .{ .rank = k, .a = a, .b = b };
     }
 
-    // Full normalisation: W' = diag(n) rownorm(Wn + b aᵀ) with b = -λ v.
-    // The delta D = W' - W = diag(c) W + d aᵀ, where for row i with
-    // s_i = ||Wn_i + b_i a||:  c_i = 1/s_i - 1,  d_i = n_i b_i / s_i.
+    // Full normalisation: W' = diag(n) rownorm(Wn + B Aᵀ) with B = -λ V.
+    // The delta D = W' - W = diag(c) W + Σ_j d_j a_jᵀ, where for row i with
+    // s_i = ||Wn_i + Σ_j b_ij a_j||:  c_i = 1/s_i - 1,  d_ij = n_i b_ij / s_i.
     // D is approximated by a rank-r randomised SVD without materialising it.
-    const wa = try gpa.alloc(f32, rows); // W_i · a
+    const wa = try gpa.alloc(f32, k * rows); // wa[j][i] = W_i · a_j
     defer gpa.free(wa);
-    try tensor.matmulT(pool, gpa, wa, a, 1, w, null);
-    const a_norm2 = tensor.dot(a, a);
+    try tensor.matmulT(pool, gpa, wa, a, k, w, null);
+    const gram = try gpa.alloc(f32, k * k); // a_j · a_l
+    defer gpa.free(gram);
+    for (0..k) |j| for (0..k) |l| {
+        gram[j * k + l] = tensor.dot(a[j * cols ..][0..cols], a[l * cols ..][0..cols]);
+    };
     const c = try gpa.alloc(f32, rows);
     defer gpa.free(c);
-    const d = try gpa.alloc(f32, rows);
+    const d = try gpa.alloc(f32, k * rows);
     defer gpa.free(d);
     for (0..rows) |i| {
-        const bi = -weight * v[i];
-        const wn_dot_a = if (norms[i] > 0) wa[i] / norms[i] else 0;
-        const s2 = 1.0 + 2.0 * bi * wn_dot_a + bi * bi * a_norm2;
+        var s2: f32 = 1.0;
+        for (0..k) |j| {
+            const bij = -weight * v[j * rows + i];
+            const wn_dot_a = if (norms[i] > 0) wa[j * rows + i] / norms[i] else 0;
+            s2 += 2.0 * bij * wn_dot_a;
+            for (0..k) |l| s2 += bij * (-weight * v[l * rows + i]) * gram[j * k + l];
+        }
         const s = @sqrt(@max(s2, 1e-12));
         c[i] = 1.0 / s - 1.0;
-        d[i] = norms[i] * bi / s;
+        for (0..k) |j| d[j * rows + i] = norms[i] * (-weight * v[j * rows + i]) / s;
     }
     defer gpa.free(a);
 
-    const r = opts.lora_rank;
+    const r = @max(opts.lora_rank, k);
     const q = @min(2 * r + 4, @min(rows, cols));
-    const op = DeltaOperator{ .pool = pool, .gpa = gpa, .w = w, .a = a, .c = c, .d = d };
+    const op = DeltaOperator{ .pool = pool, .gpa = gpa, .w = w, .a = a, .c = c, .d = d, .k = k };
     var svd = try randomizedSvd(gpa, op, rows, cols, q, 6, seed);
     defer svd.deinit(gpa);
 
@@ -216,22 +248,23 @@ pub fn computeDelta(pool: *const tensor.Pool, gpa: Allocator, w: Weight, v: []co
     const lora_a = try gpa.alloc(f32, rank * cols);
     errdefer gpa.free(lora_a);
     const lora_b = try gpa.alloc(f32, rows * rank);
-    for (0..rank) |k| {
-        const sq = @sqrt(@max(svd.s[k], 0));
-        for (0..cols) |j| lora_a[k * cols + j] = sq * svd.v[k * cols + j];
-        for (0..rows) |i| lora_b[i * rank + k] = svd.u[k * rows + i] * sq;
+    for (0..rank) |t| {
+        const sq = @sqrt(@max(svd.s[t], 0));
+        for (0..cols) |j| lora_a[t * cols + j] = sq * svd.v[t * cols + j];
+        for (0..rows) |i| lora_b[i * rank + t] = svd.u[t * rows + i] * sq;
     }
     return .{ .rank = rank, .a = lora_a, .b = lora_b };
 }
 
-/// Implicit representation of D = diag(c) W + d aᵀ.
+/// Implicit representation of D = diag(c) W + Σ_l d_l a_lᵀ (l < k).
 const DeltaOperator = struct {
     pool: *const tensor.Pool,
     gpa: Allocator,
     w: Weight,
-    a: []const f32, // cols
+    a: []const f32, // [k][cols]
     c: []const f32, // rows
-    d: []const f32, // rows
+    d: []const f32, // [k][rows]
+    k: usize,
 
     /// out[q][rows] = (D X)ᵀ for X given as x[q][cols].
     fn applyMulti(self: DeltaOperator, out: []f32, x: []const f32, q: usize) !void {
@@ -239,9 +272,12 @@ const DeltaOperator = struct {
         const cols = self.w.cols;
         try tensor.matmulT(self.pool, self.gpa, out, x, q, self.w, null);
         for (0..q) |j| {
-            const ax = tensor.dot(self.a, x[j * cols ..][0..cols]);
             const o = out[j * rows ..][0..rows];
-            for (0..rows) |i| o[i] = self.c[i] * o[i] + self.d[i] * ax;
+            for (0..rows) |i| o[i] *= self.c[i];
+            for (0..self.k) |l| {
+                const ax = tensor.dot(self.a[l * cols ..][0..cols], x[j * cols ..][0..cols]);
+                tensor.axpy(o, ax, self.d[l * rows ..][0..rows]);
+            }
         }
     }
 
@@ -256,8 +292,10 @@ const DeltaOperator = struct {
         };
         try tensor.matvecTMulti(self.pool, self.gpa, out, self.w, cy, q);
         for (0..q) |j| {
-            const dy = tensor.dot(self.d, y[j * rows ..][0..rows]);
-            tensor.axpy(out[j * cols ..][0..cols], dy, self.a);
+            for (0..self.k) |l| {
+                const dy = tensor.dot(self.d[l * rows ..][0..rows], y[j * rows ..][0..rows]);
+                tensor.axpy(out[j * cols ..][0..cols], dy, self.a[l * cols ..][0..cols]);
+            }
         }
     }
 };
@@ -275,7 +313,7 @@ const Svd = struct {
 };
 
 /// Modified Gram-Schmidt orthonormalisation of `q` vectors of length `n` stored as rows.
-fn orthonormalize(vecs: []f32, q: usize, n: usize) void {
+pub fn orthonormalize(vecs: []f32, q: usize, n: usize) void {
     for (0..q) |i| {
         const vi = vecs[i * n ..][0..n];
         var pass: usize = 0;
@@ -431,58 +469,92 @@ test "abliteration removes the direction (none / pre / full)" {
     var wf: [rows * cols]f32 = undefined;
     for (&wf) |*x| x.* = rand.floatNorm(f32);
     const w = Weight{ .data = std.mem.sliceAsBytes(&wf), .dtype = .f32, .rows = rows, .cols = cols };
-    var v: [rows]f32 = undefined;
+    // Two orthonormal directions; K = 1 uses the first only.
+    var v: [2 * rows]f32 = undefined;
     for (&v) |*x| x.* = rand.floatNorm(f32);
-    tensor.normalize(&v);
+    orthonormalize(&v, 2, rows);
 
-    for ([_]RowNormalization{ .none, .pre, .full }) |mode| {
-        const delta = try computeDelta(&pool, gpa, w, &v, 1.0, .{ .row_normalization = mode, .lora_rank = 5 }, 1);
-        defer {
-            gpa.free(delta.a);
-            gpa.free(delta.b);
-        }
-        const wp = try materialize(gpa, w, delta);
-        defer gpa.free(wp);
-        // The direction must vanish from the (row-normalised, for pre/full) matrix:
-        // Σ_i (v_i / n_i) W'_ij ≈ 0, with n_i = 1 for mode none.
-        var proj: [cols]f32 = undefined;
-        for (0..cols) |j| {
-            var acc: f32 = 0;
-            for (0..rows) |i| {
-                const n = if (mode == .none) 1.0 else tensor.norm2(wf[i * cols ..][0..cols]);
-                acc += v[i] / n * wp[i * cols + j];
+    for ([_]usize{ 1, 2 }) |k| {
+        for ([_]RowNormalization{ .none, .pre, .full }) |mode| {
+            const delta = try computeDelta(&pool, gpa, w, v[0 .. k * rows], 1.0, .{ .row_normalization = mode, .lora_rank = 5 }, 1);
+            defer {
+                gpa.free(delta.a);
+                gpa.free(delta.b);
             }
-            proj[j] = acc;
-        }
-        if (mode != .full) {
-            for (proj) |p| try std.testing.expect(@abs(p) < 1e-4);
-        } else {
-            // Full mode is only approximately direction-free (non-linear renormalisation);
-            // instead compare against the exact W' = diag(n) rownorm(Wn + b aᵀ), which the
-            // rank-5 SVD must reproduce for a 6x5 matrix.
-            var wn: [rows * cols]f32 = undefined;
-            var norms: [rows]f32 = undefined;
-            for (0..rows) |i| {
-                norms[i] = tensor.norm2(wf[i * cols ..][0..cols]);
-                for (0..cols) |j| wn[i * cols + j] = wf[i * cols + j] / norms[i];
-            }
-            var a: [cols]f32 = undefined;
-            for (0..cols) |j| {
-                var acc: f32 = 0;
-                for (0..rows) |i| acc += v[i] * wn[i * cols + j];
-                a[j] = acc;
-            }
-            for (0..rows) |i| {
-                var row: [cols]f32 = undefined;
-                for (0..cols) |j| row[j] = wn[i * cols + j] - v[i] * a[j];
-                tensor.normalize(&row);
+            try std.testing.expectEqual(if (mode == .full) @as(usize, 5) else k, delta.rank);
+            const wp = try materialize(gpa, w, delta);
+            defer gpa.free(wp);
+            // Every direction must vanish from the (row-normalised, for pre/full) matrix:
+            // Σ_i (v_ki / n_i) W'_ij ≈ 0, with n_i = 1 for mode none.
+            for (0..k) |d| {
+                const vd = v[d * rows ..][0..rows];
                 for (0..cols) |j| {
-                    const expected = row[j] * norms[i];
-                    try std.testing.expectApproxEqAbs(expected, wp[i * cols + j], 1e-3);
+                    var acc: f32 = 0;
+                    for (0..rows) |i| {
+                        const n = if (mode == .none) 1.0 else tensor.norm2(wf[i * cols ..][0..cols]);
+                        acc += vd[i] / n * wp[i * cols + j];
+                    }
+                    if (mode != .full) try std.testing.expect(@abs(acc) < 1e-4);
+                }
+            }
+            if (mode == .full) {
+                // Full mode is only approximately direction-free (non-linear renormalisation);
+                // instead compare against the exact W' = diag(n) rownorm(Wn + B Aᵀ), which the
+                // rank-5 SVD must reproduce for a 6x5 matrix.
+                var wn: [rows * cols]f32 = undefined;
+                var norms: [rows]f32 = undefined;
+                for (0..rows) |i| {
+                    norms[i] = tensor.norm2(wf[i * cols ..][0..cols]);
+                    for (0..cols) |j| wn[i * cols + j] = wf[i * cols + j] / norms[i];
+                }
+                var a: [2 * cols]f32 = undefined;
+                for (0..k) |d| for (0..cols) |j| {
+                    var acc: f32 = 0;
+                    for (0..rows) |i| acc += v[d * rows + i] * wn[i * cols + j];
+                    a[d * cols + j] = acc;
+                };
+                for (0..rows) |i| {
+                    var row: [cols]f32 = undefined;
+                    for (0..cols) |j| {
+                        row[j] = wn[i * cols + j];
+                        for (0..k) |d| row[j] -= v[d * rows + i] * a[d * cols + j];
+                    }
+                    tensor.normalize(&row);
+                    for (0..cols) |j| {
+                        const expected = row[j] * norms[i];
+                        try std.testing.expectApproxEqAbs(expected, wp[i * cols + j], 1e-3);
+                    }
                 }
             }
         }
     }
+}
+
+test "basis interpolation stays orthonormal" {
+    const gpa = std.testing.allocator;
+    const hidden = 7;
+    const k = 2;
+    var prng = std.Random.DefaultPrng.init(5);
+    const rand = prng.random();
+    var dirs: [3 * k * hidden]f32 = undefined;
+    for (&dirs) |*x| x.* = rand.floatNorm(f32);
+    for (0..3) |e| orthonormalize(dirs[e * k * hidden ..][0 .. k * hidden], k, hidden);
+    const mid = try interpolateBasis(gpa, &dirs, k, hidden, 0.4);
+    defer gpa.free(mid);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), tensor.norm2(mid[0..hidden]), 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), tensor.norm2(mid[hidden..]), 1e-5);
+    try std.testing.expect(@abs(tensor.dot(mid[0..hidden], mid[hidden..])) < 1e-5);
+    // The first direction lies in the span of the neighbouring entries' first directions.
+    const a = dirs[1 * k * hidden ..][0..hidden];
+    const b = dirs[2 * k * hidden ..][0..hidden];
+    var expected: [hidden]f32 = undefined;
+    for (&expected, 0..) |*x, i| x.* = a[i] + 0.4 * (b[i] - a[i]);
+    tensor.normalize(&expected);
+    try std.testing.expect(tensor.dot(mid[0..hidden], &expected) > 0.9999);
+    // k = 1 is the plain interpolation.
+    const single = try interpolateDirection(gpa, dirs[0 .. 3 * hidden], hidden, 1.0);
+    defer gpa.free(single);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), tensor.norm2(single), 1e-5);
 }
 
 test "kernel weight shape" {

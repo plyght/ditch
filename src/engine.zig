@@ -9,6 +9,7 @@ const chat = @import("chat.zig");
 const config = @import("config.zig");
 const hf = @import("hf.zig");
 const tensor = @import("tensor.zig");
+const directions = @import("directions.zig");
 
 const Allocator = std.mem.Allocator;
 const Model = model_mod.Model;
@@ -137,6 +138,12 @@ pub const Engine = struct {
     /// Mean residual vector at the last prompt position for every layer entry:
     /// `[num_layers + 1][hidden]`, optionally winsorised per prompt and layer.
     pub fn getResidualMean(self: *Engine, gpa: Allocator, prompts: []const Prompt, progress: ?*Io.Writer) ![]f32 {
+        return self.getResidualMeanSketched(gpa, prompts, progress, null);
+    }
+
+    /// Like `getResidualMean`; every (winsorised) per-prompt residual is also
+    /// fed to `sketch` (see `directions.Sketch`) in the same pass.
+    pub fn getResidualMeanSketched(self: *Engine, gpa: Allocator, prompts: []const Prompt, progress: ?*Io.Writer, sketch: ?*directions.Sketch) ![]f32 {
         const c = &self.model.config;
         const entries = c.num_layers + 1;
         const hidden = c.hidden_size;
@@ -171,6 +178,7 @@ pub const Engine = struct {
                     }
                     const acc = sum[l * hidden ..][0..hidden];
                     for (v, 0..) |x, i| acc[i] += x;
+                    if (sketch) |s| s.add(l, v);
                 }
             }
             count += ids.len;

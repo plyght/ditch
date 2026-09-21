@@ -65,13 +65,16 @@ return {
   -- (cosine similarity between good and bad means, norms, norm of the difference).
   print_residual_geometry = false,
 
-  -- Scorers to evaluate. Each entry is { plugin = <plugin>, optimization = <opt>,
-  -- instance_name = <optional> } where <plugin> is "keyword_rate" or
-  -- "kl_divergence" (heretic's fully qualified plugin names are accepted too)
-  -- and <opt> is "minimize", "maximize" or "none" (do not optimize).
+  -- Scorers to evaluate, in evaluation order. Each entry is { plugin = <plugin>,
+  -- optimization = <opt>, instance_name = <optional> } where <plugin> is
+  -- "keyword_rate" or "kl_divergence" (heretic's fully qualified plugin names
+  -- are accepted too) and <opt> is "minimize", "maximize" or "none" (do not
+  -- optimize). The cheap KL divergence comes first so that early stopping (see
+  -- early_stop below) can prune trials while the refusals are being scored;
+  -- heretic's order (keyword_rate first) works too but disables early stopping.
   scorers = {
-    { plugin = "keyword_rate", optimization = "minimize" },
     { plugin = "kl_divergence", optimization = "minimize" },
+    { plugin = "keyword_rate", optimization = "minimize" },
   },
 
   -- Whether to adjust the residual directions so that only the component that is
@@ -94,6 +97,31 @@ return {
   -- 1.0 disables it. Example: 0.95 computes the 0.95-quantile of the absolute
   -- values of the components, then clamps all components to that magnitude.
   winsorization_quantile = 1.0,
+
+  -- Number of orthonormal refusal directions removed per layer. 1 is heretic's
+  -- difference-of-means direction. With K > 1 the remaining K-1 directions are
+  -- the top principal components of the per-prompt "bad" residuals (centred on
+  -- the "good" mean) after projecting out the first direction; they are
+  -- estimated from a randomised covariance sketch in the same pass over the
+  -- prompts. All K directions are projected out at once (a rank-K edit), and
+  -- a study records its K: it cannot be continued with a different value.
+  n_directions = 1,
+
+  -- Early stopping of hopeless trials. Scorers run in the order listed above,
+  -- so the KL divergence of a trial is known before its refusals are counted.
+  -- After every batch of refusal prompts the trial is pruned as soon as its
+  -- refusals so far exceed those of a completed Pareto-optimal trial whose KL
+  -- divergence is not larger: it can then never reach the Pareto front. Pruned
+  -- trials are journaled (with the remaining prompts counted as refusals) so
+  -- the sampler learns from them, but they are never offered as results.
+  -- Command line: --early-stop false or --no-early-stop.
+  early_stop = true,
+
+  -- Journal (checkpoints/<model>.jsonl) of a previous study on the same
+  -- architecture (same number of layers, components and objectives) whose
+  -- trials seed the sampler. They are only used for sampling: they neither
+  -- count towards n_trials nor appear in the results.
+  -- warm_start = "checkpoints/Qwen--Qwen2.5-0.5B-Instruct.jsonl",
 
   -- Number of abliteration trials to run during optimization. On a CPU you
   -- will usually want far fewer than heretic's default of 200 (for example 50

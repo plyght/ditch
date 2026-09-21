@@ -421,20 +421,22 @@ pub fn forward(model: *const Model, m: *const MoeLayer, out: []f32, h: []const f
 // Expert ranking and selection
 // ---------------------------------------------------------------------------
 
-/// Ranking heuristic: `score_e = ||vᵀ W_down_e||₂ / ||W_down_e||_F`, the fraction
-/// of the expert's output energy that lies along the refusal direction `v`
-/// (unit vector in residual space). Experts whose down projection writes more
-/// strongly along `v` are assumed to carry more of the refusal behaviour.
-/// Only routed experts are scored; the shared expert is never a candidate.
+/// Ranking heuristic: `score_e = ||Vᵀ W_down_e||_F / ||W_down_e||_F`, the fraction
+/// of the expert's output energy that lies along the refusal direction(s) `V`
+/// (one or more orthonormal vectors in residual space, `v.len == K * rows`).
+/// Experts whose down projection writes more strongly along `V` are assumed to
+/// carry more of the refusal behaviour. Only routed experts are scored; the
+/// shared expert is never a candidate.
 pub fn scoreLayer(pool: *const tensor.Pool, gpa: Allocator, m: *const MoeLayer, v: []const f32) ![]f32 {
     const scores = try gpa.alloc(f32, m.experts.len);
     errdefer gpa.free(scores);
     for (m.experts, 0..) |ex, e| {
         const w = ex.down;
-        std.debug.assert(v.len == w.rows);
-        const proj = try gpa.alloc(f32, w.cols);
+        std.debug.assert(v.len > 0 and v.len % w.rows == 0);
+        const k = v.len / w.rows;
+        const proj = try gpa.alloc(f32, k * w.cols);
         defer gpa.free(proj);
-        try tensor.matvecT(pool, gpa, proj, w, v);
+        try tensor.matvecTMulti(pool, gpa, proj, w, v, k);
         const norms = try gpa.alloc(f32, w.rows);
         defer gpa.free(norms);
         try tensor.rowNorms(pool, gpa, norms, w);
@@ -522,14 +524,15 @@ pub fn applyExpertSelective(model: *Model, dirs: []const f32, cfg: search.TrialC
     const sel = cfg.experts orelse search.ExpertSelection{ .n_experts = 0, .strength = 1.0 };
     const gpa = model.gpa;
     const hidden = model.config.hidden_size;
+    const stride = opts.n_directions * hidden;
     var global_dir: ?[]f32 = null;
     defer if (global_dir) |g| gpa.free(g);
-    if (cfg.direction_index) |di| global_dir = try abliterate.interpolateDirection(gpa, dirs, hidden, di);
+    if (cfg.direction_index) |di| global_dir = try abliterate.interpolateBasis(gpa, dirs, opts.n_directions, hidden, di);
 
     model.resetDeltas();
     var seed_counter: u64 = 0;
     for (model.layers, 0..) |*layer, li| {
-        const v = if (global_dir) |g| g else dirs[(li + 1) * hidden ..][0..hidden];
+        const v = if (global_dir) |g| g else dirs[(li + 1) * stride ..][0..stride];
         if (cfg.parameters.get(.attn_o_proj)) |p| {
             if (abliterate.kernelWeight(p, li)) |weight| {
                 const delta = try abliterate.computeDelta(model.pool, gpa, layer.o, v, weight, opts, opts.seed +% seed_counter);
