@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Unit tests
+        run: zig build test --summary all
+      - name: Build release binaries
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          mkdir -p dist
+          for t in x86_64-linux-musl aarch64-linux-musl x86_64-macos aarch64-macos x86_64-windows-gnu; do
+            zig build -Doptimize=ReleaseFast -Dtarget="$t" --prefix "zig-out/$t"
+            name="ditch-${version}-${t}"
+            staging="dist/$name"
+            mkdir -p "$staging"
+            cp README.md LICENSE config.default.lua "$staging/"
+            case "$t" in
+              *windows*)
+                cp "zig-out/$t/bin/ditch.exe" "$staging/"
+                (cd dist && zip -qr "$name.zip" "$name")
+                ;;
+              *)
+                cp "zig-out/$t/bin/ditch" "$staging/"
+                tar -C dist -czf "dist/$name.tar.gz" "$name"
+                ;;
+            esac
+            rm -rf "$staging"
+          done
+          (cd dist && sha256sum * > SHA256SUMS)
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
+          generate_release_notes: true

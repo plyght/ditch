@@ -32,10 +32,16 @@ What ditch adds on top of the port:
 
 ## Install
 
-ditch needs Zig 0.16.0.
+Prebuilt binaries for Linux (x86_64, aarch64), macOS (Intel, Apple silicon)
+and Windows (x86_64) are attached to every
+[release](https://github.com/plyght/ditch/releases); download the archive for
+your platform, unpack it and put `ditch` on your `PATH`. Every release ships
+with a `SHA256SUMS` file.
+
+To build from source you need Zig 0.16.0:
 
 ```sh
-git clone <this repository> ditch
+git clone https://github.com/plyght/ditch
 cd ditch
 zig build -Doptimize=ReleaseFast
 ```

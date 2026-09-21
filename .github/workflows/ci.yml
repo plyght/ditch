@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Format check
+        run: zig fmt --check src build.zig
+      - name: Unit tests
+        run: zig build test --summary all
+      - name: End-to-end
+        run: bash tests/e2e.sh
+      - name: Cross-compile all release targets
+        run: |
+          for t in x86_64-linux-musl aarch64-linux-musl x86_64-macos aarch64-macos x86_64-windows-gnu; do
+            zig build -Doptimize=ReleaseFast -Dtarget=$t --prefix "zig-out/$t"
+          done
