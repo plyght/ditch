@@ -22,6 +22,7 @@ const tpe = @import("tpe.zig");
 const study_mod = @import("study.zig");
 const scorers = @import("scorers.zig");
 const export_mod = @import("export.zig");
+const directions = @import("directions.zig");
 
 const Model = model_mod.Model;
 const Engine = engine_mod.Engine;
@@ -165,6 +166,8 @@ const App = struct {
     sampler: *tpe.Sampler,
     optimization_start: Io.Timestamp,
     start_index: usize,
+    /// Warm-start observations from a previous study (sampled from, never counted or shown).
+    warm: []const tpe.Observation = &.{},
 
     fn abliterateOptions(self: *App) abliterate.Options {
         return .{
@@ -173,7 +176,18 @@ const App = struct {
             .seed = self.settings.seed orelse 0,
             .expert_selection = self.settings.expert_selection,
             .debug_writer = if (self.settings.print_debug_information) self.con.out else null,
+            .n_directions = self.settings.n_directions,
         };
+    }
+
+    /// Warm-start observations followed by this study's own trials.
+    fn allObservations(self: *App, gpa: Allocator) ![]tpe.Observation {
+        const own = try self.study.observations(gpa);
+        defer gpa.free(own);
+        const out = try gpa.alloc(tpe.Observation, self.warm.len + own.len);
+        @memcpy(out[0..self.warm.len], self.warm);
+        @memcpy(out[self.warm.len..], own);
+        return out;
     }
 
     /// Runs trials `study.trials.len .. settings.n_trials`. Returns false if interrupted.
@@ -192,7 +206,7 @@ const App = struct {
         while (self.study.trials.items.len < n_trials) {
             if (takeInterrupt()) return false;
             const trial_index = self.study.trials.items.len + 1;
-            const observations = try self.study.observations(gpa);
+            const observations = try self.allObservations(gpa);
             defer gpa.free(observations);
             try self.sampler.sample(gpa, observations, vector);
             const cfg = search.decode(self.space, vector);
@@ -211,7 +225,11 @@ const App = struct {
             var scratch = std.heap.ArenaAllocator.init(gpa);
             defer scratch.deinit();
             const sa = scratch.allocator();
-            const scores = try self.evaluator.scores(sa, self.engine, out);
+            // Early stopping compares against the Pareto front of completed trials.
+            var front: ?[]const []const f64 = null;
+            if (self.settings.early_stop) front = try self.study.frontLosses(sa);
+            const scores = try self.evaluator.evaluate(sa, self.engine, out, front);
+            const pruned = scorers.Evaluator.prunedOf(scores);
             try printScores(out, scores);
 
             const elapsed = secondsSince(self.io, self.optimization_start);
@@ -232,9 +250,12 @@ const App = struct {
                 .direction_index = cfg.direction_index,
                 .parameters = cfg.parameters,
                 .scores = records,
+                .state = if (pruned != null) .pruned else .complete,
             });
             if (takeInterrupt()) return false;
         }
+        const n_pruned = self.study.prunedCount();
+        if (n_pruned > 0) try out.print("\n{d} of {d} trials were pruned by early stopping.\n", .{ n_pruned, self.study.trials.items.len });
         try self.study.markFinished();
         return true;
     }
@@ -384,6 +405,7 @@ const App = struct {
         try o.print(", made using [ditch](https://github.com/p-e-w/heretic) v{s} (a Zig port of [Heretic](https://heretic-project.org))\n\n", .{config.version});
         try o.writeAll("## Abliteration parameters\n\n| Parameter | Value |\n| :-------- | :---: |\n");
         if (trial.direction_index) |di| try o.print("| **direction_index** | {d:.2} |\n", .{di}) else try o.writeAll("| **direction_index** | per layer |\n");
+        if (self.settings.n_directions > 1) try o.print("| **n_directions** | {d} |\n", .{self.settings.n_directions});
         for (model_mod.Component.all) |comp| {
             const p = trial.parameters.get(comp) orelse continue;
             try o.print("| **{s}.max_weight** | {d:.2} |\n", .{ comp.name(), p.max_weight });
@@ -691,7 +713,7 @@ fn printResidualGeometry(out: *Io.Writer, good: []const f32, bad: []const f32, e
     }
 }
 
-fn settingsSnapshot(a: Allocator, settings: *const config.Settings) ![]const u8 {
+fn settingsSnapshot(a: Allocator, settings: *const config.Settings, model: *const Model) ![]const u8 {
     var w: Io.Writer.Allocating = .init(a);
     var js: std.json.Stringify = .{ .writer = &w.writer };
     try js.beginObject();
@@ -699,6 +721,14 @@ fn settingsSnapshot(a: Allocator, settings: *const config.Settings) ![]const u8 
     try js.write("settings");
     try js.objectField("model");
     try js.write(settings.model);
+    // Architecture and direction settings that a study cannot be continued
+    // or warm-started across.
+    try js.objectField("num_layers");
+    try js.write(model.config.num_layers);
+    try js.objectField("n_components");
+    try js.write(model_mod.Component.all.len);
+    try js.objectField("n_directions");
+    try js.write(settings.n_directions);
     try js.objectField("n_trials");
     try js.write(settings.n_trials);
     try js.objectField("n_startup_trials");
@@ -713,6 +743,44 @@ fn settingsSnapshot(a: Allocator, settings: *const config.Settings) ![]const u8 
     try js.write(settings.orthogonalize_direction);
     try js.endObject();
     return w.toOwnedSlice();
+}
+
+/// Refuses to continue a study whose direction count differs from the settings.
+fn checkStudyDirections(study: *const study_mod.Study, settings: *const config.Settings) !void {
+    const stored: usize = @intCast(study.settingInteger("n_directions") orelse 1);
+    if (stored != settings.n_directions) {
+        std.log.err("the checkpoint was created with n_directions = {d}, but n_directions = {d} was requested; pass --n-directions {d} or restart the study", .{ stored, settings.n_directions, stored });
+        return error.StudyDirectionsMismatch;
+    }
+}
+
+/// Loads the trials of a previous study (read-only) as sampler observations.
+/// The study must come from the same architecture and parameter space.
+fn loadWarmStart(gpa: Allocator, arena: Allocator, io: Io, path: []const u8, model: *const Model, dims: usize, n_objectives: usize, out: *Io.Writer) ![]tpe.Observation {
+    var warm = try study_mod.Study.open(gpa, io, path);
+    defer warm.deinit();
+    if (!warm.exists()) {
+        std.log.err("warm-start study {s} does not exist or is empty", .{path});
+        return error.WarmStartNotFound;
+    }
+    const layers = warm.settingInteger("num_layers") orelse {
+        std.log.err("warm-start study {s} carries no architecture information (num_layers)", .{path});
+        return error.WarmStartIncompatible;
+    };
+    if (layers != @as(i64, @intCast(model.config.num_layers))) {
+        std.log.err("warm-start study {s} was run on a model with {d} layers, this model has {d}", .{ path, layers, model.config.num_layers });
+        return error.WarmStartIncompatible;
+    }
+    var obs = std.ArrayList(tpe.Observation).empty;
+    for (warm.trials.items) |t| {
+        if (t.params.len != dims or t.losses.len != n_objectives) {
+            std.log.err("warm-start study {s} has a different parameter space ({d} parameters, {d} objectives; expected {d} and {d})", .{ path, t.params.len, t.losses.len, dims, n_objectives });
+            return error.WarmStartIncompatible;
+        }
+        try obs.append(arena, .{ .params = try arena.dupe(f64, t.params), .losses = try arena.dupe(f64, t.losses) });
+    }
+    try out.print("\nWarm start: {d} trials loaded from {s}\n", .{ obs.items.len, path });
+    return obs.toOwnedSlice(arena);
 }
 
 // ---------------------------------------------------------------------------
@@ -877,11 +945,17 @@ fn run(init: std.process.Init, con: *Console) !void {
     defer gpa.free(good_means);
     try out.writeAll("* Obtaining residual mean for bad prompts...\n");
     try out.flush();
-    const bad_means = try engine.getResidualMean(gpa, bad_prompts, out);
-    defer gpa.free(bad_means);
     const entries = c.num_layers + 1;
+    // With several directions per layer, the same pass over the bad prompts
+    // also accumulates the covariance sketch (see directions.zig).
+    var sketch: ?directions.Sketch = null;
+    defer if (sketch) |*s| s.deinit();
+    if (settings.n_directions > 1) sketch = try directions.Sketch.init(gpa, entries, c.hidden_size, settings.n_directions, good_means, settings.seed.?);
+    const bad_means = try engine.getResidualMeanSketched(gpa, bad_prompts, out, if (sketch) |*s| s else null);
+    defer gpa.free(bad_means);
     if (settings.print_residual_geometry) try printResidualGeometry(out, good_means, bad_means, entries, c.hidden_size);
-    const dirs = try abliterate.computeDirections(gpa, good_means, bad_means, entries, c.hidden_size, settings.orthogonalize_direction);
+    if (settings.n_directions > 1) try out.print("* Extracting {d} orthonormal directions per layer...\n", .{settings.n_directions});
+    const dirs = try directions.computeBasis(gpa, good_means, bad_means, entries, c.hidden_size, settings.n_directions, settings.orthogonalize_direction, if (sketch) |*s| s else null);
     defer gpa.free(dirs);
     try out.flush();
 
@@ -914,8 +988,9 @@ fn run(init: std.process.Init, con: *Console) !void {
             };
         }
         if (std.mem.eql(u8, action, "restart")) {
-            try study.reset(try settingsSnapshot(arena, settings));
+            try study.reset(try settingsSnapshot(arena, settings, model));
         } else if (std.mem.eql(u8, action, "continue")) {
+            try checkStudyDirections(&study, settings);
             if (study.finished) show_results_only = true;
             if (study.trials.items.len > settings.n_trials) settings.n_trials = study.trials.items.len;
         } else if (std.mem.eql(u8, action, "exit")) {
@@ -925,13 +1000,18 @@ fn run(init: std.process.Init, con: *Console) !void {
             return error.InvalidCheckpointAction;
         }
     } else {
-        try study.reset(try settingsSnapshot(arena, settings));
+        try study.reset(try settingsSnapshot(arena, settings, model));
     }
     try out.print("\nStudy checkpoint: {s}\n", .{checkpoint_path});
 
     var space = try search.buildSpace(gpa, model);
     defer space.deinit();
     var sampler = tpe.Sampler.init(space.space, settings.n_startup_trials, settings.seed.?);
+    var warm: []const tpe.Observation = &.{};
+    if (settings.warm_start) |p| warm = try loadWarmStart(gpa, arena, io, p, model, space.dims(), evaluator.objectiveCount(), out);
+    if (settings.early_stop and evaluator.earlyStopEntry() == null) {
+        try out.writeAll("\nEarly stopping is disabled: it requires a minimised keyword-rate scorer as the last objective (list kl_divergence before keyword_rate).\n");
+    }
 
     var app = App{
         .gpa = gpa,
@@ -952,6 +1032,7 @@ fn run(init: std.process.Init, con: *Console) !void {
         .sampler = &sampler,
         .optimization_start = Io.Timestamp.now(io, .awake),
         .start_index = 0,
+        .warm = warm,
     };
 
     if (!show_results_only) {

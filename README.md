@@ -106,6 +106,10 @@ ditch Qwen/Qwen2.5-0.5B-Instruct --n-trials 50 --n-startup-trials 15 \
   for GPUs; 50 / 15 already finds good settings for small models.
 * `--max-response-length`: shorter responses make the refusal scorer cheaper.
 * `--batch-size`: skip auto-detection.
+* Early stopping (on by default, see below) skips the rest of the refusal
+  scoring for trials that can no longer reach the Pareto front, and
+  `--warm-start <study.jsonl>` seeds the search with a previous study of the
+  same architecture so the random start-up phase can be shortened.
 * Use `--evaluate-model <dir>` to score an already exported model against the
   base model's scorers without running a study.
 
@@ -131,6 +135,40 @@ ditch implements Heretic's algorithm unchanged:
    of the first-token distribution on harmless prompts, i.e. it removes
    refusals while changing the model as little as possible. The Pareto front is
    presented for selection.
+
+### Beyond heretic
+
+Three optional extensions make the search cheaper or the edit stronger. All
+are documented in `config.default.lua`; the first two are on by default and
+do not change what the search finds.
+
+* **Early stopping** (`early_stop`, `--no-early-stop`). Scorers run in the
+  configured order, KL divergence first, so a trial's KL divergence (one
+  prefill pass) is known before its refusals are counted batch by batch. After
+  every batch the trial is pruned as soon as its refusals so far exceed those
+  of a completed Pareto-optimal trial whose KL divergence is not larger: that
+  trial dominates it whatever the remaining prompts do, so it could never
+  enter the front. Pruned trials are journaled with the remaining prompts
+  counted as refusals (an upper bound), which the TPE still learns from, but
+  they are never offered in the results menu. The trial log prints
+  `* Pruned after N/M prompts`.
+* **Warm start** (`--warm-start <study.jsonl>`). The trials of a previous
+  study on the same architecture (same number of layers, components and
+  objectives; verified from the journal) seed the sampler. They are used for
+  sampling only: they count neither towards `n_trials` nor appear in the
+  results, and the previous journal is never written to. Combine with a small
+  `--n-startup-trials` to skip most of the random exploration.
+* **Multi-direction ablation** (`--n-directions K`). Heretic removes one
+  direction per layer. With `K > 1`, direction 1 is the difference of means
+  as before and directions 2..K are the top principal components of the
+  per-prompt harmful residuals (centred on the harmless mean) after
+  projecting out direction 1, estimated from a randomised Nyström covariance
+  sketch accumulated in the same pass over the prompts (no
+  `hidden × hidden` matrices). The orthonormal basis is projected out at once
+  (a rank-K delta, in all row-normalisation modes), a fractional global
+  direction index interpolates and re-orthonormalises the whole basis, and
+  the study manifest records K so a study cannot be continued with a
+  different value.
 
 ## Configuration
 
@@ -168,6 +206,9 @@ The interactive menus can be answered from the command line:
 | `--model-action save\|chat\|exit` | what to do with the selected model |
 | `--save-directory DIR` | where to save it |
 | `--export-dtype bf16\|f16\|f32` | storage dtype of the exported weights |
+| `--warm-start FILE` | seed the sampler with the trials of a previous study |
+| `--no-early-stop` | score every trial completely |
+| `--n-directions K` | remove K orthonormal directions per layer |
 
 For example, a fully unattended run:
 
