@@ -1,0 +1,5 @@
+# Test tooling and vendored code: not part of the ditch program itself.
+tools/*.py linguist-vendored
+tests/fixtures/** linguist-generated
+vendor/** linguist-vendored
+src/unicode_tables.zig linguist-generated
