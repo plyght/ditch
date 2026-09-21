@@ -54,6 +54,12 @@ fn modifiedDelta(model: *const Model, name: []const u8) ?Edit {
     return null;
 }
 
+/// Storage dtype of a tensor in a Hugging Face export when none is requested:
+/// its own for floating-point sources, f16 for quantised (GGUF) sources.
+pub fn hfDtype(source: tensor.DType) tensor.DType {
+    return if (source.isQuantized()) .f16 else source;
+}
+
 fn whole(delta: ?tensor.Delta) ?Edit {
     return if (delta) |d| .{ .whole = d } else null;
 }
@@ -68,7 +74,10 @@ fn rowsPerChunk(model: *const Model, e: Entry) usize {
     if (model.budget) |b| {
         if (b.limited()) chunk_bytes = @min(chunk_bytes, b.limitBytes() / 16);
     }
-    const row_bytes = @max(1, e.ref.cols * @max(e.ref.dtype.size(), e.out_dtype.size()));
+    const plain = e.edit == null and e.out_dtype == e.ref.dtype;
+    const cols = e.ref.cols;
+    // A plain copy holds one chunk; a conversion also holds its f32 copy and the output chunk.
+    const row_bytes = @max(1, if (plain) e.ref.dtype.rowBytes(cols) else e.ref.dtype.rowBytes(cols) + 4 * cols + e.out_dtype.rowBytes(cols));
     return @intCast(@max(1, @min(@as(u64, e.ref.rows), chunk_bytes / row_bytes)));
 }
 
@@ -80,11 +89,11 @@ pub fn peakBytes(model: *const Model, export_dtype: ?tensor.DType) u64 {
         var it = f.tensors.iterator();
         while (it.next()) |kv| {
             const info = kv.value_ptr.*;
-            const out_dtype = export_dtype orelse info.dtype;
+            const out_dtype = export_dtype orelse hfDtype(info.dtype);
             const e = Entry{ .name = info.name, .info = info, .ref = model.store.refFor(fi, info), .out_dtype = out_dtype, .byte_len = info.numel() * out_dtype.size(), .edit = modifiedDelta(model, info.name) };
             const rows = rowsPerChunk(model, e);
-            const elems: u64 = @as(u64, rows) * e.ref.cols;
-            peak = @max(peak, elems * (e.ref.dtype.size() + 4 + out_dtype.size()));
+            const cols = e.ref.cols;
+            peak = @max(peak, @as(u64, rows) * (e.ref.dtype.rowBytes(cols) + 4 * cols + out_dtype.rowBytes(cols)));
         }
     }
     return peak;
@@ -195,7 +204,7 @@ fn saveModelInner(gpa: Allocator, io: Io, model: *const Model, dir: Io.Dir, opts
         var it = f.tensors.iterator();
         while (it.next()) |kv| {
             const info = kv.value_ptr.*;
-            const out_dtype = opts.export_dtype orelse info.dtype;
+            const out_dtype = opts.export_dtype orelse hfDtype(info.dtype);
             const byte_len = info.numel() * out_dtype.size();
             try entries.append(gpa, .{ .name = info.name, .info = info, .ref = model.store.refFor(fi, info), .out_dtype = out_dtype, .byte_len = byte_len, .edit = modifiedDelta(model, info.name) });
             total += byte_len;

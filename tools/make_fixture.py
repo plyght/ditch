@@ -2,8 +2,12 @@
 """Generates tiny synthetic Hugging Face-format models plus a NumPy reference
 forward pass, used to validate ditch's inference against known-good numbers.
 
-Usage: make_fixture.py <family> <out_dir>
+Usage: make_fixture.py <family> [<out_dir>] [--gguf]
     family: llama | qwen2 | qwen3 | gemma3 | qwen3_moe | qwen3_moe_fused | qwen3_moe_fused_t
+    --gguf: additionally write <out_dir>_gguf/model.gguf, the same model as a
+            llama.cpp GGUF file (f16 attention and embedding matrices, Q8_0
+            feed-forward matrices, f32 norms, the llama q/k permutation, the
+            ggml vocabulary) with a reference.json computed on the rounded weights.
 
 The qwen3_moe variants share identical weights: `qwen3_moe` stores one tensor
 per expert, `qwen3_moe_fused` the fused [E, 2I, H] / [E, H, I] layout and
@@ -15,11 +19,18 @@ import json
 import os
 import struct
 import sys
+import tempfile
 
 import numpy as np
 
-FAMILY = sys.argv[1] if len(sys.argv) > 1 else "llama"
-OUT = sys.argv[2] if len(sys.argv) > 2 else f"tests/fixtures/{FAMILY}"
+ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
+WRITE_GGUF = "--gguf" in sys.argv
+FAMILY = ARGS[0] if len(ARGS) > 0 else "llama"
+# The GGUF variant needs block-aligned feed-forward matrices (a multiple of 32
+# columns), so it is a slightly different model; its Hugging Face twin goes to
+# a scratch directory unless an output directory is given explicitly.
+OUT = ARGS[1] if len(ARGS) > 1 else (tempfile.mkdtemp(prefix="ditch-fixture-") if WRITE_GGUF else f"tests/fixtures/{FAMILY}")
+GOUT = f"tests/fixtures/{FAMILY}_gguf" if len(ARGS) < 2 else ARGS[1].rstrip("/") + "_gguf"
 os.makedirs(OUT, exist_ok=True)
 rng = np.random.default_rng(1234)
 
@@ -135,7 +146,7 @@ vocab_size = len(vocab)
 # Model config and weights
 # ---------------------------------------------------------------------------
 
-H, I, L, NH, NKV = 32, 48, 3, 4, 2
+H, I, L, NH, NKV = 32, (64 if WRITE_GGUF else 48), 3, 4, 2
 HD = H // NH
 # MoE: E routed experts of size MI, top-K routing; layer 1 stays dense (mlp_only_layers).
 E, K, MI = 4, 2, 12
@@ -455,19 +466,194 @@ def encode_spm(text):
 
 
 texts = ["the ant or you", "an era in the", "hello"]
-cases = []
-for t in texts:
-    ids = encode_bytelevel(t) if byte_level else encode_spm(t)
-    if bos:
-        ids = [vocab[bos]] + ids
-    logits, hidden = forward(ids)
-    cases.append({
-        "text": t,
-        "ids": ids,
-        "last_logits": logits[-1].tolist(),
-        "argmax": int(np.argmax(logits[-1])),
-        # residual stream at the last position for every layer entry
-        "last_hidden": [h[-1].tolist() for h in hidden],
-    })
-json.dump({"family": FAMILY, "cases": cases}, open(f"{OUT}/reference.json", "w"))
+
+
+def references():
+    cases = []
+    for t in texts:
+        ids = encode_bytelevel(t) if byte_level else encode_spm(t)
+        if bos:
+            ids = [vocab[bos]] + ids
+        logits, hidden = forward(ids)
+        cases.append({
+            "text": t,
+            "ids": ids,
+            "last_logits": logits[-1].tolist(),
+            "argmax": int(np.argmax(logits[-1])),
+            # residual stream at the last position for every layer entry
+            "last_hidden": [h[-1].tolist() for h in hidden],
+        })
+    return cases
+
+
+json.dump({"family": FAMILY, "cases": references()}, open(f"{OUT}/reference.json", "w"))
 print(f"wrote fixture to {OUT}: vocab={vocab_size}, layers={L}, hidden={H}")
+
+# ---------------------------------------------------------------------------
+# GGUF variant (--gguf): the same model as llama.cpp would store it.
+# ---------------------------------------------------------------------------
+
+if WRITE_GGUF:
+    if MOE or FAMILY == "gemma3":
+        sys.exit("--gguf is implemented for the llama and qwen families only")
+    os.makedirs(GOUT, exist_ok=True)
+
+    def f16(a):
+        """Rounds to f16 and returns (raw u16, f32 values)."""
+        h = np.ascontiguousarray(a, dtype=np.float32).astype(np.float16)
+        return h.view(np.uint16), h.astype(np.float32)
+
+    def q8_0(a):
+        """ggml Q8_0: blocks of 32 with an f16 scale d = amax / 127 and int8 quants.
+        Returns (block bytes, dequantised f32 values)."""
+        x = np.ascontiguousarray(a, dtype=np.float32)
+        rows, cols = x.shape
+        assert cols % 32 == 0
+        blocks = x.reshape(rows, cols // 32, 32)
+        amax = np.abs(blocks).max(axis=-1)
+        d = (amax / 127.0).astype(np.float32)
+        d16 = d.astype(np.float16)
+        inv = np.where(d != 0, 1.0 / np.where(d != 0, d, 1.0), 0.0).astype(np.float32)
+        v = blocks * inv[..., None]
+        q = (np.sign(v) * np.floor(np.abs(v) + 0.5)).astype(np.int8)  # roundf: half away from zero
+        deq = (q.astype(np.float32) * d16.astype(np.float32)[..., None]).reshape(rows, cols)
+        out = bytearray()
+        for r in range(rows):
+            for b in range(cols // 32):
+                out += d16[r, b].tobytes() + q[r, b].tobytes()
+        return bytes(out), deq
+
+    def permute(w, n_head):
+        """llama.cpp's q/k permutation: per head, rows [2][hd/2] -> [hd/2][2]."""
+        hd = w.shape[0] // n_head
+        return w.reshape(n_head, 2, hd // 2, *w.shape[1:]).swapaxes(1, 2).reshape(w.shape)
+
+    F32, F16, Q8_0 = 0, 1, 8
+    gtensors = []  # (name, hf_shape, ggml_type, bytes)
+
+    def add(name, arr_or_bytes, gtype, shape):
+        data = arr_or_bytes if isinstance(arr_or_bytes, (bytes, bytearray)) else np.ascontiguousarray(arr_or_bytes).tobytes()
+        gtensors.append((name, list(shape), gtype, data))
+
+    # Embeddings (f16, tied when the config says so) and norms (f32).
+    eu, ef = f16(embed)
+    embed = ef
+    add("token_embd.weight", eu, F16, embed.shape)
+    add("output_norm.weight", final_norm.astype(np.float32), F32, final_norm.shape)
+    if not config["tie_word_embeddings"]:
+        lu, lf = f16(lm_head)
+        lm_head = lf
+        add("output.weight", lu, F16, lm_head.shape)
+    else:
+        lm_head = embed
+    if FAMILY == "llama":
+        # llama.cpp stores the llama3 rope scaling as per-frequency factors.
+        rs = config["rope_scaling"]
+        inv = 1.0 / (config["rope_theta"] ** (np.arange(0, HD, 2, dtype=np.float32) / HD))
+        low_wl, high_wl = rs["original_max_position_embeddings"] / rs["low_freq_factor"], rs["original_max_position_embeddings"] / rs["high_freq_factor"]
+        factors = []
+        for fr in inv:
+            wl = 2 * np.pi / fr
+            if wl < high_wl:
+                factors.append(1.0)
+            elif wl > low_wl:
+                factors.append(rs["factor"])
+            else:
+                sm = (rs["original_max_position_embeddings"] / wl - rs["low_freq_factor"]) / (rs["high_freq_factor"] - rs["low_freq_factor"])
+                factors.append(1.0 / ((1 - sm) / rs["factor"] + sm))
+        add("rope_freqs.weight", np.array(factors, dtype=np.float32), F32, [len(factors)])
+    for i, d in enumerate(layers):
+        b = f"blk.{i}."
+        add(b + "attn_norm.weight", d["in_norm"].astype(np.float32), F32, (H,))
+        add(b + "ffn_norm.weight", d["post_attn_norm"].astype(np.float32), F32, (H,))
+        for key, gname, nh in (("q", "attn_q", NH), ("k", "attn_k", NKV), ("v", "attn_v", None), ("o", "attn_output", None)):
+            u, f = f16(d[key])
+            d[key] = f
+            stored = permute(u, nh) if (FAMILY == "llama" and nh) else u
+            add(b + gname + ".weight", stored, F16, d[key].shape)
+        if "qb" in d:
+            for key, gname, nh in (("qb", "attn_q", NH), ("kb", "attn_k", NKV), ("vb", "attn_v", None)):
+                v = d[key].astype(np.float32)
+                add(b + gname + ".bias", permute(v, nh) if (FAMILY == "llama" and nh) else v, F32, v.shape)
+        if "qn" in d:
+            add(b + "attn_q_norm.weight", d["qn"].astype(np.float32), F32, (HD,))
+            add(b + "attn_k_norm.weight", d["kn"].astype(np.float32), F32, (HD,))
+        for key, gname in (("gate", "ffn_gate"), ("up", "ffn_up"), ("down", "ffn_down")):
+            blocks, deq = q8_0(d[key])
+            d[key] = deq
+            add(b + gname + ".weight", blocks, Q8_0, deq.shape)
+
+    # Vocabulary as llama.cpp stores it (gpt2 model, byte-level tokens).
+    arch = "llama" if FAMILY == "llama" else FAMILY
+    id_to_tok = sorted(vocab.items(), key=lambda kv: kv[1])
+    assert [i for _, i in id_to_tok] == list(range(len(id_to_tok)))
+    tokens = [t for t, _ in id_to_tok]
+    special = set(specials)
+    types = [3 if t in special else 1 for t in tokens]
+    kv = [
+        ("general.architecture", "str", arch),
+        ("general.type", "str", "model"),
+        ("general.name", "str", f"{FAMILY} fixture"),
+        ("general.quantization_version", "u32", 2),
+        ("general.file_type", "u32", 7),  # MOSTLY_Q8_0
+        (f"{arch}.context_length", "u32", config["max_position_embeddings"]),
+        (f"{arch}.embedding_length", "u32", H),
+        (f"{arch}.block_count", "u32", L),
+        (f"{arch}.feed_forward_length", "u32", I),
+        (f"{arch}.attention.head_count", "u32", NH),
+        (f"{arch}.attention.head_count_kv", "u32", NKV),
+        (f"{arch}.attention.layer_norm_rms_epsilon", "f32", config["rms_norm_eps"]),
+        (f"{arch}.attention.key_length", "u32", HD),
+        (f"{arch}.attention.value_length", "u32", HD),
+        (f"{arch}.rope.dimension_count", "u32", HD),
+        (f"{arch}.rope.freq_base", "f32", config["rope_theta"]),
+        (f"{arch}.vocab_size", "u32", len(tokens)),
+        ("tokenizer.ggml.model", "str", "gpt2"),
+        ("tokenizer.ggml.pre", "str", "llama-bpe" if FAMILY == "llama" else "qwen2"),
+        ("tokenizer.ggml.tokens", "[str]", tokens),
+        ("tokenizer.ggml.token_type", "[i32]", types),
+        ("tokenizer.ggml.merges", "[str]", merges),
+        ("tokenizer.ggml.eos_token_id", "u32", vocab[eos]),
+        ("tokenizer.ggml.padding_token_id", "u32", vocab[eos]),
+        ("tokenizer.ggml.add_bos_token", "bool", bos is not None),
+        ("tokenizer.chat_template", "str", chat_template),
+    ]
+    if bos:
+        kv.append(("tokenizer.ggml.bos_token_id", "u32", vocab[bos]))
+
+    def gstr(s):
+        b = s.encode("utf-8")
+        return struct.pack("<Q", len(b)) + b
+
+    TYPES = {"u32": (4, lambda v: struct.pack("<I", v)), "i32": (5, lambda v: struct.pack("<i", v)),
+             "f32": (6, lambda v: struct.pack("<f", v)), "bool": (7, lambda v: struct.pack("<B", 1 if v else 0)),
+             "str": (8, gstr)}
+
+    def gvalue(t, v):
+        if t.startswith("["):
+            et, enc = TYPES[t[1:-1]]
+            return struct.pack("<I", 9) + struct.pack("<I", et) + struct.pack("<Q", len(v)) + b"".join(enc(x) for x in v)
+        et, enc = TYPES[t]
+        return struct.pack("<I", et) + enc(v)
+
+    ALIGN = 32
+    header = b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", len(gtensors)) + struct.pack("<Q", len(kv))
+    for key, t, v in kv:
+        header += gstr(key) + gvalue(t, v)
+    offset = 0
+    offsets = []
+    for name, shape, gtype, data in gtensors:
+        header += gstr(name) + struct.pack("<I", len(shape))
+        for dim in reversed(shape):
+            header += struct.pack("<Q", dim)
+        header += struct.pack("<I", gtype) + struct.pack("<Q", offset)
+        offsets.append(offset)
+        offset += (len(data) + ALIGN - 1) // ALIGN * ALIGN
+    header += b"\0" * ((ALIGN - len(header) % ALIGN) % ALIGN)
+    with open(f"{GOUT}/model.gguf", "wb") as f:
+        f.write(header)
+        for name, shape, gtype, data in gtensors:
+            f.write(data)
+            f.write(b"\0" * ((ALIGN - len(data) % ALIGN) % ALIGN))
+    json.dump({"family": FAMILY + "_gguf", "cases": references()}, open(f"{GOUT}/reference.json", "w"))
+    print(f"wrote GGUF fixture to {GOUT}: {len(gtensors)} tensors, {len(header) + offset} bytes")

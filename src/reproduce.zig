@@ -112,6 +112,15 @@ pub fn hashFile(a: Allocator, io: Io, dir: Io.Dir, sub_path: []const u8) ![]cons
 }
 
 /// SHA-256 over the exact prompt list (system prompt and user text of every prompt, in order).
+/// SHA-256 of the model's config.json; for a GGUF source (no config.json on
+/// disk) the configuration reconstructed from the metadata is hashed instead.
+fn hashConfig(a: Allocator, io: Io, src: Io.Dir, model: *const model_mod.Model) ![]const u8 {
+    if (model.gguf == null) return hashFile(a, io, src, "config.json");
+    var h = Sha256.init(.{});
+    h.update(model.config_json);
+    return hexDigest(a, &h);
+}
+
 pub fn hashPrompts(a: Allocator, prompts: []const Prompt) ![]const u8 {
     var h = Sha256.init(.{});
     for (prompts) |p| {
@@ -160,7 +169,7 @@ pub fn build(a: Allocator, io: Io, in: Inputs) !Manifest {
     const model = in.model;
     var src = try Io.Dir.cwd().openDir(io, model.source_dir, .{});
     defer src.close(io);
-    const config_sha = try hashFile(a, io, src, "config.json");
+    const config_sha = try hashConfig(a, io, src, model);
     const files = try a.alloc(FileHash, model.files.len);
     for (model.files, 0..) |f, i| files[i] = .{ .name = try a.dupe(u8, f.path), .sha256 = try hashFile(a, io, src, f.path) };
 
@@ -637,7 +646,7 @@ pub fn verifyModelFiles(a: Allocator, io: Io, m: *const Manifest, model: *const 
     var src = try Io.Dir.cwd().openDir(io, model.source_dir, .{});
     defer src.close(io);
     var mismatches: usize = 0;
-    const config_sha = try hashFile(a, io, src, "config.json");
+    const config_sha = try hashConfig(a, io, src, model);
     if (std.mem.eql(u8, config_sha, m.config_sha256)) {
         try out.writeAll("* config.json: ok\n");
     } else {

@@ -32,10 +32,16 @@ What ditch adds on top of the port:
 
 ## Install
 
-ditch needs Zig 0.16.0.
+Prebuilt binaries for Linux (x86_64, aarch64), macOS (Intel, Apple silicon)
+and Windows (x86_64) are attached to every
+[release](https://github.com/plyght/ditch/releases); download the archive for
+your platform, unpack it and put `ditch` on your `PATH`. Every release ships
+with a `SHA256SUMS` file.
+
+To build from source you need Zig 0.16.0:
 
 ```sh
-git clone <this repository> ditch
+git clone https://github.com/plyght/ditch
 cd ditch
 zig build -Doptimize=ReleaseFast
 ```
@@ -79,8 +85,8 @@ so an interrupted run (Ctrl+C) can be resumed.
 * Qwen3-MoE, Qwen2-MoE and Mixtral (mixture-of-experts; separate and fused
   expert tensor layouts)
 
-Weights are read from safetensors in F32, F16 or BF16. Sharded checkpoints are
-supported.
+Weights are read from safetensors in F32, F16 or BF16 (sharded checkpoints
+are supported) or from a llama.cpp GGUF file (see "GGUF" below).
 
 ### MoE and memory budgets
 
@@ -138,6 +144,65 @@ ditch Qwen/Qwen3-30B-A3B --max-ram 12GB --scratch-dir /fast/disk/scratch --time-
   ignored (there is no GPU backend).
 
 All of this is documented in `config.default.lua` as well.
+
+### GGUF
+
+Most abliterated models end up in llama.cpp, so ditch reads and writes
+[GGUF](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md) directly.
+
+**Output.** `--export-format gguf` (or `both`; `hf`, the safetensors directory,
+is the default for Hugging Face inputs) writes a single `model.gguf` next to
+the model card and the reproducibility manifest. `--gguf-dtype` selects the
+storage type of the 2-D matrices: `f16` (default), `bf16`, `f32`, `q8_0`
+(ggml's Q8_0: blocks of 32 values with an f16 scale), `q4_0`, `q4_1`, `q5_0`
+or `q5_1`; norms, biases and other 1-D tensors are always f32, and the token
+embeddings and the output projection stay f16 when a quantised type is
+chosen. The writer follows the conventions of llama.cpp's
+`convert_hf_to_gguf.py`: its tensor names (`token_embd`, `blk.N.attn_q`,
+`ffn_gate_exps`, ...), the q/k row permutation of the llama family, gemma norms
+stored as `1 + w`, stacked `[n_expert][...]` expert tensors, the architecture
+keys llama.cpp reads (context and embedding length, head counts, RMS epsilon,
+RoPE base and scaling, llama3 scaling as `rope_freqs.weight`, sliding window,
+soft-capping, expert counts) and the tokenizer (`gpt2` byte-level vocabularies
+with merges and the `qwen2` / `llama-bpe` / `gpt-2` pre-tokenizer name, or a
+`llama` SentencePiece-style vocabulary with scores) plus the chat template.
+The abliteration deltas are merged into the affected tensors exactly as in
+the safetensors export, tensor by tensor, so the whole model is never held in
+memory. The file also embeds the original `config.json` and `tokenizer.json`
+(`tokenizer.huggingface.json`) so a later Hugging Face export is exact.
+The format is spec-conformant (v3, little endian, 32-byte alignment) and is
+tested by round trip in ditch's own reader; it has not been run through
+llama.cpp itself here.
+
+**Input.** `ditch path/to/model.gguf` (or a directory holding one `.gguf`)
+loads a llama.cpp model of any supported architecture (`llama` including
+Mistral and Mixtral, `qwen2`, `qwen3`, `qwen2moe`, `qwen3moe`, `gemma2`,
+`gemma3`). The configuration is rebuilt from the metadata, the tokenizer from
+the ggml vocabulary (merges for `gpt2` vocabularies, scores for `llama` ones,
+the pre-tokenizer name mapped to the matching regular expression), the
+permutation and norm conventions above are undone, stacked expert tensors are
+split into per-expert views, and quantised tensors are dequantised row by row
+inside the kernels. Everything else (`--max-ram` streaming, `--evaluate-model`,
+`--reproduce`, MoE expert selection) works unchanged. A GGUF input defaults to
+a GGUF export (`--gguf-dtype source`): untouched tensors are copied
+byte-for-byte, edited tensors are re-quantised to their own type (Q8_0 stays
+Q8_0; K-quants, which ditch cannot produce, become Q8_0), and
+`--export-format hf` writes a safetensors model with quantised tensors
+dequantised to f16.
+
+| ggml type | read | written |
+| :--- | :---: | :---: |
+| F32, F16, BF16 | yes | yes |
+| Q8_0 | yes | yes |
+| Q4_0, Q4_1, Q5_0, Q5_1 | yes | yes |
+| Q4_K, Q6_K, Q8_K | yes | no (edited tensors become Q8_0) |
+| other K-/IQ-quants | no | no |
+
+`tools/make_fixture.py <family> --gguf` writes the synthetic test models as
+GGUF (with Q8_0 feed-forward matrices) for the unit tests, which check the
+NumPy reference logits, the tokenizer rebuilt from the vocabulary, HF-to-GGUF
+round trips for every family (f16 within 1e-2 and Q8_0 within 5e-2 of the
+largest logit) and the llama q/k permutation.
 
 ### Datasets
 
@@ -296,6 +361,8 @@ The interactive menus can be answered from the command line:
 | `--model-action save\|chat\|exit` | what to do with the selected model |
 | `--save-directory DIR` | where to save it |
 | `--export-dtype bf16\|f16\|f32` | storage dtype of the exported weights |
+| `--export-format hf\|gguf\|both` | Hugging Face directory (default), a llama.cpp GGUF file, or both |
+| `--gguf-dtype f16\|bf16\|f32\|q8_0\|...\|source` | storage type of the GGUF matrices (see "GGUF") |
 | `--reproduce FILE` | re-derive a model from its `ditch-reproduce.lua` (no search) |
 | `--ignore-mismatches` | proceed with `--reproduce` even if file or prompt hashes differ |
 | `--warm-start FILE` | seed the sampler with the trials of a previous study |
