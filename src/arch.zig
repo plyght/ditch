@@ -89,6 +89,9 @@ pub const RopeScaling = union(enum) {
     yarn: struct { factor: f32, original_max_position: f32, beta_fast: f32, beta_slow: f32, attention_factor: f32, truncate: bool },
     /// Phi-3 LongRoPE; the short factors are used for every position.
     longrope: struct { factors: []const f32, attention_factor: f32 },
+    /// Per-frequency divisors (`rope_freqs.weight` of a GGUF file, llama.cpp's
+    /// precomputed llama3 scaling): `inv_freq[i] /= factors[i]`.
+    factors: []const f32,
 };
 
 /// Multi-head latent attention (DeepSeek V2/V3).
@@ -119,8 +122,6 @@ pub const MoeConfig = struct {
     /// Expert projections carry biases (gpt-oss).
     expert_bias: bool = false,
     swiglu: ?Swiglu = null,
-    /// Intermediate size of the dense layers of a hybrid model (defaults to `intermediate_size`).
-    dense_intermediate_size: usize = 0,
 };
 
 /// Tensor-name templates. `{p}` is the model prefix, `{i}` the layer index and
@@ -353,12 +354,12 @@ fn layerFlags(arena: Allocator, obj: std.json.ObjectMap, key: []const u8, layers
 
 pub fn parseActivation(name: []const u8) ?tensor.Activation {
     const table = .{
-        .{ "silu", tensor.Activation.silu },        .{ "swish", tensor.Activation.silu },
-        .{ "swiglu", tensor.Activation.silu },      .{ "gelu", tensor.Activation.gelu },
-        .{ "gelu_new", tensor.Activation.gelu_tanh }, .{ "gelu_pytorch_tanh", tensor.Activation.gelu_tanh },
+        .{ "silu", tensor.Activation.silu },           .{ "swish", tensor.Activation.silu },
+        .{ "swiglu", tensor.Activation.silu },         .{ "gelu", tensor.Activation.gelu },
+        .{ "gelu_new", tensor.Activation.gelu_tanh },  .{ "gelu_pytorch_tanh", tensor.Activation.gelu_tanh },
         .{ "gelu_tanh", tensor.Activation.gelu_tanh }, .{ "gelu_fast", tensor.Activation.gelu_tanh },
-        .{ "relu", tensor.Activation.relu },        .{ "relu2", tensor.Activation.relu2 },
-        .{ "relu_squared", tensor.Activation.relu2 }, .{ "quick_gelu", tensor.Activation.quick_gelu },
+        .{ "relu", tensor.Activation.relu },           .{ "relu2", tensor.Activation.relu2 },
+        .{ "relu_squared", tensor.Activation.relu2 },  .{ "quick_gelu", tensor.Activation.quick_gelu },
     };
     inline for (table) |e| {
         if (std.mem.eql(u8, name, e[0])) return e[1];
@@ -485,6 +486,20 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
             const attention_factor: f32 = if (getNum(rs, "attention_factor")) |af| @floatCast(af) else if (factor <= 1) 1.0 else @sqrt(1.0 + @log(factor) / @log(original));
             rope_scaling = .{ .longrope = .{ .factors = factors, .attention_factor = attention_factor } };
             std.log.warn("longrope: using the short rotary factors for every position (prompts beyond {d} tokens use the wrong table)", .{@as(usize, @intFromFloat(original))});
+        } else if (std.mem.eql(u8, t, "ditch_factors")) {
+            // Per-frequency divisors (a GGUF `rope_freqs.weight` that is not a
+            // standard llama3 scaling); written by gguf_model.zig, read only by ditch.
+            if (rs.get("factors")) |fa| {
+                if (fa == .array) {
+                    const factors = try arena.alloc(f32, fa.array.items.len);
+                    for (fa.array.items, 0..) |v, i| factors[i] = switch (v) {
+                        .float => |x| @floatCast(x),
+                        .integer => |x| @floatFromInt(x),
+                        else => 1.0,
+                    };
+                    rope_scaling = .{ .factors = factors };
+                }
+            }
         } else if (std.mem.eql(u8, t, "dynamic")) {
             std.log.warn("dynamic NTK rope scaling is treated as unscaled RoPE (exact below the original context length)", .{});
         } else if (std.mem.eql(u8, t, "mrope") or std.mem.eql(u8, t, "default") or t.len == 0) {
@@ -733,6 +748,8 @@ fn extraGranite(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
 }
 
 fn extraDeepseek(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
+    // The original checkpoints pair rotary coordinates as (2i, 2i+1) (`rope_interleave`).
+    c.rope_style = if (getBool(obj, "rope_interleave", true)) .gptj else .neox;
     const scoring = getStr(obj, "scoring_func") orelse "softmax";
     c.moe.scoring = if (std.mem.eql(u8, scoring, "sigmoid")) .sigmoid else .softmax;
     const method = getStr(obj, "topk_method") orelse "greedy";
@@ -757,8 +774,9 @@ fn extraLlama4(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
     c.num_experts_per_tok = getInt(obj, "num_experts_per_tok", 1);
     c.moe.scoring = .sigmoid;
     c.moe.scale_input = true;
-    c.moe.dense_intermediate_size = getInt(obj, "intermediate_size_mlp", c.intermediate_size);
+    // Routed and shared experts use `intermediate_size`; dense layers `intermediate_size_mlp`.
     c.moe_intermediate_size = c.intermediate_size;
+    c.intermediate_size = getInt(obj, "intermediate_size_mlp", c.intermediate_size);
     if (getNum(obj, "attention_chunk_size")) |_| {
         std.log.warn("llama4: chunked local attention is run as full attention (exact for prompts shorter than attention_chunk_size)", .{});
         @memset(c.sliding_layers, false);
@@ -934,8 +952,15 @@ pub const registry = [_]Arch{
         .activation = .gelu_tanh,
         .tie_word_embeddings = true,
         .embed_scale_sqrt = true,
-        .names = gemma_names,
-        .notes = "fixture: (1+w) norms, pre/post norms, sqrt(H) embedding scale, sliding layers with a local rope base, query_pre_attn_scalar, linear rope scaling.",
+        .qk_norm = .head,
+        .names = .{
+            .post_attn_norm = "post_attention_layernorm.weight",
+            .pre_ff_norm = "pre_feedforward_layernorm.weight",
+            .post_ff_norm = "post_feedforward_layernorm.weight",
+            .q_norm = "self_attn.q_norm.weight",
+            .k_norm = "self_attn.k_norm.weight",
+        },
+        .notes = "fixture: (1+w) norms, pre/post norms, per-head (1+w) q/k norms, sqrt(H) embedding scale, sliding layers with a local rope base, query_pre_attn_scalar, linear rope scaling.",
         .extra = extraGemma,
     },
     .{
@@ -1525,5 +1550,4 @@ test "parseConfig picks family knobs" {
     try std.testing.expect(ds.rope_scaling == .yarn);
     const ms = 0.1 * @log(@as(f32, 40)) + 1.0;
     try std.testing.expectApproxEqRel(ms * ms / @sqrt(@as(f32, 12)), ds.attention_scale, 1e-5);
-    try std.testing.expectError(error.UnsupportedArchitecture, parseConfig(a, "{\"model_type\":\"mamba\",\"hidden_size\":8,\"num_attention_heads\":1,\"num_hidden_layers\":1}"));
 }

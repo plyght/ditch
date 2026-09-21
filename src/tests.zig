@@ -8,6 +8,7 @@ comptime {
     _ = @import("gguf_test.zig");
     _ = @import("safetensors.zig");
     _ = @import("tokenizer.zig");
+    _ = @import("arch.zig");
     _ = @import("model.zig");
     _ = @import("model_test.zig");
     _ = @import("moe.zig");

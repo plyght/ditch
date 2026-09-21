@@ -524,7 +524,7 @@ pub fn estimate(model: *const model_mod.Model, p: EstimateParams) Estimate {
                 largest_name = info.name;
             }
             max_cols = @max(max_cols, info.cols());
-            if (model_mod.layerIndexOf(model.prefix, info.name)) |li| {
+            if (model.layerIndex(info.name)) |li| {
                 if (li < layer_bytes.len) layer_bytes[li] += info.byte_len;
             }
         }

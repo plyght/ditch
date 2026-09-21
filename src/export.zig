@@ -16,13 +16,8 @@ const stream = @import("stream.zig");
 const Allocator = std.mem.Allocator;
 const Model = model_mod.Model;
 
-/// How a tensor is modified on export.
-const Edit = union(enum) {
-    /// A 2-D matrix with one delta: `W' = W + B A`.
-    whole: tensor.Delta,
-    /// A fused expert down tensor of this layer; per-expert deltas are merged slice by slice.
-    fused_down: usize,
-};
+/// How a tensor is modified on export (decided by the model, which knows the family's tensor names).
+const Edit = model_mod.ExportEdit;
 
 const Entry = struct {
     name: []const u8,
@@ -37,31 +32,13 @@ const Entry = struct {
 pub const convert_chunk_bytes: usize = 1 << 18;
 
 fn modifiedDelta(model: *const Model, name: []const u8) ?Edit {
-    const layer = model_mod.layerIndexOf(model.prefix, name) orelse return null;
-    if (layer >= model.layers.len) return null;
-    const rest = name[model.prefix.len + "layers.".len ..];
-    const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
-    const suffix = rest[dot + 1 ..];
-    if (std.mem.eql(u8, suffix, "self_attn.o_proj.weight")) return whole(model.getDelta(layer, .attn_o_proj));
-    if (std.mem.eql(u8, suffix, "mlp.down_proj.weight")) return whole(model.getDelta(layer, .mlp_down_proj));
-    if (model.layers[layer].moe) |*m| {
-        const target = m.exportTarget(suffix) orelse return null;
-        return switch (target) {
-            .expert => |e| whole(m.getDownDelta(e)),
-            .fused_down => if (m.anyExpertDelta()) .{ .fused_down = layer } else null,
-        };
-    }
-    return null;
+    return model.exportEdit(name);
 }
 
 /// Storage dtype of a tensor in a Hugging Face export when none is requested:
 /// its own for floating-point sources, f16 for quantised (GGUF) sources.
 pub fn hfDtype(source: tensor.DType) tensor.DType {
     return if (source.isQuantized()) .f16 else source;
-}
-
-fn whole(delta: ?tensor.Delta) ?Edit {
-    return if (delta) |d| .{ .whole = d } else null;
 }
 
 /// Rows of `ref` processed per step: for a fused expert tensor one expert
@@ -129,6 +106,16 @@ fn writeTensor(gpa: Allocator, model: *const Model, out: *Io.Writer, e: Entry) !
             .whole => |d| for (0..n) |i| {
                 const row = fc[i * cols ..][0..cols];
                 for (0..d.rank) |k| tensor.axpy(row, d.b[(r + i) * d.rank + k], d.a[k * cols ..][0..cols]);
+            },
+            // Conv1D `[in][out]`: row `r + i` is input `r + i`, column `j` output `j`.
+            .whole_transposed => |d| for (0..n) |i| {
+                const row = fc[i * cols ..][0..cols];
+                const in_cols = d.a.len / d.rank;
+                for (row, 0..) |*v, j| {
+                    var acc: f32 = 0;
+                    for (0..d.rank) |k| acc += d.b[j * d.rank + k] * d.a[k * in_cols + r + i];
+                    v.* += acc;
+                }
             },
             .fused_down => |layer| model.layers[layer].moe.?.mergeExpertDown(r, fc),
         };
