@@ -4,17 +4,60 @@
 
 const std = @import("std");
 const Io = std.Io;
+const quant = @import("quant.zig");
 
 pub const DType = enum {
     f32,
     f16,
     bf16,
+    // ggml block-quantised formats (see quant.zig); only meaningful for row-major matrices
+    // whose row length is a multiple of the block size.
+    q8_0,
+    q4_0,
+    q4_1,
+    q5_0,
+    q5_1,
+    q4_k,
+    q6_k,
+    q8_k,
 
+    /// Byte size of one element (floating-point types only).
     pub fn size(self: DType) usize {
         return switch (self) {
             .f32 => 4,
             .f16, .bf16 => 2,
+            else => unreachable,
         };
+    }
+
+    pub fn isQuantized(self: DType) bool {
+        return switch (self) {
+            .f32, .f16, .bf16 => false,
+            else => true,
+        };
+    }
+
+    /// Elements per block (1 for floating-point types).
+    pub fn blockSize(self: DType) usize {
+        return quant.blockSize(self);
+    }
+
+    /// Bytes per block (the element size for floating-point types).
+    pub fn blockBytes(self: DType) usize {
+        return quant.blockBytes(self);
+    }
+
+    /// Bytes of one row of `cols` elements.
+    pub fn rowBytes(self: DType, cols: usize) usize {
+        const bs = self.blockSize();
+        std.debug.assert(cols % bs == 0);
+        return cols / bs * self.blockBytes();
+    }
+
+    /// Bytes of `numel` elements laid out as rows of `cols`.
+    pub fn byteLen(self: DType, numel: usize, cols: usize) usize {
+        if (cols == 0) return 0;
+        return numel / cols * self.rowBytes(cols);
     }
 
     pub fn fromSafetensors(name: []const u8) ?DType {
@@ -24,12 +67,32 @@ pub const DType = enum {
         return null;
     }
 
+    /// Upper-case name: the safetensors dtype for floating-point types, the ggml name otherwise.
     pub fn safetensorsName(self: DType) []const u8 {
         return switch (self) {
             .f32 => "F32",
             .f16 => "F16",
             .bf16 => "BF16",
+            .q8_0 => "Q8_0",
+            .q4_0 => "Q4_0",
+            .q4_1 => "Q4_1",
+            .q5_0 => "Q5_0",
+            .q5_1 => "Q5_1",
+            .q4_k => "Q4_K",
+            .q6_k => "Q6_K",
+            .q8_k => "Q8_K",
         };
+    }
+
+    /// Parses a user-facing dtype name (case-insensitive): f32, f16, bf16, q8_0, ...
+    pub fn parse(name: []const u8) ?DType {
+        inline for (std.meta.fields(DType)) |f| {
+            if (std.ascii.eqlIgnoreCase(name, f.name)) return @enumFromInt(f.value);
+        }
+        if (std.ascii.eqlIgnoreCase(name, "float32") or std.ascii.eqlIgnoreCase(name, "fp32")) return .f32;
+        if (std.ascii.eqlIgnoreCase(name, "float16") or std.ascii.eqlIgnoreCase(name, "fp16")) return .f16;
+        if (std.ascii.eqlIgnoreCase(name, "bfloat16")) return .bf16;
+        return null;
     }
 };
 
@@ -122,6 +185,7 @@ pub fn convertToF32(dtype: DType, bytes: []const u8, out: []f32) void {
             const src = std.mem.bytesAsSlice(u16, bytes[0 .. out.len * 2]);
             for (out, 0..) |*o, i| o.* = f16ToF32(src[i]);
         },
+        else => quant.dequantize(dtype, bytes, out),
     }
 }
 
@@ -136,6 +200,7 @@ pub fn convertFromF32(dtype: DType, src: []const f32, out: []u8) void {
             const dst = std.mem.bytesAsSlice(u16, out[0 .. src.len * 2]);
             for (src, 0..) |v, i| dst[i] = f32ToF16(v);
         },
+        else => quant.quantize(dtype, src, out),
     }
 }
 
@@ -143,7 +208,8 @@ pub fn convertFromF32(dtype: DType, src: []const f32, out: []u8) void {
 // Weight matrix views
 // ---------------------------------------------------------------------------
 
-/// A row-major matrix `[rows][cols]` stored in its on-disk dtype.
+/// A row-major matrix `[rows][cols]` stored in its on-disk dtype. Quantised
+/// dtypes are dequantised row by row in `row`, so kernels see f32 either way.
 pub const Weight = struct {
     data: []const u8,
     dtype: DType,
@@ -151,8 +217,14 @@ pub const Weight = struct {
     cols: usize,
 
     pub fn row(self: Weight, r: usize, out: []f32) void {
-        const es = self.dtype.size();
-        convertToF32(self.dtype, self.data[r * self.cols * es ..][0 .. self.cols * es], out[0..self.cols]);
+        const rb = self.dtype.rowBytes(self.cols);
+        convertToF32(self.dtype, self.data[r * rb ..][0..rb], out[0..self.cols]);
+    }
+
+    /// Raw bytes of row `r` in the on-disk dtype.
+    pub fn rowBytes(self: Weight, r: usize) []const u8 {
+        const rb = self.dtype.rowBytes(self.cols);
+        return self.data[r * rb ..][0..rb];
     }
 
     /// Reads every row into a freshly allocated f32 matrix.
