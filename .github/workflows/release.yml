@@ -28,10 +28,9 @@ jobs:
             version="${{ github.event.inputs.version }}"
             git config user.name "plyght"
             git config user.email "plyght@peril.lol"
-            if ! git ls-remote --tags origin "refs/tags/$version" | grep -q .; then
-              git tag -a "$version" -m "ditch $version"
-              git push origin "refs/tags/$version"
-            fi
+            # A dispatched release always tags the commit it builds from.
+            git tag -f -a "$version" -m "ditch $version"
+            git push -f origin "refs/tags/$version"
           else
             version="${GITHUB_REF_NAME}"
           fi
