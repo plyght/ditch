@@ -109,6 +109,8 @@ pub const Pool = struct {
     io: Io,
     threads: usize,
     workers: ?*Workers = null,
+    /// Kernel scratch that is reused across calls (persistent pools only).
+    scratch: ?*Scratch = null,
 
     pub fn init(io: Io, threads: ?usize) Pool {
         const n = threads orelse (std.Thread.getCpuCount() catch 1);
@@ -120,12 +122,49 @@ pub const Pool = struct {
     pub fn initPersistent(gpa: std.mem.Allocator, io: Io, threads: ?usize) Pool {
         var pool = init(io, threads);
         if (pool.threads > 1) pool.workers = Workers.spawn(gpa, io, pool.threads - 1) catch null;
+        if (gpa.create(Scratch)) |sc| {
+            sc.* = .{ .gpa = gpa };
+            pool.scratch = sc;
+        } else |_| {}
         return pool;
     }
 
     pub fn deinit(self: *Pool) void {
         if (self.workers) |w| w.shutdown();
         self.workers = null;
+        if (self.scratch) |sc| {
+            sc.gpa.free(sc.buf);
+            sc.gpa.destroy(sc);
+        }
+        self.scratch = null;
+    }
+
+    /// `n` floats of kernel scratch: the pool's reusable buffer when it is
+    /// free and the request is modest, otherwise a fresh allocation. Release
+    /// with `freeScratch`. Kernels never nest, so one buffer suffices.
+    pub fn allocScratch(self: *const Pool, gpa: std.mem.Allocator, n: usize) ![]f32 {
+        if (self.scratch) |sc| {
+            if (!sc.in_use and n <= Scratch.max_floats) {
+                if (sc.buf.len < n) {
+                    const grown = try sc.gpa.alloc(f32, n);
+                    sc.gpa.free(sc.buf);
+                    sc.buf = grown;
+                }
+                sc.in_use = true;
+                return sc.buf[0..n];
+            }
+        }
+        return gpa.alloc(f32, n);
+    }
+
+    pub fn freeScratch(self: *const Pool, gpa: std.mem.Allocator, s: []f32) void {
+        if (self.scratch) |sc| {
+            if (sc.in_use and s.ptr == sc.buf.ptr) {
+                sc.in_use = false;
+                return;
+            }
+        }
+        gpa.free(s);
     }
 
     /// Runs `func(ctx, start, end)` over `[0, n)` split across the pool.
@@ -163,6 +202,15 @@ pub const Pool = struct {
     }
 };
 
+const Scratch = struct {
+    gpa: std.mem.Allocator,
+    buf: []f32 = &.{},
+    in_use: bool = false,
+
+    /// Requests above this (64 MiB) are served by the caller's allocator.
+    const max_floats = 16 << 20;
+};
+
 const Job = struct {
     func: *const fn (*const anyopaque, usize, usize) void,
     ctx: *const anyopaque,
@@ -185,7 +233,7 @@ const Workers = struct {
     job: Job = undefined,
 
     /// Iterations of the wake-up spin before a worker sleeps on the futex.
-    const spin_iterations = 20_000;
+    const spin_iterations = 1000;
 
     fn spawn(gpa: std.mem.Allocator, io: Io, count: usize) !*Workers {
         const self = try gpa.create(Workers);
@@ -664,8 +712,8 @@ pub fn matmulT(pool: *const Pool, gpa: std.mem.Allocator, out: []f32, x: []const
     const per = (w.rows + chunks - 1) / chunks;
     const slots = (w.rows + per - 1) / per;
     const tile = tileRowsFor(n);
-    const scratch = try gpa.alloc(f32, if (fused) 0 else slots * tile * w.cols);
-    defer gpa.free(scratch);
+    const scratch = try pool.allocScratch(gpa, if (fused) 0 else slots * tile * w.cols);
+    defer pool.freeScratch(gpa, scratch);
     var xa: []f32 = &.{};
     defer if (xa.len > 0) gpa.free(xa);
     if (delta) |dl| {

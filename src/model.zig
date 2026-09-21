@@ -1978,8 +1978,8 @@ fn attention(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace
     const per = (n_tasks + chunks - 1) / chunks;
     var max_keys: usize = 1;
     for (rows) |row| max_keys = @max(max_keys, row.pos + 1);
-    const scores = try gpa.alloc(f32, chunks * max_keys);
-    defer gpa.free(scores);
+    const scores = try model.pool.allocScratch(gpa, chunks * max_keys);
+    defer model.pool.freeScratch(gpa, scores);
     const actx = AttnCtx{
         .model = model,
         .cache = cache,
