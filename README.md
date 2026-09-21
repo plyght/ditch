@@ -109,6 +109,30 @@ ditch Qwen/Qwen2.5-0.5B-Instruct --n-trials 50 --n-startup-trials 15 \
 * Use `--evaluate-model <dir>` to score an already exported model against the
   base model's scorers without running a study.
 
+### Reproducing a model
+
+Every exported model directory contains `ditch-reproduce.lua`, a manifest that
+records what produced it: the ditch version, the source model with the SHA-256
+of its `config.json` and of every safetensors file, the settings that affect
+the result (seed, abliteration options, chat template, response prefix, the
+datasets with a SHA-256 of the exact prompt lists), the selected trial's full
+search-space parameter vector and its decoded kernel parameters, and the scores
+next to the baseline scores. The key content is also written into the model
+card (`README.md`).
+
+```sh
+ditch --reproduce out/qwen2.5-0.5b-ditch/ditch-reproduce.lua
+```
+
+reads the manifest through the Lua sandbox, downloads or opens the recorded
+source model and verifies the file hashes (the run stops with a clear message
+on a mismatch unless `--ignore-mismatches` is given), loads the recorded prompt
+datasets and checks their hashes, re-derives the refusal directions and applies
+the recorded trial directly, without a search. The scores are printed next to
+the recorded ones (the same seed gives identical results on the same machine)
+and the usual model menu follows, so `--model-action save --save-directory DIR`
+exports the model again.
+
 ## How it works
 
 ditch implements Heretic's algorithm unchanged:
@@ -168,6 +192,8 @@ The interactive menus can be answered from the command line:
 | `--model-action save\|chat\|exit` | what to do with the selected model |
 | `--save-directory DIR` | where to save it |
 | `--export-dtype bf16\|f16\|f32` | storage dtype of the exported weights |
+| `--reproduce FILE` | re-derive a model from its `ditch-reproduce.lua` (no search) |
+| `--ignore-mismatches` | proceed with `--reproduce` even if file or prompt hashes differ |
 
 For example, a fully unattended run:
 
@@ -176,6 +202,57 @@ ditch Qwen/Qwen2.5-0.5B-Instruct --n-trials 50 --n-startup-trials 15 \
     --checkpoint-action restart --trial-index 1 \
     --model-action save --save-directory out/qwen2.5-0.5b-ditch
 ```
+
+## Benchmarks
+
+`ditch bench <model>` measures what a study costs on the current machine and
+prints a Markdown table (also written to a file with `--bench-output
+<file.md>`). It loads the model, prompt datasets and scorers exactly like a
+normal run, so the same `config.lua`, `--config` and dataset options apply
+(local text files work), and reports:
+
+* model, threads and batch size,
+* prefill tokens/s and greedy decode tokens/s over a batch of
+  `--bench-prompts N` prompts (default 16) decoding `--bench-tokens M` tokens
+  each (default 32),
+* the time of one residual-mean pass over the good-prompt dataset,
+* the time of one abliteration apply for each row-normalisation mode
+  (`none`, `pre`, `full`), at the centre of the search space,
+* the time of one full trial: apply with the configured mode plus refusal
+  scoring and KL scoring with the configured prompt counts,
+* peak RSS (`VmHWM` from `/proc/self/status` on Linux) and the total weight
+  bytes.
+
+```sh
+ditch bench Qwen/Qwen2.5-0.5B-Instruct --bench-prompts 16 --bench-tokens 32 \
+    --bench-output bench.md
+```
+
+Run it on your own hardware with a real model; the numbers below come from the
+synthetic 3-layer test fixture (`tests/fixtures/qwen2`: hidden size 32,
+vocabulary 271, 64 KB of BF16 weights) with six prompts per dataset and
+`--max-response-length 8` on this development sandbox's 4 CPUs, and only show
+that the harness runs. They say nothing about real models.
+
+| Metric | Value (synthetic fixture, 4 CPUs) |
+| :--- | ---: |
+| Model | `tests/fixtures/qwen2` (qwen2, 3 layers, BF16 weights) |
+| Threads | 4 |
+| Batch size | 2 |
+| Prefill tokens/s | 62240.4 (1196 tokens in 19.2 ms) |
+| Decode tokens/s | 11983.1 (16 prompts x 32 tokens, greedy, 42.7 ms) |
+| Residual-mean pass | 10.7 ms (6 prompts) |
+| Apply time (row_normalization = none) | 0.1 ms |
+| Apply time (row_normalization = pre) | 0.3 ms |
+| Apply time (row_normalization = full) | 2.3 ms |
+| Time per trial | 39.1 ms (apply + 6 refusal prompts + 6 KL prompts) |
+| Peak RSS | 7.0 MiB (7356416 bytes) |
+| Total weight bytes | 64256 (62.8 KiB) |
+
+`tools/compare_heretic.md` explains how to take the same measurements with
+Heretic on the same machine and model, and has a template table for reporting
+peak RAM, time per trial and result quality (Refusals, KL divergence) side by
+side.
 
 ## Development
 

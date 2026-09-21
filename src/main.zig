@@ -22,6 +22,8 @@ const tpe = @import("tpe.zig");
 const study_mod = @import("study.zig");
 const scorers = @import("scorers.zig");
 const export_mod = @import("export.zig");
+const reproduce = @import("reproduce.zig");
+const bench = @import("bench.zig");
 
 const Model = model_mod.Model;
 const Engine = engine_mod.Engine;
@@ -165,6 +167,10 @@ const App = struct {
     sampler: *tpe.Sampler,
     optimization_start: Io.Timestamp,
     start_index: usize,
+    /// Inputs recorded in the reproducibility manifest on export.
+    model_dir: []const u8,
+    good_prompts: []const Prompt,
+    bad_prompts: []const Prompt,
 
     fn abliterateOptions(self: *App) abliterate.Options {
         return .{
@@ -428,12 +434,29 @@ const App = struct {
         try out.flush();
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
-        const card = try self.modelCard(scratch.allocator(), trial);
+        const sa = scratch.allocator();
+        const manifest = try reproduce.build(sa, self.io, .{
+            .settings = self.settings,
+            .model = self.model,
+            .template = @tagName(self.template),
+            .good_prompts = self.good_prompts,
+            .bad_prompts = self.bad_prompts,
+            .keyword_rate_prompts = reproduce.scorerPrompts(self.evaluator, .keyword_rate),
+            .kl_divergence_prompts = reproduce.scorerPrompts(self.evaluator, .kl_divergence),
+            .space = self.space,
+            .trial = trial,
+            .baseline = self.evaluator.baseline,
+        });
+        var card: Io.Writer.Allocating = .init(sa);
+        try card.writer.writeAll(try self.modelCard(sa, trial));
+        try reproduce.markdown(&manifest, &card.writer);
         try export_mod.saveModel(self.gpa, self.io, self.model, dir, .{
             .max_shard_size = self.settings.max_shard_size,
             .export_dtype = dtype,
-            .readme_body = card,
+            .readme_body = card.written(),
         }, out);
+        try out.print("* Writing {s}...\n", .{reproduce.file_name});
+        try reproduce.writeFile(self.gpa, self.io, &manifest, dir);
         try out.print("Model saved to {s}.\n", .{dir});
         try out.flush();
     }
@@ -746,11 +769,19 @@ fn run(init: std.process.Init, con: *Console) !void {
 
     // Settings.
     const raw_args = try init.minimal.args.toSlice(arena);
-    const args = try arena.alloc([]const u8, raw_args.len);
+    var args = try arena.alloc([]const u8, raw_args.len);
     for (raw_args, 0..) |a, i| args[i] = a;
+    // `ditch bench <model> ...` is the benchmark subcommand.
+    var is_bench = false;
+    if (args.len > 1 and std.mem.eql(u8, args[1], "bench")) {
+        is_bench = true;
+        std.mem.copyForwards([]const u8, args[1..], args[2..]);
+        args = args[0 .. args.len - 1];
+    }
     var loaded = try config.load(gpa, io, args);
     defer loaded.deinit();
     const settings = &loaded.settings;
+    settings.bench = is_bench;
     if (settings.help) {
         try out.writeAll(config.help_text);
         return;
@@ -765,6 +796,15 @@ fn run(init: std.process.Init, con: *Console) !void {
         try out.writeAll("\nRun ditch --help or see config.default.lua for details about configuration parameters.\n");
         try out.flush();
         std.process.exit(1);
+    }
+    // A reproducibility manifest replaces the recorded settings (model, seed, datasets, ...).
+    var manifest: ?reproduce.Manifest = null;
+    if (settings.reproduce) |path| {
+        try out.print("Loading reproducibility manifest {s}...\n", .{path});
+        try out.flush();
+        manifest = try reproduce.load(gpa, arena, io, path);
+        reproduce.applySettings(&manifest.?, settings);
+        try out.print("* Recorded by ditch {s}: model {s}, trial {d}\n", .{ manifest.?.ditch_version, manifest.?.model, manifest.?.trial_index });
     }
     if (settings.model.len == 0) {
         try out.writeAll("No model specified.\n\n");
@@ -792,6 +832,10 @@ fn run(init: std.process.Init, con: *Console) !void {
     var http = try hf.Http.init(gpa, io, arena, init.environ_map);
     defer http.deinit();
     const cache_root = try hf.cacheDir(arena, settings, init.environ_map);
+    if (settings.bench) {
+        try bench.run(gpa, arena, io, settings, &http, cache_root, pool, out);
+        return;
+    }
     try out.print("\nLoading model {s}...\n", .{settings.model});
     try out.flush();
     const model_dir = try hf.resolveModel(arena, &http, cache_root, settings.model, settings.model_commit, out);
@@ -799,6 +843,7 @@ fn run(init: std.process.Init, con: *Console) !void {
     defer model.deinit();
     const c = &model.config;
     try out.print("* Architecture: {s} ({d} layers, hidden size {d}, vocabulary {d}, {s} weights)\n", .{ c.model_type, c.num_layers, c.hidden_size, c.vocab_size, model.dtype.safetensorsName() });
+    if (manifest) |*m| try reproduce.verifyModelFiles(arena, io, m, model, settings.ignore_mismatches, out);
     var template: chat.Template = undefined;
     if (settings.chat_template) |name| {
         template = chat.Template.parse(name) orelse {
@@ -826,6 +871,11 @@ fn run(init: std.process.Init, con: *Console) !void {
         std.log.err("both prompt datasets must contain at least one prompt", .{});
         return error.NoPrompts;
     }
+    if (manifest) |*m| {
+        try out.writeAll("\nVerifying prompts against the manifest...\n");
+        try reproduce.verifyPrompts(arena, m.good_prompts, good_prompts, "good prompts", settings.ignore_mismatches, out);
+        try reproduce.verifyPrompts(arena, m.bad_prompts, bad_prompts, "bad prompts", settings.ignore_mismatches, out);
+    }
     try out.flush();
 
     if (settings.batch_size == 0) {
@@ -846,6 +896,11 @@ fn run(init: std.process.Init, con: *Console) !void {
     // Scorers and baseline (always computed on the base model).
     var evaluator = try scorers.Evaluator.init(gpa, arena, &engine, settings, &http, cache_root, out);
     defer evaluator.deinit();
+    if (manifest) |*m| {
+        try out.writeAll("\nVerifying scorer prompts against the manifest...\n");
+        if (m.keyword_rate_prompts) |d| if (reproduce.scorerPrompts(&evaluator, .keyword_rate)) |p| try reproduce.verifyPrompts(arena, d, p, "refusal scoring prompts", settings.ignore_mismatches, out);
+        if (m.kl_divergence_prompts) |d| if (reproduce.scorerPrompts(&evaluator, .kl_divergence)) |p| try reproduce.verifyPrompts(arena, d, p, "KL divergence prompts", settings.ignore_mismatches, out);
+    }
     try out.flush();
 
     if (settings.evaluate_model) |eval_id| {
@@ -884,6 +939,12 @@ fn run(init: std.process.Init, con: *Console) !void {
     const dirs = try abliterate.computeDirections(gpa, good_means, bad_means, entries, c.hidden_size, settings.orthogonalize_direction);
     defer gpa.free(dirs);
     try out.flush();
+
+    if (manifest) |*m| {
+        try runReproduction(gpa, arena, io, con, settings, &http, cache_root, pool, model, &engine, template, &evaluator, dirs, model_dir, good_prompts, bad_prompts, m);
+        try out.flush();
+        return;
+    }
 
     // Study.
     const checkpoint_path = try study_mod.checkpointFileName(arena, settings.study_checkpoint_dir, settings.model);
@@ -952,6 +1013,9 @@ fn run(init: std.process.Init, con: *Console) !void {
         .sampler = &sampler,
         .optimization_start = Io.Timestamp.now(io, .awake),
         .start_index = 0,
+        .model_dir = model_dir,
+        .good_prompts = good_prompts,
+        .bad_prompts = bad_prompts,
     };
 
     if (!show_results_only) {
@@ -960,4 +1024,85 @@ fn run(init: std.process.Init, con: *Console) !void {
     }
     try app.resultsLoop();
     try out.flush();
+}
+
+/// `--reproduce`: applies the recorded trial directly (no search), prints the
+/// scores next to the recorded ones and offers the usual model menu.
+fn runReproduction(
+    gpa: Allocator,
+    arena: Allocator,
+    io: Io,
+    con: *Console,
+    settings: *config.Settings,
+    http: *hf.Http,
+    cache_root: []const u8,
+    pool: *const tensor.Pool,
+    model: *Model,
+    engine: *Engine,
+    template: chat.Template,
+    evaluator: *scorers.Evaluator,
+    dirs: []const f32,
+    model_dir: []const u8,
+    good_prompts: []const Prompt,
+    bad_prompts: []const Prompt,
+    m: *const reproduce.Manifest,
+) !void {
+    const out = con.out;
+    var space = try search.buildSpace(gpa, model);
+    defer space.deinit();
+    const vector = try reproduce.vectorFor(arena, m, &space);
+    // The study and sampler are never used: the trial comes from the manifest.
+    var study = try study_mod.Study.open(gpa, io, try study_mod.checkpointFileName(arena, settings.study_checkpoint_dir, settings.model));
+    defer study.deinit();
+    var sampler = tpe.Sampler.init(space.space, settings.n_startup_trials, settings.seed.?);
+    var app = App{
+        .gpa = gpa,
+        .arena = arena,
+        .io = io,
+        .con = con,
+        .settings = settings,
+        .http = http,
+        .cache_root = cache_root,
+        .pool = pool,
+        .model = model,
+        .engine = engine,
+        .template = template,
+        .evaluator = evaluator,
+        .dirs = dirs,
+        .space = &space,
+        .study = &study,
+        .sampler = &sampler,
+        .optimization_start = Io.Timestamp.now(io, .awake),
+        .start_index = 0,
+        .model_dir = model_dir,
+        .good_prompts = good_prompts,
+        .bad_prompts = bad_prompts,
+    };
+
+    try out.print("\nApplying recorded trial {d}...\n", .{m.trial_index});
+    try out.writeAll("* Parameters:\n");
+    try search.describe(&space, vector, out);
+    try out.writeAll("* Abliterating...\n");
+    try out.flush();
+    model.resetDeltas();
+    const cfg = search.decode(&space, vector);
+    try search.applyTrial(model, dirs, cfg, app.abliterateOptions());
+    try out.writeAll("* Evaluating...\n");
+    try out.flush();
+    const scores = try evaluator.scores(arena, engine, out);
+    _ = try reproduce.printComparison(m, scores, out);
+    try out.flush();
+
+    const losses = try evaluator.objectiveLosses(arena, scores);
+    const records = try arena.alloc(study_mod.ScoreRecord, scores.len);
+    for (scores, 0..) |s, i| records[i] = .{ .name = s.name, .value = s.score.value, .display = s.score.display };
+    const trial = study_mod.Trial{
+        .index = m.trial_index,
+        .params = vector,
+        .losses = losses,
+        .direction_index = cfg.direction_index,
+        .parameters = cfg.parameters,
+        .scores = records,
+    };
+    _ = try app.modelLoop(&trial);
 }

@@ -18,4 +18,6 @@ comptime {
     _ = @import("export.zig");
     _ = @import("search.zig");
     _ = @import("lua.zig");
+    _ = @import("reproduce.zig");
+    _ = @import("bench.zig");
 }

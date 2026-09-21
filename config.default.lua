@@ -190,4 +190,16 @@ return {
   -- model_action = "save",            -- "save", "chat" or "exit"
   -- save_directory = "out/my-model",
   -- export_dtype = "bf16",            -- "bf16", "f16" or "f32" (default: as source)
+
+  -- -------------------------------------------------------------------------
+  -- Reproducing and benchmarking
+  -- -------------------------------------------------------------------------
+  -- `ditch --reproduce <dir>/ditch-reproduce.lua` re-derives an exported model
+  -- from the manifest written next to it; the manifest's settings replace the
+  -- ones here. Hash mismatches stop the run unless ignore_mismatches is set.
+  -- ignore_mismatches = false,
+  -- `ditch bench <model>` measures throughput and per-trial cost (see README).
+  -- bench_prompts = 16,               -- prompts in the throughput batch
+  -- bench_tokens = 32,                -- tokens decoded per prompt
+  -- bench_output = "bench.md",        -- also write the table to this file
 }

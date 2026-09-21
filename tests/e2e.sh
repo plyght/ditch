@@ -72,6 +72,46 @@ for f in model.safetensors config.json tokenizer.json README.md; do
 done
 grep -q "Abliteration parameters" "$TMP/out/README.md" || fail "README.md lacks the model card"
 
+[ -f "$TMP/out/ditch-reproduce.lua" ] || fail "reproducibility manifest not written"
+grep -q "Reproduce with: \`ditch --reproduce ditch-reproduce.lua\`" "$TMP/out/README.md" || fail "README.md lacks the reproduce section"
+
+echo "==> Reproducing the saved model from its manifest"
+"$DITCH" --reproduce "$TMP/out/ditch-reproduce.lua" --model-action exit | tee "$TMP/repro.log"
+grep -q "config.json: ok" "$TMP/repro.log" || fail "manifest hash verification did not run"
+grep -q "good prompts: 6 prompts, hash ok" "$TMP/repro.log" || fail "prompt hash verification did not run"
+recorded_trial=$(sed -nE 's/^    index = ([0-9]+),$/\1/p' "$TMP/out/ditch-reproduce.lua")
+[ -n "$recorded_trial" ] || fail "manifest does not record the trial index"
+grep -q "Applying recorded trial $recorded_trial\.\.\." "$TMP/repro.log" || fail "recorded trial $recorded_trial was not applied"
+grep -q "All scores match the manifest" "$TMP/repro.log" || fail "reproduced scores differ from the recorded ones"
+for name in Refusals "KL divergence"; do
+    line=$(grep "^  \* $name: " "$TMP/repro.log" | tail -1)
+    actual=$(echo "$line" | sed -E 's/^  \* [^:]+: (.*) \(recorded .*$/\1/')
+    recorded=$(echo "$line" | sed -E 's/^.*\(recorded (.*)\).*$/\1/')
+    [ -n "$actual" ] && [ "$actual" = "$recorded" ] || fail "$name: reproduced '$actual' but recorded '$recorded'"
+done
+grep -q "Running trial" "$TMP/repro.log" && fail "--reproduce ran a search"
+
+echo "==> Reproducing with a corrupted manifest hash"
+sed 's/config_sha256 = "[0-9a-f]/config_sha256 = "0/' "$TMP/out/ditch-reproduce.lua" > "$TMP/corrupt.lua"
+if "$DITCH" --reproduce "$TMP/corrupt.lua" --model-action exit > "$TMP/corrupt.log" 2>&1; then fail "corrupted manifest was accepted"; fi
+grep -q "config.json: MISMATCH" "$TMP/corrupt.log" || fail "hash mismatch not reported"
+grep -q "Pass --ignore-mismatches to proceed" "$TMP/corrupt.log" || fail "mismatch error message missing"
+"$DITCH" --reproduce "$TMP/corrupt.lua" --model-action exit --ignore-mismatches | tee "$TMP/ignore.log"
+grep -q "mismatch(es) ignored" "$TMP/ignore.log" || fail "--ignore-mismatches did not report the ignored mismatch"
+grep -q "All scores match the manifest" "$TMP/ignore.log" || fail "--ignore-mismatches did not proceed to the scores"
+
+echo "==> Benchmark harness"
+"$DITCH" bench "${COMMON[@]}" --bench-prompts 4 --bench-tokens 4 --bench-output "$TMP/bench.md" | tee "$TMP/bench.log"
+[ -f "$TMP/bench.md" ] || fail "benchmark table not written"
+for row in "| Model |" "| Threads |" "| Batch size |" "| Prefill tokens/s |" "| Decode tokens/s |" \
+    "| Residual-mean pass |" "| Apply time (row_normalization = none) |" "| Apply time (row_normalization = pre) |" \
+    "| Apply time (row_normalization = full) |" "| Time per trial |" "| Peak RSS |" "| Total weight bytes |"; do
+    grep -qF "$row" "$TMP/bench.log" || fail "benchmark output lacks the row $row"
+    grep -qF "$row" "$TMP/bench.md" || fail "benchmark file lacks the row $row"
+done
+grep -q "4 prompts x 4 tokens" "$TMP/bench.md" || fail "benchmark did not use --bench-prompts/--bench-tokens"
+grep -q "Total weight bytes | 64256" "$TMP/bench.md" || fail "benchmark weight bytes are wrong"
+
 CKPT="$TMP/checkpoints/tests--fixtures--qwen2.jsonl"
 [ -f "$CKPT" ] || fail "checkpoint file not written"
 n_trials=$(grep -c '"type":"trial"' "$CKPT")

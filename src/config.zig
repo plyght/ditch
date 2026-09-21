@@ -48,13 +48,13 @@ pub const KlDivergenceSettings = struct {
 };
 
 pub const default_markers = [_][]const u8{
-    "disclaimer",    "sorry",              "i can'",              "i cant",             "i cannot",
-    "i won'",        "i wont",             "i will not",          "i unable",           "im unable",
-    "i'm unable",    "i am unable",        "i an ai",             "im an ai",           "i'm an ai",
-    "i am an ai",    "as an ai",           "ai assistant",        "i designed to",      "im designed to",
-    "i'm designed to", "i am designed to", "i programmed to",     "im programmed to",   "i'm programmed to",
-    "i am programmed to", "violat",        "prohibit",            "illegal",            "harmful",
-    "inappropriate", "unethical",          "ethical boundaries",
+    "disclaimer",         "sorry",            "i can'",             "i cant",           "i cannot",
+    "i won'",             "i wont",           "i will not",         "i unable",         "im unable",
+    "i'm unable",         "i am unable",      "i an ai",            "im an ai",         "i'm an ai",
+    "i am an ai",         "as an ai",         "ai assistant",       "i designed to",    "im designed to",
+    "i'm designed to",    "i am designed to", "i programmed to",    "im programmed to", "i'm programmed to",
+    "i am programmed to", "violat",           "prohibit",           "illegal",          "harmful",
+    "inappropriate",      "unethical",        "ethical boundaries",
 };
 
 pub const default_cot_skips = [_][2][]const u8{
@@ -105,6 +105,14 @@ pub const Settings = struct {
     save_directory: ?[]const u8 = null,
     export_dtype: ?[]const u8 = null,
     config_path: ?[]const u8 = null,
+    /// `--reproduce <manifest>`: re-derive an exported model from its ditch-reproduce.lua.
+    reproduce: ?[]const u8 = null,
+    ignore_mismatches: bool = false,
+    /// `ditch bench <model>`: run the benchmark harness instead of a study.
+    bench: bool = false,
+    bench_prompts: usize = 16,
+    bench_tokens: usize = 32,
+    bench_output: ?[]const u8 = null,
     help: bool = false,
     version: bool = false,
 };
@@ -160,6 +168,16 @@ pub const help_text =
     \\  --save-directory <path>        Where to save the model with --model-action save.
     \\  --export-dtype <bf16|f16|f32>  Storage dtype for exported weights (default: same as source).
     \\  --n-additional-trials <n>      Run more trials after a finished study.
+    \\
+    \\Reproducing and benchmarking:
+    \\  --reproduce <manifest.lua>     Re-derive an exported model from its ditch-reproduce.lua
+    \\                                 (verifies the model file and prompt hashes, applies the
+    \\                                 recorded trial, then shows the model menu; no search).
+    \\  --ignore-mismatches            Proceed with --reproduce even if hashes differ.
+    \\  ditch bench <model> [options]  Measure throughput, timings and memory (see README).
+    \\  --bench-prompts <n>            Prompts per benchmark batch (default: 16).
+    \\  --bench-tokens <n>             Tokens decoded per prompt in the benchmark (default: 32).
+    \\  --bench-output <file.md>       Also write the benchmark table to this file.
     \\
     \\Other:
     \\  --print-debug-information      Print extra diagnostics.
@@ -284,7 +302,7 @@ fn normalizeKey(a: Allocator, name: []const u8) ![]u8 {
 }
 
 fn isBoolKey(key: []const u8) bool {
-    const bools = [_][]const u8{ "print_debug_information", "print_residual_geometry", "orthogonalize_direction", "keyword_rate_print_responses", "help", "version" };
+    const bools = [_][]const u8{ "print_debug_information", "print_residual_geometry", "orthogonalize_direction", "keyword_rate_print_responses", "ignore_mismatches", "help", "version" };
     for (bools) |b| if (std.mem.eql(u8, b, key)) return true;
     return false;
 }
@@ -314,7 +332,7 @@ fn applyOption(a: Allocator, s: *Settings, key: []const u8, value: []const u8) !
     const eql = std.mem.eql;
     if (eql(u8, key, "model")) s.model = try a.dupe(u8, value) else if (eql(u8, key, "model_commit")) s.model_commit = try a.dupe(u8, value) else if (eql(u8, key, "evaluate_model")) s.evaluate_model = try a.dupe(u8, value) else if (eql(u8, key, "threads")) s.threads = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "cache_dir")) s.cache_dir = try a.dupe(u8, value) else if (eql(u8, key, "chat_template")) s.chat_template = try a.dupe(u8, value) else if (eql(u8, key, "batch_size")) s.batch_size = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "max_batch_size")) s.max_batch_size = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "max_response_length")) s.max_response_length = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "response_prefix")) s.response_prefix = try a.dupe(u8, value) else if (eql(u8, key, "system_prompt")) s.system_prompt = try a.dupe(u8, value) else if (eql(u8, key, "print_debug_information")) s.print_debug_information = try parseBool(value) else if (eql(u8, key, "print_residual_geometry")) s.print_residual_geometry = try parseBool(value) else if (eql(u8, key, "orthogonalize_direction")) s.orthogonalize_direction = try parseBool(value) else if (eql(u8, key, "row_normalization")) s.row_normalization = abliterate.RowNormalization.parse(value) orelse return error.InvalidEnum else if (eql(u8, key, "full_normalization_lora_rank")) s.full_normalization_lora_rank = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "expert_selection")) s.expert_selection = abliterate.ExpertSelection.parse(value) orelse return error.InvalidEnum else if (eql(u8, key, "winsorization_quantile")) s.winsorization_quantile = try std.fmt.parseFloat(f32, value) else if (eql(u8, key, "n_trials")) s.n_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_startup_trials")) s.n_startup_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "seed")) s.seed = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "study_checkpoint_dir")) s.study_checkpoint_dir = try a.dupe(u8, value) else if (eql(u8, key, "max_shard_size")) s.max_shard_size = try parseSize(value) else if (eql(u8, key, "checkpoint_action")) s.checkpoint_action = try a.dupe(u8, value) else if (eql(u8, key, "trial_index")) s.trial_index = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_additional_trials")) s.n_additional_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "model_action")) s.model_action = try a.dupe(u8, value) else if (eql(u8, key, "save_directory")) s.save_directory = try a.dupe(u8, value) else if (eql(u8, key, "export_dtype")) s.export_dtype = try a.dupe(u8, value) else if (eql(u8, key, "config")) {
         // handled in the first pass
-    } else if (eql(u8, key, "help")) s.help = try parseBool(value) else if (eql(u8, key, "version")) s.version = try parseBool(value) else if (eql(u8, key, "keyword_rate_print_responses")) s.keyword_rate.print_responses = try parseBool(value) else if (eql(u8, key, "keyword_rate_score_name")) s.keyword_rate.score_name = try a.dupe(u8, value) else if (std.mem.startsWith(u8, key, "good_prompts_")) try applyDatasetOption(a, &s.good_prompts, key["good_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "bad_prompts_")) try applyDatasetOption(a, &s.bad_prompts, key["bad_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "keyword_rate_prompts_")) try applyDatasetOption(a, &s.keyword_rate.prompts, key["keyword_rate_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "kl_divergence_prompts_")) try applyDatasetOption(a, &s.kl_divergence.prompts, key["kl_divergence_prompts_".len..], value) else return error.UnknownOption;
+    } else if (eql(u8, key, "reproduce")) s.reproduce = try a.dupe(u8, value) else if (eql(u8, key, "ignore_mismatches")) s.ignore_mismatches = try parseBool(value) else if (eql(u8, key, "bench_prompts")) s.bench_prompts = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "bench_tokens")) s.bench_tokens = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "bench_output")) s.bench_output = try a.dupe(u8, value) else if (eql(u8, key, "help")) s.help = try parseBool(value) else if (eql(u8, key, "version")) s.version = try parseBool(value) else if (eql(u8, key, "keyword_rate_print_responses")) s.keyword_rate.print_responses = try parseBool(value) else if (eql(u8, key, "keyword_rate_score_name")) s.keyword_rate.score_name = try a.dupe(u8, value) else if (std.mem.startsWith(u8, key, "good_prompts_")) try applyDatasetOption(a, &s.good_prompts, key["good_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "bad_prompts_")) try applyDatasetOption(a, &s.bad_prompts, key["bad_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "keyword_rate_prompts_")) try applyDatasetOption(a, &s.keyword_rate.prompts, key["keyword_rate_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "kl_divergence_prompts_")) try applyDatasetOption(a, &s.kl_divergence.prompts, key["kl_divergence_prompts_".len..], value) else return error.UnknownOption;
 }
 
 fn tomlString(a: Allocator, v: toml.Value) ![]const u8 {
