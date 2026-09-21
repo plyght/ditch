@@ -705,8 +705,7 @@ fn runExpert(model: *const Model, m: *const MoeLayer, gate_w: Weight, up_w: Weig
             g.* = (uc + 1.0) * gc * sigmoid(sw.alpha * gc);
         }
     } else {
-        const act = m.activation;
-        for (gate[0 .. ne * inter], 0..) |*g, j| g.* = act.apply(g.*) * up[j];
+        tensor.gatedActivation(model.pool, m.activation, gate, gate, up, ne, inter, inter, inter);
     }
     try tensor.matmulT(model.pool, gpa, out, gate, ne, down_w, delta);
     if (biases[2]) |b| for (0..ne) |i| tensor.axpy(out[i * hidden ..][0..hidden], 1.0, b[0..hidden]);

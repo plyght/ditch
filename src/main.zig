@@ -1027,7 +1027,8 @@ fn run(init: std.process.Init, con: *Console) !void {
     // Threads.
     const cpu_count = std.Thread.getCpuCount() catch 1;
     const pool = try arena.create(tensor.Pool);
-    pool.* = tensor.Pool.init(io, settings.threads);
+    pool.* = tensor.Pool.initPersistent(gpa, io, settings.threads);
+    defer pool.deinit();
     try out.print("Using {d} threads ({d} CPUs available)\n", .{ pool.threads, cpu_count });
     try out.flush();
     installSigint();
