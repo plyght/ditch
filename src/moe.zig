@@ -6,11 +6,19 @@
 //! and `mixtral`. Every expert's down projection is exposed as a
 //! `tensor.Weight` view regardless of the on-disk layout, so the abliteration
 //! kernels address a target by (layer, expert index) only.
+//!
+//! Every expert matrix also carries a `MatrixRef` describing where it lives on
+//! disk (a whole tensor, a slice of a stacked expert tensor, or a transposed
+//! column range of such a slice). In mapped mode the `Weight` views are always
+//! valid; in streamed mode they carry only the shape and the matrices are made
+//! resident per layer through the model's `WeightStore` (`acquireLayer`), or
+//! one at a time for abliteration (`MoeLayer.acquireDown`).
 
 const std = @import("std");
 const Io = std.Io;
 const tensor = @import("tensor.zig");
 const model_mod = @import("model.zig");
+const stream = @import("stream.zig");
 const abliterate = @import("abliterate.zig");
 const search = @import("search.zig");
 
@@ -18,6 +26,43 @@ const Allocator = std.mem.Allocator;
 const Weight = tensor.Weight;
 const Delta = tensor.Delta;
 const Model = model_mod.Model;
+const WeightRef = stream.WeightRef;
+const Lease = stream.Lease;
+
+/// Where an expert matrix lives on disk and how to make it resident.
+pub const MatrixRef = struct {
+    /// The on-disk block (`[rows][cols]`).
+    ref: WeightRef,
+    /// null: the block is the matrix. Otherwise the matrix is columns `[lo, hi)`
+    /// of the block, transposed (`[hi - lo][block rows]`).
+    transposed: ?[2]usize = null,
+
+    pub fn rows(self: MatrixRef) usize {
+        return if (self.transposed) |t| t[1] - t[0] else self.ref.rows;
+    }
+
+    pub fn cols(self: MatrixRef) usize {
+        return if (self.transposed != null) self.ref.rows else self.ref.cols;
+    }
+
+    /// Bytes of the resident matrix.
+    pub fn residentBytes(self: MatrixRef) u64 {
+        return @as(u64, self.rows()) * self.cols() * self.ref.dtype.size();
+    }
+
+    /// Placeholder view carrying the shape only.
+    pub fn shapeOnly(self: MatrixRef) Weight {
+        return .{ .data = &.{}, .dtype = self.ref.dtype, .rows = self.rows(), .cols = self.cols() };
+    }
+
+    /// Makes the matrix resident (streamed mode); release with `store.release`.
+    pub fn acquire(self: MatrixRef, store: *stream.WeightStore) !Lease {
+        const t = self.transposed orelse return store.acquire(self.ref);
+        var out: [1]Lease = undefined;
+        try store.acquireTransposed(self.ref, &.{t}, &out);
+        return out[0];
+    }
+};
 
 /// On-disk layout of the routed experts.
 pub const Layout = enum {
@@ -37,6 +82,10 @@ pub const Expert = struct {
     down: Weight, // [hidden, I]
     /// Abliteration delta on the down projection (null = identity).
     down_delta: ?Delta = null,
+    /// On-disk locations of the three matrices.
+    gate_ref: MatrixRef,
+    up_ref: MatrixRef,
+    down_ref: MatrixRef,
 };
 
 /// Always-active expert (qwen2_moe). Its output is scaled by `sigmoid(x · gate_vec)`.
@@ -46,11 +95,15 @@ pub const SharedExpert = struct {
     down: Weight,
     gate_vec: ?[]f32,
     down_delta: ?Delta = null,
+    gate_ref: MatrixRef,
+    up_ref: MatrixRef,
+    down_ref: MatrixRef,
 };
 
 pub const MoeLayer = struct {
     /// Router `[E, hidden]`.
     router: Weight,
+    router_ref: WeightRef,
     top_k: usize,
     norm_topk_prob: bool,
     /// Expert intermediate size.
@@ -74,6 +127,36 @@ pub const MoeLayer = struct {
     pub fn downWeight(self: *const MoeLayer, idx: usize) Weight {
         if (idx < self.experts.len) return self.experts[idx].down;
         return self.shared.?.down;
+    }
+
+    pub fn downRef(self: *const MoeLayer, idx: usize) MatrixRef {
+        if (idx < self.experts.len) return self.experts[idx].down_ref;
+        return self.shared.?.down_ref;
+    }
+
+    /// Makes down projection `idx` resident (a view in mapped mode, a budgeted
+    /// buffer in streamed mode); release with `model.store.release`.
+    pub fn acquireDown(self: *const MoeLayer, model: *const Model, idx: usize) !Lease {
+        if (!model.streamed()) return .{ .weight = self.downWeight(idx) };
+        return self.downRef(idx).acquire(@constCast(&model.store));
+    }
+
+    /// Bytes resident while this layer computes in streamed mode: every expert
+    /// matrix (and the shared expert), plus the transient block buffer used to
+    /// transpose fused expert slices.
+    pub fn residentBytes(self: *const MoeLayer) u64 {
+        var total: u64 = 0;
+        var transient: u64 = 0;
+        for (self.experts) |ex| {
+            for ([_]MatrixRef{ ex.gate_ref, ex.up_ref, ex.down_ref }) |r| {
+                total += r.residentBytes();
+                if (r.transposed != null) transient = @max(transient, r.ref.byteLen());
+            }
+        }
+        if (self.shared) |sh| {
+            for ([_]MatrixRef{ sh.gate_ref, sh.up_ref, sh.down_ref }) |r| total += r.residentBytes();
+        }
+        return total + transient;
     }
 
     pub fn downDelta(self: *MoeLayer, idx: usize) *?Delta {
@@ -131,32 +214,95 @@ pub const MoeLayer = struct {
         return false;
     }
 
-    /// Merges every routed expert's delta into the f32 copy `f` of the fused down
-    /// tensor (`[E, hidden, I]` or `[E, I, hidden]` depending on the layout).
-    pub fn mergeFusedDown(self: *const MoeLayer, f: []f32) void {
+    /// Merges routed expert `e`'s delta (if any) into `block`, the f32 copy of
+    /// that expert's slice of the fused down tensor (`[hidden][I]` for the
+    /// `fused` layout, `[I][hidden]` for `fused_transposed`).
+    pub fn mergeExpertDown(self: *const MoeLayer, e: usize, block: []f32) void {
         const hidden = self.experts[0].down.rows;
         const inter = self.inter;
-        for (self.experts, 0..) |ex, e| {
-            const d = ex.down_delta orelse continue;
-            const block = f[e * hidden * inter ..][0 .. hidden * inter];
-            switch (self.layout) {
-                .fused => for (0..hidden) |i| {
-                    const row = block[i * inter ..][0..inter];
-                    for (0..d.rank) |k| tensor.axpy(row, d.b[i * d.rank + k], d.a[k * inter ..][0..inter]);
-                },
-                .fused_transposed => for (0..inter) |j| {
-                    const row = block[j * hidden ..][0..hidden];
-                    for (0..hidden) |i| {
-                        var acc: f32 = 0;
-                        for (0..d.rank) |k| acc += d.b[i * d.rank + k] * d.a[k * inter + j];
-                        row[i] += acc;
-                    }
-                },
-                .separate => unreachable,
-            }
+        const d = self.experts[e].down_delta orelse return;
+        std.debug.assert(block.len == hidden * inter);
+        switch (self.layout) {
+            .fused => for (0..hidden) |i| {
+                const row = block[i * inter ..][0..inter];
+                for (0..d.rank) |k| tensor.axpy(row, d.b[i * d.rank + k], d.a[k * inter ..][0..inter]);
+            },
+            .fused_transposed => for (0..inter) |j| {
+                const row = block[j * hidden ..][0..hidden];
+                for (0..hidden) |i| {
+                    var acc: f32 = 0;
+                    for (0..d.rank) |k| acc += d.b[i * d.rank + k] * d.a[k * inter + j];
+                    row[i] += acc;
+                }
+            },
+            .separate => unreachable,
         }
     }
 };
+
+/// An MoE layer whose expert matrices are resident (streamed mode). `layer` is
+/// a copy of the model's `MoeLayer` whose experts point at `experts`.
+pub const MoeLease = struct {
+    layer: MoeLayer,
+    gpa: Allocator,
+    experts: []Expert,
+    leases: []Lease,
+
+    pub fn release(self: *MoeLease, store: *stream.WeightStore) void {
+        store.releaseSet(self.leases);
+        if (self.leases.len > 0) self.gpa.free(self.leases);
+        if (self.experts.len > 0) self.gpa.free(self.experts);
+    }
+};
+
+fn acquireInto(store: *stream.WeightStore, r: MatrixRef, leases: []Lease, n: *usize) !Weight {
+    leases[n.*] = try r.acquire(store);
+    n.* += 1;
+    return leases[n.* - 1].weight;
+}
+
+/// Makes every expert matrix of `m` resident through the model's store. In
+/// mapped mode the views are already valid and nothing is allocated.
+pub fn acquireLayer(model: *const Model, m: *const MoeLayer) !MoeLease {
+    const gpa = model.gpa;
+    var lease = MoeLease{ .layer = m.*, .gpa = gpa, .experts = &.{}, .leases = &.{} };
+    if (!model.streamed()) return lease;
+    const store: *stream.WeightStore = @constCast(&model.store);
+    const experts = try gpa.alloc(Expert, m.experts.len);
+    errdefer gpa.free(experts);
+    // Three matrices per routed expert (gate and up of a transposed fused block
+    // come out of one read but are still two leases) plus the shared expert.
+    const all_leases = try gpa.alloc(Lease, 3 * m.experts.len + @as(usize, if (m.shared != null) 3 else 0));
+    errdefer gpa.free(all_leases);
+    var n: usize = 0;
+    errdefer store.releaseSet(all_leases[0..n]);
+    for (m.experts, 0..) |ex, e| {
+        experts[e] = ex;
+        if (ex.gate_ref.transposed != null and ex.up_ref.transposed != null and ex.gate_ref.ref.offset == ex.up_ref.ref.offset) {
+            // Fused, transposed layout: gate and up share one block; read it once.
+            try store.acquireTransposed(ex.gate_ref.ref, &.{ ex.gate_ref.transposed.?, ex.up_ref.transposed.? }, all_leases[n..][0..2]);
+            experts[e].gate = all_leases[n].weight;
+            experts[e].up = all_leases[n + 1].weight;
+            n += 2;
+        } else {
+            experts[e].gate = try acquireInto(store, ex.gate_ref, all_leases, &n);
+            experts[e].up = try acquireInto(store, ex.up_ref, all_leases, &n);
+        }
+        experts[e].down = try acquireInto(store, ex.down_ref, all_leases, &n);
+    }
+    if (m.shared) |sh| {
+        var s = sh;
+        s.gate = try acquireInto(store, sh.gate_ref, all_leases, &n);
+        s.up = try acquireInto(store, sh.up_ref, all_leases, &n);
+        s.down = try acquireInto(store, sh.down_ref, all_leases, &n);
+        lease.layer.shared = s;
+    }
+    std.debug.assert(n == all_leases.len);
+    lease.layer.experts = experts;
+    lease.experts = experts;
+    lease.leases = all_leases;
+    return lease;
+}
 
 // ---------------------------------------------------------------------------
 // Loading
@@ -191,6 +337,24 @@ fn blockWeight(t: Weight, block: usize, block_elems: usize, rows: usize, cols: u
     };
 }
 
+/// Expert `e`'s `[rows][cols]` block of a stacked `[E, ...]` tensor ref.
+fn blockRef(stacked: WeightRef, e: usize, rows: usize, cols: usize) WeightRef {
+    var r = stacked.rowSlice(e, 1);
+    std.debug.assert(r.cols == rows * cols);
+    r.rows = rows;
+    r.cols = cols;
+    return r;
+}
+
+const Stacked = struct { ref: WeightRef, shape: []const usize };
+
+/// The stacked 3-D tensor `name` if present.
+fn findStacked(model: *const Model, name: []const u8) !?Stacked {
+    const t = model.find(name) orelse return null;
+    if (t.shape.len != 3) return error.InvalidConfig;
+    return .{ .ref = try model.ref(name), .shape = t.shape };
+}
+
 /// Loads the MoE block of layer `lp` (e.g. "model.layers.3.").
 pub fn loadLayer(model: *Model, arena: Allocator, lp: []const u8) !MoeLayer {
     const c = &model.config;
@@ -198,13 +362,16 @@ pub fn loadLayer(model: *Model, arena: Allocator, lp: []const u8) !MoeLayer {
     const inter = c.moe_intermediate_size;
     const n_experts = c.num_experts;
     const mlp: []const u8 = if (c.family == .mixtral) "block_sparse_moe." else "mlp.";
+    const mapped = !model.streamed();
 
-    const router = model.findWeight(try cat(arena, &.{ lp, mlp, "gate.weight" })) orelse {
+    const router_name = try cat(arena, &.{ lp, mlp, "gate.weight" });
+    const router_ref = model.store.lookup(router_name) orelse {
         std.log.err("missing router tensor in {s}{s}", .{ lp, mlp });
         return error.MissingWeights;
     };
     var self = MoeLayer{
-        .router = router,
+        .router = try model.loadMat(router_name),
+        .router_ref = router_ref,
         .top_k = @min(c.num_experts_per_tok, n_experts),
         .norm_topk_prob = c.norm_topk_prob,
         .inter = inter,
@@ -216,71 +383,103 @@ pub fn loadLayer(model: *Model, arena: Allocator, lp: []const u8) !MoeLayer {
 
     // Fused layout?
     const gu_names = [_][]const u8{ "experts.gate_up_proj", "experts.gate_up_proj.weight" };
-    var fused_gu: ?Weight = null;
+    var fused_gu: ?WeightRef = null;
     for (gu_names) |gn| {
-        if (model.find(try cat(arena, &.{ lp, mlp, gn }))) |t| {
-            if (t.shape.len != 3) return error.InvalidConfig;
-            fused_gu = t.asWeight();
-            fused_gu.?.rows = t.shape[1];
-            fused_gu.?.cols = t.shape[2];
-            const shape = t.shape;
+        if (try findStacked(model, try cat(arena, &.{ lp, mlp, gn }))) |st| {
+            const shape = st.shape;
             if (shape[0] != n_experts) return error.InvalidConfig;
             if (shape[1] == 2 * inter and shape[2] == hidden) self.layout = .fused else if (shape[1] == hidden and shape[2] == 2 * inter) self.layout = .fused_transposed else {
                 std.log.err("unexpected fused expert shape [{d}, {d}, {d}]", .{ shape[0], shape[1], shape[2] });
                 return error.InvalidConfig;
             }
+            fused_gu = st.ref;
             break;
         }
     }
     if (fused_gu) |gu| {
         const dn_names = [_][]const u8{ "experts.down_proj", "experts.down_proj.weight" };
-        var down: ?Weight = null;
+        var down: ?WeightRef = null;
         var down_shape: []const usize = &.{};
         for (dn_names) |dn| {
             const suffix = try cat(arena, &.{ mlp, dn });
-            if (model.find(try cat(arena, &.{ lp, suffix }))) |t| {
-                down = t.asWeight();
-                down_shape = t.shape;
+            if (try findStacked(model, try cat(arena, &.{ lp, suffix }))) |st| {
+                down = st.ref;
+                down_shape = st.shape;
                 self.fused_down_suffix = suffix;
                 break;
             }
         }
         const dw = down orelse return error.MissingWeights;
-        if (down_shape.len != 3 or down_shape[0] != n_experts) return error.InvalidConfig;
+        if (down_shape[0] != n_experts) return error.InvalidConfig;
         const es = gu.dtype.size();
+        // Views of the whole stacked tensors (data valid in mapped mode only).
+        const gu_w: Weight = if (mapped) model.find(gu.name).?.asWeight() else gu.shapeOnly();
+        const dw_w: Weight = if (mapped) model.find(dw.name).?.asWeight() else dw.shapeOnly();
         switch (self.layout) {
             .fused => {
                 if (down_shape[1] != hidden or down_shape[2] != inter) return error.InvalidConfig;
                 for (self.experts, 0..) |*ex, e| {
+                    const gu_block = blockRef(gu, e, 2 * inter, hidden);
                     ex.* = .{
-                        .gate = blockWeight(gu, e, 2 * inter * hidden, inter, hidden, 0),
-                        .up = blockWeight(gu, e, 2 * inter * hidden, inter, hidden, inter),
-                        .down = blockWeight(dw, e, hidden * inter, hidden, inter, 0),
+                        .gate_ref = .{ .ref = gu_block.rowSlice(0, inter) },
+                        .up_ref = .{ .ref = gu_block.rowSlice(inter, inter) },
+                        .down_ref = .{ .ref = blockRef(dw, e, hidden, inter) },
+                        .gate = undefined,
+                        .up = undefined,
+                        .down = undefined,
                     };
+                    if (mapped) {
+                        ex.gate = blockWeight(gu_w, e, 2 * inter * hidden, inter, hidden, 0);
+                        ex.up = blockWeight(gu_w, e, 2 * inter * hidden, inter, hidden, inter);
+                        ex.down = blockWeight(dw_w, e, hidden * inter, hidden, inter, 0);
+                    }
                 }
             },
             .fused_transposed => {
                 if (down_shape[1] != inter or down_shape[2] != hidden) return error.InvalidConfig;
                 for (self.experts, 0..) |*ex, e| {
-                    const gu_block = gu.data[e * hidden * 2 * inter * es ..][0 .. hidden * 2 * inter * es];
-                    const dn_block = dw.data[e * inter * hidden * es ..][0 .. inter * hidden * es];
+                    const gu_block = blockRef(gu, e, hidden, 2 * inter);
                     ex.* = .{
-                        .gate = .{ .data = try transposeSub(arena, es, gu_block, hidden, 2 * inter, 0, inter), .dtype = gu.dtype, .rows = inter, .cols = hidden },
-                        .up = .{ .data = try transposeSub(arena, es, gu_block, hidden, 2 * inter, inter, 2 * inter), .dtype = gu.dtype, .rows = inter, .cols = hidden },
-                        .down = .{ .data = try transposeSub(arena, es, dn_block, inter, hidden, 0, hidden), .dtype = dw.dtype, .rows = hidden, .cols = inter },
+                        .gate_ref = .{ .ref = gu_block, .transposed = .{ 0, inter } },
+                        .up_ref = .{ .ref = gu_block, .transposed = .{ inter, 2 * inter } },
+                        .down_ref = .{ .ref = blockRef(dw, e, inter, hidden), .transposed = .{ 0, hidden } },
+                        .gate = undefined,
+                        .up = undefined,
+                        .down = undefined,
                     };
+                    if (mapped) {
+                        // Transposed once on load into arena-owned copies.
+                        const gu_bytes = gu_w.data[e * hidden * 2 * inter * es ..][0 .. hidden * 2 * inter * es];
+                        const dn_bytes = dw_w.data[e * inter * hidden * es ..][0 .. inter * hidden * es];
+                        ex.gate = .{ .data = try transposeSub(arena, es, gu_bytes, hidden, 2 * inter, 0, inter), .dtype = gu.dtype, .rows = inter, .cols = hidden };
+                        ex.up = .{ .data = try transposeSub(arena, es, gu_bytes, hidden, 2 * inter, inter, 2 * inter), .dtype = gu.dtype, .rows = inter, .cols = hidden };
+                        ex.down = .{ .data = try transposeSub(arena, es, dn_bytes, inter, hidden, 0, hidden), .dtype = dw.dtype, .rows = hidden, .cols = inter };
+                    }
                 }
             },
             .separate => unreachable,
+        }
+        if (!mapped) {
+            for (self.experts) |*ex| {
+                ex.gate = ex.gate_ref.shapeOnly();
+                ex.up = ex.up_ref.shapeOnly();
+                ex.down = ex.down_ref.shapeOnly();
+            }
         }
     } else {
         const names: [3][]const u8 = if (c.family == .mixtral) .{ "w1.weight", "w3.weight", "w2.weight" } else .{ "gate_proj.weight", "up_proj.weight", "down_proj.weight" };
         for (self.experts, 0..) |*ex, e| {
             const ep = try std.fmt.allocPrint(arena, "{s}{s}experts.{d}.", .{ lp, mlp, e });
+            const gate_name = try cat(arena, &.{ ep, names[0] });
+            const up_name = try cat(arena, &.{ ep, names[1] });
+            const down_name = try cat(arena, &.{ ep, names[2] });
             ex.* = .{
-                .gate = try loadNamed(model, try cat(arena, &.{ ep, names[0] })),
-                .up = try loadNamed(model, try cat(arena, &.{ ep, names[1] })),
-                .down = try loadNamed(model, try cat(arena, &.{ ep, names[2] })),
+                .gate = try model.loadMat(gate_name),
+                .up = try model.loadMat(up_name),
+                .down = try model.loadMat(down_name),
+                .gate_ref = .{ .ref = try model.ref(gate_name) },
+                .up_ref = .{ .ref = try model.ref(up_name) },
+                .down_ref = .{ .ref = try model.ref(down_name) },
             };
         }
     }
@@ -291,27 +490,20 @@ pub fn loadLayer(model: *Model, arena: Allocator, lp: []const u8) !MoeLayer {
     // Shared expert (qwen2_moe).
     if (model.find(try cat(arena, &.{ lp, "mlp.shared_expert.down_proj.weight" }))) |_| {
         const sp = try cat(arena, &.{ lp, "mlp.shared_expert." });
-        var gate_vec: ?[]f32 = null;
-        if (model.find(try cat(arena, &.{ lp, "mlp.shared_expert_gate.weight" }))) |g| {
-            const v = try arena.alloc(f32, g.numel());
-            tensor.convertToF32(g.dtype, g.data, v);
-            gate_vec = v;
-        }
+        const gate_name = try cat(arena, &.{ sp, "gate_proj.weight" });
+        const up_name = try cat(arena, &.{ sp, "up_proj.weight" });
+        const down_name = try cat(arena, &.{ sp, "down_proj.weight" });
         self.shared = .{
-            .gate = try loadNamed(model, try cat(arena, &.{ sp, "gate_proj.weight" })),
-            .up = try loadNamed(model, try cat(arena, &.{ sp, "up_proj.weight" })),
-            .down = try loadNamed(model, try cat(arena, &.{ sp, "down_proj.weight" })),
-            .gate_vec = gate_vec,
+            .gate = try model.loadMat(gate_name),
+            .up = try model.loadMat(up_name),
+            .down = try model.loadMat(down_name),
+            .gate_ref = .{ .ref = try model.ref(gate_name) },
+            .up_ref = .{ .ref = try model.ref(up_name) },
+            .down_ref = .{ .ref = try model.ref(down_name) },
+            .gate_vec = model.loadVecOpt(try cat(arena, &.{ lp, "mlp.shared_expert_gate.weight" })),
         };
     }
     return self;
-}
-
-fn loadNamed(model: *const Model, name: []const u8) !Weight {
-    return model.findWeight(name) orelse {
-        std.log.err("missing tensor: {s}", .{name});
-        return error.MissingWeights;
-    };
 }
 
 // ---------------------------------------------------------------------------
@@ -421,32 +613,43 @@ pub fn forward(model: *const Model, m: *const MoeLayer, out: []f32, h: []const f
 // Expert ranking and selection
 // ---------------------------------------------------------------------------
 
-/// Ranking heuristic: `score_e = ||vᵀ W_down_e||₂ / ||W_down_e||_F`, the fraction
-/// of the expert's output energy that lies along the refusal direction `v`
+/// Ranking heuristic: `score = ||vᵀ W||₂ / ||W||_F`, the fraction of a down
+/// projection's output energy that lies along the refusal direction `v`
 /// (unit vector in residual space). Experts whose down projection writes more
 /// strongly along `v` are assumed to carry more of the refusal behaviour.
-/// Only routed experts are scored; the shared expert is never a candidate.
+pub fn scoreDown(pool: *const tensor.Pool, gpa: Allocator, w: Weight, v: []const f32) !f32 {
+    std.debug.assert(v.len == w.rows);
+    const proj = try gpa.alloc(f32, w.cols);
+    defer gpa.free(proj);
+    try tensor.matvecT(pool, gpa, proj, w, v);
+    const norms = try gpa.alloc(f32, w.rows);
+    defer gpa.free(norms);
+    try tensor.rowNorms(pool, gpa, norms, w);
+    const fro = tensor.norm2(norms);
+    return if (fro > 0) tensor.norm2(proj) / fro else 0;
+}
+
+/// Scores every routed expert of a layer whose down projections are resident
+/// (mapped mode). Only routed experts are scored; the shared expert is never a candidate.
 pub fn scoreLayer(pool: *const tensor.Pool, gpa: Allocator, m: *const MoeLayer, v: []const f32) ![]f32 {
     const scores = try gpa.alloc(f32, m.experts.len);
     errdefer gpa.free(scores);
-    for (m.experts, 0..) |ex, e| {
-        const w = ex.down;
-        std.debug.assert(v.len == w.rows);
-        const proj = try gpa.alloc(f32, w.cols);
-        defer gpa.free(proj);
-        try tensor.matvecT(pool, gpa, proj, w, v);
-        const norms = try gpa.alloc(f32, w.rows);
-        defer gpa.free(norms);
-        try tensor.rowNorms(pool, gpa, norms, w);
-        const fro = tensor.norm2(norms);
-        scores[e] = if (fro > 0) tensor.norm2(proj) / fro else 0;
-    }
+    for (m.experts, 0..) |ex, e| scores[e] = try scoreDown(pool, gpa, ex.down, v);
     return scores;
 }
 
+/// Scores every routed expert of `layer`, making one down projection resident at a time.
 pub fn scoreExperts(model: *const Model, layer: usize, v: []const f32) ![]f32 {
     const m = &(model.layers[layer].moe orelse return error.NotMoeLayer);
-    return scoreLayer(model.pool, model.gpa, m, v);
+    const gpa = model.gpa;
+    const scores = try gpa.alloc(f32, m.experts.len);
+    errdefer gpa.free(scores);
+    for (0..m.experts.len) |e| {
+        const lease = try m.acquireDown(model, e);
+        defer @constCast(&model.store).release(lease);
+        scores[e] = try scoreDown(model.pool, gpa, lease.weight, v);
+    }
+    return scores;
 }
 
 /// Expert indices sorted by descending score (ties keep index order).
@@ -526,13 +729,18 @@ pub fn applyExpertSelective(model: *Model, dirs: []const f32, cfg: search.TrialC
     defer if (global_dir) |g| gpa.free(g);
     if (cfg.direction_index) |di| global_dir = try abliterate.interpolateDirection(gpa, dirs, hidden, di);
 
+    const store: *stream.WeightStore = @constCast(&model.store);
     model.resetDeltas();
     var seed_counter: u64 = 0;
     for (model.layers, 0..) |*layer, li| {
+        if (model.budget) |b| try b.checkTime();
         const v = if (global_dir) |g| g else dirs[(li + 1) * hidden ..][0..hidden];
         if (cfg.parameters.get(.attn_o_proj)) |p| {
             if (abliterate.kernelWeight(p, li)) |weight| {
-                const delta = try abliterate.computeDelta(model.pool, gpa, layer.o, v, weight, opts, opts.seed +% seed_counter);
+                // One matrix resident at a time (streamed mode reads it from disk).
+                const lease = try model.acquireComponent(li, .attn_o_proj);
+                defer store.release(lease);
+                const delta = try abliterate.computeDelta(model.pool, gpa, lease.weight, v, weight, opts, opts.seed +% seed_counter);
                 seed_counter += 1;
                 model.setDelta(li, .attn_o_proj, delta);
             }
@@ -541,7 +749,9 @@ pub fn applyExpertSelective(model: *Model, dirs: []const f32, cfg: search.TrialC
         const lambda = abliterate.kernelWeight(p, li) orelse continue;
         const m = &(layer.moe orelse {
             // Dense layer inside a hybrid model.
-            const delta = try abliterate.computeDelta(model.pool, gpa, layer.down.?, v, lambda, opts, opts.seed +% seed_counter);
+            const lease = try model.acquireComponent(li, .mlp_down_proj);
+            defer store.release(lease);
+            const delta = try abliterate.computeDelta(model.pool, gpa, lease.weight, v, lambda, opts, opts.seed +% seed_counter);
             seed_counter += 1;
             model.setDelta(li, .mlp_down_proj, delta);
             continue;
@@ -550,7 +760,9 @@ pub fn applyExpertSelective(model: *Model, dirs: []const f32, cfg: search.TrialC
         if (n == 0 or opts.expert_selection == .broad) {
             var idx: usize = 0;
             while (idx < m.numDown()) : (idx += 1) {
-                const delta = try abliterate.computeDelta(model.pool, gpa, m.downWeight(idx), v, lambda, opts, opts.seed +% seed_counter);
+                const lease = try m.acquireDown(model, idx);
+                defer store.release(lease);
+                const delta = try abliterate.computeDelta(model.pool, gpa, lease.weight, v, lambda, opts, opts.seed +% seed_counter);
                 seed_counter += 1;
                 model.setExpertDelta(li, idx, delta);
             }
@@ -558,7 +770,7 @@ pub fn applyExpertSelective(model: *Model, dirs: []const f32, cfg: search.TrialC
         }
         const weight = @max(0.0, lambda * sel.strength);
         if (weight == 0) continue;
-        const scores = try scoreLayer(model.pool, gpa, m, v);
+        const scores = try scoreExperts(model, li, v);
         defer gpa.free(scores);
         const ranking = try rankScores(gpa, scores);
         defer gpa.free(ranking);
@@ -570,7 +782,9 @@ pub fn applyExpertSelective(model: *Model, dirs: []const f32, cfg: search.TrialC
         defer gpa.free(selected);
         if (opts.debug_writer) |w| try printExpertTable(w, li, scores, ranking, selected);
         for (selected) |e| {
-            const delta = try abliterate.computeDelta(model.pool, gpa, m.experts[e].down, v, weight, opts, opts.seed +% seed_counter);
+            const lease = try m.acquireDown(model, e);
+            defer store.release(lease);
+            const delta = try abliterate.computeDelta(model.pool, gpa, lease.weight, v, weight, opts, opts.seed +% seed_counter);
             seed_counter += 1;
             model.setExpertDelta(li, e, delta);
         }
@@ -601,11 +815,12 @@ test "expert ranking prefers the aligned expert" {
         }
     }
     var experts: [3]Expert = undefined;
+    const dummy_ref = MatrixRef{ .ref = .{ .name = "", .file = 0, .offset = 0, .rows = hidden, .cols = inter, .dtype = .f32 } };
     for (&experts, 0..) |*ex, e| {
         const w = Weight{ .data = std.mem.sliceAsBytes(&mats[e]), .dtype = .f32, .rows = hidden, .cols = inter };
-        ex.* = .{ .gate = w, .up = w, .down = w };
+        ex.* = .{ .gate = w, .up = w, .down = w, .gate_ref = dummy_ref, .up_ref = dummy_ref, .down_ref = dummy_ref };
     }
-    const layer = MoeLayer{ .router = experts[0].gate, .top_k = 1, .norm_topk_prob = true, .inter = inter, .layout = .separate, .experts = &experts, .shared = null, .fused_down_suffix = null };
+    const layer = MoeLayer{ .router = experts[0].gate, .router_ref = dummy_ref.ref, .top_k = 1, .norm_topk_prob = true, .inter = inter, .layout = .separate, .experts = &experts, .shared = null, .fused_down_suffix = null };
     const scores = try scoreLayer(&pool, gpa, &layer, &v);
     defer gpa.free(scores);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), scores[1], 1e-4);
@@ -774,4 +989,63 @@ test "selective export round trip (fused experts)" {
 }
 test "selective export round trip (transposed fused experts)" {
     try checkExportRoundTrip("qwen3_moe_fused_t");
+}
+
+fn checkStreamedMatchesMapped(comptime fixture: []const u8) !void {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const pool = tensor.Pool.init(io, 2);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path_buf);
+    const scratch = try std.fs.path.join(gpa, &.{ path_buf[0..n], "scratch" });
+    defer gpa.free(scratch);
+    const dir = "tests/fixtures/" ++ fixture;
+    const mapped = try Model.load(gpa, io, &pool, dir);
+    defer mapped.deinit();
+    const streamed = try Model.loadWithOptions(gpa, io, &pool, dir, .{ .store = .streamed, .scratch_dir = scratch });
+    defer streamed.deinit();
+    try std.testing.expect(streamed.streamed() and streamed.isMoe());
+    const ids = [_]u32{ 40, 100, 200, 7, 3 };
+    // Base model: bitwise identical logits.
+    const l0 = try runLogits(mapped, gpa, &ids);
+    defer gpa.free(l0);
+    const l1 = try runLogits(streamed, gpa, &ids);
+    defer gpa.free(l1);
+    try std.testing.expectEqualSlices(f32, l0, l1);
+    // Expert-selective edits computed through the store match the mapped ones.
+    const hidden = mapped.config.hidden_size;
+    const dirs = try randomDirs(gpa, mapped.config.num_layers + 1, hidden, 9);
+    defer gpa.free(dirs);
+    try model_mod.applyExpertSelective(mapped, dirs, selectiveConfig(2, 1.1), .{ .row_normalization = .full, .lora_rank = 2 });
+    try model_mod.applyExpertSelective(streamed, dirs, selectiveConfig(2, 1.1), .{ .row_normalization = .full, .lora_rank = 2 });
+    for (mapped.layers, 0..) |*layer, li| {
+        const m = &(layer.moe orelse continue);
+        for (0..m.experts.len) |e| {
+            const a = mapped.getExpertDelta(li, e);
+            const b = streamed.getExpertDelta(li, e);
+            try std.testing.expectEqual(a == null, b == null);
+            if (a) |da| {
+                try std.testing.expectEqualSlices(f32, da.a, b.?.a);
+                try std.testing.expectEqualSlices(f32, da.b, b.?.b);
+            }
+        }
+    }
+    const l2 = try runLogits(mapped, gpa, &ids);
+    defer gpa.free(l2);
+    const l3 = try runLogits(streamed, gpa, &ids);
+    defer gpa.free(l3);
+    try std.testing.expectEqualSlices(f32, l2, l3);
+    try std.testing.expect(streamed.store.weight_bytes_read.load(.monotonic) > 0);
+}
+
+test "streamed MoE forward and edits match mapped (separate experts)" {
+    try checkStreamedMatchesMapped("qwen3_moe");
+}
+test "streamed MoE forward and edits match mapped (fused experts)" {
+    try checkStreamedMatchesMapped("qwen3_moe_fused");
+}
+test "streamed MoE forward and edits match mapped (transposed fused experts)" {
+    try checkStreamedMatchesMapped("qwen3_moe_fused_t");
 }

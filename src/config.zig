@@ -48,13 +48,13 @@ pub const KlDivergenceSettings = struct {
 };
 
 pub const default_markers = [_][]const u8{
-    "disclaimer",    "sorry",              "i can'",              "i cant",             "i cannot",
-    "i won'",        "i wont",             "i will not",          "i unable",           "im unable",
-    "i'm unable",    "i am unable",        "i an ai",             "im an ai",           "i'm an ai",
-    "i am an ai",    "as an ai",           "ai assistant",        "i designed to",      "im designed to",
-    "i'm designed to", "i am designed to", "i programmed to",     "im programmed to",   "i'm programmed to",
-    "i am programmed to", "violat",        "prohibit",            "illegal",            "harmful",
-    "inappropriate", "unethical",          "ethical boundaries",
+    "disclaimer",         "sorry",            "i can'",             "i cant",           "i cannot",
+    "i won'",             "i wont",           "i will not",         "i unable",         "im unable",
+    "i'm unable",         "i am unable",      "i an ai",            "im an ai",         "i'm an ai",
+    "i am an ai",         "as an ai",         "ai assistant",       "i designed to",    "im designed to",
+    "i'm designed to",    "i am designed to", "i programmed to",    "im programmed to", "i'm programmed to",
+    "i am programmed to", "violat",           "prohibit",           "illegal",          "harmful",
+    "inappropriate",      "unethical",        "ethical boundaries",
 };
 
 pub const default_cot_skips = [_][2][]const u8{
@@ -93,6 +93,17 @@ pub const Settings = struct {
     seed: ?u64 = null,
     study_checkpoint_dir: []const u8 = "checkpoints",
     max_shard_size: u64 = 5 * 1024 * 1024 * 1024,
+    /// Resident-memory budget in bytes for ditch-owned buffers (0 = unlimited; weights are memory-mapped).
+    max_ram: u64 = 0,
+    /// Accepted for CLI compatibility with heretic; unused (there is no GPU backend).
+    max_vram: u64 = 0,
+    /// Directory for spilled activations / KV caches (default: <cache_dir>/scratch or ./scratch).
+    scratch_dir: ?[]const u8 = null,
+    /// Wall-clock limit for the whole run in seconds (null = none).
+    time_limit_seconds: ?u64 = null,
+    /// Override of the memory reserved outside ditch-owned buffers (null = automatic:
+    /// max(10% of max_ram, 256MB), at most half of max_ram).
+    budget_headroom: ?u64 = null,
     system_prompt: []const u8 = "You are a helpful assistant.",
     good_prompts: DatasetSpec = .{ .dataset = "mlabonne/harmless_alpaca", .split = "train[:400]", .column = "text" },
     bad_prompts: DatasetSpec = .{ .dataset = "mlabonne/harmful_behaviors", .split = "train[:400]", .column = "text" },
@@ -131,6 +142,16 @@ pub const help_text =
     \\  --max-response-length <n>      Tokens generated per response (default: 100).
     \\  --response-prefix <text>       Text appended to every prompt (default: auto-detect).
     \\  --system-prompt <text>         System prompt for all prompts.
+    \\
+    \\Resource budget:
+    \\  --max-ram <size>               Keep resident memory under this budget, e.g. 8GB (default: unlimited;
+    \\                                 weights are memory-mapped). With a budget, weights are streamed layer
+    \\                                 by layer from disk and caches spill to --scratch-dir when needed.
+    \\  --max-vram <size>              Accepted for compatibility; unused (CPU-only, no GPU backend).
+    \\  --scratch-dir <path>           Spill directory (default: <cache-dir>/scratch or ./scratch).
+    \\  --time-limit <duration>        Stop cleanly after this long, e.g. 90m, 2h, 1h30m (default: none).
+    \\  --budget-headroom <size>       Memory reserved for everything ditch does not allocate itself
+    \\                                 (default: max(10% of --max-ram, 256MB), at most half of it).
     \\
     \\Abliteration:
     \\  --orthogonalize-direction <bool>      Project directions orthogonal to the good direction (default: true).
@@ -295,6 +316,40 @@ fn parseBool(s: []const u8) !bool {
     return error.InvalidBool;
 }
 
+/// Parses a duration such as "90m", "2h", "1h30m", "45s" or "3600" (seconds) into seconds.
+pub fn parseDuration(s: []const u8) !u64 {
+    const t = std.mem.trim(u8, s, " ");
+    if (t.len == 0) return error.InvalidDuration;
+    var total: u64 = 0;
+    var i: usize = 0;
+    var any = false;
+    while (i < t.len) {
+        var j = i;
+        while (j < t.len and (std.ascii.isDigit(t[j]) or t[j] == '.')) j += 1;
+        if (j == i) return error.InvalidDuration;
+        const num = std.fmt.parseFloat(f64, t[i..j]) catch return error.InvalidDuration;
+        var k = j;
+        while (k < t.len and std.ascii.isAlphabetic(t[k])) k += 1;
+        const unit = t[j..k];
+        const mult: f64 = if (unit.len == 0 or std.ascii.eqlIgnoreCase(unit, "s") or std.ascii.eqlIgnoreCase(unit, "sec"))
+            1
+        else if (std.ascii.eqlIgnoreCase(unit, "m") or std.ascii.eqlIgnoreCase(unit, "min"))
+            60
+        else if (std.ascii.eqlIgnoreCase(unit, "h") or std.ascii.eqlIgnoreCase(unit, "hr"))
+            3600
+        else if (std.ascii.eqlIgnoreCase(unit, "d"))
+            86400
+        else
+            return error.InvalidDuration;
+        if (unit.len == 0 and k != t.len) return error.InvalidDuration;
+        total += @intFromFloat(num * mult);
+        any = true;
+        i = k;
+    }
+    if (!any) return error.InvalidDuration;
+    return total;
+}
+
 pub fn parseSize(s: []const u8) !u64 {
     var end = s.len;
     while (end > 0 and !std.ascii.isDigit(s[end - 1]) and s[end - 1] != '.') end -= 1;
@@ -312,7 +367,7 @@ fn applyDatasetOption(a: Allocator, spec: *DatasetSpec, field: []const u8, value
 
 fn applyOption(a: Allocator, s: *Settings, key: []const u8, value: []const u8) !void {
     const eql = std.mem.eql;
-    if (eql(u8, key, "model")) s.model = try a.dupe(u8, value) else if (eql(u8, key, "model_commit")) s.model_commit = try a.dupe(u8, value) else if (eql(u8, key, "evaluate_model")) s.evaluate_model = try a.dupe(u8, value) else if (eql(u8, key, "threads")) s.threads = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "cache_dir")) s.cache_dir = try a.dupe(u8, value) else if (eql(u8, key, "chat_template")) s.chat_template = try a.dupe(u8, value) else if (eql(u8, key, "batch_size")) s.batch_size = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "max_batch_size")) s.max_batch_size = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "max_response_length")) s.max_response_length = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "response_prefix")) s.response_prefix = try a.dupe(u8, value) else if (eql(u8, key, "system_prompt")) s.system_prompt = try a.dupe(u8, value) else if (eql(u8, key, "print_debug_information")) s.print_debug_information = try parseBool(value) else if (eql(u8, key, "print_residual_geometry")) s.print_residual_geometry = try parseBool(value) else if (eql(u8, key, "orthogonalize_direction")) s.orthogonalize_direction = try parseBool(value) else if (eql(u8, key, "row_normalization")) s.row_normalization = abliterate.RowNormalization.parse(value) orelse return error.InvalidEnum else if (eql(u8, key, "full_normalization_lora_rank")) s.full_normalization_lora_rank = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "expert_selection")) s.expert_selection = abliterate.ExpertSelection.parse(value) orelse return error.InvalidEnum else if (eql(u8, key, "winsorization_quantile")) s.winsorization_quantile = try std.fmt.parseFloat(f32, value) else if (eql(u8, key, "n_trials")) s.n_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_startup_trials")) s.n_startup_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "seed")) s.seed = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "study_checkpoint_dir")) s.study_checkpoint_dir = try a.dupe(u8, value) else if (eql(u8, key, "max_shard_size")) s.max_shard_size = try parseSize(value) else if (eql(u8, key, "checkpoint_action")) s.checkpoint_action = try a.dupe(u8, value) else if (eql(u8, key, "trial_index")) s.trial_index = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_additional_trials")) s.n_additional_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "model_action")) s.model_action = try a.dupe(u8, value) else if (eql(u8, key, "save_directory")) s.save_directory = try a.dupe(u8, value) else if (eql(u8, key, "export_dtype")) s.export_dtype = try a.dupe(u8, value) else if (eql(u8, key, "config")) {
+    if (eql(u8, key, "model")) s.model = try a.dupe(u8, value) else if (eql(u8, key, "model_commit")) s.model_commit = try a.dupe(u8, value) else if (eql(u8, key, "evaluate_model")) s.evaluate_model = try a.dupe(u8, value) else if (eql(u8, key, "threads")) s.threads = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "cache_dir")) s.cache_dir = try a.dupe(u8, value) else if (eql(u8, key, "chat_template")) s.chat_template = try a.dupe(u8, value) else if (eql(u8, key, "batch_size")) s.batch_size = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "max_batch_size")) s.max_batch_size = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "max_response_length")) s.max_response_length = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "response_prefix")) s.response_prefix = try a.dupe(u8, value) else if (eql(u8, key, "system_prompt")) s.system_prompt = try a.dupe(u8, value) else if (eql(u8, key, "print_debug_information")) s.print_debug_information = try parseBool(value) else if (eql(u8, key, "print_residual_geometry")) s.print_residual_geometry = try parseBool(value) else if (eql(u8, key, "orthogonalize_direction")) s.orthogonalize_direction = try parseBool(value) else if (eql(u8, key, "row_normalization")) s.row_normalization = abliterate.RowNormalization.parse(value) orelse return error.InvalidEnum else if (eql(u8, key, "full_normalization_lora_rank")) s.full_normalization_lora_rank = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "expert_selection")) s.expert_selection = abliterate.ExpertSelection.parse(value) orelse return error.InvalidEnum else if (eql(u8, key, "winsorization_quantile")) s.winsorization_quantile = try std.fmt.parseFloat(f32, value) else if (eql(u8, key, "n_trials")) s.n_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_startup_trials")) s.n_startup_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "seed")) s.seed = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "study_checkpoint_dir")) s.study_checkpoint_dir = try a.dupe(u8, value) else if (eql(u8, key, "max_shard_size")) s.max_shard_size = try parseSize(value) else if (eql(u8, key, "max_ram")) s.max_ram = try parseSize(value) else if (eql(u8, key, "max_vram")) s.max_vram = try parseSize(value) else if (eql(u8, key, "scratch_dir")) s.scratch_dir = try a.dupe(u8, value) else if (eql(u8, key, "time_limit")) s.time_limit_seconds = try parseDuration(value) else if (eql(u8, key, "time_limit_seconds")) s.time_limit_seconds = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "budget_headroom")) s.budget_headroom = try parseSize(value) else if (eql(u8, key, "checkpoint_action")) s.checkpoint_action = try a.dupe(u8, value) else if (eql(u8, key, "trial_index")) s.trial_index = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_additional_trials")) s.n_additional_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "model_action")) s.model_action = try a.dupe(u8, value) else if (eql(u8, key, "save_directory")) s.save_directory = try a.dupe(u8, value) else if (eql(u8, key, "export_dtype")) s.export_dtype = try a.dupe(u8, value) else if (eql(u8, key, "config")) {
         // handled in the first pass
     } else if (eql(u8, key, "help")) s.help = try parseBool(value) else if (eql(u8, key, "version")) s.version = try parseBool(value) else if (eql(u8, key, "keyword_rate_print_responses")) s.keyword_rate.print_responses = try parseBool(value) else if (eql(u8, key, "keyword_rate_score_name")) s.keyword_rate.score_name = try a.dupe(u8, value) else if (std.mem.startsWith(u8, key, "good_prompts_")) try applyDatasetOption(a, &s.good_prompts, key["good_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "bad_prompts_")) try applyDatasetOption(a, &s.bad_prompts, key["bad_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "keyword_rate_prompts_")) try applyDatasetOption(a, &s.keyword_rate.prompts, key["keyword_rate_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "kl_divergence_prompts_")) try applyDatasetOption(a, &s.kl_divergence.prompts, key["kl_divergence_prompts_".len..], value) else return error.UnknownOption;
 }
@@ -415,6 +470,46 @@ test "parse size" {
     try std.testing.expectEqual(@as(u64, 5 * 1024 * 1024 * 1024), try parseSize("5GB"));
     try std.testing.expectEqual(@as(u64, 1536), try parseSize("1.5KB"));
     try std.testing.expectEqual(@as(u64, 42), try parseSize("42"));
+    try std.testing.expectEqual(@as(u64, 8 << 30), try parseSize("8G"));
+    try std.testing.expectEqual(@as(u64, 512 << 20), try parseSize("512 MB"));
+    try std.testing.expectError(error.InvalidSize, parseSize("8TB"));
+    try std.testing.expectError(error.InvalidSize, parseSize("abc"));
+}
+
+test "parse duration" {
+    try std.testing.expectEqual(@as(u64, 90 * 60), try parseDuration("90m"));
+    try std.testing.expectEqual(@as(u64, 2 * 3600), try parseDuration("2h"));
+    try std.testing.expectEqual(@as(u64, 5400), try parseDuration("1h30m"));
+    try std.testing.expectEqual(@as(u64, 45), try parseDuration("45s"));
+    try std.testing.expectEqual(@as(u64, 3600), try parseDuration("3600"));
+    try std.testing.expectEqual(@as(u64, 90), try parseDuration("1.5min"));
+    try std.testing.expectError(error.InvalidDuration, parseDuration("2x"));
+    try std.testing.expectError(error.InvalidDuration, parseDuration(""));
+    try std.testing.expectError(error.InvalidDuration, parseDuration("m"));
+}
+
+test "budget options" {
+    const gpa = std.testing.allocator;
+    const args = [_][]const u8{ "ditch", "--max-ram", "8GB", "--max-vram=24GB", "--time-limit", "90m", "--scratch-dir", "/tmp/x", "--budget-headroom", "0", "m" };
+    var r = try load(gpa, std.testing.io, &args);
+    defer r.deinit();
+    try std.testing.expectEqual(@as(usize, 0), r.errors.len);
+    try std.testing.expectEqual(@as(u64, 8 << 30), r.settings.max_ram);
+    try std.testing.expectEqual(@as(?u64, 0), r.settings.budget_headroom);
+    try std.testing.expectEqual(@as(u64, 24 << 30), r.settings.max_vram);
+    try std.testing.expectEqual(@as(?u64, 5400), r.settings.time_limit_seconds);
+    try std.testing.expectEqualStrings("/tmp/x", r.settings.scratch_dir.?);
+    // TOML values go through the same parser.
+    var parsed = try toml.parse(gpa, "max_ram = \"2GB\"\ntime_limit = \"2h\"\n");
+    defer parsed.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var s = Settings{};
+    var errors = std.ArrayList([]const u8).empty;
+    try applyToml(arena.allocator(), &s, parsed.root, &errors);
+    try std.testing.expectEqual(@as(usize, 0), errors.items.len);
+    try std.testing.expectEqual(@as(u64, 2 << 30), s.max_ram);
+    try std.testing.expectEqual(@as(?u64, 7200), s.time_limit_seconds);
 }
 
 test "cli parsing" {

@@ -1,11 +1,18 @@
 //! Transformer model loading and inference for Llama-family models
 //! (Llama 2/3, Mistral, Qwen 2/2.5/3, Gemma 2/3 text) and their
 //! mixture-of-experts variants (Mixtral, Qwen2-MoE, Qwen3-MoE; see moe.zig).
+//!
+//! Weights are accessed through a `stream.WeightStore`: memory-mapped by
+//! default, or streamed layer by layer from disk under a memory budget
+//! (`LoadOptions`), in which case `forward` keeps one layer (plus a prefetched
+//! one) resident at a time.
 
 const std = @import("std");
 const Io = std.Io;
 const tensor = @import("tensor.zig");
 const safetensors = @import("safetensors.zig");
+const stream = @import("stream.zig");
+const budget_mod = @import("budget.zig");
 const Tokenizer = @import("tokenizer.zig").Tokenizer;
 const moe = @import("moe.zig");
 const abliterate = @import("abliterate.zig");
@@ -14,6 +21,7 @@ const search = @import("search.zig");
 const Allocator = std.mem.Allocator;
 const Weight = tensor.Weight;
 const Delta = tensor.Delta;
+const WeightRef = stream.WeightRef;
 
 pub const Family = enum {
     llama,
@@ -241,6 +249,47 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
 // Weights
 // ---------------------------------------------------------------------------
 
+/// Where a layer's matrices live on disk. `Model.acquireLayer` turns these
+/// into resident `Weight` views for the duration of one layer's compute.
+/// Dense layers carry `gate`/`up`/`down`; mixture-of-experts layers carry the
+/// `router` instead (the expert matrices are described by `Layer.moe`).
+pub const LayerRefs = struct {
+    q: WeightRef,
+    k: WeightRef,
+    v: WeightRef,
+    o: WeightRef,
+    gate: ?WeightRef = null,
+    up: ?WeightRef = null,
+    down: ?WeightRef = null,
+    router: ?WeightRef = null,
+
+    pub const max = 8;
+
+    /// The refs in a fixed order (q, k, v, o, then gate, up, down or router).
+    pub fn all(self: *const LayerRefs, buf: *[max]WeightRef) []WeightRef {
+        buf[0] = self.q;
+        buf[1] = self.k;
+        buf[2] = self.v;
+        buf[3] = self.o;
+        var n: usize = 4;
+        inline for (.{ self.gate, self.up, self.down, self.router }) |opt| {
+            if (opt) |r| {
+                buf[n] = r;
+                n += 1;
+            }
+        }
+        return buf[0..n];
+    }
+
+    /// Bytes of the attention / dense-MLP / router matrices (expert matrices excluded).
+    pub fn bytes(self: *const LayerRefs) u64 {
+        var buf: [max]WeightRef = undefined;
+        var total: u64 = 0;
+        for (self.all(&buf)) |r| total += r.byteLen();
+        return total;
+    }
+};
+
 pub const Layer = struct {
     input_norm: []f32,
     post_attn_norm: []f32,
@@ -256,14 +305,60 @@ pub const Layer = struct {
     k_bias: ?[]f32,
     v_bias: ?[]f32,
     /// Dense MLP (null for mixture-of-experts layers).
+    ///
+    /// In mapped mode the `Weight` fields of a layer view the mapping and are
+    /// always valid. In streamed mode they carry only the shape (empty data)
+    /// and the resident views live in the `Layer` copy returned by
+    /// `Model.acquireLayer`.
     gate: ?Weight,
     up: ?Weight,
     down: ?Weight,
     /// Routed mixture of experts (null for dense layers).
     moe: ?moe.MoeLayer = null,
+    refs: LayerRefs,
     /// Abliteration deltas (null = identity). Expert deltas live in `moe`.
     o_delta: ?Delta = null,
     down_delta: ?Delta = null,
+
+    /// Bytes that must be resident to run this layer (attention, MLP or
+    /// router plus every expert, and the transient needed to transpose fused
+    /// expert blocks in streamed mode).
+    pub fn residentBytes(self: *const Layer) u64 {
+        var total = self.refs.bytes();
+        if (self.moe) |*m| total += m.residentBytes();
+        return total;
+    }
+};
+
+/// A layer whose matrices are resident. `layer` is a copy of the model's
+/// `Layer` with valid `Weight` views; release it when done with the layer.
+pub const LayerLease = struct {
+    model: *const Model,
+    layer: Layer,
+    leases: [LayerRefs.max]stream.Lease,
+    n_leases: usize,
+    experts: ?moe.MoeLease = null,
+
+    pub fn release(self: *LayerLease) void {
+        const store: *stream.WeightStore = @constCast(&self.model.store);
+        if (self.experts) |*e| e.release(store);
+        store.releaseSet(self.leases[0..self.n_leases]);
+    }
+};
+
+/// Options for `Model.loadWithOptions`. The default preserves the historical
+/// behaviour (memory-mapped weights, no budget).
+pub const LoadOptions = struct {
+    store: stream.Mode = .mapped,
+    /// When set, weight buffers, deltas and runtime buffers allocated through
+    /// `model.gpa` come from the budget's allocator.
+    budget: ?*budget_mod.Budget = null,
+    /// Directory for spilled activations / KV caches (default: the budget's, else "scratch").
+    scratch_dir: ?[]const u8 = null,
+    /// Read the next layer's weights while the current one computes (streamed mode).
+    prefetch: bool = true,
+    /// Always spill activations and KV caches to scratch (testing aid).
+    spill_always: bool = false,
 };
 
 /// The two abliterable components, named as in heretic.
@@ -288,17 +383,33 @@ pub const Component = enum {
 };
 
 pub const Model = struct {
+    /// Runtime allocator (the budget's allocator when loaded with a budget).
     gpa: Allocator,
+    /// Allocator for metadata (tokenizer, config, rope tables, this struct).
+    meta_gpa: Allocator,
     io: Io,
     pool: *const tensor.Pool,
     arena: std.heap.ArenaAllocator,
     config: Config,
     tokenizer: *Tokenizer,
     files: []*safetensors.File,
+    /// Weight access (mapped or streamed) over `files`. The forward pass takes
+    /// `*const Model` but acquiring weights mutates the store (buffer pool,
+    /// prefetch state); since a `Model` always lives on the heap this is done
+    /// through `@constCast` in `acquireLayer` & co.
+    store: stream.WeightStore,
+    budget: ?*budget_mod.Budget,
+    scratch_dir: []const u8,
     /// Tensor name prefix for the language model (e.g. "model." or "language_model.model.").
     prefix: []const u8,
+    /// Shape-valid always; data valid only in mapped mode (use `embedRow` / `acquireLmHead`).
     embed: Weight,
     lm_head: Weight,
+    embed_ref: WeightRef,
+    lm_head_ref: WeightRef,
+    largest_layer_bytes: u64,
+    largest_tensor_bytes: u64,
+    spill_always: bool,
     final_norm: []f32,
     layers: []Layer,
     eos_ids: []u32,
@@ -320,18 +431,40 @@ pub const Model = struct {
 
     pub fn deinit(self: *Model) void {
         self.resetDeltas();
-        for (self.files) |f| f.close(self.gpa, self.io);
+        self.store.deinit();
+        for (self.files) |f| f.close(self.meta_gpa, self.io);
         self.tokenizer.deinit();
         self.arena.deinit();
-        self.gpa.destroy(self);
+        self.meta_gpa.destroy(self);
+    }
+
+    pub fn streamed(self: *const Model) bool {
+        return self.store.mode == .streamed;
+    }
+
+    /// Bytes of weights that must be resident at once in streamed mode
+    /// (one layer plus a prefetched one, or the LM head, whichever is larger).
+    pub fn residentWeightNeed(self: *const Model) u64 {
+        if (!self.streamed()) return 0;
+        const layers = if (self.store.prefetch_enabled) 2 * self.largest_layer_bytes else self.largest_layer_bytes;
+        return @max(layers, self.lm_head_ref.byteLen());
     }
 
     /// Loads a model from a local directory containing config.json, tokenizer.json and safetensors files.
     pub fn load(gpa: Allocator, io: Io, pool: *const tensor.Pool, dir_path: []const u8) !*Model {
+        return loadWithOptions(gpa, io, pool, dir_path, .{});
+    }
+
+    /// Loads a model with an explicit weight store mode and optional memory budget.
+    /// `gpa` is used for metadata; runtime buffers use `opts.budget` when given.
+    pub fn loadWithOptions(gpa: Allocator, io: Io, pool: *const tensor.Pool, dir_path: []const u8, opts: LoadOptions) !*Model {
         const self = try gpa.create(Model);
         errdefer gpa.destroy(self);
         self.* = undefined;
-        self.gpa = gpa;
+        self.meta_gpa = gpa;
+        self.gpa = if (opts.budget) |b| b.allocator() else gpa;
+        self.budget = opts.budget;
+        self.spill_always = opts.spill_always;
         self.io = io;
         self.pool = pool;
         self.arena = std.heap.ArenaAllocator.init(gpa);
@@ -340,8 +473,13 @@ pub const Model = struct {
 
         var dir = try Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
         defer dir.close(io);
+        if (dir.access(io, export_incomplete_marker, .{})) |_| {
+            std.log.warn("{s} contains {s}: the export did not finish; refusing to load it", .{ dir_path, export_incomplete_marker });
+            return error.IncompleteModel;
+        } else |_| {}
 
         self.source_dir = try arena.dupe(u8, dir_path);
+        self.scratch_dir = try arena.dupe(u8, opts.scratch_dir orelse (if (opts.budget) |b| b.scratch_dir else "scratch"));
         self.config_json = try dir.readFileAlloc(io, "config.json", arena, .unlimited);
         self.config = try parseConfig(arena, self.config_json);
         self.generation_config_json = dir.readFileAlloc(io, "generation_config.json", arena, .unlimited) catch null;
@@ -427,9 +565,12 @@ pub const Model = struct {
                 std.log.err("no .safetensors files found in {s}", .{dir_path});
                 return error.MissingWeights;
             }
-            for (names.items) |n| try files.append(arena, try safetensors.File.open(gpa, io, dir, n));
+            for (names.items) |n| try files.append(arena, try safetensors.File.openOptions(gpa, io, dir, n, .{ .map = opts.store == .mapped }));
         }
         self.files = files.items;
+        self.store = stream.WeightStore.init(self.gpa, io, self.files, opts.store, .{ .budget = opts.budget, .prefetch = opts.prefetch });
+        self.store.registerReclaim();
+        errdefer self.store.deinit();
 
         // Detect prefix.
         const prefixes = [_][]const u8{ "model.", "language_model.model.", "model.language_model.", "" };
@@ -445,17 +586,25 @@ pub const Model = struct {
         }
         if (!found_prefix) return error.MissingWeights;
 
-        const embed_t = self.find(try std.fmt.allocPrint(arena, "{s}embed_tokens.weight", .{self.prefix})).?;
-        self.embed = embed_t.asWeight();
-        self.dtype = embed_t.dtype;
+        const embed_name = try std.fmt.allocPrint(arena, "{s}embed_tokens.weight", .{self.prefix});
+        self.embed_ref = self.store.lookup(embed_name).?;
+        self.embed = try self.loadMat(embed_name);
+        self.dtype = self.embed_ref.dtype;
         if (self.config.vocab_size == 0) self.config.vocab_size = self.embed.rows;
         self.final_norm = try self.loadVec(try std.fmt.allocPrint(arena, "{s}norm.weight", .{self.prefix}));
-        if (self.find("lm_head.weight")) |lm| {
-            self.lm_head = lm.asWeight();
-        } else if (self.find(try std.fmt.allocPrint(arena, "{s}lm_head.weight", .{std.mem.trimEnd(u8, self.prefix, "model.")}))) |lm| {
-            self.lm_head = lm.asWeight();
+        if (self.store.lookup("lm_head.weight")) |lm| {
+            self.lm_head_ref = lm;
+        } else if (self.store.lookup(try std.fmt.allocPrint(arena, "{s}lm_head.weight", .{std.mem.trimEnd(u8, self.prefix, "model.")}))) |lm| {
+            self.lm_head_ref = lm;
         } else {
-            self.lm_head = self.embed;
+            self.lm_head_ref = self.embed_ref;
+        }
+        self.lm_head = try self.loadMat(self.lm_head_ref.name);
+
+        self.largest_tensor_bytes = 0;
+        for (self.files) |f| {
+            var it = f.tensors.iterator();
+            while (it.next()) |kv| self.largest_tensor_bytes = @max(self.largest_tensor_bytes, kv.value_ptr.byte_len);
         }
 
         const c = &self.config;
@@ -479,18 +628,105 @@ pub const Model = struct {
                 .gate = null,
                 .up = null,
                 .down = null,
+                .refs = .{
+                    .q = try self.ref(try cat(arena, lp, "self_attn.q_proj.weight")),
+                    .k = try self.ref(try cat(arena, lp, "self_attn.k_proj.weight")),
+                    .v = try self.ref(try cat(arena, lp, "self_attn.v_proj.weight")),
+                    .o = try self.ref(try cat(arena, lp, "self_attn.o_proj.weight")),
+                },
             };
             if (c.moe_layers[i]) {
                 layer.moe = try moe.loadLayer(self, arena, lp);
+                layer.refs.router = layer.moe.?.router_ref;
             } else {
                 layer.gate = try self.loadMat(try cat(arena, lp, "mlp.gate_proj.weight"));
                 layer.up = try self.loadMat(try cat(arena, lp, "mlp.up_proj.weight"));
                 layer.down = try self.loadMat(try cat(arena, lp, "mlp.down_proj.weight"));
+                layer.refs.gate = try self.ref(try cat(arena, lp, "mlp.gate_proj.weight"));
+                layer.refs.up = try self.ref(try cat(arena, lp, "mlp.up_proj.weight"));
+                layer.refs.down = try self.ref(try cat(arena, lp, "mlp.down_proj.weight"));
             }
+        }
+        self.largest_layer_bytes = 0;
+        for (self.layers) |*layer| self.largest_layer_bytes = @max(self.largest_layer_bytes, layer.residentBytes());
+        if (opts.budget) |b| {
+            // Prefetching needs two layers resident; disable it up front when that cannot fit.
+            if (b.limited() and b.limitBytes() < 2 * self.largest_layer_bytes + self.lm_head_ref.byteLen()) self.store.prefetch_enabled = false;
         }
 
         try self.buildRope();
         return self;
+    }
+
+    /// Locates a tensor by name in the store.
+    pub fn ref(self: *const Model, name: []const u8) !WeightRef {
+        return self.store.lookup(name) orelse {
+            std.log.err("missing tensor: {s}", .{name});
+            return error.MissingWeights;
+        };
+    }
+
+    /// Makes layer `li`'s matrices resident (view in mapped mode, budgeted
+    /// buffers in streamed mode) and starts prefetching layer `li + 1`.
+    ///
+    /// For a mixture-of-experts layer every expert matrix is acquired as well
+    /// (one lease per matrix, sliced out of the stacked tensor for the fused
+    /// layouts), so a layer is read from disk once per forward call; the
+    /// experts are released together with the layer.
+    pub fn acquireLayer(self: *const Model, li: usize) !LayerLease {
+        const store: *stream.WeightStore = @constCast(&self.store);
+        var lease = LayerLease{ .model = self, .layer = self.layers[li], .leases = undefined, .n_leases = 0 };
+        var buf: [LayerRefs.max]WeightRef = undefined;
+        const refs = self.layers[li].refs.all(&buf);
+        try store.acquireSet(li, refs, lease.leases[0..refs.len]);
+        lease.n_leases = refs.len;
+        errdefer store.releaseSet(lease.leases[0..lease.n_leases]);
+        const l = &lease.layer;
+        l.q = lease.leases[0].weight;
+        l.k = lease.leases[1].weight;
+        l.v = lease.leases[2].weight;
+        l.o = lease.leases[3].weight;
+        if (l.moe) |*m| {
+            m.router = lease.leases[4].weight;
+            lease.experts = try moe.acquireLayer(self, m);
+            l.moe = lease.experts.?.layer;
+        } else {
+            l.gate = lease.leases[4].weight;
+            l.up = lease.leases[5].weight;
+            l.down = lease.leases[6].weight;
+        }
+        if (li + 1 < self.layers.len) {
+            var next_buf: [LayerRefs.max]WeightRef = undefined;
+            store.prefetch(li + 1, self.layers[li + 1].refs.all(&next_buf));
+        }
+        return lease;
+    }
+
+    /// Makes one abliterable matrix resident; release with `self.store.release`.
+    /// For `.mlp_down_proj` on a mixture-of-experts layer use `acquireExpertDown`.
+    pub fn acquireComponent(self: *const Model, layer: usize, comp: Component) !stream.Lease {
+        const store: *stream.WeightStore = @constCast(&self.store);
+        return store.acquire(switch (comp) {
+            .attn_o_proj => self.layers[layer].refs.o,
+            .mlp_down_proj => self.layers[layer].refs.down.?,
+        });
+    }
+
+    /// Makes the down projection of expert `expert` of an MoE layer resident
+    /// (the shared expert, if any, is index `experts.len`); release with `self.store.release`.
+    pub fn acquireExpertDown(self: *const Model, layer: usize, expert: usize) !stream.Lease {
+        return self.layers[layer].moe.?.acquireDown(self, expert);
+    }
+
+    pub fn acquireLmHead(self: *const Model) !stream.Lease {
+        const store: *stream.WeightStore = @constCast(&self.store);
+        return store.acquire(self.lm_head_ref);
+    }
+
+    /// Reads embedding row `t` as f32 (a positional read in streamed mode).
+    pub fn embedRow(self: *const Model, t: u32, out: []f32) !void {
+        const store: *stream.WeightStore = @constCast(&self.store);
+        try store.readRow(self.embed_ref, @min(t, self.embed_ref.rows - 1), out);
     }
 
     fn cat(arena: Allocator, a: []const u8, b: []const u8) ![]const u8 {
@@ -504,16 +740,13 @@ pub const Model = struct {
         return null;
     }
 
-    /// Matrix view of a named tensor, or null if absent.
-    pub fn findWeight(self: *const Model, name: []const u8) ?Weight {
-        const t = self.find(name) orelse return null;
-        return t.asWeight();
-    }
-
-    fn loadMat(self: *Model, name: []const u8) !Weight {
-        return self.findWeight(name) orelse {
-            std.log.err("missing tensor: {s}", .{name});
-            return error.MissingWeights;
+    /// Matrix view of a named tensor: the mapping in mapped mode, the shape
+    /// only (empty data) in streamed mode.
+    pub fn loadMat(self: *Model, name: []const u8) !Weight {
+        const r = try self.ref(name);
+        return switch (self.store.mode) {
+            .mapped => self.find(name).?.asWeight(),
+            .streamed => r.shapeOnly(),
         };
     }
 
@@ -524,11 +757,10 @@ pub const Model = struct {
         };
     }
 
-    fn loadVecOpt(self: *Model, name: []const u8) ?[]f32 {
-        const t = self.find(name) orelse return null;
-        const out = self.arena.allocator().alloc(f32, t.numel()) catch return null;
-        tensor.convertToF32(t.dtype, t.data, out);
-        return out;
+    /// Reads a small tensor as an f32 vector (null if absent).
+    pub fn loadVecOpt(self: *Model, name: []const u8) ?[]f32 {
+        const r = self.store.lookup(name) orelse return null;
+        return self.store.readVecF32(self.arena.allocator(), r) catch null;
     }
 
     fn buildRope(self: *Model) !void {
@@ -611,7 +843,9 @@ pub const Model = struct {
         }
     }
 
-    /// Weight of a dense component. For `.mlp_down_proj` on an MoE layer use `expertDownWeight`.
+    /// The matrix view for a dense abliterable component. Valid data only in
+    /// mapped mode; in streamed mode use `acquireComponent`. For
+    /// `.mlp_down_proj` on an MoE layer use `expertDownWeight`.
     pub fn componentWeight(self: *const Model, layer: usize, comp: Component) Weight {
         return switch (comp) {
             .attn_o_proj => self.layers[layer].o,
@@ -619,8 +853,8 @@ pub const Model = struct {
         };
     }
 
-    /// Down projection of routed expert `expert` of an MoE layer; the shared
-    /// expert (if any) is addressed by index `experts.len`.
+    /// Down projection of routed expert `expert` of an MoE layer (data valid in
+    /// mapped mode only); the shared expert (if any) is addressed by index `experts.len`.
     pub fn expertDownWeight(self: *const Model, layer: usize, expert: usize) Weight {
         return self.layers[layer].moe.?.downWeight(expert);
     }
@@ -681,19 +915,44 @@ pub const Model = struct {
     }
 };
 
+/// Marker file written by the exporter before any shard and removed only when
+/// the export completed; a directory containing it is refused by `Model.load`.
+pub const export_incomplete_marker = ".incomplete";
+
+/// Layer index encoded in a tensor name (`<prefix>layers.<n>.…`), if any.
+pub fn layerIndexOf(prefix: []const u8, name: []const u8) ?usize {
+    if (!std.mem.startsWith(u8, name, prefix)) return null;
+    const rest = name[prefix.len..];
+    if (!std.mem.startsWith(u8, rest, "layers.")) return null;
+    const after = rest["layers.".len..];
+    const dot = std.mem.indexOfScalar(u8, after, '.') orelse return null;
+    return std.fmt.parseInt(usize, after[0..dot], 10) catch null;
+}
+
 // ---------------------------------------------------------------------------
 // Inference
 // ---------------------------------------------------------------------------
 
+/// Key/value cache `[layer][batch][pos][kv_dim]`. Either fully in RAM or, when
+/// the budget does not allow that, in a scratch file with only the current
+/// layer's slice resident (`beginLayer` loads it, `endLayer` writes it back).
+/// In scratch mode every layer visit costs one read + one write of the
+/// layer's `[batch][high_water][kv_dim]` region, on top of the weight reads.
 pub const KvCache = struct {
     gpa: Allocator,
     batch: usize,
     max_len: usize,
     kv_dim: usize,
     layers: usize,
-    /// [layer][batch][pos][kv_dim]
+    /// RAM mode: [layer][batch][pos][kv_dim]. Scratch mode: [batch][pos][kv_dim] of `current_layer`.
     k: []f32,
     v: []f32,
+    scratch: ?stream.ScratchFile = null,
+    current_layer: usize = 0,
+    /// Highest `pos + 1` ever written (bounds scratch traffic).
+    high_water: usize = 0,
+    /// Scratch mode: per layer, how many positions have been written to the file.
+    layer_written: []usize = &.{},
 
     pub fn init(gpa: Allocator, layers: usize, batch: usize, max_len: usize, kv_dim: usize) !KvCache {
         const n = layers * batch * max_len * kv_dim;
@@ -703,20 +962,102 @@ pub const KvCache = struct {
         return .{ .gpa = gpa, .batch = batch, .max_len = max_len, .kv_dim = kv_dim, .layers = layers, .k = k, .v = v };
     }
 
+    /// A cache backed by a scratch file; only one layer is resident at a time.
+    pub fn initScratch(gpa: Allocator, io: Io, scratch_dir: []const u8, budget: ?*budget_mod.Budget, layers: usize, batch: usize, max_len: usize, kv_dim: usize) !KvCache {
+        const n = batch * max_len * kv_dim;
+        const k = try gpa.alloc(f32, n);
+        errdefer gpa.free(k);
+        const v = try gpa.alloc(f32, n);
+        errdefer gpa.free(v);
+        @memset(k, 0);
+        @memset(v, 0);
+        const lw = try gpa.alloc(usize, layers);
+        errdefer gpa.free(lw);
+        @memset(lw, 0);
+        const sf = try stream.ScratchFile.create(io, scratch_dir, budget);
+        return .{ .gpa = gpa, .batch = batch, .max_len = max_len, .kv_dim = kv_dim, .layers = layers, .k = k, .v = v, .scratch = sf, .layer_written = lw };
+    }
+
+    pub fn bytesFor(layers: usize, batch: usize, max_len: usize, kv_dim: usize) u64 {
+        return @as(u64, layers) * batch * max_len * kv_dim * 4 * 2;
+    }
+
+    /// Picks RAM or scratch backing depending on the model's budget.
+    pub fn initFor(model: *const Model, gpa: Allocator, batch: usize, max_len: usize) !KvCache {
+        const c = &model.config;
+        const kvd = c.num_kv_heads * c.head_dim;
+        if (model.spill_always) return initScratch(gpa, model.io, model.scratch_dir, model.budget, c.num_layers, batch, max_len, kvd);
+        if (model.budget) |b| {
+            const need = bytesFor(c.num_layers, batch, max_len, kvd) + model.residentWeightNeed();
+            if (b.limited() and !b.fits(need)) {
+                return initScratch(gpa, model.io, model.scratch_dir, b, c.num_layers, batch, max_len, kvd);
+            }
+        }
+        return init(gpa, c.num_layers, batch, max_len, kvd) catch |err| switch (err) {
+            error.OutOfMemory => if (model.streamed()) initScratch(gpa, model.io, model.scratch_dir, model.budget, c.num_layers, batch, max_len, kvd) else err,
+        };
+    }
+
     pub fn deinit(self: *KvCache) void {
         self.gpa.free(self.k);
         self.gpa.free(self.v);
+        if (self.scratch) |*s| s.deinit();
+        if (self.layer_written.len > 0) self.gpa.free(self.layer_written);
+    }
+
+    pub fn spilled(self: *const KvCache) bool {
+        return self.scratch != null;
     }
 
     inline fn index(self: *const KvCache, layer: usize, b: usize, pos: usize) usize {
-        return ((layer * self.batch + b) * self.max_len + pos) * self.kv_dim;
+        const l = if (self.scratch != null) 0 else layer;
+        return ((l * self.batch + b) * self.max_len + pos) * self.kv_dim;
+    }
+
+    fn scratchIndex(self: *const KvCache, layer: usize, b: usize, which: usize) u64 {
+        // Layout in the scratch file: [layer][k/v][batch][max_len][kv_dim] floats.
+        return ((@as(u64, layer) * 2 + which) * self.batch + b) * self.max_len * self.kv_dim;
+    }
+
+    /// Loads `layer`'s slice into RAM (scratch mode only).
+    pub fn beginLayer(self: *KvCache, layer: usize) !void {
+        const s = &(self.scratch orelse return);
+        self.current_layer = layer;
+        const n = self.layer_written[layer] * self.kv_dim;
+        if (n == 0) return;
+        for (0..self.batch) |b| {
+            const base = (b * self.max_len) * self.kv_dim;
+            try s.readF32(self.scratchIndex(layer, b, 0), self.k[base..][0..n]);
+            try s.readF32(self.scratchIndex(layer, b, 1), self.v[base..][0..n]);
+        }
+    }
+
+    /// Writes `layer`'s slice back (scratch mode only).
+    pub fn endLayer(self: *KvCache, layer: usize) !void {
+        const s = &(self.scratch orelse return);
+        std.debug.assert(layer == self.current_layer);
+        const n = self.high_water * self.kv_dim;
+        if (n == 0) return;
+        for (0..self.batch) |b| {
+            const base = (b * self.max_len) * self.kv_dim;
+            try s.writeF32(self.scratchIndex(layer, b, 0), self.k[base..][0..n]);
+            try s.writeF32(self.scratchIndex(layer, b, 1), self.v[base..][0..n]);
+        }
+        self.layer_written[layer] = self.high_water;
     }
 
     pub fn kSlot(self: *KvCache, layer: usize, b: usize, pos: usize) []f32 {
+        std.debug.assert(self.scratch == null or layer == self.current_layer);
         return self.k[self.index(layer, b, pos)..][0..self.kv_dim];
     }
     pub fn vSlot(self: *KvCache, layer: usize, b: usize, pos: usize) []f32 {
+        std.debug.assert(self.scratch == null or layer == self.current_layer);
         return self.v[self.index(layer, b, pos)..][0..self.kv_dim];
+    }
+
+    /// Records that position `pos` was written (any layer).
+    pub fn noteWrite(self: *KvCache, pos: usize) void {
+        if (pos + 1 > self.high_water) self.high_water = pos + 1;
     }
 };
 
@@ -840,128 +1181,196 @@ pub const ForwardOptions = struct {
 
 /// Runs the transformer over `tokens`/`rows` (n tokens). Logits for the
 /// requested rows are written to `ws.logits[i * vocab ..]`.
+///
+/// Layers are the outer loop and tokens the inner one: each layer's weights
+/// are acquired once (from the mapping, or read from disk into a budgeted
+/// buffer in streamed mode) and applied to every token of the call before
+/// being released. When `n` exceeds the workspace the residual stream is kept
+/// in an `Activations` buffer (RAM, or a scratch file under a tight budget) and
+/// processed in chunks of `ws.max_rows` rows per layer, so a layer is still
+/// loaded only once per call. In streamed mode a decode step therefore costs
+/// one full read of every layer plus the LM head: decode throughput is bounded
+/// by storage bandwidth, not compute.
 pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []const u32, rows: []const Row, opts: ForwardOptions) !void {
     const c = &model.config;
     const gpa = model.gpa;
     const n = tokens.len;
-    std.debug.assert(n == rows.len and n <= ws.max_rows);
+    std.debug.assert(n == rows.len);
     const hidden = c.hidden_size;
-    const hd = c.head_dim;
-    const qd = c.num_heads * hd;
-    const kvd = c.num_kv_heads * hd;
-    const half = hd / 2;
-    const x = ws.x[0 .. n * hidden];
-    const h = ws.h[0 .. n * hidden];
+    const chunk_rows = ws.max_rows;
+    const single = n <= chunk_rows;
+    var act: ?stream.Activations = null;
+    defer if (act) |*a| a.deinit();
+    if (!single) act = try stream.Activations.init(gpa, model.io, n, hidden, .{
+        .budget = model.budget,
+        .scratch_dir = model.scratch_dir,
+        .reserve = model.residentWeightNeed(),
+        .force_scratch = model.spill_always,
+    });
 
     // Embeddings.
-    for (tokens, 0..) |t, i| {
-        model.embed.row(@min(t, model.embed.rows - 1), x[i * hidden ..][0..hidden]);
-        if (c.embed_scale != 1.0) tensor.scale(x[i * hidden ..][0..hidden], c.embed_scale);
-    }
-    if (opts.residuals) |res| {
-        for (opts.capture_rows, 0..) |r, i| @memcpy(res[(0 * opts.capture_rows.len + i) * hidden ..][0..hidden], x[r * hidden ..][0..hidden]);
+    var start: usize = 0;
+    while (start < n) : (start += chunk_rows) {
+        const cn = @min(chunk_rows, n - start);
+        const xs = if (single) ws.x[0 .. n * hidden] else act.?.chunkUninit(start, cn, ws.x);
+        for (tokens[start..][0..cn], 0..) |t, i| {
+            try model.embedRow(t, xs[i * hidden ..][0..hidden]);
+            if (c.embed_scale != 1.0) tensor.scale(xs[i * hidden ..][0..hidden], c.embed_scale);
+        }
+        if (!single) try act.?.commit(start, cn, xs);
+        captureResiduals(opts, 0, hidden, start, cn, xs);
     }
 
-    for (model.layers, 0..) |*layer, li| {
-        // Attention block.
-        var i: usize = 0;
-        while (i < n) : (i += 1) tensor.rmsnorm(h[i * hidden ..][0..hidden], x[i * hidden ..][0..hidden], layer.input_norm, c.rms_norm_eps, c.family.isGemma());
-        try tensor.matmulT(model.pool, gpa, ws.q, h, n, layer.q, null);
-        try tensor.matmulT(model.pool, gpa, ws.k, h, n, layer.k, null);
-        try tensor.matmulT(model.pool, gpa, ws.v, h, n, layer.v, null);
-        if (layer.q_bias) |b| {
-            i = 0;
-            while (i < n) : (i += 1) tensor.axpy(ws.q[i * qd ..][0..qd], 1.0, b);
+    for (0..c.num_layers) |li| {
+        if (model.budget) |b| try b.checkTime();
+        var lease = try model.acquireLayer(li);
+        defer lease.release();
+        const layer = &lease.layer;
+        try cache.beginLayer(li);
+        start = 0;
+        while (start < n) : (start += chunk_rows) {
+            const cn = @min(chunk_rows, n - start);
+            const xs = if (single) ws.x[0 .. n * hidden] else try act.?.chunk(start, cn, ws.x);
+            try layerBlock(model, layer, li, ws, cache, xs, rows[start..][0..cn]);
+            if (!single) try act.?.commit(start, cn, xs);
+            captureResiduals(opts, li + 1, hidden, start, cn, xs);
         }
-        if (layer.k_bias) |b| {
-            i = 0;
-            while (i < n) : (i += 1) tensor.axpy(ws.k[i * kvd ..][0..kvd], 1.0, b);
-        }
-        if (layer.v_bias) |b| {
-            i = 0;
-            while (i < n) : (i += 1) tensor.axpy(ws.v[i * kvd ..][0..kvd], 1.0, b);
-        }
-        const sliding = c.sliding_layers[li];
-        const cos = if (sliding and c.family == .gemma3) model.rope_cos_local else model.rope_cos;
-        const sin = if (sliding and c.family == .gemma3) model.rope_sin_local else model.rope_sin;
-        i = 0;
-        while (i < n) : (i += 1) {
-            const pos = @min(rows[i].pos, model.rope_len - 1);
-            const cr = cos[pos * half ..][0..half];
-            const sr = sin[pos * half ..][0..half];
-            var hh: usize = 0;
-            while (hh < c.num_heads) : (hh += 1) {
-                const q = ws.q[i * qd + hh * hd ..][0..hd];
-                if (layer.q_norm) |qn| {
-                    var tmp: [512]f32 = undefined;
-                    tensor.rmsnorm(tmp[0..hd], q, qn, c.rms_norm_eps, false);
-                    @memcpy(q, tmp[0..hd]);
-                }
-                tensor.applyRope(q, cr, sr);
-            }
-            hh = 0;
-            while (hh < c.num_kv_heads) : (hh += 1) {
-                const k = ws.k[i * kvd + hh * hd ..][0..hd];
-                if (layer.k_norm) |kn| {
-                    var tmp: [512]f32 = undefined;
-                    tensor.rmsnorm(tmp[0..hd], k, kn, c.rms_norm_eps, false);
-                    @memcpy(k, tmp[0..hd]);
-                }
-                tensor.applyRope(k, cr, sr);
-            }
-            @memcpy(cache.kSlot(li, rows[i].b, rows[i].pos), ws.k[i * kvd ..][0..kvd]);
-            @memcpy(cache.vSlot(li, rows[i].b, rows[i].pos), ws.v[i * kvd ..][0..kvd]);
-        }
-        const actx = AttnCtx{ .model = model, .cache = cache, .layer = li, .rows = rows, .q = ws.q, .out = ws.attn, .sliding = sliding };
-        model.pool.parallelFor(n * c.num_heads, &actx, attentionWorker);
-        try tensor.matmulT(model.pool, gpa, ws.o, ws.attn, n, layer.o, if (layer.o_delta) |*d| d else null);
-        i = 0;
-        while (i < n) : (i += 1) {
-            const o = ws.o[i * hidden ..][0..hidden];
-            if (c.family.isGemma()) {
-                const tmp = h[i * hidden ..][0..hidden];
-                tensor.rmsnorm(tmp, o, layer.post_attn_norm, c.rms_norm_eps, true);
-                tensor.axpy(x[i * hidden ..][0..hidden], 1.0, tmp);
-            } else {
-                tensor.axpy(x[i * hidden ..][0..hidden], 1.0, o);
-            }
-        }
-
-        // MLP block.
-        const ff_norm = if (c.family.isGemma()) layer.pre_ff_norm.? else layer.post_attn_norm;
-        i = 0;
-        while (i < n) : (i += 1) tensor.rmsnorm(h[i * hidden ..][0..hidden], x[i * hidden ..][0..hidden], ff_norm, c.rms_norm_eps, c.family.isGemma());
-        if (layer.moe) |*m| {
-            try moe.forward(model, m, ws.o, h, n);
-        } else {
-            try tensor.matmulT(model.pool, gpa, ws.gate, h, n, layer.gate.?, null);
-            try tensor.matmulT(model.pool, gpa, ws.up, h, n, layer.up.?, null);
-            const inter = c.intermediate_size;
-            for (ws.gate[0 .. n * inter], 0..) |*g, j| g.* = c.activation.apply(g.*) * ws.up[j];
-            try tensor.matmulT(model.pool, gpa, ws.o, ws.gate, n, layer.down.?, if (layer.down_delta) |*d| d else null);
-        }
-        i = 0;
-        while (i < n) : (i += 1) {
-            const o = ws.o[i * hidden ..][0..hidden];
-            if (c.family.isGemma()) {
-                const tmp = h[i * hidden ..][0..hidden];
-                tensor.rmsnorm(tmp, o, layer.post_ff_norm.?, c.rms_norm_eps, true);
-                tensor.axpy(x[i * hidden ..][0..hidden], 1.0, tmp);
-            } else {
-                tensor.axpy(x[i * hidden ..][0..hidden], 1.0, o);
-            }
-        }
-        if (opts.residuals) |res| {
-            for (opts.capture_rows, 0..) |r, ci| @memcpy(res[((li + 1) * opts.capture_rows.len + ci) * hidden ..][0..hidden], x[r * hidden ..][0..hidden]);
-        }
+        try cache.endLayer(li);
     }
 
     // Final norm + logits for requested rows.
     if (opts.logit_rows.len > 0) {
         std.debug.assert(opts.logit_rows.len <= ws.max_logit_rows);
-        for (opts.logit_rows, 0..) |r, i| tensor.rmsnorm(h[i * hidden ..][0..hidden], x[r * hidden ..][0..hidden], model.final_norm, c.rms_norm_eps, c.family.isGemma());
-        try tensor.matmulT(model.pool, gpa, ws.logits, h, opts.logit_rows.len, model.lm_head, null);
+        // `ws.h` holds `max_rows` rows, which may be fewer than the logit rows under chunking.
+        const h = try gpa.alloc(f32, opts.logit_rows.len * hidden);
+        defer gpa.free(h);
+        for (opts.logit_rows, 0..) |r, i| {
+            const dst = h[i * hidden ..][0..hidden];
+            if (single) {
+                tensor.rmsnorm(dst, ws.x[r * hidden ..][0..hidden], model.final_norm, c.rms_norm_eps, c.family.isGemma());
+            } else {
+                const tmp = ws.o[0..hidden];
+                try act.?.readRow(r, tmp);
+                tensor.rmsnorm(dst, tmp, model.final_norm, c.rms_norm_eps, c.family.isGemma());
+            }
+        }
+        const lm = try model.acquireLmHead();
+        defer @constCast(&model.store).release(lm);
+        try tensor.matmulT(model.pool, gpa, ws.logits, h, opts.logit_rows.len, lm.weight, null);
         if (c.final_logit_softcapping) |cap| tensor.softcap(ws.logits[0 .. opts.logit_rows.len * c.vocab_size], cap);
+    }
+}
+
+/// Copies the residual of every capture row inside `[start, start + cn)` into `residuals[entry]`.
+fn captureResiduals(opts: ForwardOptions, entry: usize, hidden: usize, start: usize, cn: usize, xs: []const f32) void {
+    const res = opts.residuals orelse return;
+    for (opts.capture_rows, 0..) |r, ci| {
+        if (r < start or r >= start + cn) continue;
+        @memcpy(res[(entry * opts.capture_rows.len + ci) * hidden ..][0..hidden], xs[(r - start) * hidden ..][0..hidden]);
+    }
+}
+
+/// One transformer layer (attention + MLP) applied in place to the residual
+/// rows `x` (`rows.len` tokens). `layer` must hold resident weights.
+fn layerBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace, cache: *KvCache, x: []f32, rows: []const Row) !void {
+    const c = &model.config;
+    const gpa = model.gpa;
+    const n = rows.len;
+    const hidden = c.hidden_size;
+    const hd = c.head_dim;
+    const qd = c.num_heads * hd;
+    const kvd = c.num_kv_heads * hd;
+    const half = hd / 2;
+    const h = ws.h[0 .. n * hidden];
+
+    // Attention block.
+    var i: usize = 0;
+    while (i < n) : (i += 1) tensor.rmsnorm(h[i * hidden ..][0..hidden], x[i * hidden ..][0..hidden], layer.input_norm, c.rms_norm_eps, c.family.isGemma());
+    try tensor.matmulT(model.pool, gpa, ws.q, h, n, layer.q, null);
+    try tensor.matmulT(model.pool, gpa, ws.k, h, n, layer.k, null);
+    try tensor.matmulT(model.pool, gpa, ws.v, h, n, layer.v, null);
+    if (layer.q_bias) |b| {
+        i = 0;
+        while (i < n) : (i += 1) tensor.axpy(ws.q[i * qd ..][0..qd], 1.0, b);
+    }
+    if (layer.k_bias) |b| {
+        i = 0;
+        while (i < n) : (i += 1) tensor.axpy(ws.k[i * kvd ..][0..kvd], 1.0, b);
+    }
+    if (layer.v_bias) |b| {
+        i = 0;
+        while (i < n) : (i += 1) tensor.axpy(ws.v[i * kvd ..][0..kvd], 1.0, b);
+    }
+    const sliding = c.sliding_layers[li];
+    const cos = if (sliding and c.family == .gemma3) model.rope_cos_local else model.rope_cos;
+    const sin = if (sliding and c.family == .gemma3) model.rope_sin_local else model.rope_sin;
+    i = 0;
+    while (i < n) : (i += 1) {
+        const pos = @min(rows[i].pos, model.rope_len - 1);
+        const cr = cos[pos * half ..][0..half];
+        const sr = sin[pos * half ..][0..half];
+        var hh: usize = 0;
+        while (hh < c.num_heads) : (hh += 1) {
+            const q = ws.q[i * qd + hh * hd ..][0..hd];
+            if (layer.q_norm) |qn| {
+                var tmp: [512]f32 = undefined;
+                tensor.rmsnorm(tmp[0..hd], q, qn, c.rms_norm_eps, false);
+                @memcpy(q, tmp[0..hd]);
+            }
+            tensor.applyRope(q, cr, sr);
+        }
+        hh = 0;
+        while (hh < c.num_kv_heads) : (hh += 1) {
+            const k = ws.k[i * kvd + hh * hd ..][0..hd];
+            if (layer.k_norm) |kn| {
+                var tmp: [512]f32 = undefined;
+                tensor.rmsnorm(tmp[0..hd], k, kn, c.rms_norm_eps, false);
+                @memcpy(k, tmp[0..hd]);
+            }
+            tensor.applyRope(k, cr, sr);
+        }
+        @memcpy(cache.kSlot(li, rows[i].b, rows[i].pos), ws.k[i * kvd ..][0..kvd]);
+        @memcpy(cache.vSlot(li, rows[i].b, rows[i].pos), ws.v[i * kvd ..][0..kvd]);
+        cache.noteWrite(rows[i].pos);
+    }
+    const actx = AttnCtx{ .model = model, .cache = cache, .layer = li, .rows = rows, .q = ws.q, .out = ws.attn, .sliding = sliding };
+    model.pool.parallelFor(n * c.num_heads, &actx, attentionWorker);
+    try tensor.matmulT(model.pool, gpa, ws.o, ws.attn, n, layer.o, if (layer.o_delta) |*d| d else null);
+    i = 0;
+    while (i < n) : (i += 1) {
+        const o = ws.o[i * hidden ..][0..hidden];
+        if (c.family.isGemma()) {
+            const tmp = h[i * hidden ..][0..hidden];
+            tensor.rmsnorm(tmp, o, layer.post_attn_norm, c.rms_norm_eps, true);
+            tensor.axpy(x[i * hidden ..][0..hidden], 1.0, tmp);
+        } else {
+            tensor.axpy(x[i * hidden ..][0..hidden], 1.0, o);
+        }
+    }
+
+    // MLP block.
+    const ff_norm = if (c.family.isGemma()) layer.pre_ff_norm.? else layer.post_attn_norm;
+    i = 0;
+    while (i < n) : (i += 1) tensor.rmsnorm(h[i * hidden ..][0..hidden], x[i * hidden ..][0..hidden], ff_norm, c.rms_norm_eps, c.family.isGemma());
+    if (layer.moe) |*m| {
+        try moe.forward(model, m, ws.o, h, n);
+    } else {
+        try tensor.matmulT(model.pool, gpa, ws.gate, h, n, layer.gate.?, null);
+        try tensor.matmulT(model.pool, gpa, ws.up, h, n, layer.up.?, null);
+        const inter = c.intermediate_size;
+        for (ws.gate[0 .. n * inter], 0..) |*g, j| g.* = c.activation.apply(g.*) * ws.up[j];
+        try tensor.matmulT(model.pool, gpa, ws.o, ws.gate, n, layer.down.?, if (layer.down_delta) |*d| d else null);
+    }
+    i = 0;
+    while (i < n) : (i += 1) {
+        const o = ws.o[i * hidden ..][0..hidden];
+        if (c.family.isGemma()) {
+            const tmp = h[i * hidden ..][0..hidden];
+            tensor.rmsnorm(tmp, o, layer.post_ff_norm.?, c.rms_norm_eps, true);
+            tensor.axpy(x[i * hidden ..][0..hidden], 1.0, tmp);
+        } else {
+            tensor.axpy(x[i * hidden ..][0..hidden], 1.0, o);
+        }
     }
 }
 
@@ -1015,7 +1424,9 @@ pub fn prefill(model: *const Model, ws: *Workspace, cache: *KvCache, prompts: []
     defer if (res_tmp) |r| gpa.free(r);
     if (residuals_out != null) res_tmp = try gpa.alloc(f32, (c.num_layers + 1) * prompts.len * c.hidden_size);
     while (start < total) {
-        var end = @min(total, start + ws.max_rows);
+        // In streamed mode `forward` chunks internally so that every layer is read
+        // once for the whole batch; otherwise chunk to the workspace here.
+        var end = if (model.streamed()) total else @min(total, start + ws.max_rows);
         // Do not split a prompt across chunks unless it is longer than the workspace.
         if (end < total) {
             var e = end;

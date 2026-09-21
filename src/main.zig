@@ -3,7 +3,9 @@
 //! This file is the program flow (a port of heretic's `main.py`): settings,
 //! model loading, batch size and response prefix detection, residual
 //! direction extraction, the TPE optimisation loop with a resumable study
-//! journal, and the interactive result / save / chat menus.
+//! journal, and the interactive result / save / chat menus. A memory budget
+//! (`--max-ram`) switches weight access to layer streaming and a time limit
+//! (`--time-limit`) turns the optimisation into a clean, resumable stop.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -22,6 +24,8 @@ const tpe = @import("tpe.zig");
 const study_mod = @import("study.zig");
 const scorers = @import("scorers.zig");
 const export_mod = @import("export.zig");
+const budget_mod = @import("budget.zig");
+const stream = @import("stream.zig");
 
 const Model = model_mod.Model;
 const Engine = engine_mod.Engine;
@@ -148,6 +152,8 @@ fn printScores(out: *Io.Writer, scores: []const scorers.NamedScore) !void {
 
 const App = struct {
     gpa: Allocator,
+    /// The budget's allocator: used for weights, workspaces, caches and exports.
+    rt_gpa: Allocator,
     arena: Allocator,
     io: Io,
     con: *Console,
@@ -155,6 +161,7 @@ const App = struct {
     http: *hf.Http,
     cache_root: []const u8,
     pool: *const tensor.Pool,
+    budget: *budget_mod.Budget,
     model: *Model,
     engine: *Engine,
     template: chat.Template,
@@ -165,6 +172,7 @@ const App = struct {
     sampler: *tpe.Sampler,
     optimization_start: Io.Timestamp,
     start_index: usize,
+    good_prompts: []const Prompt,
 
     fn abliterateOptions(self: *App) abliterate.Options {
         return .{
@@ -176,8 +184,12 @@ const App = struct {
         };
     }
 
-    /// Runs trials `study.trials.len .. settings.n_trials`. Returns false if interrupted.
-    fn runTrials(self: *App) !bool {
+    const TrialsOutcome = enum { finished, interrupted, time_limit };
+
+    /// Runs trials `study.trials.len .. settings.n_trials`. Stops early on
+    /// Ctrl+C or when the time limit expires; completed trials are always in
+    /// the study journal, so either stop can be resumed.
+    fn runTrials(self: *App) !TrialsOutcome {
         const out = self.con.out;
         const gpa = self.gpa;
         const n_trials = self.settings.n_trials;
@@ -190,53 +202,72 @@ const App = struct {
         self.optimization_start = Io.Timestamp.now(self.io, .awake);
         self.start_index = self.study.trials.items.len;
         while (self.study.trials.items.len < n_trials) {
-            if (takeInterrupt()) return false;
-            const trial_index = self.study.trials.items.len + 1;
-            const observations = try self.study.observations(gpa);
-            defer gpa.free(observations);
-            try self.sampler.sample(gpa, observations, vector);
-            const cfg = search.decode(self.space, vector);
-
-            try out.print("\nRunning trial {d} of {d}...\n", .{ trial_index, n_trials });
-            try out.writeAll("* Parameters:\n");
-            try search.describe(self.space, vector, out);
-            try out.writeAll("* Resetting model...\n");
-            try out.flush();
-            self.model.resetDeltas();
-            try out.writeAll("* Abliterating...\n");
-            try out.flush();
-            try search.applyTrial(self.model, self.dirs, cfg, self.abliterateOptions());
-            try out.writeAll("* Evaluating...\n");
-            try out.flush();
-            var scratch = std.heap.ArenaAllocator.init(gpa);
-            defer scratch.deinit();
-            const sa = scratch.allocator();
-            const scores = try self.evaluator.scores(sa, self.engine, out);
-            try printScores(out, scores);
-
-            const elapsed = secondsSince(self.io, self.optimization_start);
-            const done: f64 = @floatFromInt(trial_index - self.start_index);
-            const remaining = elapsed / done * @as(f64, @floatFromInt(n_trials - trial_index));
-            var buf: [64]u8 = undefined;
-            try out.print("\nElapsed time: {s}\n", .{formatDuration(&buf, elapsed)});
-            if (trial_index < n_trials) try out.print("Estimated remaining time: {s}\n", .{formatDuration(&buf, remaining)});
-            try out.flush();
-
-            const losses = try self.evaluator.objectiveLosses(sa, scores);
-            const records = try sa.alloc(study_mod.ScoreRecord, scores.len);
-            for (scores, 0..) |s, i| records[i] = .{ .name = s.name, .value = s.score.value, .display = s.score.display };
-            try self.study.addTrial(gpa, .{
-                .index = trial_index,
-                .params = vector,
-                .losses = losses,
-                .direction_index = cfg.direction_index,
-                .parameters = cfg.parameters,
-                .scores = records,
-            });
-            if (takeInterrupt()) return false;
+            if (takeInterrupt()) return .interrupted;
+            if (self.budget.expired()) return .time_limit;
+            self.runTrial(vector) catch |err| switch (err) {
+                error.TimeLimitExceeded => return .time_limit,
+                else => return err,
+            };
+            if (takeInterrupt()) return .interrupted;
         }
         try self.study.markFinished();
-        return true;
+        return .finished;
+    }
+
+    fn runTrial(self: *App, vector: []f64) !void {
+        const out = self.con.out;
+        const gpa = self.gpa;
+        const n_trials = self.settings.n_trials;
+        const trial_index = self.study.trials.items.len + 1;
+        const observations = try self.study.observations(gpa);
+        defer gpa.free(observations);
+        try self.sampler.sample(gpa, observations, vector);
+        const cfg = search.decode(self.space, vector);
+
+        try out.print("\nRunning trial {d} of {d}...\n", .{ trial_index, n_trials });
+        try out.writeAll("* Parameters:\n");
+        try search.describe(self.space, vector, out);
+        try out.writeAll("* Resetting model...\n");
+        try out.flush();
+        self.model.resetDeltas();
+        try out.writeAll("* Abliterating...\n");
+        try out.flush();
+        try search.applyTrial(self.model, self.dirs, cfg, self.abliterateOptions());
+        try out.writeAll("* Evaluating...\n");
+        try out.flush();
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        const scores = try self.evaluator.scores(sa, self.engine, out);
+        try printScores(out, scores);
+
+        const elapsed = secondsSince(self.io, self.optimization_start);
+        const done: f64 = @floatFromInt(trial_index - self.start_index);
+        const remaining = elapsed / done * @as(f64, @floatFromInt(n_trials - trial_index));
+        var buf: [64]u8 = undefined;
+        try out.print("\nElapsed time: {s}\n", .{formatDuration(&buf, elapsed)});
+        if (trial_index < n_trials) try out.print("Estimated remaining time: {s}\n", .{formatDuration(&buf, remaining)});
+        if (self.settings.print_debug_information) try self.budget.report().print(out, "Memory");
+        try out.flush();
+
+        const losses = try self.evaluator.objectiveLosses(sa, scores);
+        const records = try sa.alloc(study_mod.ScoreRecord, scores.len);
+        for (scores, 0..) |s, i| records[i] = .{ .name = s.name, .value = s.score.value, .display = s.score.display };
+        try self.study.addTrial(gpa, .{
+            .index = trial_index,
+            .params = vector,
+            .losses = losses,
+            .direction_index = cfg.direction_index,
+            .parameters = cfg.parameters,
+            .scores = records,
+        });
+    }
+
+    /// Prints the time-limit notice; the study journal holds every completed trial.
+    fn printTimeLimit(self: *App) !void {
+        const r = self.budget.report();
+        try self.con.out.print("\nTime limit reached ({f} elapsed of {f}). The {d} completed trial(s) have been saved; run ditch again with --checkpoint-action continue to resume.\n", .{ budget_mod.fmtDuration(r.elapsed), budget_mod.fmtDuration(r.time_limit orelse r.elapsed), self.study.trials.items.len });
+        try self.con.out.flush();
     }
 
     fn restoreTrial(self: *App, trial: *const study_mod.Trial) !void {
@@ -326,7 +357,10 @@ const App = struct {
                 if (n_additional == 0) continue;
                 self.settings.n_trials = self.study.trials.items.len + n_additional;
                 self.study.markUnfinished();
-                _ = try self.runTrials();
+                if (try self.runTrials() == .time_limit) {
+                    try self.printTimeLimit();
+                    return;
+                }
                 continue;
             }
 
@@ -357,7 +391,8 @@ const App = struct {
             switch (action) {
                 0 => self.saveModel(trial) catch |err| {
                     try out.print("Error while saving the model: {s}\n", .{@errorName(err)});
-                    if (self.settings.model_action != null) return err;
+                    if (err == error.TimeLimitExceeded) try out.print("The export directory is incomplete (it contains {s}) and will be refused on load.\n", .{model_mod.export_incomplete_marker});
+                    if (self.settings.model_action != null) return if (err == error.TimeLimitExceeded) error.ExportIncomplete else err;
                 },
                 1 => try self.chatLoop(),
                 2 => return true,
@@ -429,12 +464,40 @@ const App = struct {
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
         const card = try self.modelCard(scratch.allocator(), trial);
-        try export_mod.saveModel(self.gpa, self.io, self.model, dir, .{
+        try export_mod.saveModel(self.rt_gpa, self.io, self.model, dir, .{
             .max_shard_size = self.settings.max_shard_size,
             .export_dtype = dtype,
             .readme_body = card,
         }, out);
         try out.print("Model saved to {s}.\n", .{dir});
+        try out.flush();
+        self.validateExport(dir) catch |err| {
+            try out.print("* Validation failed: {s} (the model was saved; verify it by hand)\n", .{@errorName(err)});
+            try out.flush();
+        };
+    }
+
+    /// Reloads the export through the streamed path and compares first-token
+    /// logits with the in-memory (delta) model on a few good prompts.
+    fn validateExport(self: *App, dir: []const u8) !void {
+        const out = self.con.out;
+        // Metadata of the reloaded model (tokenizer, config) is not budgeted;
+        // its weights and buffers are, through `self.budget`.
+        const gpa = self.gpa;
+        try out.writeAll("Validating the exported model...\n");
+        try out.flush();
+        const n = @min(self.good_prompts.len, 4);
+        var ids = std.ArrayList([]const u32).empty;
+        defer {
+            for (ids.items) |x| gpa.free(x);
+            ids.deinit(gpa);
+        }
+        for (self.good_prompts[0..n]) |p| try ids.append(gpa, try self.engine.encodePrompt(gpa, p));
+        // Two models run under the budget for a moment: drop the cached workspace.
+        self.engine.releaseWorkspace();
+        const v = try stream.validateExport(gpa, self.io, self.pool, self.model, dir, ids.items, self.budget);
+        try out.print("* {d} prompts: max |Δ| first-token logit {d:.4}, argmax agreement {d:.0}%\n", .{ v.prompts, v.max_abs_diff, 100.0 * v.argmax_match });
+        if (v.argmax_match < 1.0) try out.writeAll("* Warning: the exported model does not reproduce the abliterated model on every prompt.\n");
         try out.flush();
     }
 
@@ -474,7 +537,7 @@ const App = struct {
     /// Generates a response for the conversation, printing tokens as they are produced.
     fn streamResponse(self: *App, messages: []const chat.Message) ![]u8 {
         const out = self.con.out;
-        const gpa = self.gpa;
+        const gpa = self.rt_gpa;
         const model = self.model;
         const c = &model.config;
         const max_new: usize = 1024;
@@ -484,9 +547,10 @@ const App = struct {
         const ids = try model.tokenizer.encode(gpa, text, true);
         defer gpa.free(ids);
         const max_len = ids.len + max_new + 1;
-        var ws = try model_mod.Workspace.init(gpa, c, @max(ids.len, 1), 1);
+        const kv_bytes = model_mod.KvCache.bytesFor(c.num_layers, 1, max_len, c.num_kv_heads * c.head_dim);
+        var ws = try model_mod.Workspace.init(gpa, c, stream.workspaceRows(model, @max(ids.len, 1), 1, kv_bytes), 1);
         defer ws.deinit();
-        var cache = try model_mod.KvCache.init(gpa, c.num_layers, 1, max_len, c.num_kv_heads * c.head_dim);
+        var cache = try model_mod.KvCache.initFor(model, gpa, 1, max_len);
         defer cache.deinit();
         const logits = try gpa.alloc(f32, c.vocab_size);
         defer gpa.free(logits);
@@ -731,9 +795,37 @@ pub fn main(init: std.process.Init) !void {
 
     run(init, &con) catch |err| {
         out.flush() catch {};
-        std.log.err("{s}", .{@errorName(err)});
+        switch (err) {
+            error.TimeLimitExceeded => std.log.err("time limit reached before the optimisation could start; nothing to resume", .{}),
+            error.ExportIncomplete => std.log.err("the export was cut short (time limit); the output directory is marked {s}", .{model_mod.export_incomplete_marker}),
+            error.BudgetTooSmall => std.log.err("memory budget too small (see above)", .{}),
+            else => std.log.err("{s}", .{@errorName(err)}),
+        }
         std.process.exit(1);
     };
+}
+
+/// Feasibility estimate for the loaded model under the current settings.
+fn estimateFor(model: *const Model, settings: *const config.Settings, threads: usize, max_prompt_tokens: usize) budget_mod.Estimate {
+    return budget_mod.estimate(model, .{
+        .batch_size = if (settings.batch_size > 0) settings.batch_size else settings.max_batch_size,
+        .max_prompt_tokens = max_prompt_tokens,
+        .max_response_length = settings.max_response_length,
+        .threads = threads,
+        .lora_rank = settings.full_normalization_lora_rank,
+        .export_dtype = if (settings.export_dtype) |d| App.parseExportDtype(d) else null,
+    });
+}
+
+/// Longest tokenised prompt (in tokens) among `prompts`.
+fn maxPromptTokens(gpa: Allocator, engine: *Engine, prompts: []const Prompt) !usize {
+    var max: usize = 0;
+    for (prompts) |p| {
+        const ids = try engine.encodePrompt(gpa, p);
+        defer gpa.free(ids);
+        max = @max(max, ids.len);
+    }
+    return max;
 }
 
 fn run(init: std.process.Init, con: *Console) !void {
@@ -788,6 +880,22 @@ fn run(init: std.process.Init, con: *Console) !void {
     try out.flush();
     installSigint();
 
+    // Memory / time budget. Every large runtime buffer comes from the budget's
+    // allocator (unlimited when no --max-ram is given, but still accounted).
+    var budget = try budget_mod.Budget.fromSettings(gpa, io, settings);
+    defer budget.deinit();
+    const rt_gpa = budget.allocator();
+    const store_mode: stream.Mode = if (settings.max_ram > 0) .streamed else .mapped;
+    if (budget.limited()) try out.print("Memory budget: {f} (headroom {f}, scratch directory {s})\n", .{ budget_mod.fmtBytes(budget.max_ram), budget_mod.fmtBytes(budget.headroom), budget.scratch_dir });
+    if (budget.time_limit) |t| try out.print("Time limit: {f}\n", .{budget_mod.fmtDuration(t)});
+    if (settings.max_vram > 0) try out.writeAll("Note: --max-vram is accepted for compatibility but unused (ditch runs on the CPU).\n");
+    defer {
+        if (budget.limited() or budget.time_limit != null or settings.print_debug_information) {
+            budget.report().print(out, "\nMemory") catch {};
+            out.flush() catch {};
+        }
+    }
+
     // Model.
     var http = try hf.Http.init(gpa, io, arena, init.environ_map);
     defer http.deinit();
@@ -795,10 +903,11 @@ fn run(init: std.process.Init, con: *Console) !void {
     try out.print("\nLoading model {s}...\n", .{settings.model});
     try out.flush();
     const model_dir = try hf.resolveModel(arena, &http, cache_root, settings.model, settings.model_commit, out);
-    const model = try Model.load(gpa, io, pool, model_dir);
+    const model = try Model.loadWithOptions(gpa, io, pool, model_dir, .{ .store = store_mode, .budget = &budget });
     defer model.deinit();
     const c = &model.config;
     try out.print("* Architecture: {s} ({d} layers, hidden size {d}, vocabulary {d}, {s} weights)\n", .{ c.model_type, c.num_layers, c.hidden_size, c.vocab_size, model.dtype.safetensorsName() });
+    try out.print("* Weights: {s}\n", .{if (model.streamed()) "streamed layer by layer from disk (memory budget)" else "memory-mapped"});
     var template: chat.Template = undefined;
     if (settings.chat_template) |name| {
         template = chat.Template.parse(name) orelse {
@@ -810,7 +919,7 @@ fn run(init: std.process.Init, con: *Console) !void {
         template = chat.detect(model.chat_template, c.model_type);
         try out.print("* Chat template: {s} ({s})\n", .{ @tagName(template), if (model.chat_template != null) "detected from the model's chat template" else "inferred from the model type" });
     }
-    var engine = Engine.init(gpa, model, settings, template);
+    var engine = Engine.init(rt_gpa, model, settings, template);
     defer engine.deinit();
 
     // Prompts.
@@ -826,6 +935,22 @@ fn run(init: std.process.Init, con: *Console) !void {
         std.log.err("both prompt datasets must contain at least one prompt", .{});
         return error.NoPrompts;
     }
+    try out.flush();
+
+    // Feasibility: what must be resident, and does it fit the budget?
+    const max_prompt_tokens = @max(try maxPromptTokens(gpa, &engine, good_prompts), try maxPromptTokens(gpa, &engine, bad_prompts));
+    const estimate = estimateFor(model, settings, pool.threads, max_prompt_tokens);
+    if (budget.limited() or settings.print_debug_information) {
+        try out.writeAll("\n");
+        try estimate.print(out);
+    }
+    budget_mod.check(estimate, &budget, out) catch |err| switch (err) {
+        error.BudgetTooSmall => {
+            try out.flush();
+            std.process.exit(2);
+        },
+        else => return err,
+    };
     try out.flush();
 
     if (settings.batch_size == 0) {
@@ -852,9 +977,16 @@ fn run(init: std.process.Init, con: *Console) !void {
         try out.print("\nLoading model {s}...\n", .{eval_id});
         try out.flush();
         const eval_dir = try hf.resolveModel(arena, &http, cache_root, eval_id, null, out);
-        const eval_model = try Model.load(gpa, io, pool, eval_dir);
+        const eval_model = try Model.loadWithOptions(gpa, io, pool, eval_dir, .{ .store = store_mode, .budget = &budget });
         defer eval_model.deinit();
-        var eval_engine = Engine.init(gpa, eval_model, settings, template);
+        budget_mod.check(estimateFor(eval_model, settings, pool.threads, max_prompt_tokens), &budget, out) catch |err| switch (err) {
+            error.BudgetTooSmall => {
+                try out.flush();
+                std.process.exit(2);
+            },
+            else => return err,
+        };
+        var eval_engine = Engine.init(rt_gpa, eval_model, settings, template);
         defer eval_engine.deinit();
         eval_engine.batch_size = engine.batch_size;
         try out.writeAll("* Evaluating...\n");
@@ -873,16 +1005,16 @@ fn run(init: std.process.Init, con: *Console) !void {
     try out.writeAll("\nCalculating per-layer residual directions...\n");
     try out.writeAll("* Obtaining residual mean for good prompts...\n");
     try out.flush();
-    const good_means = try engine.getResidualMean(gpa, good_prompts, out);
-    defer gpa.free(good_means);
+    const good_means = try engine.getResidualMean(rt_gpa, good_prompts, out);
+    defer rt_gpa.free(good_means);
     try out.writeAll("* Obtaining residual mean for bad prompts...\n");
     try out.flush();
-    const bad_means = try engine.getResidualMean(gpa, bad_prompts, out);
-    defer gpa.free(bad_means);
+    const bad_means = try engine.getResidualMean(rt_gpa, bad_prompts, out);
+    defer rt_gpa.free(bad_means);
     const entries = c.num_layers + 1;
     if (settings.print_residual_geometry) try printResidualGeometry(out, good_means, bad_means, entries, c.hidden_size);
-    const dirs = try abliterate.computeDirections(gpa, good_means, bad_means, entries, c.hidden_size, settings.orthogonalize_direction);
-    defer gpa.free(dirs);
+    const dirs = try abliterate.computeDirections(rt_gpa, good_means, bad_means, entries, c.hidden_size, settings.orthogonalize_direction);
+    defer rt_gpa.free(dirs);
     try out.flush();
 
     // Study.
@@ -935,6 +1067,7 @@ fn run(init: std.process.Init, con: *Console) !void {
 
     var app = App{
         .gpa = gpa,
+        .rt_gpa = rt_gpa,
         .arena = arena,
         .io = io,
         .con = con,
@@ -942,6 +1075,7 @@ fn run(init: std.process.Init, con: *Console) !void {
         .http = &http,
         .cache_root = cache_root,
         .pool = pool,
+        .budget = &budget,
         .model = model,
         .engine = &engine,
         .template = template,
@@ -952,11 +1086,19 @@ fn run(init: std.process.Init, con: *Console) !void {
         .sampler = &sampler,
         .optimization_start = Io.Timestamp.now(io, .awake),
         .start_index = 0,
+        .good_prompts = good_prompts,
     };
 
     if (!show_results_only) {
-        const completed = try app.runTrials();
-        if (!completed) try out.writeAll("\nOptimization interrupted. The completed trials have been saved; run ditch again to continue.\n");
+        switch (try app.runTrials()) {
+            .finished => {},
+            .interrupted => try out.writeAll("\nOptimization interrupted. The completed trials have been saved; run ditch again to continue.\n"),
+            .time_limit => {
+                // A clean stop: the journal is resumable, nothing else is attempted.
+                try app.printTimeLimit();
+                return;
+            },
+        }
     }
     try app.resultsLoop();
     try out.flush();
