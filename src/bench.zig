@@ -286,6 +286,7 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings,
     for (evaluator.entries) |e| switch (e.scorer) {
         .keyword_rate => |k| result.refusal_prompts += k.prompts.len,
         .kl_divergence => |k| result.kl_prompts += k.prompts.len,
+        .refusal_logit => |r| result.refusal_prompts += r.prompts.len,
     };
     try out.writeAll("\nMeasuring one full trial...\n");
     try out.flush();

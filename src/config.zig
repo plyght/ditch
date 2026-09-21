@@ -4,6 +4,7 @@ const std = @import("std");
 const toml = @import("toml.zig");
 const lua = @import("lua.zig");
 const abliterate = @import("abliterate.zig");
+const directions = @import("directions.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -22,10 +23,53 @@ pub const Optimization = enum { minimize, maximize, none };
 pub const ScorerKind = enum {
     keyword_rate,
     kl_divergence,
+    /// First-token probability mass on refusal-start tokens (one prefill; see scorers.zig).
+    refusal_logit,
 
     pub fn fromPlugin(name: []const u8) ?ScorerKind {
         if (std.mem.eql(u8, name, "keyword_rate") or std.mem.indexOf(u8, name, "KeywordRate") != null) return .keyword_rate;
         if (std.mem.eql(u8, name, "kl_divergence") or std.mem.indexOf(u8, name, "KLDivergence") != null) return .kl_divergence;
+        if (std.mem.eql(u8, name, "refusal_logit") or std.mem.indexOf(u8, name, "RefusalLogit") != null) return .refusal_logit;
+        return null;
+    }
+};
+
+/// The scorer set of `--fast-search`: the keyword scorer is deferred to the
+/// Pareto candidates (see `Settings.fast_search`).
+pub const fast_search_scorers = [_]ScorerConfig{
+    .{ .kind = .kl_divergence, .optimization = .minimize },
+    .{ .kind = .refusal_logit, .optimization = .minimize },
+};
+
+/// Bounds of the `direction_index` search parameter as fractions of the last
+/// layer index, or `auto` (from the per-layer separation scores).
+pub const DirectionRange = union(enum) {
+    auto,
+    fixed: struct { low: f64, high: f64 },
+
+    /// Parses "auto" or "<low>:<high>" with 0 <= low < high <= 1.
+    pub fn parse(s: []const u8) ?DirectionRange {
+        const t = std.mem.trim(u8, s, " ");
+        if (std.ascii.eqlIgnoreCase(t, "auto")) return .auto;
+        const colon = std.mem.indexOfScalar(u8, t, ':') orelse return null;
+        const low = std.fmt.parseFloat(f64, t[0..colon]) catch return null;
+        const high = std.fmt.parseFloat(f64, t[colon + 1 ..]) catch return null;
+        if (!(low >= 0 and high <= 1 and low < high)) return null;
+        return .{ .fixed = .{ .low = low, .high = high } };
+    }
+};
+
+/// How the trial shown first in the results menu is chosen.
+pub const Select = enum {
+    /// The Pareto front sorted by losses (heretic).
+    pareto,
+    /// The front trial minimising `refusals + λ · KL` is listed first.
+    auto,
+
+    pub fn parse(s: []const u8) ?Select {
+        inline for (@typeInfo(Select).@"enum".fields) |f| {
+            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        }
         return null;
     }
 };
@@ -92,6 +136,26 @@ pub const Settings = struct {
     winsorization_quantile: f32 = 1.0,
     /// Number of orthonormal refusal directions removed per layer (1 = heretic).
     n_directions: usize = 1,
+    /// How the refusal direction of every layer is estimated (mean = heretic).
+    direction_method: directions.Method = .mean,
+    /// Prompt tokens averaged for the per-prompt residual (1 = the last token, heretic).
+    direction_token_window: usize = 1,
+    /// Shrinkage of the diagonal covariance of the "separating" method, as a
+    /// fraction of the mean per-coordinate variance.
+    direction_shrinkage: f32 = 0.1,
+    /// Bounds of the `direction_index` search parameter (heretic: 0.4–0.9 of the last layer).
+    direction_range: DirectionRange = .{ .fixed = .{ .low = 0.4, .high = 0.9 } },
+    /// Also ablate the input side of the edited matrices (see abliterate.zig).
+    ablate_inputs: bool = false,
+    /// Positions of the baseline's greedy continuation the KL divergence is averaged over (1 = heretic).
+    kl_tokens: usize = 1,
+    /// Search with the KL divergence and the refusal-logit proxy only; the
+    /// keyword scorer runs on the Pareto candidates before the results menu.
+    fast_search: bool = false,
+    /// Which trial the results menu lists first.
+    select: Select = .pareto,
+    /// λ of `select = auto`.
+    select_lambda: f64 = 1.0,
     /// Prune trials whose partial refusal count already guarantees Pareto domination.
     early_stop: bool = true,
     /// Journal of a previous study whose trials seed the sampler.
@@ -210,6 +274,15 @@ pub const help_text =
     \\  --full-normalization-lora-rank <n>    Rank of the "full" approximation (default: 3).
     \\  --winsorization-quantile <q>          Clamp residual magnitudes to this quantile (default: 1.0 = off).
     \\  --n-directions <k>                    Orthonormal refusal directions removed per layer (default: 1).
+    \\  --direction-method <mean|separating>  Per-layer direction: difference of means (default, heretic) or
+    \\                                        the difference whitened by the per-coordinate variance.
+    \\  --direction-token-window <w>          Average the last <w> prompt tokens' residuals (default: 1).
+    \\  --direction-shrinkage <f>             Diagonal-covariance shrinkage of "separating" (default: 0.1).
+    \\  --direction-range <lo:hi|auto>        direction_index bounds as fractions of the last layer
+    \\                                        (default: 0.4:0.9), or auto = the layers whose projection
+    \\                                        AUROC is within 0.01 of the best (costs one extra pass).
+    \\  --ablate-inputs                       Also remove the input pattern that writes the direction from
+    \\                                        every edited matrix (stronger edit, higher KL; default: off).
     \\  --expert-selection <ranked|random|broad>  MoE models: edit the experts best aligned with the
     \\                                        refusal direction (ranked, default), a random subset of the
     \\                                        same size (baseline), or always every expert (broad).
@@ -222,6 +295,12 @@ pub const help_text =
     \\  --checkpoint-action <continue|restart>  What to do with an existing checkpoint.
     \\  --early-stop <bool>, --no-early-stop  Prune trials that can no longer reach the Pareto front (default: on).
     \\  --warm-start <study.jsonl>     Seed the sampler with the trials of a previous study.
+    \\  --fast-search                  Optimise KL divergence and the refusal-logit proxy (one prefill per
+    \\                                 scorer); the keyword scorer runs on the Pareto candidates only.
+    \\  --kl-tokens <t>                Average the KL divergence over the first <t> positions of the base
+    \\                                 model's greedy continuation (default: 1; costs t x prefill tokens).
+    \\  --select <pareto|auto>         List the front trial minimising refusals + lambda * KL first (auto).
+    \\  --select-lambda <f>            The lambda of --select auto (default: 1).
     \\
     \\Datasets (also for --keyword-rate-* and --kl-divergence-* scorer prompts):
     \\  --good-prompts-dataset <id|file>  --good-prompts-split <s>  --good-prompts-column <c>
@@ -362,6 +441,8 @@ pub fn load(gpa: Allocator, io: std.Io, args: []const []const u8) !LoadResult {
             try errors.append(a, try std.fmt.allocPrint(a, "invalid value for --{s}: {s}", .{ name, @errorName(err) }));
         };
     }
+    // The fast search fixes the objective set; the keyword scorer is deferred.
+    if (settings.fast_search) settings.scorers = &fast_search_scorers;
     return .{ .settings = settings, .arena = arena, .errors = try errors.toOwnedSlice(a) };
 }
 
@@ -374,7 +455,7 @@ fn normalizeKey(a: Allocator, name: []const u8) ![]u8 {
 }
 
 fn isBoolKey(key: []const u8) bool {
-    const bools = [_][]const u8{ "print_debug_information", "print_residual_geometry", "orthogonalize_direction", "keyword_rate_print_responses", "ignore_mismatches", "early_stop", "no_early_stop", "visited_experts_only", "remote_weights", "hotlist", "no_hotlist", "help", "version" };
+    const bools = [_][]const u8{ "print_debug_information", "print_residual_geometry", "orthogonalize_direction", "keyword_rate_print_responses", "ignore_mismatches", "early_stop", "no_early_stop", "visited_experts_only", "remote_weights", "hotlist", "no_hotlist", "ablate_inputs", "fast_search", "help", "version" };
     for (bools) |b| if (std.mem.eql(u8, b, key)) return true;
     return false;
 }
@@ -439,6 +520,18 @@ fn applyOption(a: Allocator, s: *Settings, key: []const u8, value: []const u8) !
     if (eql(u8, key, "model")) s.model = try a.dupe(u8, value) else if (eql(u8, key, "model_commit")) s.model_commit = try a.dupe(u8, value) else if (eql(u8, key, "evaluate_model")) s.evaluate_model = try a.dupe(u8, value) else if (eql(u8, key, "threads")) s.threads = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "cache_dir")) s.cache_dir = try a.dupe(u8, value) else if (eql(u8, key, "chat_template")) s.chat_template = try a.dupe(u8, value) else if (eql(u8, key, "batch_size")) s.batch_size = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "max_batch_size")) s.max_batch_size = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "max_response_length")) s.max_response_length = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "response_prefix")) s.response_prefix = try a.dupe(u8, value) else if (eql(u8, key, "system_prompt")) s.system_prompt = try a.dupe(u8, value) else if (eql(u8, key, "print_debug_information")) s.print_debug_information = try parseBool(value) else if (eql(u8, key, "print_residual_geometry")) s.print_residual_geometry = try parseBool(value) else if (eql(u8, key, "orthogonalize_direction")) s.orthogonalize_direction = try parseBool(value) else if (eql(u8, key, "row_normalization")) s.row_normalization = abliterate.RowNormalization.parse(value) orelse return error.InvalidEnum else if (eql(u8, key, "full_normalization_lora_rank")) s.full_normalization_lora_rank = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "expert_selection")) s.expert_selection = abliterate.ExpertSelection.parse(value) orelse return error.InvalidEnum else if (eql(u8, key, "winsorization_quantile")) s.winsorization_quantile = try std.fmt.parseFloat(f32, value) else if (eql(u8, key, "n_directions")) {
         s.n_directions = try std.fmt.parseInt(usize, value, 10);
         if (s.n_directions == 0) return error.InvalidValue;
+    } else if (eql(u8, key, "direction_method")) s.direction_method = directions.Method.parse(value) orelse return error.InvalidEnum else if (eql(u8, key, "direction_token_window")) {
+        s.direction_token_window = try std.fmt.parseInt(usize, value, 10);
+        if (s.direction_token_window == 0) return error.InvalidValue;
+    } else if (eql(u8, key, "direction_shrinkage")) {
+        s.direction_shrinkage = try std.fmt.parseFloat(f32, value);
+        if (!(s.direction_shrinkage >= 0)) return error.InvalidValue;
+    } else if (eql(u8, key, "direction_range")) s.direction_range = DirectionRange.parse(value) orelse return error.InvalidValue else if (eql(u8, key, "ablate_inputs")) s.ablate_inputs = try parseBool(value) else if (eql(u8, key, "kl_tokens")) {
+        s.kl_tokens = try std.fmt.parseInt(usize, value, 10);
+        if (s.kl_tokens == 0) return error.InvalidValue;
+    } else if (eql(u8, key, "fast_search")) s.fast_search = try parseBool(value) else if (eql(u8, key, "select")) s.select = Select.parse(value) orelse return error.InvalidEnum else if (eql(u8, key, "select_lambda")) {
+        s.select_lambda = try std.fmt.parseFloat(f64, value);
+        if (!(s.select_lambda >= 0)) return error.InvalidValue;
     } else if (eql(u8, key, "early_stop")) s.early_stop = try parseBool(value) else if (eql(u8, key, "no_early_stop")) s.early_stop = !(try parseBool(value)) else if (eql(u8, key, "warm_start")) s.warm_start = try a.dupe(u8, value) else if (eql(u8, key, "n_trials")) s.n_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_startup_trials")) s.n_startup_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "seed")) s.seed = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "study_checkpoint_dir")) s.study_checkpoint_dir = try a.dupe(u8, value) else if (eql(u8, key, "max_shard_size")) s.max_shard_size = try parseSize(value) else if (eql(u8, key, "max_ram")) s.max_ram = try parseSize(value) else if (eql(u8, key, "max_vram")) s.max_vram = try parseSize(value) else if (eql(u8, key, "scratch_dir")) s.scratch_dir = try a.dupe(u8, value) else if (eql(u8, key, "time_limit")) s.time_limit_seconds = try parseDuration(value) else if (eql(u8, key, "time_limit_seconds")) s.time_limit_seconds = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "budget_headroom")) s.budget_headroom = try parseSize(value) else if (eql(u8, key, "expert_cache")) s.expert_cache = try parseSize(value) else if (eql(u8, key, "visited_experts_only")) s.visited_experts_only = try parseBool(value) else if (eql(u8, key, "remote_weights")) s.remote_weights = try parseBool(value) else if (eql(u8, key, "remote_chunk_size")) s.remote_chunk_size = try parseSize(value) else if (eql(u8, key, "hotlist")) s.hotlist = try parseBool(value) else if (eql(u8, key, "no_hotlist")) s.hotlist = !(try parseBool(value)) else if (eql(u8, key, "checkpoint_action")) s.checkpoint_action = try a.dupe(u8, value) else if (eql(u8, key, "trial_index")) s.trial_index = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_additional_trials")) s.n_additional_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "model_action")) s.model_action = try a.dupe(u8, value) else if (eql(u8, key, "save_directory")) s.save_directory = try a.dupe(u8, value) else if (eql(u8, key, "export_dtype")) s.export_dtype = try a.dupe(u8, value) else if (eql(u8, key, "export_format")) s.export_format = try a.dupe(u8, value) else if (eql(u8, key, "gguf_dtype")) s.gguf_dtype = try a.dupe(u8, value) else if (eql(u8, key, "config")) {
         // handled in the first pass
     } else if (eql(u8, key, "reproduce")) s.reproduce = try a.dupe(u8, value) else if (eql(u8, key, "ignore_mismatches")) s.ignore_mismatches = try parseBool(value) else if (eql(u8, key, "bench_prompts")) s.bench_prompts = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "bench_tokens")) s.bench_tokens = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "bench_output")) s.bench_output = try a.dupe(u8, value) else if (eql(u8, key, "help")) s.help = try parseBool(value) else if (eql(u8, key, "version")) s.version = try parseBool(value) else if (eql(u8, key, "keyword_rate_print_responses")) s.keyword_rate.print_responses = try parseBool(value) else if (eql(u8, key, "keyword_rate_score_name")) s.keyword_rate.score_name = try a.dupe(u8, value) else if (std.mem.startsWith(u8, key, "good_prompts_")) try applyDatasetOption(a, &s.good_prompts, key["good_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "bad_prompts_")) try applyDatasetOption(a, &s.bad_prompts, key["bad_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "keyword_rate_prompts_")) try applyDatasetOption(a, &s.keyword_rate.prompts, key["keyword_rate_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "kl_divergence_prompts_")) try applyDatasetOption(a, &s.kl_divergence.prompts, key["kl_divergence_prompts_".len..], value) else return error.UnknownOption;
@@ -508,7 +601,7 @@ fn applyToml(a: Allocator, s: *Settings, root: *const toml.Table, errors: *std.A
                 if (item != .table) continue;
                 const plugin = try tomlString(a, item.table.get("plugin") orelse .{ .string = "" });
                 const kind = ScorerKind.fromPlugin(plugin) orelse {
-                    try errors.append(a, try std.fmt.allocPrint(a, "unsupported scorer plugin: {s} (available: keyword_rate, kl_divergence)", .{plugin}));
+                    try errors.append(a, try std.fmt.allocPrint(a, "unsupported scorer plugin: {s} (available: keyword_rate, kl_divergence, refusal_logit)", .{plugin}));
                     continue;
                 };
                 const opt_s = try tomlString(a, item.table.get("optimization") orelse .{ .string = "none" });
@@ -618,4 +711,49 @@ test "cli parsing" {
     try std.testing.expect(!r.settings.early_stop);
     try std.testing.expectEqualStrings("old.jsonl", r.settings.warm_start.?);
     try std.testing.expectEqual(ScorerKind.kl_divergence, r.settings.scorers[0].kind);
+}
+
+test "algorithm options" {
+    const gpa = std.testing.allocator;
+    const args = [_][]const u8{ "ditch", "--direction-method", "separating", "--direction-token-window=3", "--direction-range", "auto", "--ablate-inputs", "--kl-tokens", "2", "--select", "auto", "--select-lambda", "0.5", "--fast-search", "m" };
+    var r = try load(gpa, std.testing.io, &args);
+    defer r.deinit();
+    try std.testing.expectEqual(@as(usize, 0), r.errors.len);
+    try std.testing.expectEqual(directions.Method.separating, r.settings.direction_method);
+    try std.testing.expectEqual(@as(usize, 3), r.settings.direction_token_window);
+    try std.testing.expectEqual(DirectionRange.auto, r.settings.direction_range);
+    try std.testing.expect(r.settings.ablate_inputs);
+    try std.testing.expectEqual(@as(usize, 2), r.settings.kl_tokens);
+    try std.testing.expectEqual(Select.auto, r.settings.select);
+    try std.testing.expectEqual(@as(f64, 0.5), r.settings.select_lambda);
+    try std.testing.expect(r.settings.fast_search);
+    try std.testing.expectEqual(@as(usize, 2), r.settings.scorers.len);
+    try std.testing.expectEqual(ScorerKind.refusal_logit, r.settings.scorers[1].kind);
+    // Defaults are heretic's.
+    const d = Settings{};
+    try std.testing.expectEqual(directions.Method.mean, d.direction_method);
+    try std.testing.expectEqual(@as(usize, 1), d.direction_token_window);
+    try std.testing.expectEqual(@as(f64, 0.4), d.direction_range.fixed.low);
+    try std.testing.expect(!d.ablate_inputs and !d.fast_search);
+    try std.testing.expectEqual(@as(usize, 1), d.kl_tokens);
+    // Range parsing.
+    try std.testing.expectEqual(@as(f64, 0.75), DirectionRange.parse("0.25:0.75").?.fixed.high);
+    try std.testing.expect(DirectionRange.parse("0.9:0.4") == null);
+    try std.testing.expect(DirectionRange.parse("half") == null);
+    const bad = [_][]const u8{ "ditch", "--kl-tokens", "0", "m" };
+    var rb = try load(gpa, std.testing.io, &bad);
+    defer rb.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rb.errors.len);
+    // A Lua config selects the scorer by plugin name.
+    var result = try lua.parse(gpa, "return { scorers = { { plugin = \"refusal_logit\", optimization = \"minimize\" } }, direction_range = \"auto\" }", "test.lua");
+    defer result.parsed.deinit();
+    try std.testing.expect(result.err == null);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var s = Settings{};
+    var errors = std.ArrayList([]const u8).empty;
+    try applyToml(arena.allocator(), &s, result.parsed.root, &errors);
+    try std.testing.expectEqual(@as(usize, 0), errors.items.len);
+    try std.testing.expectEqual(ScorerKind.refusal_logit, s.scorers[0].kind);
+    try std.testing.expectEqual(DirectionRange.auto, s.direction_range);
 }

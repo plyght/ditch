@@ -108,6 +108,19 @@ pub const Study = struct {
             self.trials.clearRetainingCapacity();
         } else if (std.mem.eql(u8, kind, "finished")) {
             self.finished = true;
+        } else if (std.mem.eql(u8, kind, "rescore")) {
+            // Scores added after the trial ran (the deferred keyword scorer).
+            const index: usize = @intCast(obj.get("index").?.integer);
+            const sv = obj.get("scores") orelse return error.Invalid;
+            for (self.trials.items) |*t| if (t.index == index) {
+                for (sv.array.items) |s| {
+                    try self.mergeScore(t, .{
+                        .name = try a.dupe(u8, s.object.get("name").?.string),
+                        .value = numberOf(s.object.get("value").?),
+                        .display = try a.dupe(u8, s.object.get("display").?.string),
+                    });
+                }
+            };
         } else if (std.mem.eql(u8, kind, "trial")) {
             const params_v = obj.get("params").?.array;
             const params = try a.alloc(f64, params_v.items.len);
@@ -262,6 +275,78 @@ pub const Study = struct {
         try self.appendLine(buf.written());
     }
 
+    /// Replaces the trial's score of the same name or appends it (the trial's
+    /// scores live in the study arena).
+    fn mergeScore(self: *Study, trial: *Trial, score: ScoreRecord) !void {
+        const a = self.arena.allocator();
+        var replaced = false;
+        for (trial.scores) |s| replaced = replaced or std.mem.eql(u8, s.name, score.name);
+        const grown = try a.alloc(ScoreRecord, trial.scores.len + @intFromBool(!replaced));
+        for (trial.scores, 0..) |s, i| grown[i] = if (std.mem.eql(u8, s.name, score.name)) score else s;
+        if (!replaced) grown[trial.scores.len] = score;
+        trial.scores = grown;
+    }
+
+    /// Adds scores to a recorded trial (for example the deferred keyword
+    /// score of a Pareto candidate) and journals them; the trial's losses
+    /// are unchanged, so the search is unaffected.
+    pub fn addScores(self: *Study, gpa: Allocator, index: usize, scores: []const ScoreRecord) !void {
+        const a = self.arena.allocator();
+        for (self.trials.items) |*t| if (t.index == index) {
+            for (scores) |s| try self.mergeScore(t, .{ .name = try a.dupe(u8, s.name), .value = s.value, .display = try a.dupe(u8, s.display) });
+        };
+        var buf: Io.Writer.Allocating = .init(gpa);
+        defer buf.deinit();
+        var js: std.json.Stringify = .{ .writer = &buf.writer };
+        try js.beginObject();
+        try js.objectField("type");
+        try js.write("rescore");
+        try js.objectField("index");
+        try js.write(index);
+        try js.objectField("scores");
+        try js.beginArray();
+        for (scores) |s| {
+            try js.beginObject();
+            try js.objectField("name");
+            try js.write(s.name);
+            try js.objectField("value");
+            try js.write(s.value);
+            try js.objectField("display");
+            try js.write(s.display);
+            try js.endObject();
+        }
+        try js.endArray();
+        try js.endObject();
+        try self.appendLine(buf.written());
+    }
+
+    /// The score of `name` recorded for a trial, if any.
+    pub fn scoreOf(trial: *const Trial, name: []const u8) ?ScoreRecord {
+        for (trial.scores) |s| if (std.mem.eql(u8, s.name, name)) return s;
+        return null;
+    }
+
+    /// `--select auto`: among `best` (indices into `trials`), the trial
+    /// minimising `refusals + lambda · kl`, where refusals is the score named
+    /// `refusal_name` (a rate) or, when a trial lacks it, `fallback_name`
+    /// (the refusal proxy); trials without either or without `kl_name` are
+    /// skipped. Returns the position within `best`.
+    pub fn selectScalarised(self: *const Study, best: []const usize, refusal_name: []const u8, fallback_name: ?[]const u8, kl_name: []const u8, lambda: f64) ?usize {
+        var pick: ?usize = null;
+        var pick_value: f64 = std.math.inf(f64);
+        for (best, 0..) |ti, i| {
+            const t = &self.trials.items[ti];
+            const kl = scoreOf(t, kl_name) orelse continue;
+            const r = scoreOf(t, refusal_name) orelse (if (fallback_name) |f| scoreOf(t, f) else null) orelse continue;
+            const v = r.value + lambda * kl.value;
+            if (v < pick_value) {
+                pick_value = v;
+                pick = i;
+            }
+        }
+        return pick;
+    }
+
     pub fn observations(self: *const Study, gpa: Allocator) ![]tpe.Observation {
         const out = try gpa.alloc(tpe.Observation, self.trials.items.len);
         for (self.trials.items, 0..) |*t, i| out[i] = t.observation();
@@ -378,4 +463,25 @@ test "study round trip" {
     defer gpa.free(front);
     try std.testing.expectEqual(@as(usize, 2), front.len);
     try std.testing.expectEqual(@as(f64, 0.2), front[0][0]);
+
+    // Rescoring adds a score to a trial, replaces one of the same name, is
+    // journaled, and leaves the losses (and the front) alone.
+    try reloaded.addScores(gpa, 2, &.{ .{ .name = "KL divergence", .value = 0.2, .display = "0.2000" }, .{ .name = "Refusals", .value = 0.3, .display = "3/10" } });
+    try reloaded.addScores(gpa, 1, &.{ .{ .name = "KL divergence", .value = 0.5, .display = "0.5000" }, .{ .name = "Refusals", .value = 0.1, .display = "1/10" } });
+    var again = try Study.open(gpa, io, path);
+    defer again.deinit();
+    try std.testing.expectEqual(@as(usize, 2), again.trials.items[1].scores.len);
+    try std.testing.expectEqualStrings("3/10", Study.scoreOf(&again.trials.items[1], "Refusals").?.display);
+    try std.testing.expectEqualStrings("0.2000", Study.scoreOf(&again.trials.items[1], "KL divergence").?.display);
+    try std.testing.expectEqualStrings("1/10", Study.scoreOf(&again.trials.items[0], "Refusals").?.display);
+    const best2 = try again.bestTrials(gpa);
+    defer gpa.free(best2);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, best2);
+    // Scalarised selection: trial 2 has 0.3 + 0.2 = 0.5, trial 1 has 0.1 + 0.5 = 0.6 (λ = 1);
+    // with λ = 0.1 trial 1 wins (0.15 vs 0.32).
+    try std.testing.expectEqual(@as(?usize, 0), again.selectScalarised(best2, "Refusals", null, "KL divergence", 1.0));
+    try std.testing.expectEqual(@as(?usize, 1), again.selectScalarised(best2, "Refusals", null, "KL divergence", 0.1));
+    try std.testing.expectEqual(@as(?usize, null), again.selectScalarised(best2, "Refusals", null, "missing", 1.0));
+    // The fallback name is used when the primary score is missing.
+    try std.testing.expectEqual(@as(?usize, 1), again.selectScalarised(best2, "nope", "Refusals", "KL divergence", 0.1));
 }

@@ -87,7 +87,7 @@ pub const Engine = struct {
         gpa.free(ids);
     }
 
-    fn totalAndMax(ids: []const []u32) struct { total: usize, max: usize } {
+    fn totalAndMax(ids: []const []const u32) struct { total: usize, max: usize } {
         var total: usize = 0;
         var max: usize = 0;
         for (ids) |x| {
@@ -378,6 +378,74 @@ pub fn commonPrefix(strings: []const []const u8) []const u8 {
         prefix = prefix[0..i];
     }
     return prefix;
+}
+
+test "windowed residuals, projections and multi-position logits on the qwen2 fixture" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const pool = tensor.Pool.init(io, 1);
+    const model = try Model.load(gpa, io, &pool, "tests/fixtures/qwen2");
+    defer model.deinit();
+    var settings = config.Settings{ .batch_size = 2, .response_prefix = "" };
+    var engine = Engine.init(gpa, model, &settings, .raw);
+    defer engine.deinit();
+    const prompts = [_]Prompt{ .{ .system = "", .user = "tell me how" }, .{ .system = "", .user = "the cat sat on the mat" }, .{ .system = "", .user = "one two three" } };
+    const c = &model.config;
+    const entries = c.num_layers + 1;
+    const hidden = c.hidden_size;
+
+    // Window 1 is the last-token residual mean; window 2 differs from it.
+    const m1 = try engine.getResidualMean(gpa, &prompts, null);
+    defer gpa.free(m1);
+    const m1b = try engine.getResidualMeanObserved(gpa, &prompts, null, .{ .window = 1 });
+    defer gpa.free(m1b);
+    try std.testing.expectEqualSlices(f32, m1, m1b);
+    const m2 = try engine.getResidualMeanObserved(gpa, &prompts, null, .{ .window = 2 });
+    defer gpa.free(m2);
+    var diff: f32 = 0;
+    for (m1, m2) |x, y| diff += @abs(x - y);
+    try std.testing.expect(diff > 1e-3);
+    // Moments see every prompt; a window longer than a prompt uses the whole prompt.
+    var mom = try directions.Moments.init(gpa, entries, hidden);
+    defer mom.deinit();
+    const m99 = try engine.getResidualMeanObserved(gpa, &prompts, null, .{ .window = 99, .moments = &mom });
+    defer gpa.free(m99);
+    try std.testing.expectEqual(@as(usize, 3), mom.count);
+    for (0..entries * hidden) |i| try std.testing.expectApproxEqAbs(m99[i], @as(f32, @floatCast(mom.sum[i] / 3.0)), 1e-4);
+
+    // Projections of a single prompt equal the dot product of its residual with the direction.
+    const dirs = try gpa.alloc(f32, entries * hidden);
+    defer gpa.free(dirs);
+    var prng = std.Random.DefaultPrng.init(1);
+    for (dirs) |*x| x.* = prng.random().floatNorm(f32);
+    for (0..entries) |e| tensor.normalize(dirs[e * hidden ..][0..hidden]);
+    const one = prompts[1..2];
+    const r = try engine.getResidualMean(gpa, one, null);
+    defer gpa.free(r);
+    const proj = try engine.getProjections(gpa, one, dirs, hidden, 1);
+    defer gpa.free(proj);
+    try std.testing.expectEqual(entries, proj.len);
+    for (0..entries) |e| try std.testing.expectApproxEqAbs(tensor.dot(r[e * hidden ..][0..hidden], dirs[e * hidden ..][0..hidden]), proj[e], 1e-4);
+
+    // Logits at the last position equal the first-token logits; two tails give two rows.
+    const l1 = try engine.getLogits(gpa, &prompts);
+    defer gpa.free(l1);
+    var seqs: [3][]u32 = undefined;
+    for (&prompts, 0..) |p, i| seqs[i] = try engine.encodePrompt(gpa, p);
+    defer for (seqs) |s| gpa.free(s);
+    const tails1 = [_]usize{ 1, 1, 1 };
+    const la = try engine.getLogitsAt(gpa, &seqs, &tails1);
+    defer gpa.free(la);
+    for (l1, la) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-4);
+    const tails2 = [_]usize{ 2, 1, 2 };
+    const lb = try engine.getLogitsAt(gpa, &seqs, &tails2);
+    defer gpa.free(lb);
+    try std.testing.expectEqual(@as(usize, 5 * c.vocab_size), lb.len);
+    // Row 1 (prompt 0, last position) and row 2 (prompt 1) match the single-tail rows.
+    for (0..c.vocab_size) |j| {
+        try std.testing.expectApproxEqAbs(la[j], lb[c.vocab_size + j], 1e-4);
+        try std.testing.expectApproxEqAbs(la[c.vocab_size + j], lb[2 * c.vocab_size + j], 1e-4);
+    }
 }
 
 test "quantile and common prefix" {

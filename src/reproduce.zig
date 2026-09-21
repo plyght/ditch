@@ -158,7 +158,9 @@ pub fn scorerPrompts(ev: *const scorers.Evaluator, kind: config.ScorerKind) ?[]c
     for (ev.entries) |e| switch (e.scorer) {
         .keyword_rate => |k| if (kind == .keyword_rate) return k.prompts,
         .kl_divergence => |k| if (kind == .kl_divergence) return k.prompts,
+        .refusal_logit => |r| if (kind == .refusal_logit or kind == .keyword_rate) return r.prompts,
     };
+    if (ev.deferred) |d| if (kind == .keyword_rate) return d.scorer.keyword_rate.prompts;
     return null;
 }
 
