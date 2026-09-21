@@ -1624,12 +1624,29 @@ pub const Workspace = struct {
     max_rows: usize,
     max_logit_rows: usize,
 
+    /// Bytes `init` allocates per row (everything but the logits).
+    pub fn bytesPerRow(c: *const Config) u64 {
+        const hidden: u64 = c.hidden_size;
+        const qd: u64 = c.num_heads * c.head_dim;
+        const kvd: u64 = c.num_kv_heads * c.head_dim;
+        const inter: u64 = c.intermediate_size;
+        return (5 * hidden + 2 * qd + 2 * kvd + fusedQkvRows(c) + 2 * inter + fusedGateUpCols(c)) * 4;
+    }
+
+    fn fusedQkvRows(c: *const Config) usize {
+        return if (c.qkv_layout != .separate and c.mla == null) (c.num_heads + 2 * c.num_kv_heads) * c.head_dim else 0;
+    }
+
+    fn fusedGateUpCols(c: *const Config) usize {
+        return if (c.mlp == .gated_fused) 2 * c.intermediate_size else 0;
+    }
+
     pub fn init(gpa: Allocator, c: *const Config, max_rows: usize, max_logit_rows: usize) !Workspace {
         const hidden = c.hidden_size;
         const qd = c.num_heads * c.head_dim;
         const kvd = c.num_kv_heads * c.head_dim;
-        const qkv_rows: usize = if (c.qkv_layout != .separate and c.mla == null) qd + 2 * kvd else 0;
-        const gu: usize = if (c.mlp == .gated_fused) 2 * c.intermediate_size else 0;
+        const qkv_rows = fusedQkvRows(c);
+        const gu = fusedGateUpCols(c);
         var self = Workspace{
             .gpa = gpa,
             .x = &.{},

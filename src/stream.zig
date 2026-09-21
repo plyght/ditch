@@ -607,7 +607,7 @@ pub fn workspaceRows(model: *const model_mod.Model, wanted: usize, logit_rows: u
     const b = model.budget orelse return wanted;
     if (!b.limited()) return wanted;
     const c = &model.config;
-    const per_row: u64 = (2 * c.hidden_size + 2 * c.num_heads * c.head_dim + 2 * c.num_kv_heads * c.head_dim + c.hidden_size + 2 * c.intermediate_size) * 4;
+    const per_row: u64 = model_mod.Workspace.bytesPerRow(c);
     // Unpinned expert-cache entries are given back on demand, so they count as available.
     const avail = b.available() + model.expertCacheEvictable();
     // Weights, logits, KV cache, the residual-stream buffer for all rows and a
