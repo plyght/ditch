@@ -1,7 +1,8 @@
-//! Settings: defaults, `config.toml` and command-line parsing.
+//! Settings: defaults, `config.lua` (or a heretic-style `config.toml`) and command-line parsing.
 
 const std = @import("std");
 const toml = @import("toml.zig");
+const lua = @import("lua.zig");
 const abliterate = @import("abliterate.zig");
 
 const Allocator = std.mem.Allocator;
@@ -114,8 +115,9 @@ pub const help_text =
     \\Fully automatic censorship removal for language models, in Zig.
     \\<MODEL> is a Hugging Face model ID (e.g. Qwen/Qwen2.5-0.5B-Instruct) or a local directory.
     \\
-    \\Options can also be set in config.toml (see config.default.toml). Command-line
-    \\options take precedence. Every option accepts --name value or --name=value.
+    \\Options can also be set in config.lua (see config.default.lua); a heretic-style
+    \\config.toml is accepted too. Command-line options take precedence. Every option
+    \\accepts --name value or --name=value.
     \\
     \\Model & runtime:
     \\  --model <id|path>              Model to process (positional argument is equivalent).
@@ -163,7 +165,7 @@ pub const help_text =
     \\  --print-debug-information      Print extra diagnostics.
     \\  --print-residual-geometry      Print per-layer residual geometry statistics.
     \\  --keyword-rate-print-responses Print every evaluated prompt/response pair.
-    \\  --config <path>                Configuration file (default: ./config.toml if present).
+    \\  --config <path>                Configuration file, .lua or .toml (default: ./config.lua, else ./config.toml).
     \\  -h, --help                     Show this help.
     \\  --version                      Print the version.
     \\
@@ -199,16 +201,32 @@ pub fn load(gpa: Allocator, io: std.Io, args: []const []const u8) !LoadResult {
             config_path = args[i]["--config=".len..];
         }
     }
-    const path = config_path orelse "config.toml";
+    // Default: config.lua, falling back to config.toml (heretic compatibility).
     const cwd = std.Io.Dir.cwd();
+    var path: []const u8 = config_path orelse "config.lua";
+    if (config_path == null) {
+        if (cwd.access(io, "config.lua", .{})) |_| {} else |_| {
+            if (cwd.access(io, "config.toml", .{})) |_| path = "config.toml" else |_| {}
+        }
+    }
     if (cwd.readFileAlloc(io, path, a, .unlimited)) |text| {
         settings.config_path = try a.dupe(u8, path);
-        var parsed = toml.parse(gpa, text) catch |err| {
-            try errors.append(a, try std.fmt.allocPrint(a, "could not parse {s}: {s}", .{ path, @errorName(err) }));
-            return .{ .settings = settings, .arena = arena, .errors = try errors.toOwnedSlice(a) };
-        };
-        defer parsed.deinit();
-        try applyToml(a, &settings, parsed.root, &errors);
+        if (std.mem.endsWith(u8, path, ".toml")) {
+            var parsed = toml.parse(gpa, text) catch |err| {
+                try errors.append(a, try std.fmt.allocPrint(a, "could not parse {s}: {s}", .{ path, @errorName(err) }));
+                return .{ .settings = settings, .arena = arena, .errors = try errors.toOwnedSlice(a) };
+            };
+            defer parsed.deinit();
+            try applyToml(a, &settings, parsed.root, &errors);
+        } else {
+            var result = try lua.parse(gpa, text, path);
+            defer result.parsed.deinit();
+            if (result.err) |e| {
+                try errors.append(a, try std.fmt.allocPrint(a, "could not load {s}: {s}", .{ path, e }));
+                return .{ .settings = settings, .arena = arena, .errors = try errors.toOwnedSlice(a) };
+            }
+            try applyToml(a, &settings, result.parsed.root, &errors);
+        }
     } else |err| {
         if (config_path != null) try errors.append(a, try std.fmt.allocPrint(a, "could not read {s}: {s}", .{ path, @errorName(err) }));
     }

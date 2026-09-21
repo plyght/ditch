@@ -762,7 +762,7 @@ fn run(init: std.process.Init, con: *Console) !void {
     if (loaded.errors.len > 0) {
         try out.print("Configuration contains {d} error(s):\n", .{loaded.errors.len});
         for (loaded.errors) |e| try out.print("  * {s}\n", .{e});
-        try out.writeAll("\nRun ditch --help or see config.default.toml for details about configuration parameters.\n");
+        try out.writeAll("\nRun ditch --help or see config.default.lua for details about configuration parameters.\n");
         try out.flush();
         std.process.exit(1);
     }

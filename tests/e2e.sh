@@ -104,6 +104,28 @@ grep -q "Show the results from the previous run" "$TMP/chat.log" || fail "checkp
 grep -q "Which trial do you want to use?" "$TMP/chat.log" || fail "trial menu not shown"
 grep -q "Assistant: " "$TMP/chat.log" || fail "chat did not produce a response"
 
+echo "==> Lua configuration file"
+cat > "$TMP/config.lua" <<LUA
+local trials = 2
+return {
+  n_trials = trials, n_startup_trials = trials, max_response_length = 4, batch_size = 2, seed = 3,
+  study_checkpoint_dir = "$TMP/lua_checkpoints",
+  good_prompts = { dataset = "$TMP/good.txt", split = "[:4]" },
+  bad_prompts = { dataset = "$TMP/bad.txt", split = "[:4]" },
+  scorer = {
+    KeywordRate = { prompts = { dataset = "$TMP/bad.txt", split = "[:4]" }, keyword_markers = { "sorry" } },
+    KLDivergence = { prompts = { dataset = "$TMP/good.txt", split = "[:4]" } },
+  },
+  checkpoint_action = "restart", trial_index = 1, model_action = "exit",
+}
+LUA
+"$DITCH" --config "$TMP/config.lua" tests/fixtures/qwen2 | tee "$TMP/lua.log"
+grep -q "Running trial 2 of 2" "$TMP/lua.log" || fail "config.lua settings were not applied"
+[ "$(grep -c '"type":"trial"' "$TMP/lua_checkpoints/tests--fixtures--qwen2.jsonl")" -eq 2 ] || fail "config.lua checkpoint dir not used"
+echo 'return { n_trials = ' > "$TMP/broken.lua"
+if "$DITCH" --config "$TMP/broken.lua" tests/fixtures/qwen2 > "$TMP/broken.log" 2>&1; then fail "broken config.lua was accepted"; fi
+grep -qi "could not load" "$TMP/broken.log" || fail "broken config.lua error not reported"
+
 echo "==> MoE model: ranked expert selection, save and evaluate"
 MOE_COMMON=("${COMMON[@]}")
 MOE_COMMON[0]=tests/fixtures/qwen3_moe

@@ -64,8 +64,14 @@ supported.
 
 ### MoE and memory budgets
 
-Mixture-of-experts models and memory budgets for large models are documented
-in `config.default.toml`.
+Mixture-of-experts models (Qwen3-MoE, Qwen2-MoE, Mixtral) are supported, with
+per-expert deltas and optional expert-selective abliteration: experts are
+ranked by how well their down projections align with the refusal direction, and
+the number of edited experts and the edit strength become part of the search
+(`--expert-selection ranked|random|broad`, the broad edit of every expert stays
+a candidate). Large models can run within a memory budget (`--max-ram`,
+`--scratch-dir`, `--time-limit`): weights are streamed layer by layer and the
+KV cache spills to scratch storage. Both are documented in `config.default.lua`.
 
 ### Datasets
 
@@ -128,11 +134,27 @@ ditch implements Heretic's algorithm unchanged:
 
 ## Configuration
 
-Copy `config.default.toml` to `config.toml` in the directory you run ditch
-from, or pass `--config <file>`. Every option is documented there and can also
-be given on the command line (`--n-trials 50`, `--row-normalization pre`, ...).
-Heretic `config.toml` files work as they are: options that only apply to the
-PyTorch implementation are accepted and ignored.
+Configuration is written in Lua. Copy `config.default.lua` to `config.lua` in
+the directory you run ditch from, or pass `--config <file>`. The file is a Lua
+5.4 script (run in a sandbox with the base, string, table, math and utf8
+libraries and `os.getenv`) that returns a table of settings, so values can be
+computed:
+
+```lua
+local trials = tonumber(os.getenv("DITCH_TRIALS")) or 50
+return {
+  n_trials = trials,
+  n_startup_trials = trials // 4,
+  good_prompts = { dataset = "prompts/good.txt" },
+  bad_prompts = { dataset = "prompts/bad.txt" },
+}
+```
+
+Every option is documented in `config.default.lua` and can also be given on
+the command line (`--n-trials 50`, `--row-normalization pre`, ...). Heretic
+`config.toml` files are accepted as well (`--config config.toml`, or a
+`config.toml` in the working directory when no `config.lua` exists): options that only
+apply to the PyTorch implementation are ignored.
 
 ### Non-interactive use
 

@@ -17,4 +17,5 @@ comptime {
     _ = @import("study.zig");
     _ = @import("export.zig");
     _ = @import("search.zig");
+    _ = @import("lua.zig");
 }
