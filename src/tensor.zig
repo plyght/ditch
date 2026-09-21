@@ -223,33 +223,67 @@ const MatmulCtx = struct {
     n: usize,
     w: Weight,
     delta: ?*const Delta,
-    scratch: []f32, // threads * (cols + n*max_rank) scratch
+    scratch: []f32, // one slot of 4 converted weight rows per task
     scratch_per_task: usize,
 };
 
 fn matmulWorker(ctx: *const MatmulCtx, start: usize, end: usize) void {
-    // Identify a scratch slot for this task. Tasks are chunked by row ranges
-    // that are unique, so `start / per_chunk` gives a stable slot index.
     const slot = start / ctx.scratch_per_task;
     const cols = ctx.w.cols;
     const n = ctx.n;
-    const buf = ctx.scratch[slot * (cols + 1) ..][0..cols];
+    const rows = ctx.w.rows;
+    // Scratch holds 4 converted weight rows.
+    const buf = ctx.scratch[slot * (4 * cols + 1) ..][0 .. 4 * cols];
     var r = start;
-    while (r < end) : (r += 1) {
-        ctx.w.row(r, buf);
+    while (r < end) {
+        const nr = @min(4, end - r);
+        for (0..nr) |k| ctx.w.row(r + k, buf[k * cols ..][0..cols]);
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            var v = dot(buf, ctx.x[i * cols ..][0..cols]);
-            if (ctx.delta) |d| {
-                // out[i][r] += sum_k B[r][k] * (A[k] . x[i])
-                var k: usize = 0;
-                while (k < d.rank) : (k += 1) {
-                    v += d.b[r * d.rank + k] * dot(d.a[k * cols ..][0..cols], ctx.x[i * cols ..][0..cols]);
+            const xi = ctx.x[i * cols ..][0..cols];
+            if (nr == 4) {
+                const d = dot4(buf[0..cols], buf[cols .. 2 * cols], buf[2 * cols .. 3 * cols], buf[3 * cols .. 4 * cols], xi);
+                inline for (0..4) |k| ctx.out[i * rows + r + k] = d[k];
+            } else {
+                for (0..nr) |k| ctx.out[i * rows + r + k] = dot(buf[k * cols ..][0..cols], xi);
+            }
+            if (ctx.delta) |dl| {
+                for (0..nr) |k| {
+                    var v: f32 = 0;
+                    var kk: usize = 0;
+                    while (kk < dl.rank) : (kk += 1) v += dl.b[(r + k) * dl.rank + kk] * dot(dl.a[kk * cols ..][0..cols], xi);
+                    ctx.out[i * rows + r + k] += v;
                 }
             }
-            ctx.out[i * ctx.w.rows + r] = v;
         }
+        r += nr;
     }
+}
+
+/// Four dot products sharing the loads of `x`.
+inline fn dot4(a0: []const f32, a1: []const f32, a2: []const f32, a3: []const f32, x: []const f32) [4]f32 {
+    const V = @Vector(16, f32);
+    var c0: V = @splat(0);
+    var c1: V = @splat(0);
+    var c2: V = @splat(0);
+    var c3: V = @splat(0);
+    var i: usize = 0;
+    const n = x.len;
+    while (i + 16 <= n) : (i += 16) {
+        const vx: V = x[i..][0..16].*;
+        c0 += @as(V, a0[i..][0..16].*) * vx;
+        c1 += @as(V, a1[i..][0..16].*) * vx;
+        c2 += @as(V, a2[i..][0..16].*) * vx;
+        c3 += @as(V, a3[i..][0..16].*) * vx;
+    }
+    var r = [4]f32{ @reduce(.Add, c0), @reduce(.Add, c1), @reduce(.Add, c2), @reduce(.Add, c3) };
+    while (i < n) : (i += 1) {
+        r[0] += a0[i] * x[i];
+        r[1] += a1[i] * x[i];
+        r[2] += a2[i] * x[i];
+        r[3] += a3[i] * x[i];
+    }
+    return r;
 }
 
 /// `out[n][rows] = x[n][cols] @ W^T (+ x @ (B A)^T)`.
@@ -259,7 +293,7 @@ pub fn matmulT(pool: *const Pool, gpa: std.mem.Allocator, out: []f32, x: []const
     const chunks = @max(1, @min(pool.threads, w.rows));
     const per = (w.rows + chunks - 1) / chunks;
     const slots = (w.rows + per - 1) / per;
-    const scratch = try gpa.alloc(f32, slots * (w.cols + 1));
+    const scratch = try gpa.alloc(f32, slots * (4 * w.cols + 1));
     defer gpa.free(scratch);
     const ctx = MatmulCtx{ .out = out, .x = x, .n = n, .w = w, .delta = delta, .scratch = scratch, .scratch_per_task = per };
     pool.parallelFor(w.rows, &ctx, matmulWorker);
