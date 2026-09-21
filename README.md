@@ -1,5 +1,3 @@
-# ditch
-
 *ditch censorship.*
 
 **ditch** removes refusal behaviour ("abliteration") from open-weight language
