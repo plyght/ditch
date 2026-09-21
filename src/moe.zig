@@ -2,10 +2,13 @@
 //! routed forward pass, per-expert abliteration deltas, expert ranking and
 //! expert-selective abliteration.
 //!
-//! Supported architectures: `qwen3_moe`, `qwen2_moe` (with shared expert)
-//! and `mixtral`. Every expert's down projection is exposed as a
-//! `tensor.Weight` view regardless of the on-disk layout, so the abliteration
-//! kernels address a target by (layer, expert index) only.
+//! Tensor names and routing rules come from the architecture registry
+//! (`arch.zig`): Qwen2/3-MoE, Mixtral, DeepSeek V2/V3 (sigmoid or softmax
+//! scoring, group-limited top-k, correction bias, shared experts), Llama 4
+//! (top-1 routing scaling the expert input) and gpt-oss (interleaved fused
+//! experts with biases, clamped swiglu). Every expert's down projection is
+//! exposed as a `tensor.Weight` view regardless of the on-disk layout, so the
+//! abliteration kernels address a target by (layer, expert index) only.
 //!
 //! Every expert matrix also carries a `MatrixRef` describing where it lives on
 //! disk (a whole tensor, a slice of a stacked expert tensor, or a transposed
@@ -21,6 +24,7 @@ const model_mod = @import("model.zig");
 const stream = @import("stream.zig");
 const abliterate = @import("abliterate.zig");
 const search = @import("search.zig");
+const arch = @import("arch.zig");
 
 const Allocator = std.mem.Allocator;
 const Weight = tensor.Weight;
@@ -34,11 +38,12 @@ pub const MatrixRef = struct {
     /// The on-disk block (`[rows][cols]`).
     ref: WeightRef,
     /// null: the block is the matrix. Otherwise the matrix is columns `[lo, hi)`
-    /// of the block, transposed (`[hi - lo][block rows]`).
+    /// of the block (every `stride`-th one), transposed (`[(hi - lo) / stride][block rows]`).
     transposed: ?[2]usize = null,
+    stride: usize = 1,
 
     pub fn rows(self: MatrixRef) usize {
-        return if (self.transposed) |t| t[1] - t[0] else self.ref.rows;
+        return if (self.transposed) |t| (t[1] - t[0]) / self.stride else self.ref.rows;
     }
 
     pub fn cols(self: MatrixRef) usize {
@@ -55,11 +60,16 @@ pub const MatrixRef = struct {
         return .{ .data = &.{}, .dtype = self.ref.dtype, .rows = self.rows(), .cols = self.cols() };
     }
 
+    pub fn columns(self: MatrixRef) stream.ColumnSpec {
+        const t = self.transposed.?;
+        return .{ .lo = t[0], .hi = t[1], .stride = self.stride };
+    }
+
     /// Makes the matrix resident (streamed mode); release with `store.release`.
     pub fn acquire(self: MatrixRef, store: *stream.WeightStore) !Lease {
-        const t = self.transposed orelse return store.acquire(self.ref);
+        if (self.transposed == null) return store.acquire(self.ref);
         var out: [1]Lease = undefined;
-        try store.acquireTransposed(self.ref, &.{t}, &out);
+        try store.acquireColumns(self.ref, &.{self.columns()}, &out);
         return out[0];
     }
 };
@@ -86,9 +96,14 @@ pub const Expert = struct {
     gate_ref: MatrixRef,
     up_ref: MatrixRef,
     down_ref: MatrixRef,
+    /// Projection biases (gpt-oss).
+    gate_bias: ?[]const f32 = null,
+    up_bias: ?[]const f32 = null,
+    down_bias: ?[]const f32 = null,
 };
 
-/// Always-active expert (qwen2_moe). Its output is scaled by `sigmoid(x · gate_vec)`.
+/// Always-active expert (Qwen2-MoE, DeepSeek, Llama 4). Its output is scaled
+/// by `sigmoid(x · gate_vec)` when a gate vector exists.
 pub const SharedExpert = struct {
     gate: Weight,
     up: Weight,
@@ -104,8 +119,13 @@ pub const MoeLayer = struct {
     /// Router `[E, hidden]`.
     router: Weight,
     router_ref: WeightRef,
+    router_bias: ?[]const f32,
+    /// Selection bias added to the scores when choosing experts (DeepSeek V3 `e_score_correction_bias`).
+    correction_bias: ?[]const f32,
     top_k: usize,
     norm_topk_prob: bool,
+    routing: arch.MoeConfig,
+    activation: tensor.Activation,
     /// Expert intermediate size.
     inter: usize,
     layout: Layout,
@@ -113,6 +133,8 @@ pub const MoeLayer = struct {
     shared: ?SharedExpert,
     /// Tensor-name suffix (after `layers.{i}.`) of the fused down tensor, for export.
     fused_down_suffix: ?[]const u8,
+    /// Name templates of the family (for export lookups).
+    names: *const arch.Names,
 
     /// Number of editable down projections: routed experts plus the shared expert.
     pub fn numDown(self: *const MoeLayer) usize {
@@ -193,18 +215,24 @@ pub const MoeLayer = struct {
         if (self.fused_down_suffix) |fd| {
             if (std.mem.eql(u8, suffix, fd)) return .fused_down;
         }
-        if (self.shared != null and std.mem.eql(u8, suffix, "mlp.shared_expert.down_proj.weight")) return .{ .expert = self.experts.len };
-        const prefixes = [_][]const u8{ "mlp.experts.", "block_sparse_moe.experts." };
-        for (prefixes) |p| {
-            if (!std.mem.startsWith(u8, suffix, p)) continue;
-            const rest = suffix[p.len..];
-            const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
-            const idx = std.fmt.parseInt(usize, rest[0..dot], 10) catch return null;
-            if (idx >= self.experts.len) return null;
-            const tail = rest[dot + 1 ..];
-            if (std.mem.eql(u8, tail, "down_proj.weight") or std.mem.eql(u8, tail, "w2.weight")) return .{ .expert = idx };
-            return null;
+        const names = self.names;
+        if (self.shared != null) {
+            if (names.shared_expert) |sp| {
+                if (std.mem.startsWith(u8, suffix, sp) and std.mem.eql(u8, suffix[sp.len..], names.expert_down)) return .{ .expert = self.experts.len };
+            }
         }
+        // `mlp.experts.{e}.` → prefix before `{e}` and the text after it.
+        const marker = std.mem.indexOf(u8, names.expert, "{e}") orelse return null;
+        const head = names.expert[0..marker];
+        const mid = names.expert[marker + 3 ..];
+        if (!std.mem.startsWith(u8, suffix, head)) return null;
+        const rest = suffix[head.len..];
+        const end = std.mem.indexOf(u8, rest, mid) orelse return null;
+        if (end == 0) return null;
+        const idx = std.fmt.parseInt(usize, rest[0..end], 10) catch return null;
+        if (idx >= self.experts.len) return null;
+        const tail = rest[end + mid.len ..];
+        if (std.mem.eql(u8, tail, names.expert_down)) return .{ .expert = idx };
         return null;
     }
 
@@ -280,7 +308,7 @@ pub fn acquireLayer(model: *const Model, m: *const MoeLayer) !MoeLease {
         experts[e] = ex;
         if (ex.gate_ref.transposed != null and ex.up_ref.transposed != null and ex.gate_ref.ref.offset == ex.up_ref.ref.offset) {
             // Fused, transposed layout: gate and up share one block; read it once.
-            try store.acquireTransposed(ex.gate_ref.ref, &.{ ex.gate_ref.transposed.?, ex.up_ref.transposed.? }, all_leases[n..][0..2]);
+            try store.acquireColumns(ex.gate_ref.ref, &.{ ex.gate_ref.columns(), ex.up_ref.columns() }, all_leases[n..][0..2]);
             experts[e].gate = all_leases[n].weight;
             experts[e].up = all_leases[n + 1].weight;
             n += 2;
