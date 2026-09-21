@@ -36,6 +36,25 @@ const Model = model_mod.Model;
 const Engine = engine_mod.Engine;
 const Prompt = hf.Prompt;
 
+/// Colour of stderr messages (errors, warnings): decided in `run` from the
+/// terminal, NO_COLOR / FORCE_COLOR / DITCH_NO_COLOR / TERM and --no-color.
+var color_enabled: ?bool = null;
+
+pub const std_options: std.Options = .{ .logFn = logFn };
+
+fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
+    var buffer: [64]u8 = undefined;
+    const locked = std.debug.lockStderr(&buffer);
+    defer std.debug.unlockStderr();
+    var t = locked.terminal();
+    if (color_enabled) |on| {
+        if (!on) t.mode = .no_color else if (t.mode == .no_color) t.mode = .escape_codes;
+    }
+    std.log.defaultLogFileTerminal(level, scope, format, args, t) catch {};
+    // The process may exit right after an error: do not leave it in the buffer.
+    t.writer.flush() catch {};
+}
+
 const banner =
     \\    _ _ _       _
     \\ __| (_) |_ __| |_
@@ -56,6 +75,14 @@ fn onSigint(_: std.posix.SIG) callconv(.c) void {
         std.process.exit(130);
     }
     interrupted.store(true, .seq_cst);
+    budget_mod.interrupt_requested.store(true, .seq_cst);
+    // Only async-signal-safe calls here.
+    const msg = "\nInterrupted: finishing the current step (press Ctrl+C again to abort now)\n";
+    if (builtin.os.tag == .linux) {
+        _ = std.os.linux.write(2, msg.ptr, msg.len);
+    } else if (builtin.link_libc) {
+        _ = std.c.write(2, msg.ptr, msg.len);
+    }
 }
 
 fn installSigint() void {
@@ -69,6 +96,7 @@ fn installSigint() void {
 }
 
 fn takeInterrupt() bool {
+    budget_mod.interrupt_requested.store(false, .seq_cst);
     return interrupted.swap(false, .seq_cst);
 }
 
@@ -76,15 +104,30 @@ fn takeInterrupt() bool {
 // Console helpers
 // ---------------------------------------------------------------------------
 
+/// Messaging (banner, progress, trial logs, prompts) goes to `out` = stderr;
+/// primary output (results, scores, the benchmark table, JSON, chat
+/// responses) to `result` = stdout, so pipes and redirections see only the
+/// results. Prompts are only shown when `interactive` (stdin is a terminal or
+/// --interactive, and not --no-input); otherwise the answer's flag is named.
 const Console = struct {
+    /// General messaging; a discarding writer under --quiet.
     out: *Io.Writer,
+    /// Essential messaging (trial one-liners, menus, "model saved"): stderr, always.
+    log: *Io.Writer,
+    result: *Io.Writer,
     in: *Io.Reader,
-    /// Whether stdout is a terminal (progress lines are overwritten in place).
+    /// Whether stderr is a terminal (progress lines are overwritten in place).
     tty: bool = false,
+    /// Whether stdout is a terminal (bold headings in the help).
+    tty_out: bool = false,
+    tty_in: bool = false,
+    interactive: bool = false,
+    color: bool = false,
 
     /// Reads one line from stdin (without the newline); null on end of input.
     fn readLine(self: *Console) !?[]const u8 {
         try self.out.flush();
+        try self.log.flush();
         const line = self.in.takeDelimiter('\n') catch |err| switch (err) {
             error.StreamTooLong => return error.LineTooLong,
             error.ReadFailed => return null,
@@ -93,30 +136,58 @@ const Console = struct {
         return std.mem.trimEnd(u8, line orelse return null, "\r");
     }
 
+    /// The error for a prompt that cannot be shown: names the flag to pass instead.
+    fn needInput(self: *Console, question: []const u8, flag: []const u8) error{NoInput} {
+        self.out.flush() catch {};
+        std.log.err("\"{s}\" needs an answer, but stdin is not a terminal: pass {s} (or --interactive to read answers from stdin)", .{ question, flag });
+        return error.NoInput;
+    }
+
     /// Prints a numbered menu and returns the chosen (0-based) option, or null to exit.
-    fn menu(self: *Console, question: []const u8, options: []const []const u8) !?usize {
+    /// `flag` is the option that answers the question non-interactively.
+    fn menu(self: *Console, question: []const u8, options: []const []const u8, flag: []const u8) !?usize {
+        if (!self.interactive) return self.needInput(question, flag);
         while (true) {
-            try self.out.print("\n{s}\n", .{question});
-            for (options, 0..) |o, i| try self.out.print("  [{d}] {s}\n", .{ i + 1, o });
-            try self.out.print("Enter a number (1-{d}): ", .{options.len});
+            try self.log.print("\n{s}\n", .{question});
+            for (options, 0..) |o, i| try self.log.print("  [{d}] {s}\n", .{ i + 1, o });
+            try self.log.print("Enter a number (1-{d}): ", .{options.len});
             const line = (try self.readLine()) orelse return null;
             const trimmed = std.mem.trim(u8, line, " \t");
             if (trimmed.len == 0) continue;
             const n = std.fmt.parseInt(usize, trimmed, 10) catch {
-                try self.out.writeAll("Please enter a number.\n");
+                try self.log.writeAll("Please enter a number.\n");
                 continue;
             };
             if (n < 1 or n > options.len) {
-                try self.out.writeAll("Please enter one of the listed numbers.\n");
+                try self.log.writeAll("Please enter one of the listed numbers.\n");
                 continue;
             }
             return n - 1;
         }
     }
 
-    fn ask(self: *Console, question: []const u8) !?[]const u8 {
-        try self.out.print("{s} ", .{question});
+    fn ask(self: *Console, question: []const u8, flag: []const u8) !?[]const u8 {
+        if (!self.interactive) return self.needInput(question, flag);
+        try self.log.print("{s} ", .{question});
         return self.readLine();
+    }
+
+    /// A yes/no question (default no). Non-interactive: false, with `flag` named.
+    fn confirm(self: *Console, question: []const u8, flag: []const u8) !bool {
+        if (!self.interactive) {
+            std.log.err("{s} Pass {s} to proceed without asking.", .{ question, flag });
+            return false;
+        }
+        try self.log.print("{s} [y/N] ", .{question});
+        const line = (try self.readLine()) orelse return false;
+        const t = std.mem.trim(u8, line, " \t");
+        return t.len > 0 and (t[0] == 'y' or t[0] == 'Y');
+    }
+
+    /// Writes primary output; flushed at once so a pipe sees every line.
+    fn emit(self: *Console, text: []const u8) !void {
+        try self.result.writeAll(text);
+        try self.result.flush();
     }
 };
 
@@ -151,6 +222,34 @@ fn printRepr(out: *Io.Writer, s: []const u8) !void {
 
 fn printScores(out: *Io.Writer, scores: []const scorers.NamedScore) !void {
     for (scores) |s| try out.print("  * {s}: {s}\n", .{ s.name, s.score.display });
+}
+
+/// The primary output of --evaluate-model: the scores as text or JSON on stdout.
+fn writeScores(con: *Console, a: Allocator, model: []const u8, scores: []const scorers.NamedScore, settings: *const config.Settings) !void {
+    var w: Io.Writer.Allocating = .init(a);
+    if (settings.json) {
+        var js: std.json.Stringify = .{ .writer = &w.writer };
+        try js.beginObject();
+        try js.objectField("model");
+        try js.write(model);
+        try js.objectField("scores");
+        try js.beginObject();
+        for (scores) |s| {
+            try js.objectField(s.name);
+            try js.beginObject();
+            try js.objectField("value");
+            try js.write(s.score.value);
+            try js.objectField("display");
+            try js.write(s.score.display);
+            try js.endObject();
+        }
+        try js.endObject();
+        try js.endObject();
+        try w.writer.writeAll("\n");
+    } else {
+        try printScores(&w.writer, scores);
+    }
+    try con.emit(w.written());
 }
 
 // ---------------------------------------------------------------------------
@@ -292,11 +391,13 @@ const App = struct {
         var buf: [64]u8 = undefined;
         if (quiet) {
             // One line per trial: "trial 3/50: kl=0.0123 refusals=4/100 (12.3 s, 9 min left)".
-            try out.print("trial {d}/{d}:", .{ trial_index, n_trials });
-            for (scores) |s| try out.print(" {s}={s}", .{ s.name, s.score.display });
-            try out.print(" ({d:.1} s", .{trial_seconds});
-            if (trial_index < n_trials) try out.print(", {s} left", .{formatDuration(&buf, remaining)});
-            try out.writeAll(")\n");
+            const log = self.con.log;
+            try log.print("trial {d}/{d}:", .{ trial_index, n_trials });
+            for (scores) |s| try log.print(" {s}={s}", .{ s.name, s.score.display });
+            try log.print(" ({d:.1} s", .{trial_seconds});
+            if (trial_index < n_trials) try log.print(", {s} left", .{formatDuration(&buf, remaining)});
+            try log.writeAll(")\n");
+            try log.flush();
         } else {
             try printScores(out, scores);
             try out.print("\nElapsed time: {s}\n", .{formatDuration(&buf, elapsed)});
@@ -344,8 +445,8 @@ const App = struct {
     /// Prints the time-limit notice; the study journal holds every completed trial.
     fn printTimeLimit(self: *App) !void {
         const r = self.budget.report();
-        try self.con.out.print("\nTime limit reached ({f} elapsed of {f}). The {d} completed trial(s) have been saved; run ditch again with --checkpoint-action continue to resume.\n", .{ budget_mod.fmtDuration(r.elapsed), budget_mod.fmtDuration(r.time_limit orelse r.elapsed), self.study.trials.items.len });
-        try self.con.out.flush();
+        try self.con.log.print("\nTime limit reached ({f} elapsed of {f}). The {d} completed trial(s) have been saved; run ditch again with --checkpoint-action continue to resume.\n", .{ budget_mod.fmtDuration(r.elapsed), budget_mod.fmtDuration(r.time_limit orelse r.elapsed), self.study.trials.items.len });
+        try self.con.log.flush();
     }
 
     fn restoreTrial(self: *App, trial: *const study_mod.Trial) !void {
@@ -378,6 +479,7 @@ const App = struct {
         const gpa = self.gpa;
         var trial_index_used = false;
         var additional_used = false;
+        var results_shown = false;
         while (true) {
             if (self.study.trials.items.len == 0) {
                 try out.writeAll("\nNo trials have been completed.\n");
@@ -404,6 +506,10 @@ const App = struct {
             try options.append(ma, "Exit");
 
             try out.writeAll("\nOptimization finished!\n");
+            if (!results_shown) {
+                results_shown = true;
+                try self.writeResults(ma, best);
+            }
             if (self.settings.trial_index == null) {
                 try out.writeAll("\nThe following trials resulted in Pareto optimal combinations of the optimization objectives. After selecting a trial, you will be able to save the model or chat with it to test how well it works. You can return to this menu later to select a different trial.\n");
             }
@@ -429,7 +535,7 @@ const App = struct {
                 choice = ti - 1;
                 try out.print("\nSelected: {s}\n", .{options.items[choice]});
             } else {
-                choice = (try self.con.menu("Which trial do you want to use?", options.items)) orelse return;
+                choice = (try self.con.menu("Which trial do you want to use?", options.items, "--trial-index <n>")) orelse return;
             }
 
             if (choice == best.len + 1) return;
@@ -439,7 +545,7 @@ const App = struct {
                     n_additional = n;
                 } else {
                     while (true) {
-                        const line = (try self.con.ask("How many additional trials do you want to run?")) orelse return;
+                        const line = (try self.con.ask("How many additional trials do you want to run?", "--n-additional-trials <n>")) orelse return;
                         const t = std.mem.trim(u8, line, " \t");
                         if (t.len == 0) break;
                         n_additional = std.fmt.parseInt(usize, t, 10) catch {
@@ -465,6 +571,42 @@ const App = struct {
             const back = try self.modelLoop(trial);
             if (!back) return;
         }
+    }
+
+    /// The primary output of a study: the Pareto-optimal trials, as text
+    /// (one per line) or, with --json, as one JSON document.
+    fn writeResults(self: *App, a: Allocator, best: []const usize) !void {
+        var w: Io.Writer.Allocating = .init(a);
+        if (self.settings.json) {
+            var js: std.json.Stringify = .{ .writer = &w.writer };
+            try js.beginObject();
+            try js.objectField("model");
+            try js.write(self.settings.model);
+            try js.objectField("trials");
+            try js.write(self.study.trials.items.len);
+            try js.objectField("parameters");
+            try js.write(self.space.space.names);
+            try js.objectField("pareto");
+            try js.beginArray();
+            for (best) |bi| {
+                try js.beginObject();
+                try study_mod.Study.writeTrialFields(&js, &self.study.trials.items[bi]);
+                try js.endObject();
+            }
+            try js.endArray();
+            try js.endObject();
+            try w.writer.writeAll("\n");
+        } else {
+            if (!self.settings.plain) try w.writer.writeAll("Pareto-optimal trials:\n");
+            const bold = self.con.color and self.con.tty_out and !self.settings.plain;
+            for (best) |bi| {
+                const t = &self.study.trials.items[bi];
+                if (bold) try w.writer.print("\x1b[1mtrial {d}:\x1b[0m", .{t.index}) else try w.writer.print("trial {d}:", .{t.index});
+                for (t.scores) |s| try w.writer.print(" {s}={s}", .{ s.name, s.display });
+                try w.writer.writeAll("\n");
+            }
+        }
+        try self.con.emit(w.written());
     }
 
     /// `--fast-search`: runs the deferred keyword scorer on every Pareto
@@ -507,7 +649,7 @@ const App = struct {
                     return error.InvalidModelAction;
                 }
             } else {
-                action = (try self.con.menu("What do you want to do with the decensored model?", &options)) orelse return false;
+                action = (try self.con.menu("What do you want to do with the decensored model?", &options, "--model-action save|chat|exit")) orelse return false;
             }
             switch (action) {
                 0 => self.saveModel(trial) catch |err| {
@@ -599,7 +741,7 @@ const App = struct {
         if (self.settings.save_directory) |d| {
             dir = d;
         } else {
-            const line = (try self.con.ask("Path to the folder:")) orelse return;
+            const line = (try self.con.ask("Path to the folder:", "--save-directory <path> (-o)")) orelse return;
             const t = std.mem.trim(u8, line, " \t");
             if (t.len == 0) return;
             dir = try self.arena.dupe(u8, t);
@@ -610,6 +752,11 @@ const App = struct {
                 std.log.err("unknown export dtype: {s} (expected bf16, f16 or f32)", .{d});
                 return error.InvalidExportDtype;
             };
+        }
+        if (!self.settings.force and try dirHasEntries(self.io, dir)) {
+            var q: [std.fs.max_path_bytes + 96]u8 = undefined;
+            const question = try std.fmt.bufPrint(&q, "{s} is not empty; overwrite its files?", .{dir});
+            if (!try self.con.confirm(question, "--force (-f)")) return error.DirectoryNotEmpty;
         }
         try out.writeAll("Saving merged model...\n");
         try out.flush();
@@ -649,7 +796,8 @@ const App = struct {
         }
         try out.print("* Writing {s}...\n", .{reproduce.file_name});
         try reproduce.writeFile(self.gpa, self.io, &manifest, dir);
-        try out.print("Model saved to {s}.\n", .{dir});
+        try self.con.log.print("Model saved to {s}.\n", .{dir});
+        try self.con.log.flush();
         try out.flush();
         self.validateExport(dir) catch |err| {
             try out.print("* Validation failed: {s} (the model was saved; verify it by hand)\n", .{@errorName(err)});
@@ -684,6 +832,10 @@ const App = struct {
     fn chatLoop(self: *App) !void {
         const out = self.con.out;
         const gpa = self.gpa;
+        if (!self.con.interactive) {
+            std.log.err("chat needs messages from a terminal (or --interactive to read them from stdin)", .{});
+            return error.NoInput;
+        }
         try out.writeAll("\nType a message and press Enter. An empty line or /exit returns to the menu; Ctrl+C stops a response.\n");
         var history = std.ArrayList(chat.Message).empty;
         defer {
@@ -697,11 +849,10 @@ const App = struct {
             const msg = std.mem.trim(u8, line, " \t");
             if (msg.len == 0 or std.mem.eql(u8, msg, "/exit") or std.mem.eql(u8, msg, "/quit")) break;
             try history.append(gpa, .{ .role = .user, .content = try gpa.dupe(u8, msg) });
-            try out.writeAll("Assistant: ");
-            try out.flush();
+            try self.con.emit("Assistant: ");
             const response = try self.streamResponse(history.items);
             try history.append(gpa, .{ .role = .assistant, .content = response });
-            try out.writeAll("\n");
+            try self.con.emit("\n");
         }
         _ = takeInterrupt();
     }
@@ -714,9 +865,9 @@ const App = struct {
         return @intCast(best);
     }
 
-    /// Generates a response for the conversation, printing tokens as they are produced.
+    /// Generates a response for the conversation, printing tokens (to stdout) as they are produced.
     fn streamResponse(self: *App, messages: []const chat.Message) ![]u8 {
-        const out = self.con.out;
+        const out = self.con.result;
         const gpa = self.rt_gpa;
         const model = self.model;
         const c = &model.config;
@@ -784,11 +935,12 @@ const App = struct {
         if (full.len > printed.items.len and std.mem.startsWith(u8, full, printed.items)) {
             try out.writeAll(full[printed.items.len..]);
         }
+        try out.flush();
         const decode_seconds = secondsSince(self.io, decode_start);
         if (generated.items.len > 0) {
-            try out.print("\n[{d} tokens, {d:.1} tokens/s]", .{ generated.items.len, @as(f64, @floatFromInt(generated.items.len)) / @max(decode_seconds, 1e-9) });
+            try self.con.out.print("\n[{d} tokens, {d:.1} tokens/s]", .{ generated.items.len, @as(f64, @floatFromInt(generated.items.len)) / @max(decode_seconds, 1e-9) });
+            try self.con.out.flush();
         }
-        try out.flush();
         return gpa.dupe(u8, full);
     }
 };
@@ -1105,23 +1257,40 @@ fn loadWarmStart(gpa: Allocator, arena: Allocator, io: Io, path: []const u8, mod
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    var out_buf: [8192]u8 = undefined;
-    var fw = Io.File.Writer.init(.stdout(), io, &out_buf);
-    const out = &fw.interface;
+    var err_buf: [8192]u8 = undefined;
+    var ew = Io.File.Writer.initStreaming(.stderr(), io, &err_buf);
+    const out = &ew.interface;
     defer out.flush() catch {};
+    var out_buf: [8192]u8 = undefined;
+    var rw = Io.File.Writer.initStreaming(.stdout(), io, &out_buf);
+    const result = &rw.interface;
+    defer result.flush() catch {};
     var in_buf: [4096]u8 = undefined;
     var fr = Io.File.stdin().readerStreaming(io, &in_buf);
-    var con = Console{ .out = out, .in = &fr.interface, .tty = Io.File.stdout().isTty(io) catch false };
+    var discard_buf: [256]u8 = undefined;
+    var discarding: Io.Writer.Discarding = .init(&discard_buf);
+    var con = Console{
+        .out = out,
+        .log = out,
+        .result = result,
+        .in = &fr.interface,
+        .tty = Io.File.stderr().isTty(io) catch false,
+        .tty_out = Io.File.stdout().isTty(io) catch false,
+        .tty_in = Io.File.stdin().isTty(io) catch false,
+    };
 
-    run(init, &con) catch |err| {
+    run(init, &con, &discarding.writer) catch |err| {
         out.flush() catch {};
+        result.flush() catch {};
         switch (err) {
             error.TimeLimitExceeded => std.log.err("time limit reached before the optimisation could start; nothing to resume", .{}),
             error.ExportIncomplete => std.log.err("the export was cut short (time limit); the output directory is marked {s}", .{model_mod.export_incomplete_marker}),
             error.BudgetTooSmall => std.log.err("memory budget too small (see above)", .{}),
+            error.Interrupted => std.log.err("interrupted", .{}),
+            error.NoInput, error.DirectoryNotEmpty => {},
             else => std.log.err("{s}", .{@errorName(err)}),
         }
-        std.process.exit(1);
+        std.process.exit(if (err == error.BudgetTooSmall) 2 else 1);
     };
 }
 
@@ -1137,6 +1306,23 @@ fn estimateFor(model: *const Model, settings: *const config.Settings, threads: u
     });
 }
 
+/// True when the environment variable is present and non-empty.
+fn envSet(env: *std.process.Environ.Map, name: []const u8) bool {
+    const v = env.get(name) orelse return false;
+    return v.len > 0;
+}
+
+/// True when `path` is a directory with at least one entry.
+fn dirHasEntries(io: Io, path: []const u8) !bool {
+    var dir = Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer dir.close(io);
+    var it = dir.iterate();
+    return (try it.next(io)) != null;
+}
+
 /// Longest tokenised prompt (in tokens) among `prompts`.
 fn maxPromptTokens(gpa: Allocator, engine: *Engine, prompts: []const Prompt) !usize {
     var max: usize = 0;
@@ -1148,46 +1334,59 @@ fn maxPromptTokens(gpa: Allocator, engine: *Engine, prompts: []const Prompt) !us
     return max;
 }
 
-fn run(init: std.process.Init, con: *Console) !void {
+fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     const gpa = init.gpa;
     const arena = init.arena.allocator();
     const io = init.io;
-    const out = con.out;
 
     // Settings.
     const raw_args = try init.minimal.args.toSlice(arena);
     var args = try arena.alloc([]const u8, raw_args.len);
     for (raw_args, 0..) |a, i| args[i] = a;
-    // `ditch bench <model> ...` is the benchmark subcommand.
-    var is_bench = false;
-    if (args.len > 1 and std.mem.eql(u8, args[1], "bench")) {
-        is_bench = true;
-        std.mem.copyForwards([]const u8, args[1..], args[2..]);
-        args = args[0 .. args.len - 1];
-    }
-    var loaded = try config.load(gpa, io, args);
+    var loaded = try config.load(gpa, io, args, init.environ_map);
     defer loaded.deinit();
     const settings = &loaded.settings;
-    settings.bench = is_bench;
+    // --quiet: general messaging is dropped; `con.log` keeps the essentials.
+    if (settings.quiet) con.out = discarding;
+    const out = con.out;
+
+    // Terminal, colour and interactivity.
+    const env = init.environ_map;
+    const env_no_color = envSet(env, "NO_COLOR") or envSet(env, "DITCH_NO_COLOR") or (if (env.get("TERM")) |t| std.mem.eql(u8, t, "dumb") else false);
+    const env_force_color = envSet(env, "FORCE_COLOR");
+    con.color = if (settings.no_color or settings.plain) false else if (env_force_color) true else con.tty and !env_no_color;
+    color_enabled = con.color;
+    con.interactive = !settings.no_input and (con.tty_in or settings.interactive);
+    if (settings.quiet) engine_mod.progress_style = .off else if (con.tty) engine_mod.progress_style = .tty;
+    const bold_out = con.tty_out and con.color;
+
     if (settings.version) {
-        try out.print("ditch {s} (zig {s}, {s}-{s}, {s})\n", .{ config.version, builtin.zig_version_string, @tagName(builtin.cpu.arch), @tagName(builtin.os.tag), @tagName(builtin.mode) });
+        try con.result.print("ditch {s} (zig {s}, {s}-{s}, {s})\n", .{ config.version, builtin.zig_version_string, @tagName(builtin.cpu.arch), @tagName(builtin.os.tag), @tagName(builtin.mode) });
         return;
+    }
+    if (settings.help) {
+        const bench_topic = settings.bench or (if (settings.help_topic) |t| std.mem.eql(u8, t, "bench") else false);
+        if (settings.help_topic) |t| if (!std.mem.eql(u8, t, "bench")) {
+            std.log.err("unknown help topic: {s} (try ditch help bench)", .{t});
+            std.process.exit(2);
+        };
+        if (bench_topic) try config.writeBenchHelp(con.result, bold_out) else try config.writeHelp(con.result, bold_out);
+        return;
+    }
+    if (args.len == 1) {
+        try config.writeConciseHelp(con.result, bold_out);
+        try con.result.flush();
+        std.process.exit(2);
+    }
+    if (loaded.errors.len > 0) {
+        for (loaded.errors) |e| std.log.err("{s}", .{e});
+        try out.writeAll("Run ditch --help for all options; config.default.lua documents every setting.\n");
+        try out.flush();
+        std.process.exit(2);
     }
     if (!settings.quiet) {
         try out.print("{s}  v{s}  ditches censorship.  https://github.com/plyght/ditch\n", .{ banner, config.version });
         try out.writeAll("  Built on Heretic: https://github.com/p-e-w/heretic\n\n");
-    }
-    if (settings.help) {
-        try out.writeAll(config.help_text);
-        return;
-    }
-    if (settings.quiet) engine_mod.progress_style = .off else if (con.tty) engine_mod.progress_style = .tty;
-    if (loaded.errors.len > 0) {
-        try out.print("Configuration contains {d} error(s):\n", .{loaded.errors.len});
-        for (loaded.errors) |e| try out.print("  * {s}\n", .{e});
-        try out.writeAll("\nRun ditch --help or see config.default.lua for details about configuration parameters.\n");
-        try out.flush();
-        std.process.exit(1);
     }
     // A reproducibility manifest replaces the recorded settings (model, seed, datasets, ...).
     var manifest: ?reproduce.Manifest = null;
@@ -1223,7 +1422,7 @@ fn run(init: std.process.Init, con: *Console) !void {
 
     // Memory / time budget. Every large runtime buffer comes from the budget's
     // allocator (unlimited when no --max-ram is given, but still accounted).
-    var budget = try budget_mod.Budget.fromSettings(gpa, io, settings);
+    var budget = try budget_mod.Budget.fromSettingsEnv(gpa, io, settings, init.environ_map);
     defer budget.deinit();
     const rt_gpa = budget.allocator();
     // Remote weights and an explicit expert cache imply streaming.
@@ -1240,11 +1439,11 @@ fn run(init: std.process.Init, con: *Console) !void {
     }
 
     // Model.
-    var http = try hf.Http.init(gpa, io, arena, init.environ_map);
+    var http = try hf.Http.initWithOptions(gpa, io, arena, init.environ_map, .{ .token_file = settings.token_file, .timeout_seconds = settings.http_timeout_seconds });
     defer http.deinit();
     const cache_root = try hf.cacheDir(arena, settings, init.environ_map);
     if (settings.bench) {
-        try bench.run(gpa, arena, io, settings, &http, cache_root, pool, out);
+        try bench.run(gpa, arena, io, settings, &http, cache_root, pool, out, con.result);
         return;
     }
     try out.print("\nLoading model {s}...\n", .{settings.model});
@@ -1343,7 +1542,7 @@ fn run(init: std.process.Init, con: *Console) !void {
             try out.writeAll("\n");
             try estimate.print(out);
         }
-        try out.writeAll("\nDry run: the model, prompts and memory estimate are in order; stopping here.\n");
+        try con.log.writeAll("\nDry run: the model, prompts and memory estimate are in order; stopping here (exit 0).\n");
         return;
     }
 
@@ -1391,8 +1590,10 @@ fn run(init: std.process.Init, con: *Console) !void {
         try out.writeAll("* Evaluating...\n");
         try out.flush();
         const scores = try evaluator.scores(arena, &eval_engine, out);
-        try printScores(out, scores);
-        if (try evaluator.deferredScore(arena, &eval_engine, out)) |d| try out.print("  * {s}: {s}\n", .{ d.name, d.score.display });
+        var all_scores = std.ArrayList(scorers.NamedScore).empty;
+        try all_scores.appendSlice(arena, scores);
+        if (try evaluator.deferredScore(arena, &eval_engine, out)) |d| try all_scores.append(arena, d);
+        try writeScores(con, arena, eval_id, all_scores.items, settings);
         return;
     }
 
@@ -1478,19 +1679,19 @@ fn run(init: std.process.Init, con: *Console) !void {
         } else if (study.finished) {
             try out.writeAll("\nYou have already processed this model. You can show the results from the previous run, allowing you to export models or to run additional trials. Alternatively, you can ignore the previous run and start from scratch. This will delete the checkpoint file and all results from the previous run.\n");
             const opts = [_][]const u8{ "Show the results from the previous run", "Ignore the previous run and start from scratch", "Exit" };
-            const choice = (try con.menu("How would you like to proceed?", &opts)) orelse return;
+            const choice = (try con.menu("How would you like to proceed?", &opts, "--checkpoint-action continue|restart")) orelse return;
             action = switch (choice) {
                 0 => "continue",
-                1 => "restart",
+                1 => if (try con.confirm("This deletes the checkpoint and every result of the previous run. Continue?", "--checkpoint-action restart")) "restart" else return,
                 else => return,
             };
         } else {
             try out.writeAll("\nYou have already processed this model, but the run was interrupted. You can continue the previous run from where it stopped. Alternatively, you can ignore the previous run and start from scratch. This will delete the checkpoint file and all results from the previous run.\n");
             const opts = [_][]const u8{ "Continue the previous run", "Ignore the previous run and start from scratch", "Exit" };
-            const choice = (try con.menu("How would you like to proceed?", &opts)) orelse return;
+            const choice = (try con.menu("How would you like to proceed?", &opts, "--checkpoint-action continue|restart")) orelse return;
             action = switch (choice) {
                 0 => "continue",
-                1 => "restart",
+                1 => if (try con.confirm("This deletes the checkpoint and every result of the previous run. Continue?", "--checkpoint-action restart")) "restart" else return,
                 else => return,
             };
         }

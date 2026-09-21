@@ -62,7 +62,7 @@ echo "==> Running the full pipeline (3 trials, save trial 1)"
     --n-trials 3 --n-startup-trials 2 \
     --checkpoint-action restart \
     --trial-index 1 --model-action save --save-directory "$TMP/out" \
-    | tee "$TMP/run.log"
+    2>&1 | tee "$TMP/run.log"
 
 grep -q "Running trial 3 of 3" "$TMP/run.log" || fail "trial 3 did not run"
 grep -q "Optimization finished" "$TMP/run.log" || fail "optimization did not finish"
@@ -76,7 +76,7 @@ grep -q "Abliteration parameters" "$TMP/out/README.md" || fail "README.md lacks 
 grep -q "Reproduce with: \`ditch --reproduce ditch-reproduce.lua\`" "$TMP/out/README.md" || fail "README.md lacks the reproduce section"
 
 echo "==> Reproducing the saved model from its manifest"
-"$DITCH" --reproduce "$TMP/out/ditch-reproduce.lua" --model-action exit | tee "$TMP/repro.log"
+"$DITCH" --reproduce "$TMP/out/ditch-reproduce.lua" --model-action exit 2>&1 | tee "$TMP/repro.log"
 grep -q "config.json: ok" "$TMP/repro.log" || fail "manifest hash verification did not run"
 grep -q "good prompts: 6 prompts, hash ok" "$TMP/repro.log" || fail "prompt hash verification did not run"
 recorded_trial=$(sed -nE 's/^    index = ([0-9]+),$/\1/p' "$TMP/out/ditch-reproduce.lua")
@@ -96,12 +96,12 @@ sed 's/config_sha256 = "[0-9a-f]/config_sha256 = "0/' "$TMP/out/ditch-reproduce.
 if "$DITCH" --reproduce "$TMP/corrupt.lua" --model-action exit > "$TMP/corrupt.log" 2>&1; then fail "corrupted manifest was accepted"; fi
 grep -q "config.json: MISMATCH" "$TMP/corrupt.log" || fail "hash mismatch not reported"
 grep -q "Pass --ignore-mismatches to proceed" "$TMP/corrupt.log" || fail "mismatch error message missing"
-"$DITCH" --reproduce "$TMP/corrupt.lua" --model-action exit --ignore-mismatches | tee "$TMP/ignore.log"
+"$DITCH" --reproduce "$TMP/corrupt.lua" --model-action exit --ignore-mismatches 2>&1 | tee "$TMP/ignore.log"
 grep -q "mismatch(es) ignored" "$TMP/ignore.log" || fail "--ignore-mismatches did not report the ignored mismatch"
 grep -q "All scores match the manifest" "$TMP/ignore.log" || fail "--ignore-mismatches did not proceed to the scores"
 
 echo "==> Benchmark harness"
-"$DITCH" bench "${COMMON[@]}" --bench-prompts 4 --bench-tokens 4 --bench-output "$TMP/bench.md" | tee "$TMP/bench.log"
+"$DITCH" bench "${COMMON[@]}" --bench-prompts 4 --bench-tokens 4 --bench-output "$TMP/bench.md" 2>&1 | tee "$TMP/bench.log"
 [ -f "$TMP/bench.md" ] || fail "benchmark table not written"
 for row in "| Model |" "| Threads |" "| Batch size |" "| Prefill tokens/s |" "| Decode tokens/s |" \
     "| Residual-mean pass |" "| Apply time (row_normalization = none) |" "| Apply time (row_normalization = pre) |" \
@@ -112,6 +112,34 @@ done
 grep -q "4 prompts x 4 tokens" "$TMP/bench.md" || fail "benchmark did not use --bench-prompts/--bench-tokens"
 grep -q "Total weight bytes | 64256" "$TMP/bench.md" || fail "benchmark weight bytes are wrong"
 
+echo "==> Streams, JSON output, help and exit codes"
+# Primary output on stdout (one JSON document), everything else on stderr.
+"$DITCH" bench "${COMMON[@]}" --bench-prompts 2 --bench-tokens 2 --json > "$TMP/bench.json" 2> "$TMP/bench_err.log"
+python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['weight_bytes']==64256 and d['bench_prompts']==2, d" "$TMP/bench.json" || fail "bench --json is not one valid JSON document"
+grep -q "Benchmarking" "$TMP/bench_err.log" || fail "benchmark messages did not go to stderr"
+"$DITCH" "${COMMON[@]}" --study-checkpoint-dir "$TMP/json_checkpoints" --n-trials 1 --n-startup-trials 1 \
+    --checkpoint-action restart --trial-index 1 --model-action exit --json > "$TMP/study.json" 2> "$TMP/study_err.log"
+python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert len(d['pareto'])>=1 and d['pareto'][0]['scores'], d" "$TMP/study.json" || fail "study --json is not one valid JSON document"
+grep -q "Running trial 1 of 1" "$TMP/study_err.log" || fail "trial log did not go to stderr"
+"$DITCH" "${COMMON[@]}" --evaluate-model "$TMP/out" --json > "$TMP/eval.json" 2> /dev/null
+python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert 'KL divergence' in d['scores'], d" "$TMP/eval.json" || fail "evaluate --json is not one valid JSON document"
+# Non-interactive prompts fail with the flag to pass.
+if "$DITCH" "${COMMON[@]}" --study-checkpoint-dir "$TMP/json_checkpoints" --checkpoint-action continue --no-input > "$TMP/noinput.log" 2>&1; then fail "a needed prompt did not fail with --no-input"; fi
+grep -q "pass --trial-index <n>" "$TMP/noinput.log" || fail "--no-input failure did not name the flag"
+# Help and exit codes.
+code=0; "$DITCH" > "$TMP/noargs.log" 2>&1 || code=$?; [ "$code" -eq 2 ] || fail "ditch without arguments must exit 2 (got $code)"
+grep -q "Run ditch --help for all options" "$TMP/noargs.log" || fail "concise help not shown"
+"$DITCH" --n-trials 3 --help > "$TMP/help.log" 2>&1 || fail "--help must exit 0"
+grep -q "^Exit codes:" "$TMP/help.log" || fail "full help lacks the exit codes"
+"$DITCH" help bench > "$TMP/help_bench.log" 2>&1 || fail "ditch help bench must exit 0"
+grep -q "ditch bench \[OPTIONS\] <MODEL>" "$TMP/help_bench.log" || fail "bench help not shown"
+code=0; "$DITCH" --n-trails 3 tests/fixtures/qwen2 > "$TMP/typo.log" 2>&1 || code=$?; [ "$code" -eq 2 ] || fail "an unknown option must exit 2 (got $code)"
+grep -q "did you mean --n-trials" "$TMP/typo.log" || fail "no suggestion for a misspelt option"
+"$DITCH" --version > "$TMP/version.log" 2>&1 || fail "--version must exit 0"
+grep -q "zig 0.16" "$TMP/version.log" || fail "--version does not name the Zig version"
+"$DITCH" "${COMMON[@]}" --dry-run > "$TMP/dry.log" 2>&1 || fail "--dry-run must exit 0"
+grep -q "Dry run" "$TMP/dry.log" || fail "--dry-run did not stop after the estimate"
+
 CKPT="$TMP/checkpoints/tests--fixtures--qwen2.jsonl"
 [ -f "$CKPT" ] || fail "checkpoint file not written"
 n_trials=$(grep -c '"type":"trial"' "$CKPT")
@@ -119,7 +147,7 @@ n_trials=$(grep -c '"type":"trial"' "$CKPT")
 grep -q '"type":"finished"' "$CKPT" || fail "checkpoint not marked finished"
 
 echo "==> Evaluating the exported model against the base model"
-"$DITCH" "${COMMON[@]}" --evaluate-model "$TMP/out" | tee "$TMP/eval.log"
+"$DITCH" "${COMMON[@]}" --evaluate-model "$TMP/out" 2>&1 | tee "$TMP/eval.log"
 grep -q "^\* Evaluating" "$TMP/eval.log" || fail "evaluation did not run"
 grep -q "  \* Refusals: [0-9]*/[0-9]*" "$TMP/eval.log" || fail "no refusal score printed"
 grep -q "  \* KL divergence: [0-9.]*" "$TMP/eval.log" || fail "no KL divergence printed"
@@ -132,14 +160,14 @@ echo "==> Resuming the checkpoint with one additional trial"
     --n-trials 3 \
     --checkpoint-action continue --n-additional-trials 1 \
     --trial-index 1 --model-action exit \
-    | tee "$TMP/resume.log"
+    2>&1 | tee "$TMP/resume.log"
 grep -q "Running trial 4 of 4" "$TMP/resume.log" || fail "additional trial did not run"
 n_trials=$(grep -c '"type":"trial"' "$CKPT")
 [ "$n_trials" -eq 4 ] || fail "expected 4 trials after resuming, found $n_trials"
 [ "$(tail -n 1 "$CKPT")" = '{"type":"finished"}' ] || fail "resumed study not marked finished"
 
 echo "==> Interactive menus and chat over stdin"
-printf '1\n1\n2\nHello, who are you?\n\n4\n' | "$DITCH" "${COMMON[@]}" --n-trials 4 | tee "$TMP/chat.log"
+printf '1\n1\n2\nHello, who are you?\n\n4\n' | "$DITCH" "${COMMON[@]}" --n-trials 4 --interactive 2>&1 | tee "$TMP/chat.log"
 grep -q "Show the results from the previous run" "$TMP/chat.log" || fail "checkpoint menu not shown"
 grep -q "Which trial do you want to use?" "$TMP/chat.log" || fail "trial menu not shown"
 grep -q "Assistant: " "$TMP/chat.log" || fail "chat did not produce a response"
@@ -159,7 +187,7 @@ return {
   checkpoint_action = "restart", trial_index = 1, model_action = "exit",
 }
 LUA
-"$DITCH" --config "$TMP/config.lua" tests/fixtures/qwen2 | tee "$TMP/lua.log"
+"$DITCH" --config "$TMP/config.lua" tests/fixtures/qwen2 2>&1 | tee "$TMP/lua.log"
 grep -q "Running trial 2 of 2" "$TMP/lua.log" || fail "config.lua settings were not applied"
 [ "$(grep -c '"type":"trial"' "$TMP/lua_checkpoints/tests--fixtures--qwen2.jsonl")" -eq 2 ] || fail "config.lua checkpoint dir not used"
 echo 'return { n_trials = ' > "$TMP/broken.lua"
@@ -190,7 +218,7 @@ return {
   model_action = "exit",
 }
 LUA
-"$DITCH" --config "$TMP/prune.lua" tests/fixtures/qwen2 --checkpoint-action restart --trial-index 1 | tee "$TMP/prune.log"
+"$DITCH" --config "$TMP/prune.lua" tests/fixtures/qwen2 --checkpoint-action restart --trial-index 1 2>&1 | tee "$TMP/prune.log"
 grep -q "^\* Pruned after [0-9]*/12 prompts" "$TMP/prune.log" || fail "no trial was pruned"
 grep -q "Refusals: >=[0-9]*/12" "$TMP/prune.log" || fail "pruned refusal score not shown as a bound"
 grep -q "trials were pruned by early stopping" "$TMP/prune.log" || fail "pruning summary missing"
@@ -199,11 +227,11 @@ grep -q '"state":"pruned"' "$PRUNE_CKPT" || fail "pruned trial not journaled as 
 [ "$(grep -c '"type":"trial"' "$PRUNE_CKPT")" -eq 4 ] || fail "pruned trials must count towards n_trials"
 pruned_idx=$(awk '/Running trial/ { t = $3 } /Pruned after/ { print t; exit }' "$TMP/prune.log")
 # The results menu (shown once, then stdin ends) must not offer the pruned trial.
-"$DITCH" --config "$TMP/prune.lua" tests/fixtures/qwen2 --checkpoint-action continue < /dev/null | tee "$TMP/prune_menu.log"
+"$DITCH" --config "$TMP/prune.lua" tests/fixtures/qwen2 --checkpoint-action continue --interactive < /dev/null 2>&1 | tee "$TMP/prune_menu.log"
 grep -q "Which trial do you want to use?" "$TMP/prune_menu.log" || fail "results menu not shown"
 grep -q "\[Trial  *[0-9]*\]" "$TMP/prune_menu.log" || fail "no completed trial offered"
 if grep -q "\[Trial  *$pruned_idx\]" "$TMP/prune_menu.log"; then fail "pruned trial $pruned_idx offered in the results menu"; fi
-"$DITCH" --config "$TMP/prune.lua" tests/fixtures/qwen2 --checkpoint-action restart --trial-index 1 --no-early-stop | tee "$TMP/noprune.log"
+"$DITCH" --config "$TMP/prune.lua" tests/fixtures/qwen2 --checkpoint-action restart --trial-index 1 --no-early-stop 2>&1 | tee "$TMP/noprune.log"
 if grep -q "Pruned after" "$TMP/noprune.log"; then fail "--no-early-stop still pruned"; fi
 [ "$(grep -c "  \* Refusals: [0-9]*/12" "$TMP/noprune.log")" -eq 4 ] || fail "not every trial was fully scored with --no-early-stop"
 
@@ -211,7 +239,7 @@ echo "==> Warm start from the first run's checkpoint"
 "$DITCH" "${COMMON[@]}" --study-checkpoint-dir "$TMP/warm_checkpoints" \
     --warm-start "$CKPT" --n-trials 2 --n-startup-trials 0 \
     --checkpoint-action restart --trial-index 1 --model-action exit \
-    | tee "$TMP/warm.log"
+    2>&1 | tee "$TMP/warm.log"
 grep -q "Warm start: 4 trials loaded" "$TMP/warm.log" || fail "warm start did not load the 4 previous trials"
 grep -q "Running trial 2 of 2" "$TMP/warm.log" || fail "warm-started study did not run its own trials"
 [ "$(grep -c '"type":"trial"' "$TMP/warm_checkpoints/tests--fixtures--qwen2.jsonl")" -eq 2 ] || fail "warm-start trials must not be journaled"
@@ -224,12 +252,12 @@ echo "==> Multi-direction ablation (--n-directions 2)"
 "$DITCH" "${COMMON[@]}" --study-checkpoint-dir "$TMP/k2_checkpoints" --n-directions 2 \
     --n-trials 2 --n-startup-trials 2 \
     --checkpoint-action restart --trial-index 1 --model-action save --save-directory "$TMP/k2_out" \
-    | tee "$TMP/k2.log"
+    2>&1 | tee "$TMP/k2.log"
 grep -q "Extracting 2 orthonormal directions per layer" "$TMP/k2.log" || fail "two directions were not extracted"
 grep -q "Model saved to" "$TMP/k2.log" || fail "n_directions=2 model was not saved"
 grep -q "n_directions.*| 2 |" "$TMP/k2_out/README.md" || fail "model card lacks n_directions"
 grep -q '"n_directions":2' "$TMP/k2_checkpoints/tests--fixtures--qwen2.jsonl" || fail "n_directions missing from the study manifest"
-"$DITCH" "${COMMON[@]}" --evaluate-model "$TMP/k2_out" | tee "$TMP/k2_eval.log"
+"$DITCH" "${COMMON[@]}" --evaluate-model "$TMP/k2_out" 2>&1 | tee "$TMP/k2_eval.log"
 kl=$(grep "  \* KL divergence:" "$TMP/k2_eval.log" | tail -1 | awk '{print $4}')
 awk -v kl="$kl" 'BEGIN { exit !(kl < 1.0) }' || fail "KL divergence of the n_directions=2 export is implausible: $kl"
 if "$DITCH" "${COMMON[@]}" --study-checkpoint-dir "$TMP/k2_checkpoints" \
@@ -255,7 +283,7 @@ return {
   checkpoint_action = "restart", trial_index = 1, model_action = "save", save_directory = "$TMP/fast_out",
 }
 LUA
-"$DITCH" --config "$TMP/fast.lua" tests/fixtures/qwen2 | tee "$TMP/fast.log"
+"$DITCH" --config "$TMP/fast.lua" tests/fixtures/qwen2 2>&1 | tee "$TMP/fast.log"
 grep -q "Deferred: KeywordRate (Refusals) runs on the Pareto-optimal trials only" "$TMP/fast.log" || fail "keyword scorer was not deferred"
 grep -qE "refusal-start tokens learned from [0-9]+ baseline refusals|using [0-9]+ tokenised refusal openers" "$TMP/fast.log" || fail "refusal-start token set not reported"
 grep -q "Baseline Refusal mass: [0-9.]*" "$TMP/fast.log" || fail "no baseline refusal mass"
@@ -271,10 +299,10 @@ grep -q '"scorers":"kl_divergence:minimize,refusal_logit:minimize"' "$FAST_CKPT"
 grep -q "fast_search = true" "$TMP/fast_out/ditch-reproduce.lua" || fail "manifest lacks fast_search"
 grep -q 'plugin = "refusal_logit"' "$TMP/fast_out/ditch-reproduce.lua" || fail "manifest lacks the refusal_logit scorer"
 grep -q "| \*\*Refusals\*\* | [0-9]*/12 |" "$TMP/fast_out/README.md" || fail "model card lacks the deferred refusal count"
-"$DITCH" --config "$TMP/fast.lua" tests/fixtures/qwen2 --evaluate-model "$TMP/fast_out" | tee "$TMP/fast_eval.log"
+"$DITCH" --config "$TMP/fast.lua" tests/fixtures/qwen2 --evaluate-model "$TMP/fast_out" 2>&1 | tee "$TMP/fast_eval.log"
 grep -q "  \* Refusal mass: [0-9.]*" "$TMP/fast_eval.log" || fail "evaluation lacks the refusal mass"
 grep -q "  \* Refusals: [0-9]*/12" "$TMP/fast_eval.log" || fail "evaluation lacks the deferred refusal count"
-"$DITCH" --reproduce "$TMP/fast_out/ditch-reproduce.lua" --model-action exit | tee "$TMP/fast_repro.log"
+"$DITCH" --reproduce "$TMP/fast_out/ditch-reproduce.lua" --model-action exit 2>&1 | tee "$TMP/fast_repro.log"
 grep -q "All scores match the manifest" "$TMP/fast_repro.log" || fail "the fast-search export does not reproduce"
 # The objectives differ without --fast-search: the study cannot be continued.
 if "$DITCH" --config "$TMP/fast.lua" tests/fixtures/qwen2 --fast-search false --checkpoint-action continue --model-action exit > "$TMP/fast_mismatch.log" 2>&1; then
@@ -287,7 +315,7 @@ echo "==> Separating directions, token window, auto direction range and the geom
     --direction-method separating --direction-token-window 2 --direction-range auto --print-residual-geometry \
     --n-trials 2 --n-startup-trials 2 \
     --checkpoint-action restart --trial-index 1 --model-action save --save-directory "$TMP/sep_out" \
-    | tee "$TMP/sep.log"
+    2>&1 | tee "$TMP/sep.log"
 grep -q "Residuals are averaged over the last 2 prompt tokens" "$TMP/sep.log" || fail "token window not applied"
 grep -q "Whitening the difference of means by the per-coordinate variance" "$TMP/sep.log" || fail "separating method not used"
 grep -q "AUROC        d'" "$TMP/sep.log" || fail "geometry table lacks the separation columns"
@@ -302,10 +330,10 @@ grep -q 'direction_method = "separating"' "$TMP/sep_out/ditch-reproduce.lua" || 
 grep -q 'direction_range = "auto"' "$TMP/sep_out/ditch-reproduce.lua" || fail "manifest lacks direction_range"
 grep -q "direction_token_window = 2" "$TMP/sep_out/ditch-reproduce.lua" || fail "manifest lacks direction_token_window"
 grep -q "direction_method.*| separating |" "$TMP/sep_out/README.md" || fail "model card lacks direction_method"
-"$DITCH" "${COMMON[@]}" --evaluate-model "$TMP/sep_out" | tee "$TMP/sep_eval.log"
+"$DITCH" "${COMMON[@]}" --evaluate-model "$TMP/sep_out" 2>&1 | tee "$TMP/sep_eval.log"
 kl=$(grep "  \* KL divergence:" "$TMP/sep_eval.log" | tail -1 | awk '{print $4}')
 awk -v kl="$kl" 'BEGIN { exit !(kl < 1.0) }' || fail "KL divergence of the separating-direction export is implausible: $kl"
-"$DITCH" --reproduce "$TMP/sep_out/ditch-reproduce.lua" --model-action exit | tee "$TMP/sep_repro.log"
+"$DITCH" --reproduce "$TMP/sep_out/ditch-reproduce.lua" --model-action exit 2>&1 | tee "$TMP/sep_repro.log"
 grep -q "All scores match the manifest" "$TMP/sep_repro.log" || fail "the separating-direction export does not reproduce"
 if "$DITCH" "${COMMON[@]}" --study-checkpoint-dir "$TMP/sep_checkpoints" --direction-token-window 2 --direction-range auto \
     --checkpoint-action continue --trial-index 1 --model-action exit > "$TMP/sep_mismatch.log" 2>&1; then
@@ -317,17 +345,17 @@ echo "==> Input-side ablation and a 2-position KL divergence"
 "$DITCH" "${COMMON[@]}" --study-checkpoint-dir "$TMP/inputs_checkpoints" --ablate-inputs --kl-tokens 2 \
     --n-trials 2 --n-startup-trials 2 \
     --checkpoint-action restart --trial-index 1 --model-action save --save-directory "$TMP/inputs_out" \
-    | tee "$TMP/inputs.log"
+    2>&1 | tee "$TMP/inputs.log"
 grep -q "Generating the baseline continuation (1 tokens)" "$TMP/inputs.log" || fail "multi-position KL baseline not generated"
 grep -q "Model saved to" "$TMP/inputs.log" || fail "input-ablated model was not saved"
 grep -q "argmax agreement 100%" "$TMP/inputs.log" || fail "input-ablated export validation disagreed"
 grep -q "ablate_inputs = true" "$TMP/inputs_out/ditch-reproduce.lua" || fail "manifest lacks ablate_inputs"
 grep -q "kl_tokens = 2" "$TMP/inputs_out/ditch-reproduce.lua" || fail "manifest lacks kl_tokens"
 grep -q "ablate_inputs.*| true |" "$TMP/inputs_out/README.md" || fail "model card lacks ablate_inputs"
-"$DITCH" "${COMMON[@]}" --kl-tokens 2 --evaluate-model "$TMP/inputs_out" | tee "$TMP/inputs_eval.log"
+"$DITCH" "${COMMON[@]}" --kl-tokens 2 --evaluate-model "$TMP/inputs_out" 2>&1 | tee "$TMP/inputs_eval.log"
 kl=$(grep "  \* KL divergence:" "$TMP/inputs_eval.log" | tail -1 | awk '{print $4}')
 awk -v kl="$kl" 'BEGIN { exit !(kl < 1.0) }' || fail "KL divergence of the input-ablated export is implausible: $kl"
-"$DITCH" --reproduce "$TMP/inputs_out/ditch-reproduce.lua" --model-action exit | tee "$TMP/inputs_repro.log"
+"$DITCH" --reproduce "$TMP/inputs_out/ditch-reproduce.lua" --model-action exit 2>&1 | tee "$TMP/inputs_repro.log"
 grep -q "All scores match the manifest" "$TMP/inputs_repro.log" || fail "the input-ablated export does not reproduce"
 if "$DITCH" "${COMMON[@]}" --study-checkpoint-dir "$TMP/inputs_checkpoints" --ablate-inputs \
     --checkpoint-action continue --trial-index 1 --model-action exit > "$TMP/inputs_mismatch.log" 2>&1; then
@@ -341,10 +369,10 @@ MOE_COMMON[0]=tests/fixtures/qwen3_moe
 "$DITCH" "${MOE_COMMON[@]}" \
     --n-trials 2 --n-startup-trials 2 --print-debug-information \
     --checkpoint-action restart --trial-index 1 --model-action save --save-directory "$TMP/moe_out" \
-    | tee "$TMP/moe.log"
+    2>&1 | tee "$TMP/moe.log"
 grep -q "experts.n_selected" "$TMP/moe.log" || fail "MoE search space did not include expert selection"
 [ -f "$TMP/moe_out/model.safetensors" ] || fail "MoE model was not saved"
-"$DITCH" "${MOE_COMMON[@]}" --evaluate-model "$TMP/moe_out" | tee "$TMP/moe_eval.log"
+"$DITCH" "${MOE_COMMON[@]}" --evaluate-model "$TMP/moe_out" 2>&1 | tee "$TMP/moe_eval.log"
 grep -q "  \* KL divergence: [0-9.]*" "$TMP/moe_eval.log" || fail "no KL divergence printed for MoE export"
 "$DITCH" "${MOE_COMMON[@]}" --n-trials 2 --expert-selection broad \
     --checkpoint-action restart --trial-index 1 --model-action exit > "$TMP/moe_broad.log" || fail "broad expert selection run failed"
@@ -364,7 +392,7 @@ BUDGET=(--max-ram 60KB --budget-headroom 0 --threads 4 --scratch-dir "$TMP/scrat
 "$DITCH" "${COMMON[@]}" "${BUDGET[@]}" --study-checkpoint-dir "$TMP/budget_checkpoints" \
     --n-trials 2 --n-startup-trials 2 --print-debug-information \
     --checkpoint-action restart --trial-index 1 --model-action save --save-directory "$TMP/budget_out" \
-    | tee "$TMP/budget.log"
+    2>&1 | tee "$TMP/budget.log"
 grep -q "^Memory budget: 60.0KB (headroom 0B" "$TMP/budget.log" || fail "memory budget not announced"
 grep -q "Weights: streamed layer by layer" "$TMP/budget.log" || fail "budgeted run did not stream the weights"
 grep -q "^Memory estimate:" "$TMP/budget.log" || fail "feasibility estimate not printed"
@@ -375,7 +403,7 @@ grep -q "Model saved to" "$TMP/budget.log" || fail "budgeted model was not saved
 grep -q "argmax agreement 100%" "$TMP/budget.log" || fail "export validation did not agree with the in-memory model"
 [ -f "$TMP/budget_out/model.safetensors" ] || fail "budgeted export lacks model.safetensors"
 [ ! -e "$TMP/budget_out/.incomplete" ] || fail "finished export still carries the .incomplete marker"
-"$DITCH" "${COMMON[@]}" "${BUDGET[@]}" --evaluate-model "$TMP/budget_out" | tee "$TMP/budget_eval.log"
+"$DITCH" "${COMMON[@]}" "${BUDGET[@]}" --evaluate-model "$TMP/budget_out" 2>&1 | tee "$TMP/budget_eval.log"
 grep -q "  \* KL divergence: [0-9.]*" "$TMP/budget_eval.log" || fail "no KL divergence printed for the budgeted evaluation"
 kl=$(grep "  \* KL divergence:" "$TMP/budget_eval.log" | tail -1 | awk '{print $4}')
 awk -v kl="$kl" 'BEGIN { exit !(kl < 1.0) }' || fail "KL divergence of the budgeted export is implausible: $kl"
@@ -395,7 +423,7 @@ echo "==> Time limit stops cleanly (exit 0) and leaves a resumable checkpoint"
 "$DITCH" "${COMMON[@]}" "${BUDGET[@]}" --study-checkpoint-dir "$TMP/time_checkpoints" \
     --time-limit 5s --n-trials 500 --n-startup-trials 2 --response-prefix "" \
     --checkpoint-action restart --trial-index 1 --model-action exit \
-    | tee "$TMP/time.log"
+    2>&1 | tee "$TMP/time.log"
 grep -q "^Time limit: 5.0s" "$TMP/time.log" || fail "time limit not announced"
 grep -q "^Time limit reached (.* elapsed of 5.0s)" "$TMP/time.log" || fail "time limit notice missing"
 grep -q "checkpoint-action continue to resume" "$TMP/time.log" || fail "time limit notice lacks the resume hint"
@@ -406,7 +434,7 @@ if grep -q '"type":"finished"' "$TIME_CKPT"; then fail "time-limited study marke
 "$DITCH" "${COMMON[@]}" "${BUDGET[@]}" --study-checkpoint-dir "$TMP/time_checkpoints" \
     --n-trials 1 --n-startup-trials 1 --response-prefix "" \
     --checkpoint-action continue --trial-index 1 --model-action exit \
-    | tee "$TMP/time_resume.log"
+    2>&1 | tee "$TMP/time_resume.log"
 grep -q "Optimization finished" "$TMP/time_resume.log" || fail "time-limited study could not be resumed"
 grep -q '"type":"finished"' "$TIME_CKPT" || fail "resumed study not marked finished"
 
@@ -415,12 +443,12 @@ MOE_BUDGET=(--max-ram 96KB --budget-headroom 0 --threads 4 --scratch-dir "$TMP/s
 "$DITCH" "${MOE_COMMON[@]}" "${MOE_BUDGET[@]}" --study-checkpoint-dir "$TMP/moe_budget_checkpoints" \
     --n-trials 2 --n-startup-trials 2 \
     --checkpoint-action restart --trial-index 1 --model-action save --save-directory "$TMP/moe_budget_out" \
-    | tee "$TMP/moe_budget.log"
+    2>&1 | tee "$TMP/moe_budget.log"
 grep -qE "Weights: (streamed layer by layer|trunk streamed layer by layer)" "$TMP/moe_budget.log" || fail "budgeted MoE run did not stream the weights"
 grep -q "experts.n_selected" "$TMP/moe_budget.log" || fail "budgeted MoE run lost expert selection"
 grep -q "argmax agreement 100%" "$TMP/moe_budget.log" || fail "streamed MoE export validation disagreed"
 [ ! -e "$TMP/moe_budget_out/.incomplete" ] || fail "MoE export still carries the .incomplete marker"
-"$DITCH" "${MOE_COMMON[@]}" --evaluate-model "$TMP/moe_budget_out" | tee "$TMP/moe_budget_eval.log"
+"$DITCH" "${MOE_COMMON[@]}" --evaluate-model "$TMP/moe_budget_out" 2>&1 | tee "$TMP/moe_budget_eval.log"
 kl=$(grep "  \* KL divergence:" "$TMP/moe_budget_eval.log" | tail -1 | awk '{print $4}')
 awk -v kl="$kl" 'BEGIN { exit !(kl < 1.0) }' || fail "KL divergence of the streamed MoE export is implausible: $kl"
 MOE_T=("${COMMON[@]}")
@@ -428,7 +456,7 @@ MOE_T[0]=tests/fixtures/qwen3_moe_fused_t
 "$DITCH" "${MOE_T[@]}" "${MOE_BUDGET[@]}" --study-checkpoint-dir "$TMP/moe_t_checkpoints" \
     --n-trials 1 --n-startup-trials 1 \
     --checkpoint-action restart --trial-index 1 --model-action save --save-directory "$TMP/moe_t_out" \
-    | tee "$TMP/moe_t.log"
+    2>&1 | tee "$TMP/moe_t.log"
 grep -q "argmax agreement 100%" "$TMP/moe_t.log" || fail "streamed transposed-fused MoE export validation disagreed"
 [ -f "$TMP/moe_t_out/model.safetensors" ] || fail "transposed-fused MoE export missing"
 
@@ -437,7 +465,7 @@ echo "==> GGUF export: qwen2 -> model.gguf (Q8_0), evaluated as a GGUF model"
     --n-trials 2 --n-startup-trials 2 \
     --checkpoint-action restart --trial-index 1 --model-action save --save-directory "$TMP/gguf_out" \
     --export-format gguf --gguf-dtype q8_0 \
-    | tee "$TMP/gguf.log"
+    2>&1 | tee "$TMP/gguf.log"
 grep -q "Writing model.gguf" "$TMP/gguf.log" || fail "GGUF export did not run"
 grep -q "argmax agreement 100%" "$TMP/gguf.log" || fail "GGUF export validation disagreed"
 [ -f "$TMP/gguf_out/model.gguf" ] || fail "model.gguf was not written"
@@ -446,12 +474,12 @@ grep -q "argmax agreement 100%" "$TMP/gguf.log" || fail "GGUF export validation 
 [ ! -f "$TMP/gguf_out/model.safetensors" ] || fail "--export-format gguf also wrote safetensors"
 [ ! -e "$TMP/gguf_out/.incomplete" ] || fail "GGUF export still carries the .incomplete marker"
 head -c 4 "$TMP/gguf_out/model.gguf" | grep -q "GGUF" || fail "model.gguf lacks the GGUF magic"
-"$DITCH" "${COMMON[@]}" --evaluate-model "$TMP/gguf_out/model.gguf" | tee "$TMP/gguf_eval.log"
+"$DITCH" "${COMMON[@]}" --evaluate-model "$TMP/gguf_out/model.gguf" 2>&1 | tee "$TMP/gguf_eval.log"
 grep -q "Loading model $TMP/gguf_out/model.gguf" "$TMP/gguf_eval.log" || fail "the exported GGUF was not evaluated"
 grep -q "  \* Refusals: [0-9]*/[0-9]*" "$TMP/gguf_eval.log" || fail "no refusal score printed for the GGUF model"
 kl=$(grep "  \* KL divergence:" "$TMP/gguf_eval.log" | tail -1 | awk '{print $4}')
 awk -v kl="$kl" 'BEGIN { exit !(kl < 1.0) }' || fail "KL divergence of the GGUF export is implausible: $kl"
-"$DITCH" --reproduce "$TMP/gguf_out/ditch-reproduce.lua" --model-action exit | tee "$TMP/gguf_repro.log"
+"$DITCH" --reproduce "$TMP/gguf_out/ditch-reproduce.lua" --model-action exit 2>&1 | tee "$TMP/gguf_repro.log"
 grep -q "All scores match the manifest" "$TMP/gguf_repro.log" || fail "the GGUF export's manifest does not reproduce"
 
 echo "==> GGUF input: full pipeline on the GGUF fixture, saved as GGUF again, then as both formats under a budget"
@@ -460,14 +488,14 @@ GGUF_COMMON[0]=tests/fixtures/qwen2_gguf
 "$DITCH" "${GGUF_COMMON[@]}" --study-checkpoint-dir "$TMP/gguf_in_checkpoints" \
     --n-trials 2 --n-startup-trials 2 \
     --checkpoint-action restart --trial-index 1 --model-action save --save-directory "$TMP/gguf_in_out" \
-    | tee "$TMP/gguf_in.log"
+    2>&1 | tee "$TMP/gguf_in.log"
 grep -q "Source: GGUF file model.gguf (architecture qwen2, rebuilt from the ggml vocabulary tokenizer)" "$TMP/gguf_in.log" || fail "GGUF fixture was not loaded from its ggml metadata"
 grep -q "Running trial 2 of 2" "$TMP/gguf_in.log" || fail "study on the GGUF input did not run"
 grep -q "Writing model.gguf" "$TMP/gguf_in.log" || fail "GGUF input did not default to a GGUF export"
 grep -q "argmax agreement 100%" "$TMP/gguf_in.log" || fail "GGUF -> GGUF export validation disagreed"
 [ -f "$TMP/gguf_in_out/model.gguf" ] || fail "GGUF re-export missing"
 [ ! -f "$TMP/gguf_in_out/model.safetensors" ] || fail "GGUF input exported safetensors by default"
-"$DITCH" "${GGUF_COMMON[@]}" --evaluate-model "$TMP/gguf_in_out" | tee "$TMP/gguf_in_eval.log"
+"$DITCH" "${GGUF_COMMON[@]}" --evaluate-model "$TMP/gguf_in_out" 2>&1 | tee "$TMP/gguf_in_eval.log"
 kl=$(grep "  \* KL divergence:" "$TMP/gguf_in_eval.log" | tail -1 | awk '{print $4}')
 awk -v kl="$kl" 'BEGIN { exit !(kl < 1.0) }' || fail "KL divergence of the GGUF re-export is implausible: $kl"
 "$DITCH" "${GGUF_COMMON[@]}" --max-ram 96KB --budget-headroom 0 --threads 4 --scratch-dir "$TMP/scratch" \
@@ -475,7 +503,7 @@ awk -v kl="$kl" 'BEGIN { exit !(kl < 1.0) }' || fail "KL divergence of the GGUF 
     --n-trials 1 --n-startup-trials 1 \
     --checkpoint-action restart --trial-index 1 --model-action save --save-directory "$TMP/gguf_both_out" \
     --export-format both \
-    | tee "$TMP/gguf_both.log"
+    2>&1 | tee "$TMP/gguf_both.log"
 grep -q "Weights: streamed layer by layer" "$TMP/gguf_both.log" || fail "budgeted GGUF run did not stream the weights"
 grep -q "Model saved to" "$TMP/gguf_both.log" || fail "budgeted GGUF run did not save"
 [ -f "$TMP/gguf_both_out/model.gguf" ] || fail "--export-format both lacks model.gguf"
@@ -494,7 +522,7 @@ WARP=(--max-ram 192KB --budget-headroom 0 --threads 4 --scratch-dir "$TMP/warp_s
 "$DITCH" "${BIG_COMMON[@]}" "${WARP[@]}" --study-checkpoint-dir "$TMP/warp_checkpoints" \
     --n-trials 2 --n-startup-trials 2 --print-debug-information \
     --checkpoint-action restart --trial-index 1 --model-action save --save-directory "$TMP/warp_out" \
-    | tee "$TMP/warp.log"
+    2>&1 | tee "$TMP/warp.log"
 grep -q "routed experts through an expert cache of .* (warp mode)" "$TMP/warp.log" || fail "warp mode was not enabled"
 grep -q "^  expert cache " "$TMP/warp.log" || fail "memory estimate lacks the expert cache line"
 grep -q "^  warp mode:     min" "$TMP/warp.log" || fail "memory estimate lacks the warp-mode minimum"
@@ -528,7 +556,7 @@ for f in __import__("glob").glob(sys.argv[1] + "/*.safetensors"):
 missing = [f"model.layers.{l}.mlp.experts.{e}.down_proj.weight" for l in range(4) for e in range(16) if f"model.layers.{l}.mlp.experts.{e}.down_proj.weight" not in names]
 sys.exit("missing experts in export: " + ", ".join(missing[:5]) if missing else 0)
 PY
-"$DITCH" "${BIG_COMMON[@]}" --evaluate-model "$TMP/warp_out" | tee "$TMP/warp_eval.log"
+"$DITCH" "${BIG_COMMON[@]}" --evaluate-model "$TMP/warp_out" 2>&1 | tee "$TMP/warp_eval.log"
 kl=$(grep "  \* KL divergence:" "$TMP/warp_eval.log" | tail -1 | awk '{print $4}')
 awk -v kl="$kl" 'BEGIN { exit !(kl < 1.0) }' || fail "KL divergence of the warp-mode export is implausible: $kl"
 
@@ -536,14 +564,14 @@ echo "==> Warp mode: second run warms the cache from the hotlist"
 "$DITCH" "${BIG_COMMON[@]}" "${WARP[@]}" --study-checkpoint-dir "$TMP/warp_checkpoints" \
     --n-trials 1 --n-startup-trials 1 \
     --checkpoint-action restart --trial-index 1 --model-action exit \
-    | tee "$TMP/warp2.log"
+    2>&1 | tee "$TMP/warp2.log"
 grep -q "^\* hotlist: [1-9][0-9]* experts warmed" "$TMP/warp2.log" || fail "second run did not warm the cache from the hotlist"
 # --expert-cache 0 falls back to plain layer streaming (a whole layer of experts
 # must fit, hence the larger budget); --no-hotlist writes none.
 "$DITCH" "${BIG_COMMON[@]}" "${WARP[@]}" --max-ram 512KB --expert-cache 0 --no-hotlist --scratch-dir "$TMP/plain_scratch" \
     --study-checkpoint-dir "$TMP/plain_checkpoints" --n-trials 1 --n-startup-trials 1 \
     --checkpoint-action restart --trial-index 1 --model-action exit \
-    | tee "$TMP/plain.log"
+    2>&1 | tee "$TMP/plain.log"
 grep -q "Weights: streamed layer by layer from disk" "$TMP/plain.log" || fail "--expert-cache 0 did not fall back to layer streaming"
 if grep -q "^Expert cache:" "$TMP/plain.log"; then fail "--expert-cache 0 still used an expert cache"; fi
 [ ! -e "$TMP/plain_scratch/tests--fixtures--qwen3_moe_big.hotlist" ] || fail "--no-hotlist wrote a hotlist"
@@ -560,7 +588,7 @@ REMOTE_COMMON[0]="http://127.0.0.1:$PORT/"
 "$DITCH" "${REMOTE_COMMON[@]}" --cache-dir "$TMP/remote_cache" --remote-chunk-size 4KB --threads 4 \
     --study-checkpoint-dir "$TMP/remote_checkpoints" --n-trials 1 --n-startup-trials 1 \
     --checkpoint-action restart --trial-index 1 --model-action save --save-directory "$TMP/remote_out" \
-    | tee "$TMP/remote.log"
+    2>&1 | tee "$TMP/remote.log"
 grep -q "Remote weights from http://127.0.0.1:$PORT/" "$TMP/remote.log" || fail "remote source not used"
 grep -q "headers are fetched now, tensors on demand in 4.0KB chunks" "$TMP/remote.log" || fail "remote chunk size not applied"
 grep -q "routed experts through an expert cache of .* (warp mode)" "$TMP/remote.log" || fail "remote MoE run did not use warp mode"
@@ -573,10 +601,10 @@ requests=$(wc -l < "$TMP/range.log")
 "$DITCH" "${REMOTE_COMMON[@]}" --cache-dir "$TMP/remote_cache" --remote-chunk-size 4KB --threads 4 \
     --study-checkpoint-dir "$TMP/remote_checkpoints" --n-trials 1 --n-startup-trials 1 \
     --checkpoint-action restart --trial-index 1 --model-action exit \
-    | tee "$TMP/remote2.log"
+    2>&1 | tee "$TMP/remote2.log"
 grep -q "^Remote source: fetched 0 ranges" "$TMP/remote2.log" || fail "second remote run fetched ranges although the chunks were cached"
 [ "$(wc -l < "$TMP/range.log")" -eq "$requests" ] || fail "second remote run sent requests to the server"
-"$DITCH" "${BIG_COMMON[@]}" --evaluate-model "$TMP/remote_out" | tee "$TMP/remote_eval.log"
+"$DITCH" "${BIG_COMMON[@]}" --evaluate-model "$TMP/remote_out" 2>&1 | tee "$TMP/remote_eval.log"
 kl=$(grep "  \* KL divergence:" "$TMP/remote_eval.log" | tail -1 | awk '{print $4}')
 awk -v kl="$kl" 'BEGIN { exit !(kl < 1.0) }' || fail "KL divergence of the remote-source export is implausible: $kl"
 kill $RANGE_PID 2>/dev/null || true
