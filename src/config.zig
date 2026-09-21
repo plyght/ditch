@@ -57,6 +57,14 @@ pub const DirectionRange = union(enum) {
         if (!(low >= 0 and high <= 1 and low < high)) return null;
         return .{ .fixed = .{ .low = low, .high = high } };
     }
+
+    /// The inverse of `parse`.
+    pub fn describe(self: DirectionRange, buf: []u8) []const u8 {
+        return switch (self) {
+            .auto => "auto",
+            .fixed => |f| std.fmt.bufPrint(buf, "{d}:{d}", .{ f.low, f.high }) catch "?",
+        };
+    }
 };
 
 /// How the trial shown first in the results menu is chosen.

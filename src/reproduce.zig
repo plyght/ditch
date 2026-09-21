@@ -15,6 +15,7 @@ const lua = @import("lua.zig");
 const toml = @import("toml.zig");
 const hf = @import("hf.zig");
 const abliterate = @import("abliterate.zig");
+const directions = @import("directions.zig");
 const model_mod = @import("model.zig");
 const search = @import("search.zig");
 const study_mod = @import("study.zig");
@@ -59,6 +60,15 @@ pub const Manifest = struct {
     full_normalization_lora_rank: usize,
     winsorization_quantile: f32,
     expert_selection: abliterate.ExpertSelection,
+    n_directions: usize,
+    direction_method: directions.Method,
+    direction_token_window: usize,
+    direction_shrinkage: f32,
+    /// As configured: "auto" or "<low>:<high>".
+    direction_range: []const u8,
+    ablate_inputs: bool,
+    kl_tokens: usize,
+    fast_search: bool,
     n_trials: usize,
     n_startup_trials: usize,
     scorers: []const config.ScorerConfig,
@@ -185,6 +195,7 @@ pub fn build(a: Allocator, io: Io, in: Inputs) !Manifest {
 
     const baseline = try a.alloc(study_mod.ScoreRecord, in.baseline.len);
     for (in.baseline, 0..) |b, i| baseline[i] = .{ .name = b.name, .value = b.score.value, .display = b.score.display };
+    var range_buf: [64]u8 = undefined;
 
     return .{
         .ditch_version = config.version,
@@ -202,6 +213,14 @@ pub fn build(a: Allocator, io: Io, in: Inputs) !Manifest {
         .full_normalization_lora_rank = s.full_normalization_lora_rank,
         .winsorization_quantile = s.winsorization_quantile,
         .expert_selection = s.expert_selection,
+        .n_directions = s.n_directions,
+        .direction_method = s.direction_method,
+        .direction_token_window = s.direction_token_window,
+        .direction_shrinkage = s.direction_shrinkage,
+        .direction_range = try a.dupe(u8, s.direction_range.describe(&range_buf)),
+        .ablate_inputs = s.ablate_inputs,
+        .kl_tokens = s.kl_tokens,
+        .fast_search = s.fast_search,
         .n_trials = s.n_trials,
         .n_startup_trials = s.n_startup_trials,
         .scorers = s.scorers,
@@ -314,6 +333,14 @@ pub fn write(m: *const Manifest, w: *Io.Writer) !void {
     try luaField(w, "    ", "full_normalization_lora_rank", m.full_normalization_lora_rank);
     try luaField(w, "    ", "winsorization_quantile", m.winsorization_quantile);
     try luaField(w, "    ", "expert_selection", m.expert_selection);
+    try luaField(w, "    ", "n_directions", m.n_directions);
+    try luaField(w, "    ", "direction_method", m.direction_method);
+    try luaField(w, "    ", "direction_token_window", m.direction_token_window);
+    try luaField(w, "    ", "direction_shrinkage", m.direction_shrinkage);
+    try luaField(w, "    ", "direction_range", m.direction_range);
+    try luaField(w, "    ", "ablate_inputs", m.ablate_inputs);
+    try luaField(w, "    ", "kl_tokens", m.kl_tokens);
+    try luaField(w, "    ", "fast_search", m.fast_search);
     try luaField(w, "    ", "n_trials", m.n_trials);
     try luaField(w, "    ", "n_startup_trials", m.n_startup_trials);
     try w.writeAll("    scorers = {\n");
@@ -394,6 +421,9 @@ pub fn markdown(m: *const Manifest, w: *Io.Writer) !void {
     try w.print("| **Orthogonalize direction** | {s} |\n", .{if (m.orthogonalize_direction) "true" else "false"});
     try w.print("| **Winsorization quantile** | {d} |\n", .{m.winsorization_quantile});
     try w.print("| **Expert selection** | {s} |\n", .{@tagName(m.expert_selection)});
+    try w.print("| **Directions** | {d} per layer, method {s}, token window {d}, direction_index range {s}{s} |\n", .{ m.n_directions, @tagName(m.direction_method), m.direction_token_window, m.direction_range, if (m.ablate_inputs) ", input side ablated" else "" });
+    try w.print("| **KL divergence positions** | {d} |\n", .{m.kl_tokens});
+    if (m.fast_search) try w.writeAll("| **Search** | fast (KL divergence + refusal-logit proxy; keyword scorer on the Pareto candidates) |\n");
     try w.print("| **Max response length** | {d} |\n", .{m.max_response_length});
     try markdownDataset(w, "Good prompts", m.good_prompts);
     try markdownDataset(w, "Bad prompts", m.bad_prompts);
@@ -560,6 +590,12 @@ pub fn fromTable(a: Allocator, root: *const toml.Table) ReadError!Manifest {
 
     const row_norm_s = try r.reqStr(settings, "row_normalization");
     const expert_sel_s = try r.reqStr(settings, "expert_selection");
+    // Settings added after the first manifests: absent means the (heretic) default.
+    const defaults = config.Settings{};
+    const method_s = (try r.str(settings, "direction_method")) orelse "mean";
+    var range_buf: [64]u8 = undefined;
+    const range_s = (try r.str(settings, "direction_range")) orelse try a.dupe(u8, defaults.direction_range.describe(&range_buf));
+    if (config.DirectionRange.parse(range_s) == null) return Reader.missing("settings.direction_range");
     return .{
         .ditch_version = (try r.str(root, "ditch_version")) orelse "unknown",
         .model = try r.reqStr(model, "id"),
@@ -576,6 +612,14 @@ pub fn fromTable(a: Allocator, root: *const toml.Table) ReadError!Manifest {
         .full_normalization_lora_rank = try r.int(settings, "full_normalization_lora_rank"),
         .winsorization_quantile = @floatCast(try r.num(settings, "winsorization_quantile")),
         .expert_selection = abliterate.ExpertSelection.parse(expert_sel_s) orelse return Reader.missing("settings.expert_selection"),
+        .n_directions = if (settings.get("n_directions") != null) try r.int(settings, "n_directions") else defaults.n_directions,
+        .direction_method = directions.Method.parse(method_s) orelse return Reader.missing("settings.direction_method"),
+        .direction_token_window = if (settings.get("direction_token_window") != null) try r.int(settings, "direction_token_window") else defaults.direction_token_window,
+        .direction_shrinkage = if (settings.get("direction_shrinkage") != null) @floatCast(try r.num(settings, "direction_shrinkage")) else defaults.direction_shrinkage,
+        .direction_range = range_s,
+        .ablate_inputs = if (settings.get("ablate_inputs") != null) try r.boolean(settings, "ablate_inputs") else defaults.ablate_inputs,
+        .kl_tokens = if (settings.get("kl_tokens") != null) try r.int(settings, "kl_tokens") else defaults.kl_tokens,
+        .fast_search = if (settings.get("fast_search") != null) try r.boolean(settings, "fast_search") else defaults.fast_search,
         .n_trials = try r.int(settings, "n_trials"),
         .n_startup_trials = try r.int(settings, "n_startup_trials"),
         .scorers = scorer_list,
@@ -625,6 +669,14 @@ pub fn applySettings(m: *const Manifest, s: *config.Settings) void {
     s.full_normalization_lora_rank = m.full_normalization_lora_rank;
     s.winsorization_quantile = m.winsorization_quantile;
     s.expert_selection = m.expert_selection;
+    s.n_directions = m.n_directions;
+    s.direction_method = m.direction_method;
+    s.direction_token_window = m.direction_token_window;
+    s.direction_shrinkage = m.direction_shrinkage;
+    s.direction_range = config.DirectionRange.parse(m.direction_range) orelse s.direction_range;
+    s.ablate_inputs = m.ablate_inputs;
+    s.kl_tokens = m.kl_tokens;
+    s.fast_search = m.fast_search;
     s.n_trials = m.n_trials;
     s.n_startup_trials = m.n_startup_trials;
     if (m.scorers.len > 0) s.scorers = m.scorers;
@@ -751,7 +803,7 @@ test "manifest write and parse round trip" {
     var space = try search.buildSpace(gpa, model);
     defer space.deinit();
 
-    var settings = config.Settings{ .model = "tests/fixtures/qwen2", .seed = 7, .response_prefix = "<think>\n</think>", .row_normalization = .pre };
+    var settings = config.Settings{ .model = "tests/fixtures/qwen2", .seed = 7, .response_prefix = "<think>\n</think>", .row_normalization = .pre, .n_directions = 2, .direction_method = .separating, .direction_token_window = 3, .direction_range = .auto, .ablate_inputs = true, .kl_tokens = 2, .fast_search = true };
     settings.good_prompts = .{ .dataset = "good.txt", .split = "[:2]" };
     const good = [_]Prompt{ .{ .system = "sys", .user = "hello \"world\"" }, .{ .system = "sys", .user = "line\nbreak" } };
     const bad = [_]Prompt{.{ .system = "sys", .user = "bad" }};
@@ -824,6 +876,34 @@ test "manifest write and parse round trip" {
     try std.testing.expectEqual(@as(?u64, 7), fresh.seed);
     try std.testing.expectEqualStrings("good.txt", fresh.good_prompts.dataset);
     try std.testing.expectEqualStrings("chatml", fresh.chat_template.?);
+    try std.testing.expectEqual(@as(usize, 2), fresh.n_directions);
+    try std.testing.expectEqual(directions.Method.separating, fresh.direction_method);
+    try std.testing.expectEqual(@as(usize, 3), fresh.direction_token_window);
+    try std.testing.expectEqual(config.DirectionRange.auto, fresh.direction_range);
+    try std.testing.expect(fresh.ablate_inputs and fresh.fast_search);
+    try std.testing.expectEqual(@as(usize, 2), fresh.kl_tokens);
+    try std.testing.expectEqualStrings("auto", back.direction_range);
+
+    // A manifest without the newer settings reads them as the defaults.
+    const text = try Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited);
+    var stripped = std.ArrayList(u8).empty;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    const newer = [_][]const u8{ "    n_directions = ", "    direction_method = ", "    direction_token_window = ", "    direction_shrinkage = ", "    direction_range = ", "    ablate_inputs = ", "    kl_tokens = ", "    fast_search = " };
+    while (lines.next()) |line| {
+        var skip = false;
+        for (newer) |k| skip = skip or std.mem.startsWith(u8, line, k);
+        if (skip) continue;
+        try stripped.appendSlice(a, line);
+        try stripped.append(a, '\n');
+    }
+    const old_path = try std.fs.path.join(a, &.{ dir_path, "old.lua" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = old_path, .data = stripped.items });
+    const old = try load(gpa, a, io, old_path);
+    try std.testing.expectEqual(@as(usize, 1), old.n_directions);
+    try std.testing.expectEqual(directions.Method.mean, old.direction_method);
+    try std.testing.expectEqual(@as(usize, 1), old.kl_tokens);
+    try std.testing.expect(!old.ablate_inputs and !old.fast_search);
+    try std.testing.expectEqualStrings("0.4:0.9", old.direction_range);
 }
 
 test "hash file matches a known digest" {

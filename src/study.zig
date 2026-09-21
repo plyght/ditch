@@ -180,6 +180,28 @@ pub const Study = struct {
         };
     }
 
+    pub fn settingFloat(self: *const Study, key: []const u8) ?f64 {
+        const s = self.settings orelse return null;
+        const v = s.get(key) orelse return null;
+        return switch (v) {
+            .integer => |i| @floatFromInt(i),
+            .float => |f| f,
+            else => null,
+        };
+    }
+
+    pub fn settingString(self: *const Study, key: []const u8) ?[]const u8 {
+        const s = self.settings orelse return null;
+        const v = s.get(key) orelse return null;
+        return if (v == .string) v.string else null;
+    }
+
+    pub fn settingBool(self: *const Study, key: []const u8) ?bool {
+        const s = self.settings orelse return null;
+        const v = s.get(key) orelse return null;
+        return if (v == .bool) v.bool else null;
+    }
+
     fn numberOf(v: std.json.Value) f64 {
         return switch (v) {
             .integer => |i| @floatFromInt(i),
