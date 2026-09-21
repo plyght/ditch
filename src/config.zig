@@ -256,7 +256,7 @@ pub const Settings = struct {
 /// headings in bold on a terminal.
 pub const HelpSection = struct { title: []const u8, body: []const u8 };
 
-pub const tagline = "ditches censorship: fully automatic refusal removal for open-weight language models, on a CPU.";
+pub const tagline = "ditch censorship: fully automatic refusal removal for open-weight language models, on a CPU.";
 pub const issues_url = "https://github.com/plyght/ditch/issues";
 
 pub const usage_text =
