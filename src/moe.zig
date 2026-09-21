@@ -48,7 +48,7 @@ pub const MatrixRef = struct {
     stride: usize = 1,
 
     pub fn rows(self: MatrixRef) usize {
-        return if (self.transposed) |t| (t[1] - t[0]) / self.stride else self.ref.rows;
+        return if (self.transposed) |t| (t[1] - t[0] + self.stride - 1) / self.stride else self.ref.rows;
     }
 
     pub fn cols(self: MatrixRef) usize {
@@ -427,7 +427,7 @@ fn cat(arena: Allocator, parts: []const []const u8) ![]const u8 {
 /// Copies the sub-block `src[rows][col_lo..col_hi]` (every `stride`-th column,
 /// row-major, element size `es`) transposed into a new `[n][rows]` buffer.
 fn transposeSub(arena: Allocator, es: usize, src: []const u8, rows: usize, cols: usize, col_lo: usize, col_hi: usize, stride: usize) ![]u8 {
-    const n = (col_hi - col_lo) / stride;
+    const n = (col_hi - col_lo + stride - 1) / stride;
     const out = try arena.alloc(u8, n * rows * es);
     var r: usize = 0;
     while (r < rows) : (r += 1) {
@@ -592,7 +592,7 @@ pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !Mo
                     const gu_block = blockRef(gu, e, hidden, 2 * inter);
                     ex.* = .{
                         .gate_ref = if (interleaved) .{ .ref = gu_block, .transposed = .{ 0, 2 * inter }, .stride = 2 } else .{ .ref = gu_block, .transposed = .{ 0, inter } },
-                        .up_ref = if (interleaved) .{ .ref = gu_block, .transposed = .{ 1, 2 * inter + 1 }, .stride = 2 } else .{ .ref = gu_block, .transposed = .{ inter, 2 * inter } },
+                        .up_ref = if (interleaved) .{ .ref = gu_block, .transposed = .{ 1, 2 * inter }, .stride = 2 } else .{ .ref = gu_block, .transposed = .{ inter, 2 * inter } },
                         .down_ref = .{ .ref = blockRef(dw, e, inter, hidden), .transposed = .{ 0, hidden } },
                         .gate = undefined,
                         .up = undefined,

@@ -195,3 +195,135 @@ test "mixtral fixture" {
 test "qwen2_moe fixture" {
     try checkFixture("qwen2_moe");
 }
+
+// ---------------------------------------------------------------------------
+// Abliteration, export and streaming on the registry layouts
+// ---------------------------------------------------------------------------
+
+const abliterate = @import("abliterate.zig");
+const export_mod = @import("export.zig");
+
+fn randomDirs(gpa: std.mem.Allocator, entries: usize, hidden: usize, seed: u64) ![]f32 {
+    const dirs = try gpa.alloc(f32, entries * hidden);
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rand = prng.random();
+    for (dirs) |*x| x.* = rand.floatNorm(f32);
+    for (0..entries) |e| tensor.normalize(dirs[e * hidden ..][0..hidden]);
+    return dirs;
+}
+
+fn runLogits(model: *const model_mod.Model, gpa: std.mem.Allocator, ids: []const u32) ![]f32 {
+    const c = &model.config;
+    var ws = try model_mod.Workspace.init(gpa, c, 16, 1);
+    defer ws.deinit();
+    var cache = try model_mod.KvCache.initFor(model, gpa, 1, 16);
+    defer cache.deinit();
+    const logits = try gpa.alloc(f32, c.vocab_size);
+    errdefer gpa.free(logits);
+    try model_mod.prefill(model, &ws, &cache, &.{ids}, logits, null);
+    return logits;
+}
+
+fn bothComponents() std.EnumMap(model_mod.Component, abliterate.Params) {
+    var params = std.EnumMap(model_mod.Component, abliterate.Params){};
+    params.put(.attn_o_proj, .{ .max_weight = 1.0, .max_weight_position = 1, .min_weight = 0.5, .min_weight_distance = 2 });
+    params.put(.mlp_down_proj, .{ .max_weight = 1.0, .max_weight_position = 1, .min_weight = 0.5, .min_weight_distance = 2 });
+    return params;
+}
+
+/// Loads a fixture, abliterates both components on every layer, checks that
+/// the edit changed the logits, exports the merged weights (f32, so nothing
+/// is re-rounded) and reloads them in mapped and streamed mode: both must
+/// reproduce the delta model, and the streamed reload must match the mapped
+/// one bit for bit. Covers the family's output/down projection mapping
+/// (`Component`), the export edit (Conv1D transposes, fused expert tensors)
+/// and the streamed acquisition of every layout.
+fn checkEditExportStream(comptime family: []const u8) !void {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const pool = tensor.Pool.init(io, 2);
+    const model = try model_mod.Model.load(gpa, io, &pool, "tests/fixtures/" ++ family);
+    defer model.deinit();
+    const ids = [_]u32{ 40, 100, 200, 7, 3 };
+    const base = try runLogits(model, gpa, &ids);
+    defer gpa.free(base);
+    const hidden = model.config.hidden_size;
+    const dirs = try randomDirs(gpa, model.config.num_layers + 1, hidden, 7);
+    defer gpa.free(dirs);
+    try abliterate.apply(model, dirs, null, bothComponents(), .{ .row_normalization = .full, .lora_rank = 2 });
+    for (model.layers, 0..) |*layer, li| {
+        try std.testing.expect(model.getDelta(li, .attn_o_proj) != null);
+        if (layer.moe) |*m| {
+            for (0..m.experts.len) |e| try std.testing.expect(model.getExpertDelta(li, e) != null);
+        } else {
+            try std.testing.expect(model.getDelta(li, .mlp_down_proj) != null);
+        }
+    }
+    const edited = try runLogits(model, gpa, &ids);
+    defer gpa.free(edited);
+    var moved: f32 = 0;
+    for (base, edited) |a, b| moved = @max(moved, @abs(a - b));
+    try std.testing.expect(moved > 1e-4);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path_buf);
+    const out_dir = try std.fs.path.join(gpa, &.{ path_buf[0..n], "exported" });
+    defer gpa.free(out_dir);
+    var sink: std.Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try export_mod.saveModel(gpa, io, model, out_dir, .{ .export_dtype = .f32 }, &sink.writer);
+
+    const reloaded = try model_mod.Model.load(gpa, io, &pool, out_dir);
+    defer reloaded.deinit();
+    const merged = try runLogits(reloaded, gpa, &ids);
+    defer gpa.free(merged);
+    var scale: f32 = 0;
+    for (edited) |x| scale = @max(scale, @abs(x));
+    for (edited, merged) |a, b| try std.testing.expectApproxEqAbs(a, b, 2e-3 * @max(scale, 1));
+    // Every tensor name and shape survives the round trip.
+    for (model.files) |f| {
+        var it = f.tensors.iterator();
+        while (it.next()) |kv| {
+            const info = reloaded.find(kv.key_ptr.*) orelse return error.TensorLost;
+            try std.testing.expectEqualSlices(usize, kv.value_ptr.shape, info.shape);
+        }
+    }
+    const scratch = try std.fs.path.join(gpa, &.{ path_buf[0..n], "scratch" });
+    defer gpa.free(scratch);
+    const streamed = try model_mod.Model.loadWithOptions(gpa, io, &pool, out_dir, .{ .store = .streamed, .scratch_dir = scratch, .expert_cache = 0 });
+    defer streamed.deinit();
+    try std.testing.expect(streamed.streamed());
+    const via_stream = try runLogits(streamed, gpa, &ids);
+    defer gpa.free(via_stream);
+    try std.testing.expectEqualSlices(f32, merged, via_stream);
+}
+
+test "gpt2 edit, export and streamed reload (Conv1D transposes)" {
+    try checkEditExportStream("gpt2");
+}
+test "phi3 edit, export and streamed reload (fused qkv and gate_up)" {
+    try checkEditExportStream("phi3");
+}
+test "gpt_neox edit, export and streamed reload (interleaved qkv, biases)" {
+    try checkEditExportStream("gpt_neox");
+}
+test "bloom edit, export and streamed reload (ALiBi, embedding norm)" {
+    try checkEditExportStream("bloom");
+}
+test "deepseek_v3 edit, export and streamed reload (MLA, sigmoid MoE)" {
+    try checkEditExportStream("deepseek_v3");
+}
+test "gpt_oss edit, export and streamed reload (sinks, interleaved fused experts)" {
+    try checkEditExportStream("gpt_oss");
+}
+test "llama4 edit, export and streamed reload (transposed fused experts, NoPE layers)" {
+    try checkEditExportStream("llama4");
+}
+test "chatglm edit, export and streamed reload (remote-code layout)" {
+    try checkEditExportStream("chatglm");
+}
+test "cohere edit, export and streamed reload (parallel residual, tied head)" {
+    try checkEditExportStream("cohere");
+}

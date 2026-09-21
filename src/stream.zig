@@ -297,7 +297,7 @@ pub const WeightStore = struct {
         errdefer for (out[0..done]) |l| self.release(l);
         for (specs) |spec| {
             std.debug.assert(spec.lo <= spec.hi and spec.hi <= ref.cols and spec.stride > 0);
-            const n = (spec.hi - spec.lo) / spec.stride;
+            const n = (spec.hi - spec.lo + spec.stride - 1) / spec.stride;
             const buf = try self.allocBuf(n * ref.rows * es);
             var r: usize = 0;
             while (r < ref.rows) : (r += 1) {
