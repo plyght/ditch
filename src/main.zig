@@ -968,7 +968,7 @@ fn run(init: std.process.Init, con: *Console) !void {
     const io = init.io;
     const out = con.out;
 
-    try out.print("{s}  v{s}  ditch ditches censorship.  https://github.com/plyght/ditch\n", .{ banner, config.version });
+    try out.print("{s}  v{s}  ditches censorship.  https://github.com/plyght/ditch\n", .{ banner, config.version });
     try out.writeAll("  Built on Heretic: https://github.com/p-e-w/heretic\n\n");
 
     // Settings.
