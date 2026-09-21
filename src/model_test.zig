@@ -87,3 +87,12 @@ test "qwen3 fixture" {
 test "gemma3 fixture" {
     try checkFixture("gemma3");
 }
+test "qwen3_moe fixture (separate expert tensors)" {
+    try checkFixture("qwen3_moe");
+}
+test "qwen3_moe fixture (fused expert tensors)" {
+    try checkFixture("qwen3_moe_fused");
+}
+test "qwen3_moe fixture (transposed fused expert tensors)" {
+    try checkFixture("qwen3_moe_fused_t");
+}

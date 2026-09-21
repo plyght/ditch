@@ -5,6 +5,7 @@ comptime {
     _ = @import("tokenizer.zig");
     _ = @import("model.zig");
     _ = @import("model_test.zig");
+    _ = @import("moe.zig");
     _ = @import("abliterate.zig");
     _ = @import("tpe.zig");
     _ = @import("toml.zig");
