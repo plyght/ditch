@@ -1,5 +1,7 @@
 # ditch
 
+*ditch ditches censorship.*
+
 **ditch** removes refusal behaviour ("abliteration") from open-weight language
 models, fully automatically, on a CPU. It is a from-scratch Zig rebuild of
 [Heretic](https://github.com/p-e-w/heretic) by Philipp Emanuel Weidmann and

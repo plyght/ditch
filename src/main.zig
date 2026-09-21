@@ -474,7 +474,7 @@ const App = struct {
         try o.writeAll("---\ntags:\n- ditch\n- heretic\n- uncensored\n- decensored\n- abliterated\n---\n\n");
         try o.writeAll("# This is a decensored version of ");
         if (is_hf) try o.print("[{s}](https://huggingface.co/{s})", .{ model_id, model_id }) else try o.writeAll("a model");
-        try o.print(", made using [ditch](https://github.com/p-e-w/heretic) v{s} (a Zig port of [Heretic](https://heretic-project.org))\n\n", .{config.version});
+        try o.print(", made using [ditch](https://github.com/plyght/ditch) v{s} (a Zig rebuild of [Heretic](https://heretic-project.org))\n\n", .{config.version});
         try o.writeAll("## Abliteration parameters\n\n| Parameter | Value |\n| :-------- | :---: |\n");
         if (trial.direction_index) |di| try o.print("| **direction_index** | {d:.2} |\n", .{di}) else try o.writeAll("| **direction_index** | per layer |\n");
         if (self.settings.n_directions > 1) try o.print("| **n_directions** | {d} |\n", .{self.settings.n_directions});
@@ -968,7 +968,8 @@ fn run(init: std.process.Init, con: *Console) !void {
     const io = init.io;
     const out = con.out;
 
-    try out.print("{s}  v{s}  https://github.com/p-e-w/heretic (original)\n\n", .{ banner, config.version });
+    try out.print("{s}  v{s}  ditch ditches censorship.  https://github.com/plyght/ditch\n", .{ banner, config.version });
+    try out.writeAll("  Built on Heretic: https://github.com/p-e-w/heretic\n\n");
 
     // Settings.
     const raw_args = try init.minimal.args.toSlice(arena);

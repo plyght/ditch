@@ -159,7 +159,7 @@ pub const Settings = struct {
 pub const help_text =
     \\Usage: ditch [OPTIONS] <MODEL>
     \\
-    \\Fully automatic censorship removal for language models, in Zig.
+    \\ditch ditches censorship: fully automatic refusal removal for language models, in Zig.
     \\<MODEL> is a Hugging Face model ID (e.g. Qwen/Qwen2.5-0.5B-Instruct) or a local directory.
     \\
     \\Options can also be set in config.lua (see config.default.lua); a heretic-style
