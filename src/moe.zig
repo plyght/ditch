@@ -47,7 +47,7 @@ pub const MatrixRef = struct {
 
     /// Bytes of the resident matrix.
     pub fn residentBytes(self: MatrixRef) u64 {
-        return @as(u64, self.rows()) * self.cols() * self.ref.dtype.size();
+        return @as(u64, self.rows()) * self.ref.dtype.rowBytes(self.cols());
     }
 
     /// Placeholder view carrying the shape only.

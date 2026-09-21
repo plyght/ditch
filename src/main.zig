@@ -24,6 +24,7 @@ const tpe = @import("tpe.zig");
 const study_mod = @import("study.zig");
 const scorers = @import("scorers.zig");
 const export_mod = @import("export.zig");
+const gguf_export = @import("gguf_export.zig");
 const budget_mod = @import("budget.zig");
 const stream = @import("stream.zig");
 const reproduce = @import("reproduce.zig");
@@ -427,6 +428,32 @@ const App = struct {
         }
     }
 
+    const ExportFormat = enum { hf, gguf, both };
+
+    fn exportFormat(self: *App) !ExportFormat {
+        const s = self.settings.export_format orelse return if (self.model.gguf != null) .gguf else .hf;
+        if (std.ascii.eqlIgnoreCase(s, "hf") or std.ascii.eqlIgnoreCase(s, "safetensors")) return .hf;
+        if (std.ascii.eqlIgnoreCase(s, "gguf")) return .gguf;
+        if (std.ascii.eqlIgnoreCase(s, "both")) return .both;
+        std.log.err("unknown export format: {s} (expected hf, gguf or both)", .{s});
+        return error.InvalidExportFormat;
+    }
+
+    /// The GGUF matrix dtype: null keeps the source types.
+    fn ggufDtype(self: *App) !?tensor.DType {
+        const s = self.settings.gguf_dtype orelse return if (self.model.gguf != null) null else .f16;
+        if (std.ascii.eqlIgnoreCase(s, "source") or std.ascii.eqlIgnoreCase(s, "auto")) return null;
+        const d = tensor.DType.parse(s) orelse {
+            std.log.err("unknown gguf dtype: {s} (expected f16, bf16, f32, q8_0, q4_0, q4_1, q5_0, q5_1 or source)", .{s});
+            return error.InvalidExportDtype;
+        };
+        if (d.isQuantized() and !@import("quant.zig").canQuantize(d)) {
+            std.log.err("ditch cannot quantise to {s}; use q8_0, q4_0, q4_1, q5_0 or q5_1", .{d.safetensorsName()});
+            return error.InvalidExportDtype;
+        }
+        return d;
+    }
+
     fn parseExportDtype(s: []const u8) ?tensor.DType {
         if (std.ascii.eqlIgnoreCase(s, "bf16") or std.ascii.eqlIgnoreCase(s, "bfloat16")) return .bf16;
         if (std.ascii.eqlIgnoreCase(s, "f16") or std.ascii.eqlIgnoreCase(s, "float16") or std.ascii.eqlIgnoreCase(s, "fp16")) return .f16;
@@ -506,11 +533,22 @@ const App = struct {
         var card: Io.Writer.Allocating = .init(sa);
         try card.writer.writeAll(try self.modelCard(sa, trial));
         try reproduce.markdown(&manifest, &card.writer);
-        try export_mod.saveModel(self.rt_gpa, self.io, self.model, dir, .{
-            .max_shard_size = self.settings.max_shard_size,
-            .export_dtype = dtype,
-            .readme_body = card.written(),
-        }, out);
+        const format = try self.exportFormat();
+        const gguf_dtype = try self.ggufDtype();
+        if (format == .hf or format == .both) {
+            try export_mod.saveModel(self.rt_gpa, self.io, self.model, dir, .{
+                .max_shard_size = self.settings.max_shard_size,
+                .export_dtype = dtype,
+                .readme_body = card.written(),
+            }, out);
+        }
+        if (format == .gguf or format == .both) {
+            try gguf_export.saveGguf(self.rt_gpa, self.io, self.model, dir, .{
+                .dtype = gguf_dtype,
+                .name = std.fs.path.basename(std.mem.trimEnd(u8, dir, "/")),
+                .readme_body = card.written(),
+            }, out);
+        }
         try out.print("* Writing {s}...\n", .{reproduce.file_name});
         try reproduce.writeFile(self.gpa, self.io, &manifest, dir);
         try out.print("Model saved to {s}.\n", .{dir});
@@ -1019,6 +1057,7 @@ fn run(init: std.process.Init, con: *Console) !void {
     const c = &model.config;
     try out.print("* Architecture: {s} ({d} layers, hidden size {d}, vocabulary {d}, {s} weights)\n", .{ c.model_type, c.num_layers, c.hidden_size, c.vocab_size, model.dtype.safetensorsName() });
     try out.print("* Weights: {s}\n", .{if (model.streamed()) "streamed layer by layer from disk (memory budget)" else "memory-mapped"});
+    if (model.gguf) |g| try out.print("* Source: GGUF file {s} (architecture {s}, {s} tokenizer)\n", .{ g.file_name, g.arch, if (g.embedded_tokenizer) "embedded Hugging Face" else "rebuilt from the ggml vocabulary" });
     if (manifest) |*m| try reproduce.verifyModelFiles(arena, io, m, model, settings.ignore_mismatches, out);
     var template: chat.Template = undefined;
     if (settings.chat_template) |name| {

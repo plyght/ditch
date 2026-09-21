@@ -335,5 +335,56 @@ MOE_T[0]=tests/fixtures/qwen3_moe_fused_t
 grep -q "argmax agreement 100%" "$TMP/moe_t.log" || fail "streamed transposed-fused MoE export validation disagreed"
 [ -f "$TMP/moe_t_out/model.safetensors" ] || fail "transposed-fused MoE export missing"
 
+echo "==> GGUF export: qwen2 -> model.gguf (Q8_0), evaluated as a GGUF model"
+"$DITCH" "${COMMON[@]}" --study-checkpoint-dir "$TMP/gguf_checkpoints" \
+    --n-trials 2 --n-startup-trials 2 \
+    --checkpoint-action restart --trial-index 1 --model-action save --save-directory "$TMP/gguf_out" \
+    --export-format gguf --gguf-dtype q8_0 \
+    | tee "$TMP/gguf.log"
+grep -q "Writing model.gguf" "$TMP/gguf.log" || fail "GGUF export did not run"
+grep -q "argmax agreement 100%" "$TMP/gguf.log" || fail "GGUF export validation disagreed"
+[ -f "$TMP/gguf_out/model.gguf" ] || fail "model.gguf was not written"
+[ -f "$TMP/gguf_out/README.md" ] || fail "GGUF export lacks README.md"
+[ -f "$TMP/gguf_out/ditch-reproduce.lua" ] || fail "GGUF export lacks the manifest"
+[ ! -f "$TMP/gguf_out/model.safetensors" ] || fail "--export-format gguf also wrote safetensors"
+[ ! -e "$TMP/gguf_out/.incomplete" ] || fail "GGUF export still carries the .incomplete marker"
+head -c 4 "$TMP/gguf_out/model.gguf" | grep -q "GGUF" || fail "model.gguf lacks the GGUF magic"
+"$DITCH" "${COMMON[@]}" --evaluate-model "$TMP/gguf_out/model.gguf" | tee "$TMP/gguf_eval.log"
+grep -q "Loading model $TMP/gguf_out/model.gguf" "$TMP/gguf_eval.log" || fail "the exported GGUF was not evaluated"
+grep -q "  \* Refusals: [0-9]*/[0-9]*" "$TMP/gguf_eval.log" || fail "no refusal score printed for the GGUF model"
+kl=$(grep "  \* KL divergence:" "$TMP/gguf_eval.log" | tail -1 | awk '{print $4}')
+awk -v kl="$kl" 'BEGIN { exit !(kl < 1.0) }' || fail "KL divergence of the GGUF export is implausible: $kl"
+"$DITCH" --reproduce "$TMP/gguf_out/ditch-reproduce.lua" --model-action exit | tee "$TMP/gguf_repro.log"
+grep -q "All scores match the manifest" "$TMP/gguf_repro.log" || fail "the GGUF export's manifest does not reproduce"
+
+echo "==> GGUF input: full pipeline on the GGUF fixture, saved as GGUF again, then as both formats under a budget"
+GGUF_COMMON=("${COMMON[@]}")
+GGUF_COMMON[0]=tests/fixtures/qwen2_gguf
+"$DITCH" "${GGUF_COMMON[@]}" --study-checkpoint-dir "$TMP/gguf_in_checkpoints" \
+    --n-trials 2 --n-startup-trials 2 \
+    --checkpoint-action restart --trial-index 1 --model-action save --save-directory "$TMP/gguf_in_out" \
+    | tee "$TMP/gguf_in.log"
+grep -q "Source: GGUF file model.gguf (architecture qwen2, rebuilt from the ggml vocabulary tokenizer)" "$TMP/gguf_in.log" || fail "GGUF fixture was not loaded from its ggml metadata"
+grep -q "Running trial 2 of 2" "$TMP/gguf_in.log" || fail "study on the GGUF input did not run"
+grep -q "Writing model.gguf" "$TMP/gguf_in.log" || fail "GGUF input did not default to a GGUF export"
+grep -q "argmax agreement 100%" "$TMP/gguf_in.log" || fail "GGUF -> GGUF export validation disagreed"
+[ -f "$TMP/gguf_in_out/model.gguf" ] || fail "GGUF re-export missing"
+[ ! -f "$TMP/gguf_in_out/model.safetensors" ] || fail "GGUF input exported safetensors by default"
+"$DITCH" "${GGUF_COMMON[@]}" --evaluate-model "$TMP/gguf_in_out" | tee "$TMP/gguf_in_eval.log"
+kl=$(grep "  \* KL divergence:" "$TMP/gguf_in_eval.log" | tail -1 | awk '{print $4}')
+awk -v kl="$kl" 'BEGIN { exit !(kl < 1.0) }' || fail "KL divergence of the GGUF re-export is implausible: $kl"
+"$DITCH" "${GGUF_COMMON[@]}" --max-ram 96KB --budget-headroom 0 --threads 4 --scratch-dir "$TMP/scratch" \
+    --study-checkpoint-dir "$TMP/gguf_both_checkpoints" \
+    --n-trials 1 --n-startup-trials 1 \
+    --checkpoint-action restart --trial-index 1 --model-action save --save-directory "$TMP/gguf_both_out" \
+    --export-format both \
+    | tee "$TMP/gguf_both.log"
+grep -q "Weights: streamed layer by layer" "$TMP/gguf_both.log" || fail "budgeted GGUF run did not stream the weights"
+grep -q "Model saved to" "$TMP/gguf_both.log" || fail "budgeted GGUF run did not save"
+[ -f "$TMP/gguf_both_out/model.gguf" ] || fail "--export-format both lacks model.gguf"
+[ -f "$TMP/gguf_both_out/model.safetensors" ] || fail "--export-format both lacks model.safetensors"
+[ -f "$TMP/gguf_both_out/config.json" ] || fail "--export-format both lacks config.json"
+[ ! -e "$TMP/gguf_both_out/.incomplete" ] || fail "budgeted GGUF export still carries the .incomplete marker"
+
 echo
 echo "e2e: all checks passed"
