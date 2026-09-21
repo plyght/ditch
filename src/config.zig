@@ -566,7 +566,7 @@ pub fn suggestOption(a: Allocator, name: []const u8) !?[]const u8 {
     return null;
 }
 
-pub const version = "0.2.0";
+pub const version = "0.3.0";
 
 pub const LoadResult = struct {
     settings: Settings,
