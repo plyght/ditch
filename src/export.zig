@@ -9,15 +9,23 @@ const model_mod = @import("model.zig");
 const Allocator = std.mem.Allocator;
 const Model = model_mod.Model;
 
+/// How a tensor is modified on export.
+const Edit = union(enum) {
+    /// A 2-D matrix with one delta: `W' = W + B A`.
+    whole: tensor.Delta,
+    /// A fused expert down tensor of this layer; per-expert deltas are merged slice by slice.
+    fused_down: usize,
+};
+
 const Entry = struct {
     name: []const u8,
     info: safetensors.TensorInfo,
     out_dtype: tensor.DType,
     byte_len: usize,
-    delta: ?tensor.Delta,
+    edit: ?Edit,
 };
 
-fn modifiedDelta(model: *const Model, name: []const u8) ?tensor.Delta {
+fn modifiedDelta(model: *const Model, name: []const u8) ?Edit {
     if (!std.mem.startsWith(u8, name, model.prefix)) return null;
     const rest = name[model.prefix.len..];
     if (!std.mem.startsWith(u8, rest, "layers.")) return null;
@@ -26,28 +34,42 @@ fn modifiedDelta(model: *const Model, name: []const u8) ?tensor.Delta {
     const layer = std.fmt.parseInt(usize, after[0..dot], 10) catch return null;
     if (layer >= model.layers.len) return null;
     const suffix = after[dot + 1 ..];
-    if (std.mem.eql(u8, suffix, "self_attn.o_proj.weight")) return model.getDelta(layer, .attn_o_proj);
-    if (std.mem.eql(u8, suffix, "mlp.down_proj.weight")) return model.getDelta(layer, .mlp_down_proj);
+    if (std.mem.eql(u8, suffix, "self_attn.o_proj.weight")) return whole(model.getDelta(layer, .attn_o_proj));
+    if (std.mem.eql(u8, suffix, "mlp.down_proj.weight")) return whole(model.getDelta(layer, .mlp_down_proj));
+    if (model.layers[layer].moe) |*m| {
+        const target = m.exportTarget(suffix) orelse return null;
+        return switch (target) {
+            .expert => |e| whole(m.getDownDelta(e)),
+            .fused_down => if (m.anyExpertDelta()) .{ .fused_down = layer } else null,
+        };
+    }
     return null;
 }
 
-/// Produces the bytes of one tensor in the export dtype, merging the delta if present.
-fn materialize(gpa: Allocator, e: Entry) ![]u8 {
+fn whole(delta: ?tensor.Delta) ?Edit {
+    return if (delta) |d| .{ .whole = d } else null;
+}
+
+/// Produces the bytes of one tensor in the export dtype, merging the edit if present.
+fn materialize(gpa: Allocator, model: *const Model, e: Entry) ![]u8 {
     const w = e.info.asWeight();
     const f = try w.toF32(gpa);
     defer gpa.free(f);
-    if (e.delta) |d| {
-        for (0..w.rows) |i| {
-            const row = f[i * w.cols ..][0..w.cols];
-            for (0..d.rank) |k| tensor.axpy(row, d.b[i * d.rank + k], d.a[k * w.cols ..][0..w.cols]);
-        }
-    }
+    if (e.edit) |edit| switch (edit) {
+        .whole => |d| {
+            for (0..w.rows) |i| {
+                const row = f[i * w.cols ..][0..w.cols];
+                for (0..d.rank) |k| tensor.axpy(row, d.b[i * d.rank + k], d.a[k * w.cols ..][0..w.cols]);
+            }
+        },
+        .fused_down => |layer| model.layers[layer].moe.?.mergeFusedDown(f),
+    };
     const out = try gpa.alloc(u8, e.byte_len);
     tensor.convertFromF32(e.out_dtype, f, out);
     return out;
 }
 
-fn writeShard(gpa: Allocator, io: Io, dir: Io.Dir, name: []const u8, entries: []const Entry) !void {
+fn writeShard(gpa: Allocator, io: Io, dir: Io.Dir, model: *const Model, name: []const u8, entries: []const Entry) !void {
     var header: Io.Writer.Allocating = .init(gpa);
     defer header.deinit();
     const w = &header.writer;
@@ -78,10 +100,10 @@ fn writeShard(gpa: Allocator, io: Io, dir: Io.Dir, name: []const u8, entries: []
     try out.writeAll(&len_buf);
     try out.writeAll(hb);
     for (entries) |e| {
-        if (e.delta == null and e.out_dtype == e.info.dtype) {
+        if (e.edit == null and e.out_dtype == e.info.dtype) {
             try out.writeAll(e.info.data);
         } else {
-            const bytes = try materialize(gpa, e);
+            const bytes = try materialize(gpa, model, e);
             defer gpa.free(bytes);
             try out.writeAll(bytes);
         }
@@ -116,7 +138,7 @@ pub fn saveModel(gpa: Allocator, io: Io, model: *const Model, out_dir: []const u
             const info = kv.value_ptr.*;
             const out_dtype = opts.export_dtype orelse info.dtype;
             const byte_len = info.numel() * out_dtype.size();
-            try entries.append(gpa, .{ .name = info.name, .info = info, .out_dtype = out_dtype, .byte_len = byte_len, .delta = modifiedDelta(model, info.name) });
+            try entries.append(gpa, .{ .name = info.name, .info = info, .out_dtype = out_dtype, .byte_len = byte_len, .edit = modifiedDelta(model, info.name) });
             total += byte_len;
         }
     }
@@ -139,7 +161,7 @@ pub fn saveModel(gpa: Allocator, io: Io, model: *const Model, out_dir: []const u
     if (shards.items.len == 1) {
         try out.writeAll("* Writing model.safetensors...\n");
         try out.flush();
-        try writeShard(gpa, io, dir, "model.safetensors", shards.items[0]);
+        try writeShard(gpa, io, dir, model, "model.safetensors", shards.items[0]);
     } else {
         var index: Io.Writer.Allocating = .init(gpa);
         defer index.deinit();
@@ -150,7 +172,7 @@ pub fn saveModel(gpa: Allocator, io: Io, model: *const Model, out_dir: []const u
             defer gpa.free(name);
             try out.print("* Writing {s}...\n", .{name});
             try out.flush();
-            try writeShard(gpa, io, dir, name, shard);
+            try writeShard(gpa, io, dir, model, name, shard);
             for (shard) |e| {
                 if (!first) try index.writer.writeAll(",\n");
                 first = false;

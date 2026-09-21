@@ -23,7 +23,7 @@ pub const TrialConfig = struct {
     experts: ?ExpertSelection = null,
 };
 
-/// Placeholder contract for expert-selective abliteration; filled in by moe.zig.
+/// Expert-selective abliteration parameters (applied by moe.zig).
 pub const ExpertSelection = struct {
     /// Number of experts per layer that receive the edit (0 = all experts, i.e. broad edit).
     n_experts: usize,
@@ -37,6 +37,8 @@ pub const Space = struct {
     n_layers: usize,
     components: []Component,
     is_moe: bool,
+    /// Routed experts per layer (upper bound of `experts.n_selected`).
+    n_experts: usize = 0,
 
     pub fn deinit(self: *Space) void {
         self.arena.deinit();
@@ -84,6 +86,7 @@ pub fn buildSpace(gpa: Allocator, model: *const Model) !Space {
         .n_layers = model.config.num_layers,
         .components = components,
         .is_moe = is_moe,
+        .n_experts = model.numExpertsPerLayer(),
     };
 }
 
@@ -110,7 +113,8 @@ pub fn decode(space: *const Space, vector: []const f64) TrialConfig {
     }
     var experts: ?ExpertSelection = null;
     if (space.is_moe) {
-        experts = .{ .n_experts = @intFromFloat(@floor(vector[i])), .strength = @floatCast(vector[i + 1]) };
+        const n: usize = @intFromFloat(@floor(@max(0.0, vector[i])));
+        experts = .{ .n_experts = @min(n, space.n_experts), .strength = @floatCast(vector[i + 1]) };
         i += 2;
     }
     return .{
@@ -135,10 +139,11 @@ pub fn describe(space: *const Space, vector: []const f64, out: *std.Io.Writer) !
     }
 }
 
-/// Applies a decoded trial configuration to the model.
+/// Applies a decoded trial configuration to the model. `n_experts == 0` (or
+/// `opts.expert_selection == .broad`) is the broad edit of every expert.
 pub fn applyTrial(model: *Model, dirs: []const f32, cfg: TrialConfig, opts: abliterate.Options) !void {
     if (cfg.experts) |sel| {
-        if (sel.n_experts > 0) {
+        if (sel.n_experts > 0 and opts.expert_selection != .broad) {
             return model_mod.applyExpertSelective(model, dirs, cfg, opts);
         }
     }
@@ -160,4 +165,43 @@ test "space round trip (dense)" {
     try std.testing.expectEqual(@as(f32, 0.0), cfg.parameters.get(.mlp_down_proj).?.max_weight);
     v[0] = 1;
     try std.testing.expectEqual(@as(?f32, null), decode(&space, &v).direction_index);
+    try std.testing.expectEqual(@as(?ExpertSelection, null), cfg.experts);
 }
+
+test "space round trip (moe)" {
+    const gpa = std.testing.allocator;
+    const pool = @import("tensor.zig").Pool.init(std.testing.io, 1);
+    const model = try Model.load(gpa, std.testing.io, &pool, "tests/fixtures/qwen3_moe");
+    defer model.deinit();
+    var space = try buildSpace(gpa, model);
+    defer space.deinit();
+    try std.testing.expect(space.is_moe);
+    try std.testing.expectEqual(@as(usize, 2 + 4 * 2 + 2), space.dims());
+    try std.testing.expectEqualStrings("experts.n_selected", space.space.names[10]);
+    try std.testing.expectEqual(@as(f64, 4.0), space.space.specs[10].float.high);
+    var v = [_]f64{ 0, 1.2, 1.0, 2.0, 0.5, 1.0, 0.7, 2.0, 0.5, 1.0, 2.9, 1.25 };
+    const cfg = decode(&space, &v);
+    try std.testing.expectEqual(@as(usize, 2), cfg.experts.?.n_experts);
+    try std.testing.expectEqual(@as(f32, 1.25), cfg.experts.?.strength);
+    v[10] = 0.4;
+    try std.testing.expectEqual(@as(usize, 0), decode(&space, &v).experts.?.n_experts);
+    v[10] = 4.0;
+    try std.testing.expectEqual(@as(usize, 4), decode(&space, &v).experts.?.n_experts);
+    // Applying a selective trial and the broad fallback both succeed on the fixture.
+    const hidden = model.config.hidden_size;
+    const dirs = try gpa.alloc(f32, (model.config.num_layers + 1) * hidden);
+    defer gpa.free(dirs);
+    for (dirs, 0..) |*x, i| x.* = if (i % hidden == 0) 1.0 else 0.0;
+    // The MLP kernel (position 2, distance 1) reaches layers 1 (dense) and 2 (MoE) only.
+    v[10] = 1.0;
+    try applyTrial(model, dirs, decode(&space, &v), .{ .row_normalization = .none });
+    var edited: usize = 0;
+    for (0..4) |e| edited += @intFromBool(model.getExpertDelta(2, e) != null);
+    try std.testing.expectEqual(@as(usize, 1), edited);
+    for (0..4) |e| try std.testing.expectEqual(@as(?tensor_mod.Delta, null), model.getExpertDelta(0, e));
+    try std.testing.expect(model.getDelta(1, .mlp_down_proj) != null);
+    try applyTrial(model, dirs, decode(&space, &v), .{ .row_normalization = .none, .expert_selection = .broad });
+    for (0..4) |e| try std.testing.expect(model.getExpertDelta(2, e) != null);
+}
+
+const tensor_mod = @import("tensor.zig");

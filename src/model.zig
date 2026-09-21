@@ -1,11 +1,15 @@
-//! Transformer model loading and inference for Llama-family dense models
-//! (Llama 2/3, Mistral, Qwen 2/2.5/3, Gemma 2/3 text).
+//! Transformer model loading and inference for Llama-family models
+//! (Llama 2/3, Mistral, Qwen 2/2.5/3, Gemma 2/3 text) and their
+//! mixture-of-experts variants (Mixtral, Qwen2-MoE, Qwen3-MoE; see moe.zig).
 
 const std = @import("std");
 const Io = std.Io;
 const tensor = @import("tensor.zig");
 const safetensors = @import("safetensors.zig");
 const Tokenizer = @import("tokenizer.zig").Tokenizer;
+const moe = @import("moe.zig");
+const abliterate = @import("abliterate.zig");
+const search = @import("search.zig");
 
 const Allocator = std.mem.Allocator;
 const Weight = tensor.Weight;
@@ -18,6 +22,9 @@ pub const Family = enum {
     qwen3,
     gemma2,
     gemma3,
+    qwen2_moe,
+    qwen3_moe,
+    mixtral,
 
     pub fn isGemma(self: Family) bool {
         return self == .gemma2 or self == .gemma3;
@@ -55,6 +62,13 @@ pub const Config = struct {
     final_logit_softcapping: ?f32,
     attention_bias: bool,
     embed_scale: f32,
+    /// Mixture-of-experts settings (num_experts == 0 for dense models).
+    num_experts: usize,
+    num_experts_per_tok: usize,
+    norm_topk_prob: bool,
+    moe_intermediate_size: usize,
+    /// Per layer: true if the layer's MLP is a routed mixture of experts.
+    moe_layers: []bool,
 };
 
 fn getNum(obj: std.json.ObjectMap, key: []const u8) ?f64 {
@@ -105,6 +119,12 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         .gemma2
     else if (std.mem.eql(u8, model_type, "gemma3") or std.mem.eql(u8, model_type, "gemma3_text"))
         .gemma3
+    else if (std.mem.eql(u8, model_type, "qwen2_moe"))
+        .qwen2_moe
+    else if (std.mem.eql(u8, model_type, "qwen3_moe"))
+        .qwen3_moe
+    else if (std.mem.eql(u8, model_type, "mixtral"))
+        .mixtral
     else {
         std.log.err("unsupported model_type: {s}", .{model_type});
         return error.UnsupportedArchitecture;
@@ -166,6 +186,22 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         @memset(sliding_layers, true);
     }
 
+    // Mixture of experts: `num_experts` (Qwen) or `num_local_experts` (Mixtral);
+    // Qwen additionally allows dense layers via `mlp_only_layers` / `decoder_sparse_step`.
+    const num_experts = getInt(obj, "num_experts", getInt(obj, "num_local_experts", 0));
+    const moe_layers = try arena.alloc(bool, layers);
+    @memset(moe_layers, false);
+    if (num_experts > 0) {
+        const sparse_step = @max(getInt(obj, "decoder_sparse_step", 1), 1);
+        for (moe_layers, 0..) |*m, i| m.* = ((i + 1) % sparse_step == 0);
+        if (obj.get("mlp_only_layers")) |ml| {
+            if (ml == .array) for (ml.array.items) |v| {
+                if (v == .integer and v.integer >= 0 and v.integer < layers) moe_layers[@intCast(v.integer)] = false;
+            };
+        }
+    }
+    const intermediate_size = getInt(obj, "intermediate_size", 4 * hidden);
+
     const query_pre_attn_scalar = getNum(obj, "query_pre_attn_scalar");
     const attention_scale: f32 = if (query_pre_attn_scalar) |q| @floatCast(1.0 / @sqrt(q)) else 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
 
@@ -173,7 +209,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         .family = family,
         .model_type = try arena.dupe(u8, model_type),
         .hidden_size = hidden,
-        .intermediate_size = getInt(obj, "intermediate_size", 4 * hidden),
+        .intermediate_size = intermediate_size,
         .num_layers = layers,
         .num_heads = heads,
         .num_kv_heads = kv_heads,
@@ -191,8 +227,13 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         .attention_scale = attention_scale,
         .attn_logit_softcapping = if (getNum(obj, "attn_logit_softcapping")) |v| @as(f32, @floatCast(v)) else null,
         .final_logit_softcapping = if (getNum(obj, "final_logit_softcapping")) |v| @as(f32, @floatCast(v)) else null,
-        .attention_bias = getBool(obj, "attention_bias", family == .qwen2),
+        .attention_bias = getBool(obj, "attention_bias", family == .qwen2 or family == .qwen2_moe),
         .embed_scale = if (family.isGemma()) @sqrt(@as(f32, @floatFromInt(hidden))) else 1.0,
+        .num_experts = num_experts,
+        .num_experts_per_tok = getInt(obj, "num_experts_per_tok", 2),
+        .norm_topk_prob = getBool(obj, "norm_topk_prob", family == .mixtral),
+        .moe_intermediate_size = getInt(obj, "moe_intermediate_size", intermediate_size),
+        .moe_layers = moe_layers,
     };
 }
 
@@ -214,10 +255,13 @@ pub const Layer = struct {
     q_bias: ?[]f32,
     k_bias: ?[]f32,
     v_bias: ?[]f32,
-    gate: Weight,
-    up: Weight,
-    down: Weight,
-    /// Abliteration deltas (null = identity).
+    /// Dense MLP (null for mixture-of-experts layers).
+    gate: ?Weight,
+    up: ?Weight,
+    down: ?Weight,
+    /// Routed mixture of experts (null for dense layers).
+    moe: ?moe.MoeLayer = null,
+    /// Abliteration deltas (null = identity). Expert deltas live in `moe`.
     o_delta: ?Delta = null,
     down_delta: ?Delta = null,
 };
@@ -432,10 +476,17 @@ pub const Model = struct {
                 .q_bias = self.loadVecOpt(try cat(arena, lp, "self_attn.q_proj.bias")),
                 .k_bias = self.loadVecOpt(try cat(arena, lp, "self_attn.k_proj.bias")),
                 .v_bias = self.loadVecOpt(try cat(arena, lp, "self_attn.v_proj.bias")),
-                .gate = try self.loadMat(try cat(arena, lp, "mlp.gate_proj.weight")),
-                .up = try self.loadMat(try cat(arena, lp, "mlp.up_proj.weight")),
-                .down = try self.loadMat(try cat(arena, lp, "mlp.down_proj.weight")),
+                .gate = null,
+                .up = null,
+                .down = null,
             };
+            if (c.moe_layers[i]) {
+                layer.moe = try moe.loadLayer(self, arena, lp);
+            } else {
+                layer.gate = try self.loadMat(try cat(arena, lp, "mlp.gate_proj.weight"));
+                layer.up = try self.loadMat(try cat(arena, lp, "mlp.up_proj.weight"));
+                layer.down = try self.loadMat(try cat(arena, lp, "mlp.down_proj.weight"));
+            }
         }
 
         try self.buildRope();
@@ -453,12 +504,17 @@ pub const Model = struct {
         return null;
     }
 
+    /// Matrix view of a named tensor, or null if absent.
+    pub fn findWeight(self: *const Model, name: []const u8) ?Weight {
+        const t = self.find(name) orelse return null;
+        return t.asWeight();
+    }
+
     fn loadMat(self: *Model, name: []const u8) !Weight {
-        const t = self.find(name) orelse {
+        return self.findWeight(name) orelse {
             std.log.err("missing tensor: {s}", .{name});
             return error.MissingWeights;
         };
-        return t.asWeight();
     }
 
     fn loadVec(self: *Model, name: []const u8) ![]f32 {
@@ -551,14 +607,35 @@ pub const Model = struct {
                 self.gpa.free(d.b);
                 l.down_delta = null;
             }
+            if (l.moe) |*m| m.resetDeltas(self.gpa);
         }
     }
 
+    /// Weight of a dense component. For `.mlp_down_proj` on an MoE layer use `expertDownWeight`.
     pub fn componentWeight(self: *const Model, layer: usize, comp: Component) Weight {
         return switch (comp) {
             .attn_o_proj => self.layers[layer].o,
-            .mlp_down_proj => self.layers[layer].down,
+            .mlp_down_proj => self.layers[layer].down.?,
         };
+    }
+
+    /// Down projection of routed expert `expert` of an MoE layer; the shared
+    /// expert (if any) is addressed by index `experts.len`.
+    pub fn expertDownWeight(self: *const Model, layer: usize, expert: usize) Weight {
+        return self.layers[layer].moe.?.downWeight(expert);
+    }
+
+    pub fn setExpertDelta(self: *Model, layer: usize, expert: usize, delta: Delta) void {
+        const slot = self.layers[layer].moe.?.downDelta(expert);
+        if (slot.*) |d| {
+            self.gpa.free(d.a);
+            self.gpa.free(d.b);
+        }
+        slot.* = delta;
+    }
+
+    pub fn getExpertDelta(self: *const Model, layer: usize, expert: usize) ?Delta {
+        return self.layers[layer].moe.?.getDownDelta(expert);
     }
 
     pub fn setDelta(self: *Model, layer: usize, comp: Component, delta: Delta) void {
@@ -581,16 +658,19 @@ pub const Model = struct {
         }
     }
 
-    /// True for mixture-of-experts architectures (implemented in moe.zig).
+    /// True if any layer is a routed mixture of experts.
     pub fn isMoe(self: *const Model) bool {
-        _ = self;
+        for (self.layers) |l| if (l.moe != null) return true;
         return false;
     }
 
-    /// Number of routed experts per layer (0 for dense models).
+    /// Largest number of routed experts in any layer (0 for dense models).
     pub fn numExpertsPerLayer(self: *const Model) usize {
-        _ = self;
-        return 0;
+        var n: usize = 0;
+        for (self.layers) |l| if (l.moe) |m| {
+            n = @max(n, m.experts.len);
+        };
+        return n;
     }
 
     pub fn getDelta(self: *const Model, layer: usize, comp: Component) ?Delta {
@@ -851,11 +931,15 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
         const ff_norm = if (c.family.isGemma()) layer.pre_ff_norm.? else layer.post_attn_norm;
         i = 0;
         while (i < n) : (i += 1) tensor.rmsnorm(h[i * hidden ..][0..hidden], x[i * hidden ..][0..hidden], ff_norm, c.rms_norm_eps, c.family.isGemma());
-        try tensor.matmulT(model.pool, gpa, ws.gate, h, n, layer.gate, null);
-        try tensor.matmulT(model.pool, gpa, ws.up, h, n, layer.up, null);
-        const inter = c.intermediate_size;
-        for (ws.gate[0 .. n * inter], 0..) |*g, j| g.* = c.activation.apply(g.*) * ws.up[j];
-        try tensor.matmulT(model.pool, gpa, ws.o, ws.gate, n, layer.down, if (layer.down_delta) |*d| d else null);
+        if (layer.moe) |*m| {
+            try moe.forward(model, m, ws.o, h, n);
+        } else {
+            try tensor.matmulT(model.pool, gpa, ws.gate, h, n, layer.gate.?, null);
+            try tensor.matmulT(model.pool, gpa, ws.up, h, n, layer.up.?, null);
+            const inter = c.intermediate_size;
+            for (ws.gate[0 .. n * inter], 0..) |*g, j| g.* = c.activation.apply(g.*) * ws.up[j];
+            try tensor.matmulT(model.pool, gpa, ws.o, ws.gate, n, layer.down.?, if (layer.down_delta) |*d| d else null);
+        }
         i = 0;
         while (i < n) : (i += 1) {
             const o = ws.o[i * hidden ..][0..hidden];
@@ -1032,11 +1116,7 @@ pub fn generate(model: *const Model, ws: *Workspace, cache: *KvCache, prompts: [
     return result;
 }
 
-/// Expert-selective abliteration entry point; implemented for MoE models in moe.zig.
-pub fn applyExpertSelective(model: *Model, dirs: []const f32, cfg: anytype, opts: anytype) !void {
-    _ = model;
-    _ = dirs;
-    _ = cfg;
-    _ = opts;
-    return error.NotMoeModel;
+/// Expert-selective abliteration entry point (see `moe.applyExpertSelective`).
+pub fn applyExpertSelective(model: *Model, dirs: []const f32, cfg: search.TrialConfig, opts: abliterate.Options) !void {
+    return moe.applyExpertSelective(model, dirs, cfg, opts);
 }
