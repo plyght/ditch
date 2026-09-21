@@ -268,7 +268,7 @@ fn luaField(w: *Io.Writer, indent: []const u8, key: []const u8, value: anytype) 
     switch (info) {
         .bool => try w.writeAll(if (value) "true" else "false"),
         .int, .comptime_int => try w.print("{d}", .{value}),
-        .float, .comptime_float => try w.print("{d}", .{@as(f64, @floatCast(value))}),
+        .float, .comptime_float => if (T == f32) try w.print("{d}", .{value}) else try w.print("{d}", .{@as(f64, @floatCast(value))}),
         .@"enum" => try luaString(w, @tagName(value)),
         else => try luaString(w, value),
     }

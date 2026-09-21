@@ -70,12 +70,17 @@ pub fn shouldPrune(matches: usize, total: usize, threshold: ?f64) bool {
 /// The first generated token of every scored response and whether the
 /// response was a keyword refusal (the training data of `RefusalLogit`).
 pub const FirstTokens = struct {
+    gpa: Allocator,
     tokens: std.ArrayList(u32) = .empty,
     refused: std.ArrayList(bool) = .empty,
 
-    pub fn deinit(self: *FirstTokens, gpa: Allocator) void {
-        self.tokens.deinit(gpa);
-        self.refused.deinit(gpa);
+    pub fn init(gpa: Allocator) FirstTokens {
+        return .{ .gpa = gpa };
+    }
+
+    pub fn deinit(self: *FirstTokens) void {
+        self.tokens.deinit(self.gpa);
+        self.refused.deinit(self.gpa);
     }
 };
 
@@ -118,8 +123,8 @@ pub const KeywordRate = struct {
                 const m = try isMatch(gpa, r, self.settings.keyword_markers);
                 if (m) matches += 1;
                 if (capture) |c| {
-                    try c.tokens.append(gpa, if (t.len > 0) t[0] else engine.model.pad_id);
-                    try c.refused.append(gpa, m);
+                    try c.tokens.append(c.gpa, if (t.len > 0) t[0] else engine.model.pad_id);
+                    try c.refused.append(c.gpa, m);
                 }
                 if (self.settings.print_responses) {
                     try out.print("\nSystem prompt: {s}\nPrompt: {s}\nResponse{s}: {s}\n", .{ p.system, p.user, if (m) " [refusal]" else "", if (std.mem.trim(u8, r, " \t\r\n").len == 0) "[empty]" else r });
@@ -558,8 +563,8 @@ pub const Evaluator = struct {
     /// keyword scorer a temporary one on the keyword prompts is used.
     fn baselineScores(self: *Evaluator, alloc: Allocator, engine: *Engine, settings: *const config.Settings, out: *Io.Writer) ![]NamedScore {
         const gpa = self.gpa;
-        var capture = FirstTokens{};
-        defer capture.deinit(gpa);
+        var capture = FirstTokens.init(gpa);
+        defer capture.deinit();
         var captured = false;
         const result = try alloc.alloc(NamedScore, self.entries.len);
         for (self.entries, 0..) |*e, i| {
@@ -794,8 +799,8 @@ test "refusal logit and multi-token KL on the qwen2 fixture" {
     // argmax token of every prompt is in the set.
     var kr_settings = config.KeywordRateSettings{ .keyword_markers = &.{"\x00never"} };
     var kr = KeywordRate{ .settings = &kr_settings, .prompts = prompts };
-    var capture = FirstTokens{};
-    defer capture.deinit(gpa);
+    var capture = FirstTokens.init(gpa);
+    defer capture.deinit();
     const s0 = try kr.scoreCapturing(gpa, &engine, &sink.writer, null, &capture);
     defer gpa.free(s0.display);
     try std.testing.expectEqual(@as(usize, 4), capture.tokens.items.len);

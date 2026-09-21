@@ -296,6 +296,7 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings,
         .lora_rank = settings.full_normalization_lora_rank,
         .seed = settings.seed orelse 0,
         .expert_selection = settings.expert_selection,
+        .ablate_inputs = settings.ablate_inputs,
     });
     const scores = try evaluator.scores(arena, &engine, out);
     result.trial_seconds = secondsSince(io, start);
