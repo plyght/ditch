@@ -3,6 +3,11 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. v0.1.0 (the tag is created if missing)"
+        required: true
 
 permissions:
   contents: write
@@ -15,12 +20,28 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+      - name: Resolve version and create the tag when dispatched
+        id: version
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            version="${{ github.event.inputs.version }}"
+            git config user.name "plyght"
+            git config user.email "plyght@peril.lol"
+            if ! git ls-remote --tags origin "refs/tags/$version" | grep -q .; then
+              git tag -a "$version" -m "ditch $version"
+              git push origin "refs/tags/$version"
+            fi
+          else
+            version="${GITHUB_REF_NAME}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Unit tests
         run: zig build test --summary all
       - name: Build release binaries
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME}"
+          version="${{ steps.version.outputs.version }}"
           mkdir -p dist
           for t in x86_64-linux-musl aarch64-linux-musl x86_64-macos aarch64-macos x86_64-windows-gnu; do
             zig build -Doptimize=ReleaseFast -Dtarget="$t" --prefix "zig-out/$t"
@@ -49,3 +70,4 @@ jobs:
             dist/*.zip
             dist/SHA256SUMS
           generate_release_notes: true
+          tag_name: ${{ steps.version.outputs.version }}
