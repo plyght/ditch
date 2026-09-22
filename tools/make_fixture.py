@@ -5,7 +5,7 @@ forward pass, used to validate ditch's inference against known-good numbers.
 Usage: make_fixture.py <family> [<out_dir>] [--gguf]
     family: llama | qwen2 | qwen3 | gemma3 | qwen3_moe | qwen3_moe_fused | qwen3_moe_fused_t
             or any family of the registry-driven generator (`SPECS` below:
-            phi3, phi, gpt_neox, gpt2, falcon, ... , gpt_oss, deepseek_v3)
+            phi3, phi, gpt_neox, gpt2, falcon, ... , gpt_oss, deepseek_v3, kimi_linear)
             | qwen3_moe_big
     --gguf: additionally write <out_dir>_gguf/model.gguf, the same model as a
             llama.cpp GGUF file (f16 attention and embedding matrices, Q8_0
@@ -473,6 +473,53 @@ spec("qwen3_next", tok="qwen2", H=32, I=32, L=4, NH=4, NKV=2, HD=8, rotary_dim=2
              "linear_num_key_heads": 2, "linear_key_head_dim": 4, "linear_num_value_heads": 4, "linear_value_head_dim": 4,
              "linear_conv_kernel_dim": 2, "full_attention_interval": 4, "partial_rotary_factor": 0.25,
              "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "silu", "max_position_embeddings": 128, "tie_word_embeddings": True})
+# Kimi Linear (KDA + MLA hybrid, DeepSeek-V3-style MoE). `kimi_linear` is the
+# original checkpoint layout (linear_attn_config, q/k/v convolutions on
+# self_attn, block_sparse_moe with w1/w3/w2 experts); `kimi_linear_hf` the
+# Hugging Face module layout (layer_types, forget_gate, fused conv1d, stacked
+# experts). Full-attention layers carry no positional encoding.
+_KIMI_MLA = {"q_lora_rank": None, "kv_lora_rank": 16, "nope": 8, "rope": 4, "v": 8}
+_KIMI_KDA = {"kind": "kda", "KH": 4, "KD": 4, "VH": 4, "VD": 4, "KC": 3}
+spec("kimi_linear", tok="deepseek3", NKV=4, HD=12, VD=8, L=4, rotary_dim=4, rope_layers=[0, 0, 0, 0], lm_head="lm_head.weight", eps=1e-5,
+     mla=_KIMI_MLA, linear=dict(_KIMI_KDA, layout="checkpoint"), linear_layers=[1, 1, 1, 0],
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "scoring": "sigmoid", "group_limited": True, "n_group": 2, "topk_group": 1, "rsf": 2.446, "norm": True,
+          "layers": [1, 2, 3], "corr_bias": True, "layout": "separate", "prefix": "block_sparse_moe.", "router": "gate.weight",
+          "expert_names": ("w1.weight", "w3.weight", "w2.weight"), "shared_name": "shared_experts."},
+     config={"model_type": "kimi_linear", "architectures": ["KimiLinearForCausalLM"], "hidden_size": 32, "intermediate_size": 32, "moe_intermediate_size": 12,
+             "num_hidden_layers": 4, "num_attention_heads": 4, "num_key_value_heads": 4, "q_lora_rank": None, "kv_lora_rank": 16,
+             "qk_nope_head_dim": 8, "qk_rope_head_dim": 4, "v_head_dim": 8, "num_experts": 4, "num_shared_experts": 1, "num_experts_per_token": 2,
+             "num_expert_group": 2, "topk_group": 1, "moe_renormalize": True, "routed_scaling_factor": 2.446, "first_k_dense_replace": 1,
+             "linear_attn_config": {"kda_layers": [1, 2, 3], "full_attn_layers": [4], "head_dim": 4, "num_heads": 4, "short_conv_kernel_size": 3},
+             "rms_norm_eps": 1e-5, "hidden_act": "silu", "model_max_length": 128, "tie_word_embeddings": False})
+spec("kimi_linear_hf", tok="deepseek3", NKV=4, HD=12, VD=8, L=4, rotary_dim=4, rope_layers=[0, 0, 0, 0], lm_head="lm_head.weight", eps=1e-5,
+     mla=_KIMI_MLA, linear=dict(_KIMI_KDA, layout="hf"), linear_layers=[1, 0, 1, 1],
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "scoring": "sigmoid", "group_limited": True, "n_group": 1, "topk_group": 1, "rsf": 2.446, "norm": True,
+          "layers": [1, 2, 3], "corr_bias": True, "layout": "fused_eih", "prefix": "mlp.", "router": "gate.weight", "shared_name": "shared_experts."},
+     config={"model_type": "kimi_linear", "architectures": ["KimiLinearForCausalLM"], "hidden_size": 32, "intermediate_size": 32, "moe_intermediate_size": 12,
+             "num_hidden_layers": 4, "num_attention_heads": 4, "num_key_value_heads": 4, "head_dim": 4, "q_lora_rank": None, "kv_lora_rank": 16,
+             "qk_nope_head_dim": 8, "qk_rope_head_dim": 4, "v_head_dim": 8, "num_local_experts": 4, "n_shared_experts": 1, "num_experts_per_tok": 2,
+             "n_group": 1, "topk_group": 1, "norm_topk_prob": True, "routed_scaling_factor": 2.446,
+             "layer_types": ["linear_attention", "full_attention", "linear_attention", "linear_attention"],
+             "mlp_layer_types": ["dense", "sparse", "sparse", "sparse"],
+             "linear_head_dim": 4, "linear_num_heads": 4, "linear_conv_kernel_dim": 3,
+             "rms_norm_eps": 1e-5, "hidden_act": "silu", "max_position_embeddings": 128, "tie_word_embeddings": False})
+# Kimi K2.5 / K2.6: the image-video wrapper around a DeepSeek V3 text config
+# (model_type kimi_k2 under text_config, language_model prefix).
+spec("kimi_k25", tok="deepseek3", NKV=4, HD=12, VD=8, L=3, prefix="language_model.model.", lm_head="language_model.lm_head.weight",
+     rope_style="gptj", rotary_dim=4,
+     mla={"q_lora_rank": 12, "kv_lora_rank": 16, "nope": 8, "rope": 4, "v": 8},
+     scaling={"type": "yarn", "factor": 32.0, "beta_fast": 1.0, "beta_slow": 1.0, "mscale": 1.0, "mscale_all_dim": 1.0, "original_max_position_embeddings": 32},
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "scoring": "sigmoid", "group_limited": True, "n_group": 1, "topk_group": 1, "rsf": 2.827, "norm": True,
+          "layers": [1, 2], "corr_bias": True, "layout": "separate", "prefix": "mlp.", "router": "gate.weight", "shared_name": "shared_experts."},
+     config={"model_type": "kimi_k25", "architectures": ["Kimi_K25ForConditionalGeneration"], "tie_word_embeddings": False,
+             "image_token_id": 200, "video_token_id": 201,
+             "vision_config": {"model_type": "kimi_k25_vision", "hidden_size": 16, "num_hidden_layers": 1, "num_attention_heads": 2, "patch_size": 14},
+             "text_config": {"model_type": "kimi_k2", "hidden_size": 32, "intermediate_size": 32, "moe_intermediate_size": 12, "num_hidden_layers": 3,
+                             "num_attention_heads": 4, "num_key_value_heads": 4, "q_lora_rank": 12, "kv_lora_rank": 16, "qk_nope_head_dim": 8, "qk_rope_head_dim": 4,
+                             "v_head_dim": 8, "n_routed_experts": 4, "n_shared_experts": 1, "num_experts_per_tok": 2, "first_k_dense_replace": 1, "moe_layer_freq": 1,
+                             "scoring_func": "sigmoid", "topk_method": "noaux_tc", "n_group": 1, "topk_group": 1, "routed_scaling_factor": 2.827,
+                             "norm_topk_prob": True, "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "max_position_embeddings": 128, "hidden_act": "silu",
+                             "tie_word_embeddings": False, "rope_interleave": True}})
 spec("qwen3_5", tok="qwen2", H=32, I=32, L=2, NH=4, NKV=2, HD=8, rotary_dim=2,
      qk_norm="head", gated_q=True,
      linear={"KH": 2, "KD": 4, "VH": 4, "VD": 4, "KC": 2, "fused": False}, linear_layers=[1, 0],
@@ -580,7 +627,35 @@ def generate_generic(family, out_dir):
         d["post_ff_norm"] = normw(lp + s["post_ff_norm"], H) if s["post_ff_norm"] else None
         d["mlp_norm"] = normw(lp + s["mlp_norm"], H) if s["mlp_norm"] else None
         qd, kvd = NH * HD, NKV * HD
-        if lin_layers[i]:
+        if lin_layers[i] and s["linear"].get("kind") == "kda":
+            ln, ap = s["linear"], "self_attn."
+            NHl, D, KC = ln["VH"], ln["VD"], ln["KC"]
+            dim = NHl * D
+            hf = ln["layout"] == "hf"
+            fp = ap + ("forget_gate." if hf else "")
+            d["q"] = mat(lp + ap + "q_proj.weight", dim, H)
+            d["k"] = mat(lp + ap + "k_proj.weight", dim, H)
+            d["v"] = mat(lp + ap + "v_proj.weight", dim, H)
+            # nn.Conv1d weights are [channels, 1, kernel]: one fused tensor over q | k | v, or one per projection.
+            parts = [bf16_round(rng.normal(0, 0.2, size=(dim, KC))) for _ in range(3)]
+            if hf:
+                weights[lp + ap + "conv1d.weight"] = np.concatenate(parts, 0).reshape(3 * dim, 1, KC)
+            else:
+                for nm, w in zip(("q", "k", "v"), parts):
+                    weights[lp + ap + f"{nm}_conv1d.weight"] = w.reshape(dim, 1, KC)
+            d["conv"] = np.concatenate(parts, 0)
+            d["f_a"] = mat(lp + fp + "f_a_proj.weight", D, H)
+            d["f_b"] = mat(lp + fp + "f_b_proj.weight", dim, D)
+            d["dt"] = vec(lp + fp + "dt_bias", dim, 0.5)
+            d["alog"] = vec(lp + fp + "A_log", NHl, 0.5)
+            weights[lp + fp + "A_log"] = d["alog"].reshape(1, 1, NHl, 1)
+            d["b"] = mat(lp + ap + "b_proj.weight", NHl, H)
+            d["g_a"] = mat(lp + ap + "g_a_proj.weight", D, H)
+            d["g_b"] = mat(lp + ap + "g_b_proj.weight", dim, D)
+            d["lnorm"] = normw(lp + ap + "o_norm.weight", D)[0]
+            d["o"] = mat(lp + ap + "o_proj.weight", H, dim)
+            d["ob"] = None
+        elif lin_layers[i]:
             ln, ap = s["linear"], "linear_attn."
             kd_tot, vd_tot = ln["KH"] * ln["KD"], ln["VH"] * ln["VD"]
             if ln["fused"]:
@@ -653,6 +728,15 @@ def generate_generic(family, out_dir):
                     weights[f"{mp}experts.{e}.{names[0]}"] = ex["gate"]
                     weights[f"{mp}experts.{e}.{names[1]}"] = ex["up"]
                     weights[f"{mp}experts.{e}.{names[2]}"] = ex["down"]
+            elif moe["layout"] == "fused_eih":
+                # The Hugging Face `Experts` module layout: gate rows then up rows per expert, down as [hidden, I].
+                gu = np.zeros((E, 2 * MI, H), np.float32)
+                dn = np.zeros((E, H, MI), np.float32)
+                for e, ex in enumerate(experts):
+                    gu[e] = np.concatenate([ex["gate"], ex["up"]], 0)
+                    dn[e] = ex["down"]
+                weights[mp + "experts.gate_up_proj"] = gu
+                weights[mp + "experts.down_proj"] = dn
             else:
                 gu = np.zeros((E, H, 2 * MI), np.float32)
                 dn = np.zeros((E, MI, H), np.float32)
@@ -859,8 +943,10 @@ def generate_generic(family, out_dir):
             ckv = ckv / np.sqrt(np.mean(ckv * ckv, -1, keepdims=True) + eps) * d["kv_a_norm"]
             kvb = (ckv @ d["kv_b"].T).reshape(T, NH, nope + vd)
             k_nope, v = kvb[..., :nope], kvb[..., nope:]
-            q = apply_rope(q, cos, sin, nope)
-            k_pe = apply_rope(k_pe.reshape(T, 1, rp), cos, sin, 0)
+            k_pe = k_pe.reshape(T, 1, rp)
+            if rope_layers[li]:
+                q = apply_rope(q, cos, sin, nope)
+                k_pe = apply_rope(k_pe, cos, sin, 0)
             k = np.concatenate([k_nope, np.repeat(k_pe, NH, axis=1)], -1)
             v = v
             groups = 1
@@ -943,8 +1029,48 @@ def generate_generic(family, out_dir):
                 o = o + d["ob"]
         return o
 
+    def kda_attn(d, h):
+        """Kimi Delta Attention (KimiLinearDeltaAttention, fused_recurrent_kda): the
+        decay is per channel of the [k_dim, v_dim] state, from a low-rank forget
+        gate; the output norm is gated by a sigmoid of a low-rank gate."""
+        ln = s["linear"]
+        NHl, D, KC = ln["VH"], ln["VD"], ln["KC"]
+        dim = NHl * D
+        T = h.shape[0]
+        mixed = np.concatenate([h @ d["q"].T, h @ d["k"].T, h @ d["v"].T], -1)
+        y = np.zeros((T, 3 * dim), np.float32)
+        for t in range(T):
+            acc = np.zeros(3 * dim, np.float32)
+            for i in range(KC):
+                if t - i >= 0:
+                    acc += d["conv"][:, KC - 1 - i] * mixed[t - i]
+            y[t] = act_fn(acc)
+        q = y[:, :dim].reshape(T, NHl, D)
+        k = y[:, dim:2 * dim].reshape(T, NHl, D)
+        v = y[:, 2 * dim:].reshape(T, NHl, D)
+        g = ((h @ d["f_a"].T) @ d["f_b"].T + d["dt"]).reshape(T, NHl, D)
+        g = -np.exp(d["alog"])[None, :, None] * np.where(g > 20.0, g, np.log1p(np.exp(np.minimum(g, 20.0))))
+        beta = 1 / (1 + np.exp(-(h @ d["b"].T)))
+        q = q / np.sqrt(np.sum(q * q, -1, keepdims=True) + 1e-6) / np.sqrt(D)
+        k = k / np.sqrt(np.sum(k * k, -1, keepdims=True) + 1e-6)
+        S = np.zeros((NHl, D, D), np.float32)
+        core = np.zeros((T, NHl, D), np.float32)
+        for t in range(T):
+            for hh in range(NHl):
+                S[hh] = S[hh] * np.exp(g[t, hh])[:, None]
+                mem = S[hh].T @ k[t, hh]
+                delta = (v[t, hh] - mem) * beta[t, hh]
+                S[hh] = S[hh] + np.outer(k[t, hh], delta)
+                core[t, hh] = S[hh].T @ q[t, hh]
+        gate = ((h @ d["g_a"].T) @ d["g_b"].T).reshape(T, NHl, D)
+        o = core / np.sqrt(np.mean(core * core, -1, keepdims=True) + eps) * d["lnorm"]
+        o = o * (1 / (1 + np.exp(-gate)))
+        return o.reshape(T, dim) @ d["o"].T
+
     def linear_attn(d, h):
         ln = s["linear"]
+        if ln.get("kind") == "kda":
+            return kda_attn(d, h)
         KH, KD, VH, VD, KC = ln["KH"], ln["KD"], ln["VH"], ln["VD"], ln["KC"]
         kd_tot, vd_tot = KH * KD, VH * VD
         T = h.shape[0]
