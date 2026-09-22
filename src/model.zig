@@ -16,6 +16,7 @@
 const std = @import("std");
 const Io = std.Io;
 const tensor = @import("tensor.zig");
+const compute = @import("compute.zig");
 const safetensors = @import("safetensors.zig");
 const stream = @import("stream.zig");
 const budget_mod = @import("budget.zig");
@@ -2856,7 +2857,7 @@ fn attentionWorker(ctx: *const AttnCtx, start: usize, end: usize) void {
         const kbase = ctx.cache.kSlot(ctx.layer, row.b, lo).ptr + kvh * hd;
         const vbase = ctx.cache.vSlot(ctx.layer, row.b, lo).ptr + kvh * hd;
         if (vectorised) {
-            tensor.attentionScores(scores, q, kbase, stride, ctx.scale);
+            compute.attentionScores(scores, q, kbase, stride, ctx.scale);
         } else {
             for (scores, 0..) |*s, p| s.* = tensor.dot(q, kbase[p * stride ..][0..hd]) * ctx.scale;
         }
@@ -2866,9 +2867,9 @@ fn attentionWorker(ctx: *const AttnCtx, start: usize, end: usize) void {
         if (slope != 0) {
             for (scores, 0..) |*s, p| s.* += slope * @as(f32, @floatFromInt(lo + p));
         }
-        if (ctx.sinks) |sk| softmaxWithSink(scores, sk[h]) else tensor.softmaxInPlace(scores);
+        if (ctx.sinks) |sk| softmaxWithSink(scores, sk[h]) else compute.softmaxInPlace(scores);
         if (vectorised) {
-            tensor.attentionValues(out, scores, vbase, stride);
+            compute.attentionValues(out, scores, vbase, stride);
         } else {
             @memset(out, 0);
             for (scores, 0..) |s, p| tensor.axpy(out, s, vbase[p * stride ..][0..vd]);
@@ -3037,12 +3038,12 @@ pub const ForwardOptions = struct {
 /// Applies the family's normalisation to one vector.
 fn applyNorm(c: *const Config, out: []f32, x: []const f32, nm: Norm) void {
     switch (c.norm) {
-        .rms => tensor.rmsnorm(out, x, nm.w, c.rms_norm_eps, false),
-        .rms_gemma => tensor.rmsnorm(out, x, nm.w, c.rms_norm_eps, true),
-        .layer => tensor.layernorm(out, x, nm.w, nm.b, c.rms_norm_eps, false),
-        .layer_1p => tensor.layernorm(out, x, nm.w, nm.b, c.rms_norm_eps, true),
-        .none => tensor.layernorm(out, x, &.{}, null, c.rms_norm_eps, false),
-        .rms_none => tensor.rmsnorm(out, x, &.{}, c.rms_norm_eps, false),
+        .rms => compute.rmsnorm(out, x, nm.w, c.rms_norm_eps, false),
+        .rms_gemma => compute.rmsnorm(out, x, nm.w, c.rms_norm_eps, true),
+        .layer => compute.layernorm(out, x, nm.w, nm.b, c.rms_norm_eps, false),
+        .layer_1p => compute.layernorm(out, x, nm.w, nm.b, c.rms_norm_eps, true),
+        .none => compute.layernorm(out, x, &.{}, null, c.rms_norm_eps, false),
+        .rms_none => compute.rmsnorm(out, x, &.{}, c.rms_norm_eps, false),
     }
 }
 
@@ -3074,9 +3075,9 @@ fn normVecInPlace(c: *const Config, x: []f32, w: []const f32, b: ?[]const f32) v
         return;
     }
     switch (c.norm) {
-        .rms, .none, .rms_none => tensor.rmsnorm(out, x, w, c.rms_norm_eps, false),
-        .rms_gemma => tensor.rmsnorm(out, x, w, c.rms_norm_eps, true),
-        .layer, .layer_1p => tensor.layernorm(out, x, w, b, c.rms_norm_eps, false),
+        .rms, .none, .rms_none => compute.rmsnorm(out, x, w, c.rms_norm_eps, false),
+        .rms_gemma => compute.rmsnorm(out, x, w, c.rms_norm_eps, true),
+        .layer, .layer_1p => compute.layernorm(out, x, w, b, c.rms_norm_eps, false),
     }
     @memcpy(x, out);
 }
@@ -3100,8 +3101,8 @@ fn ropeHead(c: *const Config, x: []f32, table: *const RopeTable, pos: usize) voi
     const cos_row = table.cos[p * table.half ..][0..table.half];
     const sin_row = table.sin[p * table.half ..][0..table.half];
     switch (c.rope_style) {
-        .neox => tensor.applyRope(x[0..d], cos_row, sin_row),
-        .gptj => tensor.applyRopeInterleaved(x[0..d], cos_row, sin_row),
+        .neox => compute.applyRope(x[0..d], cos_row, sin_row),
+        .gptj => compute.applyRopeInterleaved(x[0..d], cos_row, sin_row),
         .helium => {
             // Interleaved pairs against the `[f | f]` table: coordinate j uses
             // the angle of frequency `j mod d/2`.
@@ -3205,29 +3206,29 @@ fn mlaProject(model: *const Model, layer: *const Layer, ws: *Workspace, h: []con
         const qlr = m.q_lora_rank.?;
         const qa_out = try gpa.alloc(f32, n * qlr);
         defer gpa.free(qa_out);
-        try tensor.matmulT(model.pool, gpa, qa_out, h, n, qa, null);
+        try compute.matmulT(model.pool, gpa, qa_out, h, n, qa, null);
         const tmp = try gpa.alloc(f32, qlr);
         defer gpa.free(tmp);
         for (0..n) |t| {
             const row = qa_out[t * qlr ..][0..qlr];
-            tensor.rmsnorm(tmp, row, mw.q_a_norm.?, eps, false);
+            compute.rmsnorm(tmp, row, mw.q_a_norm.?, eps, false);
             @memcpy(row, tmp);
         }
-        try tensor.matmulT(model.pool, gpa, ws.q, qa_out, n, mw.q_b, null);
+        try compute.matmulT(model.pool, gpa, ws.q, qa_out, n, mw.q_b, null);
     } else {
-        try tensor.matmulT(model.pool, gpa, ws.q, h, n, mw.q_b, null);
+        try compute.matmulT(model.pool, gpa, ws.q, h, n, mw.q_b, null);
     }
     const kvr = m.kv_lora_rank + rd;
     const kva = try gpa.alloc(f32, n * kvr);
     defer gpa.free(kva);
-    try tensor.matmulT(model.pool, gpa, kva, h, n, mw.kv_a, null);
+    try compute.matmulT(model.pool, gpa, kva, h, n, mw.kv_a, null);
     const ckv = try gpa.alloc(f32, n * m.kv_lora_rank);
     defer gpa.free(ckv);
-    for (0..n) |t| tensor.rmsnorm(ckv[t * m.kv_lora_rank ..][0..m.kv_lora_rank], kva[t * kvr ..][0..m.kv_lora_rank], mw.kv_a_norm, eps, false);
+    for (0..n) |t| compute.rmsnorm(ckv[t * m.kv_lora_rank ..][0..m.kv_lora_rank], kva[t * kvr ..][0..m.kv_lora_rank], mw.kv_a_norm, eps, false);
     const kvb_rows = nh * (nope + vd);
     const kvb = try gpa.alloc(f32, n * kvb_rows);
     defer gpa.free(kvb);
-    try tensor.matmulT(model.pool, gpa, kvb, ckv, n, mw.kv_b, null);
+    try compute.matmulT(model.pool, gpa, kvb, ckv, n, mw.kv_b, null);
     for (0..n) |t| {
         const k_pe = kva[t * kvr + m.kv_lora_rank ..][0..rd];
         for (0..nh) |hh| {
@@ -3278,7 +3279,7 @@ fn linearForward(model: *const Model, layer: *const Layer, li: usize, ws: *Works
         const cols = 2 * kd_tot + 2 * vd_tot;
         const p = try gpa.alloc(f32, n * cols);
         defer gpa.free(p);
-        try tensor.matmulT(model.pool, gpa, p, h, n, w, null);
+        try compute.matmulT(model.pool, gpa, p, h, n, w, null);
         const sub = vd_tot / kh;
         for (0..n) |t| {
             const pr = p[t * cols ..][0..cols];
@@ -3293,13 +3294,13 @@ fn linearForward(model: *const Model, layer: *const Layer, li: usize, ws: *Works
             }
         }
     } else {
-        try tensor.matmulT(model.pool, gpa, mixed, h, n, lin.qkv.?, null);
-        try tensor.matmulT(model.pool, gpa, zbuf, h, n, lin.z.?, null);
+        try compute.matmulT(model.pool, gpa, mixed, h, n, lin.qkv.?, null);
+        try compute.matmulT(model.pool, gpa, zbuf, h, n, lin.z.?, null);
     }
     if (lin.ba) |w| {
         const p = try gpa.alloc(f32, n * 2 * vh);
         defer gpa.free(p);
-        try tensor.matmulT(model.pool, gpa, p, h, n, w, null);
+        try compute.matmulT(model.pool, gpa, p, h, n, w, null);
         const sub = vh / kh;
         for (0..n) |t| {
             const pr = p[t * 2 * vh ..][0 .. 2 * vh];
@@ -3311,8 +3312,8 @@ fn linearForward(model: *const Model, layer: *const Layer, li: usize, ws: *Works
             }
         }
     } else {
-        try tensor.matmulT(model.pool, gpa, bbuf, h, n, lin.b.?, null);
-        try tensor.matmulT(model.pool, gpa, abuf, h, n, lin.a.?, null);
+        try compute.matmulT(model.pool, gpa, bbuf, h, n, lin.b.?, null);
+        try compute.matmulT(model.pool, gpa, abuf, h, n, lin.a.?, null);
     }
 
     const core = try gpa.alloc(f32, n * vd_tot);
@@ -3405,7 +3406,7 @@ fn linearForward(model: *const Model, layer: *const Layer, li: usize, ws: *Works
         }
         next.* = pos + 1;
     }
-    try tensor.matmulT(model.pool, gpa, ws.o, core, n, layer.o, if (layer.o_delta) |*d| d else null);
+    try compute.matmulT(model.pool, gpa, ws.o, core, n, layer.o, if (layer.o_delta) |*d| d else null);
     if (layer.o_bias) |bias| addBias(ws.o, n, hidden, bias);
 }
 
@@ -3439,7 +3440,7 @@ fn kdaForward(model: *const Model, layer: *const Layer, li: usize, ws: *Workspac
         defer gpa.free(tmp);
         const projs = .{ lin.q.?, lin.k.?, lin.v.? };
         inline for (projs, 0..) |w, s| {
-            try tensor.matmulT(model.pool, gpa, tmp, h, n, w, null);
+            try compute.matmulT(model.pool, gpa, tmp, h, n, w, null);
             for (0..n) |t| @memcpy(mixed[t * conv_dim + s * dim ..][0..dim], tmp[t * dim ..][0..dim]);
         }
     }
@@ -3449,8 +3450,8 @@ fn kdaForward(model: *const Model, layer: *const Layer, li: usize, ws: *Workspac
     defer gpa.free(low);
     const decay = try gpa.alloc(f32, n * dim);
     defer gpa.free(decay);
-    try tensor.matmulT(model.pool, gpa, low, h, n, lin.f_a.?, null);
-    try tensor.matmulT(model.pool, gpa, decay, low, n, lin.f_b.?, null);
+    try compute.matmulT(model.pool, gpa, low, h, n, lin.f_a.?, null);
+    try compute.matmulT(model.pool, gpa, decay, low, n, lin.f_b.?, null);
     for (0..n) |t| {
         const g = decay[t * dim ..][0..dim];
         for (0..nh) |hh| {
@@ -3464,15 +3465,15 @@ fn kdaForward(model: *const Model, layer: *const Layer, li: usize, ws: *Workspac
     }
     const bbuf = try gpa.alloc(f32, n * nh);
     defer gpa.free(bbuf);
-    try tensor.matmulT(model.pool, gpa, bbuf, h, n, lin.b.?, null);
+    try compute.matmulT(model.pool, gpa, bbuf, h, n, lin.b.?, null);
     // Output gate: g(h) (full rank) or g_b(g_a(h)).
     const gate = try gpa.alloc(f32, n * dim);
     defer gpa.free(gate);
     if (lin.g) |g| {
-        try tensor.matmulT(model.pool, gpa, gate, h, n, g, null);
+        try compute.matmulT(model.pool, gpa, gate, h, n, g, null);
     } else {
-        try tensor.matmulT(model.pool, gpa, low, h, n, lin.g_a.?, null);
-        try tensor.matmulT(model.pool, gpa, gate, low, n, lin.g_b.?, null);
+        try compute.matmulT(model.pool, gpa, low, h, n, lin.g_a.?, null);
+        try compute.matmulT(model.pool, gpa, gate, low, n, lin.g_b.?, null);
     }
 
     const core = try gpa.alloc(f32, n * dim);
@@ -3550,7 +3551,7 @@ fn kdaForward(model: *const Model, layer: *const Layer, li: usize, ws: *Workspac
         }
         next.* = pos + 1;
     }
-    try tensor.matmulT(model.pool, gpa, ws.o, core, n, layer.o, if (layer.o_delta) |*d| d else null);
+    try compute.matmulT(model.pool, gpa, ws.o, core, n, layer.o, if (layer.o_delta) |*d| d else null);
     if (layer.o_bias) |bias| addBias(ws.o, n, hidden, bias);
 }
 
@@ -3587,11 +3588,11 @@ fn lightningForward(model: *const Model, layer: *const Layer, li: usize, ws: *Wo
 
     const proj = try gpa.alloc(f32, n * 3 * qd);
     defer gpa.free(proj);
-    try tensor.matmulT(model.pool, gpa, proj, h, n, lin.light_qkv.?, null);
+    try compute.matmulT(model.pool, gpa, proj, h, n, lin.light_qkv.?, null);
     for (proj) |*v| v.* = tensor.silu(v.*);
     const gate = try gpa.alloc(f32, n * qd);
     defer gpa.free(gate);
-    try tensor.matmulT(model.pool, gpa, gate, h, n, lin.light_gate.?, null);
+    try compute.matmulT(model.pool, gpa, gate, h, n, lin.light_gate.?, null);
     const core = try gpa.alloc(f32, n * qd);
     defer gpa.free(core);
     const decay = try gpa.alloc(f32, nh);
@@ -3629,11 +3630,11 @@ fn lightningForward(model: *const Model, layer: *const Layer, li: usize, ws: *Wo
     defer gpa.free(tmp);
     for (0..n) |t| {
         const row = core[t * qd ..][0..qd];
-        tensor.rmsnorm(tmp, row, lin.norm, norm_eps, false);
+        compute.rmsnorm(tmp, row, lin.norm, norm_eps, false);
         const g = gate[t * qd ..][0..qd];
         for (row, 0..) |*v, j| v.* = tmp[j] / (1.0 + @exp(-g[j]));
     }
-    try tensor.matmulT(model.pool, gpa, ws.o, core, n, layer.o, if (layer.o_delta) |*d| d else null);
+    try compute.matmulT(model.pool, gpa, ws.o, core, n, layer.o, if (layer.o_delta) |*d| d else null);
     if (layer.o_bias) |bias| addBias(ws.o, n, hidden, bias);
 }
 
@@ -3690,7 +3691,7 @@ fn ssmForward(model: *const Model, layer: *const Layer, li: usize, cache: *KvCac
     const proj_cols = s.in_proj.rows;
     const proj = try gpa.alloc(f32, n * proj_cols);
     defer gpa.free(proj);
-    try tensor.matmulT(model.pool, gpa, proj, hin, n, s.in_proj, null);
+    try compute.matmulT(model.pool, gpa, proj, hin, n, s.in_proj, null);
     if (s.in_bias) |b| addBias(proj, n, proj_cols, b);
 
     // Sequence bookkeeping: a slot restarts at position 0 and otherwise
@@ -3722,7 +3723,7 @@ fn ssmForward(model: *const Model, layer: *const Layer, li: usize, cache: *KvCac
     const separate = s.out != null;
     const ow = s.out orelse layer.o;
     const delta: ?*const Delta = if (separate) (if (layer.ssm_out_delta) |*dl| dl else null) else (if (layer.o_delta) |*dl| dl else null);
-    try tensor.matmulT(model.pool, gpa, out, core, n, ow, delta);
+    try compute.matmulT(model.pool, gpa, out, core, n, ow, delta);
     const bias = if (separate) s.out_bias else layer.o_bias;
     if (bias) |b| addBias(out, n, hidden, b);
 }
@@ -3939,7 +3940,7 @@ fn mamba1Scan(model: *const Model, s: *const SsmWeights, li: usize, rc: *LinearC
     const xcols = R + 2 * N;
     const xp = try gpa.alloc(f32, n * xcols);
     defer gpa.free(xp);
-    try tensor.matmulT(model.pool, gpa, xp, xa, n, s.x_proj.?, null);
+    try compute.matmulT(model.pool, gpa, xp, xa, n, s.x_proj.?, null);
     const dtr = try gpa.alloc(f32, n * R);
     defer gpa.free(dtr);
     const bc = try gpa.alloc(f32, n * 2 * N);
@@ -3949,9 +3950,9 @@ fn mamba1Scan(model: *const Model, s: *const SsmWeights, li: usize, rc: *LinearC
         const dt_part = row[0..R];
         const b_part = row[R..][0..N];
         const c_part = row[R + N ..][0..N];
-        if (s.dt_norm) |w| tensor.rmsnorm(dt_part, dt_part, w, eps, false);
-        if (s.b_norm) |w| tensor.rmsnorm(b_part, b_part, w, eps, false);
-        if (s.c_norm) |w| tensor.rmsnorm(c_part, c_part, w, eps, false);
+        if (s.dt_norm) |w| compute.rmsnorm(dt_part, dt_part, w, eps, false);
+        if (s.b_norm) |w| compute.rmsnorm(b_part, b_part, w, eps, false);
+        if (s.c_norm) |w| compute.rmsnorm(c_part, c_part, w, eps, false);
         @memcpy(dtr[t * R ..][0..R], dt_part);
         @memcpy(bc[t * 2 * N ..][0..N], b_part);
         @memcpy(bc[t * 2 * N + N ..][0..N], c_part);
@@ -3959,7 +3960,7 @@ fn mamba1Scan(model: *const Model, s: *const SsmWeights, li: usize, rc: *LinearC
     // dt = softplus(dt_proj(dt) + bias).
     const dt = try gpa.alloc(f32, n * inter);
     defer gpa.free(dt);
-    try tensor.matmulT(model.pool, gpa, dt, dtr, n, s.dt_proj.?, null);
+    try compute.matmulT(model.pool, gpa, dt, dtr, n, s.dt_proj.?, null);
     addBias(dt, n, inter, s.dt_bias);
     for (dt) |*v| v.* = softplus(v.*);
     const ctx = Mamba1Ctx{
@@ -3992,7 +3993,7 @@ fn convForward(model: *const Model, layer: *const Layer, li: usize, ws: *Workspa
     const kc = c.conv_kernel;
     const bcx = try gpa.alloc(f32, n * 3 * hidden);
     defer gpa.free(bcx);
-    try tensor.matmulT(model.pool, gpa, bcx, h, n, cw.in, null);
+    try compute.matmulT(model.pool, gpa, bcx, h, n, cw.in, null);
     if (cw.in_bias) |b| addBias(bcx, n, 3 * hidden, b);
     const y = try gpa.alloc(f32, n * hidden);
     defer gpa.free(y);
@@ -4025,7 +4026,7 @@ fn convForward(model: *const Model, layer: *const Layer, li: usize, ws: *Workspa
         }
         next.* = pos + 1;
     }
-    try tensor.matmulT(model.pool, gpa, ws.o, y, n, layer.o, if (layer.o_delta) |*d| d else null);
+    try compute.matmulT(model.pool, gpa, ws.o, y, n, layer.o, if (layer.o_delta) |*d| d else null);
     if (layer.o_bias) |bias| addBias(ws.o, n, hidden, bias);
 }
 
@@ -4045,14 +4046,14 @@ fn attention(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace
             // Kimi K3: sigmoid gate on the `[n][heads * v_head_dim]` attention output.
             const gate = try gpa.alloc(f32, n * g.rows);
             defer gpa.free(gate);
-            try tensor.matmulT(model.pool, gpa, gate, h, n, g, null);
+            try compute.matmulT(model.pool, gpa, gate, h, n, g, null);
             try attentionTail(model, layer, li, ws, cache, rows, gate, true);
             return;
         }
     } else if (layer.qkv) |w| {
         const qkv_rows = w.rows;
         const layout = if (c.qkv_layout != .separate) c.qkv_layout else c.qkv_alt.?;
-        try tensor.matmulT(model.pool, gpa, ws.qkv, h, n, w, null);
+        try compute.matmulT(model.pool, gpa, ws.qkv, h, n, w, null);
         if (layer.qkv_bias) |b| addBias(ws.qkv, n, qkv_rows, b);
         var i: usize = 0;
         while (i < n) : (i += 1) scatterQkv(c, layout, hd, c.layerVDim(li), c.layer_kv_heads[li], ws.qkv[i * qkv_rows ..][0..qkv_rows], ws.q[i * qd ..][0..qd], ws.k[i * kvd ..][0..kvd], ws.v[i * kvd ..][0..kvd]);
@@ -4061,7 +4062,7 @@ fn attention(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace
         defer gpa.free(tmp);
         const gate = try gpa.alloc(f32, n * qd);
         defer gpa.free(gate);
-        try tensor.matmulT(model.pool, gpa, tmp, h, n, layer.q.?, null);
+        try compute.matmulT(model.pool, gpa, tmp, h, n, layer.q.?, null);
         if (layer.q_bias) |b| {
             if (b.len == 2 * qd) addBias(tmp, n, 2 * qd, b);
         }
@@ -4077,21 +4078,21 @@ fn attention(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace
         if (layer.q_bias) |b| {
             if (b.len == qd) addBias(ws.q, n, qd, b);
         }
-        try tensor.matmulT(model.pool, gpa, ws.k, h, n, layer.k.?, null);
-        try tensor.matmulT(model.pool, gpa, ws.v, h, n, layer.v.?, null);
+        try compute.matmulT(model.pool, gpa, ws.k, h, n, layer.k.?, null);
+        try compute.matmulT(model.pool, gpa, ws.v, h, n, layer.v.?, null);
         if (layer.k_bias) |b| addBias(ws.k, n, kvd, b);
         if (layer.v_bias) |b| addBias(ws.v, n, kvd, b);
         try attentionTail(model, layer, li, ws, cache, rows, gate, false);
         return;
     } else {
-        try tensor.matmulT(model.pool, gpa, ws.q, h, n, layer.q.?, null);
+        try compute.matmulT(model.pool, gpa, ws.q, h, n, layer.q.?, null);
         if (layer.q_bias) |b| addBias(ws.q, n, qd, b);
         // A KV-shared layer reads its source layer's cache and projects nothing else.
         if (!c.kvShared(li)) {
-            try tensor.matmulT(model.pool, gpa, ws.k, h, n, layer.k.?, null);
+            try compute.matmulT(model.pool, gpa, ws.k, h, n, layer.k.?, null);
             const vd = c.layerVDim(li);
             if (layer.v) |vw| {
-                try tensor.matmulT(model.pool, gpa, ws.v, h, n, vw, null);
+                try compute.matmulT(model.pool, gpa, ws.v, h, n, vw, null);
             } else {
                 // Keys double as values (Gemma 4 `attention_k_eq_v`), before the norms.
                 @memcpy(ws.v[0 .. n * kvd], ws.k[0 .. n * kvd]);
@@ -4231,7 +4232,7 @@ fn attentionTail(model: *const Model, layer: *const Layer, li: usize, ws: *Works
         const per_head = gw.rows == c.num_heads;
         const g = try gpa.alloc(f32, n * gw.rows);
         defer gpa.free(g);
-        try tensor.matmulT(model.pool, gpa, g, ws.h[0 .. n * hidden], n, gw, null);
+        try compute.matmulT(model.pool, gpa, g, ws.h[0 .. n * hidden], n, gw, null);
         for (0..n) |r| {
             const a = ws.attn[r * od ..][0..od];
             const gr = g[r * gw.rows ..][0..gw.rows];
@@ -4253,7 +4254,7 @@ fn attentionTail(model: *const Model, layer: *const Layer, li: usize, ws: *Works
     if (gate) |g| if (gate_compact) {
         for (ws.attn[0 .. n * od], 0..) |*v, j| v.* /= 1.0 + @exp(-g[j]);
     };
-    try tensor.matmulT(model.pool, gpa, ws.o, ws.attn, n, layer.o, if (layer.o_delta) |*d| d else null);
+    try compute.matmulT(model.pool, gpa, ws.o, ws.attn, n, layer.o, if (layer.o_delta) |*d| d else null);
     if (layer.o_bias) |b| addBias(ws.o, n, hidden, b);
 }
 
@@ -4321,8 +4322,8 @@ pub fn mlpBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Worksp
     var din: []f32 = ws.gate;
     switch (c.mlp) {
         .gated => {
-            try tensor.matmulT(model.pool, gpa, ws.gate, h_in, n, layer.gate.?, null);
-            try tensor.matmulT(model.pool, gpa, ws.up, h_in, n, layer.up.?, null);
+            try compute.matmulT(model.pool, gpa, ws.gate, h_in, n, layer.gate.?, null);
+            try compute.matmulT(model.pool, gpa, ws.up, h_in, n, layer.up.?, null);
             if (layer.gate_bias) |b| addBias(ws.gate, n, inter, b);
             if (layer.up_bias) |b| addBias(ws.up, n, inter, b);
             if (c.mult.mlp_gate != 1.0) tensor.scale(ws.gate[0 .. n * inter], c.mult.mlp_gate);
@@ -4334,16 +4335,16 @@ pub fn mlpBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Worksp
                     ws.up[j] = std.math.clamp(ws.up[j], -limit, limit);
                 }
             }
-            if (c.moe.swiglu) |sw| swigluOai(sw, ws.gate, ws.gate, ws.up, n, inter, inter) else if (c.moe.situ) |st| moe.situGlu(st, ws.gate, ws.gate, ws.up, n, inter, inter) else tensor.gatedActivation(model.pool, c.activation, ws.gate, ws.gate, ws.up, n, inter, inter, inter);
+            if (c.moe.swiglu) |sw| swigluOai(sw, ws.gate, ws.gate, ws.up, n, inter, inter) else if (c.moe.situ) |st| moe.situGlu(st, ws.gate, ws.gate, ws.up, n, inter, inter) else compute.gatedActivation(model.pool, c.activation, ws.gate, ws.gate, ws.up, n, inter, inter, inter);
         },
         .gated_fused => {
             const gu = layer.gate_up.?;
-            try tensor.matmulT(model.pool, gpa, ws.gate_up, h_in, n, gu, null);
+            try compute.matmulT(model.pool, gpa, ws.gate_up, h_in, n, gu, null);
             if (layer.up_bias) |b| addBias(ws.gate_up, n, 2 * inter, b);
-            if (c.moe.swiglu) |sw| swigluOai(sw, ws.gate, ws.gate_up, ws.gate_up[inter..], n, inter, 2 * inter) else if (c.moe.situ) |st| moe.situGlu(st, ws.gate, ws.gate_up, ws.gate_up[inter..], n, inter, 2 * inter) else tensor.gatedActivation(model.pool, c.activation, ws.gate, ws.gate_up, ws.gate_up[inter..], n, inter, 2 * inter, inter);
+            if (c.moe.swiglu) |sw| swigluOai(sw, ws.gate, ws.gate_up, ws.gate_up[inter..], n, inter, 2 * inter) else if (c.moe.situ) |st| moe.situGlu(st, ws.gate, ws.gate_up, ws.gate_up[inter..], n, inter, 2 * inter) else compute.gatedActivation(model.pool, c.activation, ws.gate, ws.gate_up, ws.gate_up[inter..], n, inter, 2 * inter, inter);
         },
         .dense => {
-            try tensor.matmulT(model.pool, gpa, ws.up, h_in, n, layer.up.?, null);
+            try compute.matmulT(model.pool, gpa, ws.up, h_in, n, layer.up.?, null);
             if (layer.up_bias) |b| addBias(ws.up, n, inter, b);
             if (layer.xielu) |a| {
                 // xIELU (Apertus): `alpha_p x² + beta x` for x > 0, `alpha_n (expm1(min(x, eps)) - x) + beta x` otherwise.
@@ -4352,7 +4353,7 @@ pub fn mlpBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Worksp
                     v.* = if (x > 0) a[0] * x * x + 0.5 * x else a[1] * (std.math.expm1(@min(x, -1e-6)) - x) + 0.5 * x;
                 }
             } else {
-                tensor.gatedActivation(model.pool, c.activation, ws.up, ws.up, null, n, inter, inter, inter);
+                compute.gatedActivation(model.pool, c.activation, ws.up, ws.up, null, n, inter, inter, inter);
             }
             din = ws.up;
         },
@@ -4362,7 +4363,7 @@ pub fn mlpBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Worksp
         defer gpa.free(tmp);
         normRowsInPlace(c, din[0 .. n * inter], n, inter, nm, tmp);
     }
-    try tensor.matmulT(model.pool, gpa, ws.m, din, n, down, if (layer.down_delta) |*d| d else null);
+    try compute.matmulT(model.pool, gpa, ws.m, din, n, down, if (layer.down_delta) |*d| d else null);
     if (layer.down_bias) |b| addBias(ws.m, n, hidden, b);
     if (c.mult.mlp_down != 1.0) tensor.scale(ws.m[0 .. n * hidden], c.mult.mlp_down);
 }
@@ -4377,13 +4378,13 @@ fn pleBlock(model: *const Model, p: *const PleWeights, li: usize, ws: *Workspace
     const stride = c.num_layers * pd;
     const g = try gpa.alloc(f32, n * pd);
     defer gpa.free(g);
-    try tensor.matmulT(model.pool, gpa, g, src, n, p.gate, null);
+    try compute.matmulT(model.pool, gpa, g, src, n, p.gate, null);
     for (0..n) |r| {
         const row = g[r * pd ..][0..pd];
         const inp = ple[r * stride + li * pd ..][0..pd];
         for (row, 0..) |*v, j| v.* = c.activation.apply(v.*) * inp[j];
     }
-    try tensor.matmulT(model.pool, gpa, ws.m, g, n, p.out, null);
+    try compute.matmulT(model.pool, gpa, ws.m, g, n, p.out, null);
     normRowsInPlace(c, ws.m, n, hidden, p.norm, ws.h2);
 }
 
@@ -4397,7 +4398,7 @@ fn rowMagnitude(x: []const f32) f32 {
 /// Projects an AltUp stream and rescales it to `target` (`x * target / max(rms(x), sqrt(1e-5))`).
 fn altupProjectRows(model: *const Model, out: []f32, src: []const f32, n: usize, w: Weight, targets: []const f32) !void {
     const hidden = model.config.hidden_size;
-    try tensor.matmulT(model.pool, model.gpa, out, src, n, w, null);
+    try compute.matmulT(model.pool, model.gpa, out, src, n, w, null);
     for (0..n) |r| {
         const row = out[r * hidden ..][0..hidden];
         const mag = @sqrt(@max(rowMagnitude(row) * rowMagnitude(row), 1e-5));
@@ -4446,7 +4447,7 @@ fn perLayerInputs(model: *const Model, proj: Weight, tokens: []const u32, xs: []
     const width = c.num_layers * pd;
     const store: *stream.WeightStore = @constCast(&model.store);
     const emb_ref = model.ple_embed_ref.?;
-    try tensor.matmulT(model.pool, gpa, ple, xs, n, proj, null);
+    try compute.matmulT(model.pool, gpa, ple, xs, n, proj, null);
     const emb = try gpa.alloc(f32, width);
     defer gpa.free(emb);
     const tmp = try gpa.alloc(f32, pd);
@@ -4721,11 +4722,11 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
         }
         const lm = try model.acquireLmHead();
         defer store.release(lm);
-        try tensor.matmulT(model.pool, gpa, ws.logits, h, opts.logit_rows.len, lm.weight, null);
+        try compute.matmulT(model.pool, gpa, ws.logits, h, opts.logit_rows.len, lm.weight, null);
         const logits = ws.logits[0 .. opts.logit_rows.len * c.vocab_size];
         if (model.lm_head_bias) |b| addBias(logits, opts.logit_rows.len, c.vocab_size, b);
         if (c.logit_scale != 1.0) tensor.scale(logits, c.logit_scale);
-        if (c.final_logit_softcapping) |cap| tensor.softcap(logits, cap);
+        if (c.final_logit_softcapping) |cap| compute.softcap(logits, cap);
     }
 }
 
@@ -4857,7 +4858,7 @@ fn altupModalities(model: *const Model, au: *const AltUpWeights, ws: *Workspace,
     const tmp = ws.h2[0 .. n * hidden];
     normRows(c, tmp, x, n, hidden, au.router_norm);
     tensor.scale(tmp, 1.0 / @as(f32, @floatFromInt(hidden)));
-    try tensor.matmulT(model.pool, model.gpa, out, tmp, n, au.router, null);
+    try compute.matmulT(model.pool, model.gpa, out, tmp, n, au.router, null);
     for (out[0 .. n * c.altup_inputs]) |*v| v.* = std.math.tanh(v.*);
 }
 
@@ -4893,7 +4894,7 @@ fn altupLayer(model: *const Model, layer: *const Layer, li: usize, ws: *Workspac
     try altupModalities(model, &au, ws, modal, act_in, n);
     const coefs = try gpa.alloc(f32, n * na * na);
     defer gpa.free(coefs);
-    try tensor.matmulT(model.pool, gpa, coefs, modal, n, au.predict, null);
+    try compute.matmulT(model.pool, gpa, coefs, modal, n, au.predict, null);
     const pred = try gpa.alloc(f32, n * na * hidden);
     defer gpa.free(pred);
     for (0..n) |r| {
@@ -4913,8 +4914,8 @@ fn altupLayer(model: *const Model, layer: *const Layer, li: usize, ws: *Workspac
     {
         const lr = try gpa.alloc(f32, n * c.laurel_rank);
         defer gpa.free(lr);
-        try tensor.matmulT(model.pool, gpa, lr, h, n, au.laurel_l, null);
-        try tensor.matmulT(model.pool, gpa, laurel, lr, n, au.laurel_r, null);
+        try compute.matmulT(model.pool, gpa, lr, h, n, au.laurel_l, null);
+        try compute.matmulT(model.pool, gpa, laurel, lr, n, au.laurel_r, null);
         normRowsInPlace(c, laurel, n, hidden, au.laurel_norm, ws.h2);
         tensor.axpy(laurel, 1.0, h);
     }
@@ -4937,7 +4938,7 @@ fn altupLayer(model: *const Model, layer: *const Layer, li: usize, ws: *Workspac
     try altupModalities(model, &au, ws, modal, act_in, n);
     const cc = try gpa.alloc(f32, n * na);
     defer gpa.free(cc);
-    try tensor.matmulT(model.pool, gpa, cc, modal, n, au.correct, null);
+    try compute.matmulT(model.pool, gpa, cc, modal, n, au.correct, null);
     for (0..n) |r| {
         const innovation = ws.h2[r * hidden ..][0..hidden];
         @memcpy(innovation, act_in[r * hidden ..][0..hidden]);
@@ -4979,7 +4980,7 @@ fn attnResMix(c: *const Config, s: AttnResScorer, bank: []const f32, nvb: usize,
     var scores: [max_attn_res_rows + 1]f32 = undefined;
     for (0..nvb) |j| scores[j] = attnResScore(c, s, bank[j * hidden ..][0..hidden]);
     scores[nvb] = attnResScore(c, s, p);
-    tensor.softmaxInPlace(scores[0 .. nvb + 1]);
+    compute.softmaxInPlace(scores[0 .. nvb + 1]);
     @memset(out, 0);
     for (0..nvb) |j| tensor.axpy(out, scores[j], bank[j * hidden ..][0..hidden]);
     tensor.axpy(out, scores[nvb], p);

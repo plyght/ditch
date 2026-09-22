@@ -609,5 +609,13 @@ kl=$(grep "  \* KL divergence:" "$TMP/remote_eval.log" | tail -1 | awk '{print $
 awk -v kl="$kl" 'BEGIN { exit !(kl < 1.0) }' || fail "KL divergence of the remote-source export is implausible: $kl"
 kill $RANGE_PID 2>/dev/null || true
 
+echo "==> Compute backend selftest (the CPU backend against the reference kernels)"
+"$DITCH" selftest --device cpu --json > "$TMP/selftest.json" 2> "$TMP/selftest.log" \
+    || fail "ditch selftest --device cpu failed"
+grep -q '"passed":true' "$TMP/selftest.json" || fail "selftest JSON does not report a pass"
+if grep -q '"ok":false' "$TMP/selftest.json"; then fail "the CPU backend deviates from the reference kernels"; fi
+if "$DITCH" selftest --device nonsuch > "$TMP/selftest_bad.log" 2>&1; then fail "an unknown device was accepted"; fi
+grep -q "device" "$TMP/selftest_bad.log" || fail "the unknown device was not named in the error"
+
 echo
 echo "e2e: all checks passed"

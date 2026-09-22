@@ -11,6 +11,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 const config = @import("config.zig");
+const compute = @import("compute.zig");
 const lua = @import("lua.zig");
 const toml = @import("toml.zig");
 const hf = @import("hf.zig");
@@ -69,6 +70,11 @@ pub const Manifest = struct {
     ablate_inputs: bool,
     kl_tokens: usize,
     fast_search: bool,
+    /// The compute backend the run used ("cpu", or a GPU device name). The CPU
+    /// path is the reference; a GPU run reproduces it within the tolerance
+    /// documented in README's "GPU acceleration", so the device is recorded
+    /// but never re-applied on reproduction.
+    device: []const u8,
     n_trials: usize,
     n_startup_trials: usize,
     scorers: []const config.ScorerConfig,
@@ -221,6 +227,7 @@ pub fn build(a: Allocator, io: Io, in: Inputs) !Manifest {
         .ablate_inputs = s.ablate_inputs,
         .kl_tokens = s.kl_tokens,
         .fast_search = s.fast_search,
+        .device = try a.dupe(u8, compute.active.name),
         .n_trials = s.n_trials,
         .n_startup_trials = s.n_startup_trials,
         .scorers = s.scorers,
@@ -341,6 +348,7 @@ pub fn write(m: *const Manifest, w: *Io.Writer) !void {
     try luaField(w, "    ", "ablate_inputs", m.ablate_inputs);
     try luaField(w, "    ", "kl_tokens", m.kl_tokens);
     try luaField(w, "    ", "fast_search", m.fast_search);
+    try luaField(w, "    ", "device", m.device);
     try luaField(w, "    ", "n_trials", m.n_trials);
     try luaField(w, "    ", "n_startup_trials", m.n_startup_trials);
     try w.writeAll("    scorers = {\n");
@@ -425,6 +433,7 @@ pub fn markdown(m: *const Manifest, w: *Io.Writer) !void {
     try w.print("| **KL divergence positions** | {d} |\n", .{m.kl_tokens});
     if (m.fast_search) try w.writeAll("| **Search** | fast (KL divergence + refusal-logit proxy; keyword scorer on the Pareto candidates) |\n");
     try w.print("| **Max response length** | {d} |\n", .{m.max_response_length});
+    try w.print("| **Compute device** | {s} |\n", .{m.device});
     try markdownDataset(w, "Good prompts", m.good_prompts);
     try markdownDataset(w, "Bad prompts", m.bad_prompts);
     if (m.keyword_rate_prompts) |d| try markdownDataset(w, "Refusal scoring prompts", d);
@@ -620,6 +629,7 @@ pub fn fromTable(a: Allocator, root: *const toml.Table) ReadError!Manifest {
         .ablate_inputs = if (settings.get("ablate_inputs") != null) try r.boolean(settings, "ablate_inputs") else defaults.ablate_inputs,
         .kl_tokens = if (settings.get("kl_tokens") != null) try r.int(settings, "kl_tokens") else defaults.kl_tokens,
         .fast_search = if (settings.get("fast_search") != null) try r.boolean(settings, "fast_search") else defaults.fast_search,
+        .device = (try r.str(settings, "device")) orelse "cpu",
         .n_trials = try r.int(settings, "n_trials"),
         .n_startup_trials = try r.int(settings, "n_startup_trials"),
         .scorers = scorer_list,

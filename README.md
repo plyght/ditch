@@ -11,7 +11,8 @@ Direction*, 2024, <https://arxiv.org/abs/2406.11717>) when you use the results.
 
 What ditch adds:
 
-* **One dependency-free binary.** No Python, PyTorch or GPU. Linux, macOS and
+* **One dependency-free binary.** No Python, no PyTorch, no GPU needed (there
+  is an optional Metal backend; see "GPU acceleration"). Linux, macOS and
   Windows builds on every release.
 * **Models bigger than RAM.** A memory budget streams weights layer by layer;
   for mixture-of-experts models, *warp mode* streams only the routed experts,
@@ -65,6 +66,7 @@ Useful flags (all also settable in `config.lua`; see `ditch --help`):
 | `--export-format hf\|gguf\|both`, `--gguf-dtype f16\|q8_0\|...` | output format |
 | `--checkpoint-action`, `--trial-index`, `--model-action`, `--save-directory` | answer the menus non-interactively |
 | `--evaluate-model DIR`, `--reproduce FILE`, `ditch bench MODEL` | evaluate, reproduce, measure |
+| `--device auto\|cpu\|metal`, `--gpu-memory 4GB`, `ditch selftest` | compute backend (see "GPU acceleration") |
 
 ## Supported models
 
@@ -101,7 +103,8 @@ Settings live in `config.lua` (or `--config FILE`), a sandboxed Lua 5.4 script
 returning a table keyed like the flags; every option is documented in
 [`config.default.lua`](config.default.lua), and Heretic `config.toml` files are
 accepted. Precedence, highest first: flags, `DITCH_*` environment variables
-(`DITCH_THREADS`, `DITCH_MAX_RAM`, `DITCH_CACHE`, `DITCH_NO_COLOR`),
+(`DITCH_THREADS`, `DITCH_MAX_RAM`, `DITCH_CACHE`, `DITCH_DEVICE`,
+`DITCH_NO_COLOR`),
 `./config.lua`, then `$XDG_CONFIG_HOME/ditch/config.lua`. Messages go to stderr
 and results to stdout (`--json` for one JSON document, `--plain` for
 grep-friendly lines); `--no-input` turns every prompt into an error naming the
@@ -133,6 +136,58 @@ still exported. The honest cost: streamed decode re-reads the weights it needs
 for every generated token, so throughput is bound by storage bandwidth. Measure
 with `ditch bench` before committing to a long run.
 
+## GPU acceleration
+
+The CPU is still the default and the reference. `--device` selects a compute
+backend: `cpu` (default), `metal` (Apple silicon) or `auto`, which probes for a
+usable GPU and falls back to the CPU with one line on stderr. The same setting
+exists as `DITCH_DEVICE` and as `device` in `config.lua`, and the device that
+ran a study is recorded in `ditch-reproduce.lua`.
+
+```sh
+zig build -Doptimize=ReleaseFast -Dmetal    # on a Mac with Xcode's command line tools
+ditch selftest --device metal               # check every GPU kernel against the CPU
+ditch Qwen/Qwen2.5-0.5B-Instruct --device metal --gpu-memory 4GB
+```
+
+**[docs/gpu.md](docs/gpu.md)** is the full description: the backend interface,
+the Metal kernels, the test harness and a table of what is verified where.
+
+All kernels go through a backend seam (`src/compute.zig`); a backend implements
+what it can and anything else falls through to the CPU kernel, so quantised
+tiles, odd shapes and small work are never a special case. Only the
+weight-tile operations — the matrix products and row norms, which dominate the
+FLOPs — are actually dispatched to the GPU today; norms, softmax, rope, gated
+activations and per-head attention are computed per row inside the thread pool,
+where a device round trip would cost more than the arithmetic. Their Metal
+kernels exist and are checked by the selftest, ready for a forward pass that
+keeps activations resident. The GPU never needs the whole model: a weight tile
+is uploaded (or, when it is page aligned, addressed in place through unified
+memory), computed on and dropped, and `--gpu-memory N` keeps the hottest tiles
+resident up to N bytes — so `--max-ram`, streamed weights and warp mode work
+unchanged, with `--gpu-memory` ignored there because streamed buffers do not
+keep a stable address.
+
+Abliteration semantics and exports are unchanged: the directions and the edited
+weights are the CPU ones to f32 rounding. The tolerance is what `ditch selftest`
+prints — per kernel, the largest absolute and relative deviation from the CPU
+result over a sweep of shapes (matrix products: 1e-4 absolute or 1e-3 relative;
+the rest: 1e-5 / 1e-4). A kernel outside its tolerance fails the selftest with
+exit code 1.
+
+**What is verified, and what is not.** The seam, the CPU backend (bit-identical
+to calling `tensor.zig` directly, which the unit tests assert) and the selftest
+harness itself are covered by `zig build test`, on the Linux machines where this
+was written. The Zig half of the Metal backend is compiled for `aarch64-macos`
+by `zig build metal-check` on every CI run, and the shader source is checked
+structurally (`src/metal/shaders_test.zig`) — but neither a Metal compiler nor a
+GPU exists there. The macOS CI job (`macos-26`, Apple silicon) closes that gap:
+it compiles the shaders with `xcrun metal`, runs `ditch selftest --device metal`
+and fails when a kernel is outside tolerance, and runs an abliteration on the
+fixture model on both devices and compares the exports. Until that job has run
+green on your change, treat the Metal path as unverified, and run the selftest
+on your own Mac before trusting it: it is one command and takes seconds.
+
 ## GGUF
 
 `ditch model.gguf` reads GGUF directly (config and tokenizer are rebuilt from
@@ -152,7 +207,8 @@ itself.
 Every saved model contains `ditch-reproduce.lua`: ditch version, SHA-256 of the
 source files and prompt sets, the exact settings and trial parameters, and the
 scores. `ditch --reproduce path/to/ditch-reproduce.lua` verifies the hashes and
-rebuilds the model without a search. `ditch bench MODEL` measures throughput,
+rebuilds the model without a search; the compute device the run used is recorded
+too, and reproduction does not force that device back. `ditch bench MODEL` measures throughput,
 timings and peak memory as a Markdown table (`--bench-output file.md`);
 `tools/compare_heretic.md` describes how to measure Heretic on the same machine.
 
@@ -219,6 +275,8 @@ RAM. The Pareto fronts are close.
 ```sh
 zig build test --summary all   # unit tests (NumPy fixtures in tests/fixtures)
 bash tests/e2e.sh              # end-to-end run of every feature on the fixtures
+zig build metal-check          # type-check the Metal backend for aarch64-macos
+ditch selftest --device cpu    # the backend harness against itself (zero error)
 zig fmt --check src build.zig
 ```
 

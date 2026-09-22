@@ -24,6 +24,7 @@
 const std = @import("std");
 const Io = std.Io;
 const tensor = @import("tensor.zig");
+const compute = @import("compute.zig");
 const model_mod = @import("model.zig");
 const stream = @import("stream.zig");
 const abliterate = @import("abliterate.zig");
@@ -890,17 +891,17 @@ fn runExpert(model: *const Model, m: *const MoeLayer, gated: bool, gate_w: Weigh
     const gpa = model.gpa;
     const inter = gate_w.rows;
     const hidden = down_w.rows;
-    try tensor.matmulT(model.pool, gpa, gate, x, ne, gate_w, null);
+    try compute.matmulT(model.pool, gpa, gate, x, ne, gate_w, null);
     if (!gated) {
         for (0..ne) |i| {
             if (biases[0]) |b| tensor.axpy(gate[i * inter ..][0..inter], 1.0, b[0..inter]);
         }
-        tensor.gatedActivation(model.pool, m.activation, gate, gate, null, ne, inter, inter, inter);
-        try tensor.matmulT(model.pool, gpa, out, gate, ne, down_w, delta);
+        compute.gatedActivation(model.pool, m.activation, gate, gate, null, ne, inter, inter, inter);
+        try compute.matmulT(model.pool, gpa, out, gate, ne, down_w, delta);
         if (biases[2]) |b| for (0..ne) |i| tensor.axpy(out[i * hidden ..][0..hidden], 1.0, b[0..hidden]);
         return;
     }
-    try tensor.matmulT(model.pool, gpa, up, x, ne, up_w, null);
+    try compute.matmulT(model.pool, gpa, up, x, ne, up_w, null);
     for (0..ne) |i| {
         if (biases[0]) |b| tensor.axpy(gate[i * inter ..][0..inter], 1.0, b[0..inter]);
         if (biases[1]) |b| tensor.axpy(up[i * inter ..][0..inter], 1.0, b[0..inter]);
@@ -920,11 +921,11 @@ fn runExpert(model: *const Model, m: *const MoeLayer, gated: bool, gate_w: Weigh
             g.* = @min(g.*, limit);
             up[j] = std.math.clamp(up[j], -limit, limit);
         }
-        tensor.gatedActivation(model.pool, m.activation, gate, gate, up, ne, inter, inter, inter);
+        compute.gatedActivation(model.pool, m.activation, gate, gate, up, ne, inter, inter, inter);
     } else {
-        tensor.gatedActivation(model.pool, m.activation, gate, gate, up, ne, inter, inter, inter);
+        compute.gatedActivation(model.pool, m.activation, gate, gate, up, ne, inter, inter, inter);
     }
-    try tensor.matmulT(model.pool, gpa, out, gate, ne, down_w, delta);
+    try compute.matmulT(model.pool, gpa, out, gate, ne, down_w, delta);
     if (biases[2]) |b| for (0..ne) |i| tensor.axpy(out[i * hidden ..][0..hidden], 1.0, b[0..hidden]);
 }
 
@@ -987,7 +988,7 @@ pub fn forward(model: *const Model, m: *const MoeLayer, li: usize, out: []f32, h
     // routing is group-limited) with optional renormalisation and scaling.
     const logits = try gpa.alloc(f32, n * n_experts);
     defer gpa.free(logits);
-    try tensor.matmulT(model.pool, gpa, logits, h, n, m.router, null);
+    try compute.matmulT(model.pool, gpa, logits, h, n, m.router, null);
     const sel = try gpa.alloc(usize, n * k);
     defer gpa.free(sel);
     const selw = try gpa.alloc(f32, n * k);
@@ -1001,9 +1002,9 @@ pub fn forward(model: *const Model, m: *const MoeLayer, li: usize, out: []f32, h
         const row = logits[t * n_experts ..][0..n_experts];
         if (m.router_bias) |b| tensor.axpy(row, 1.0, b[0..n_experts]);
         if (r.gate_temp != 1.0) tensor.scale(row, 1.0 / r.gate_temp);
-        if (r.router_softcap) |cap| tensor.softcap(row, cap);
+        if (r.router_softcap) |cap| compute.softcap(row, cap);
         switch (r.scoring) {
-            .softmax => tensor.softmaxInPlace(row),
+            .softmax => compute.softmaxInPlace(row),
             .sigmoid => for (row) |*v| {
                 v.* = sigmoid(v.*);
             },
@@ -1094,7 +1095,7 @@ pub fn forward(model: *const Model, m: *const MoeLayer, li: usize, out: []f32, h
         errdefer gpa.free(xl);
         const al = try gpa.alloc(f32, n * ew);
         latent_bufs = .{ xl, al };
-        try tensor.matmulT(model.pool, gpa, xl, h, n, lat.down, null);
+        try compute.matmulT(model.pool, gpa, xl, h, n, lat.down, null);
         @memset(al, 0);
         xin = xl;
         acc = al;
@@ -1167,11 +1168,11 @@ pub fn forward(model: *const Model, m: *const MoeLayer, li: usize, out: []f32, h
             defer gpa.free(tmp);
             for (0..n) |t| {
                 const row = acc[t * ew ..][0..ew];
-                tensor.rmsnorm(tmp, row, nw, model.config.rms_norm_eps, false);
+                compute.rmsnorm(tmp, row, nw, model.config.rms_norm_eps, false);
                 @memcpy(row, tmp);
             }
         }
-        try tensor.matmulT(model.pool, gpa, out, acc, n, lat.up, if (lat.up_delta) |*d| d else null);
+        try compute.matmulT(model.pool, gpa, out, acc, n, lat.up, if (lat.up_delta) |*d| d else null);
     }
 
     if (m.shared) |*sh| {
@@ -1202,10 +1203,10 @@ pub fn scoreDown(pool: *const tensor.Pool, gpa: Allocator, w: Weight, v: []const
     const k = v.len / w.rows;
     const proj = try gpa.alloc(f32, k * w.cols);
     defer gpa.free(proj);
-    try tensor.matvecTMulti(pool, gpa, proj, w, v, k);
+    try compute.matvecTMulti(pool, gpa, proj, w, v, k);
     const norms = try gpa.alloc(f32, w.rows);
     defer gpa.free(norms);
-    try tensor.rowNorms(pool, gpa, norms, w);
+    try compute.rowNorms(pool, gpa, norms, w);
     const fro = tensor.norm2(norms);
     return if (fro > 0) tensor.norm2(proj) / fro else 0;
 }

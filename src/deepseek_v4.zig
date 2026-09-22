@@ -32,6 +32,7 @@
 
 const std = @import("std");
 const tensor = @import("tensor.zig");
+const compute = @import("compute.zig");
 const model_mod = @import("model.zig");
 const stream = @import("stream.zig");
 const arch = @import("arch.zig");
@@ -469,17 +470,17 @@ pub fn attention(model: *const Model, layer: *const Layer, li: usize, ws: *Works
     // Queries: low-rank projection, norm, expansion, (V4) unweighted head norm, rope on the tail.
     const q_res = try gpa.alloc(f32, n * qlr);
     defer gpa.free(q_res);
-    try tensor.matmulT(model.pool, gpa, q_res, h, n, w.q_a, null);
+    try compute.matmulT(model.pool, gpa, q_res, h, n, w.q_a, null);
     const tmp = try gpa.alloc(f32, @max(qlr, hd));
     defer gpa.free(tmp);
     for (0..n) |t| {
         const row = q_res[t * qlr ..][0..qlr];
-        tensor.rmsnorm(tmp[0..qlr], row, w.q_a_norm, c.rms_norm_eps, false);
+        compute.rmsnorm(tmp[0..qlr], row, w.q_a_norm, c.rms_norm_eps, false);
         @memcpy(row, tmp[0..qlr]);
     }
-    try tensor.matmulT(model.pool, gpa, ws.q, q_res, n, w.q_b, null);
+    try compute.matmulT(model.pool, gpa, ws.q, q_res, n, w.q_b, null);
     // Keys/values: one latent per token, normed, roped, (V4.1) FP8-rounded.
-    try tensor.matmulT(model.pool, gpa, ws.k, h, n, w.kv, null);
+    try compute.matmulT(model.pool, gpa, ws.k, h, n, w.kv, null);
     for (0..n) |t| {
         const pos = @min(rows[t].pos, model.rope.len - 1);
         const cr = cos[pos * half ..][0..half];
@@ -495,7 +496,7 @@ pub fn attention(model: *const Model, layer: *const Layer, li: usize, ws: *Works
             ropeTail(q, rd, cr, sr, 1.0);
         }
         const kv = ws.k[t * hd ..][0..hd];
-        tensor.rmsnorm(tmp[0..hd], kv, w.kv_norm, c.rms_norm_eps, false);
+        compute.rmsnorm(tmp[0..hd], kv, w.kv_norm, c.rms_norm_eps, false);
         @memcpy(kv, tmp[0..hd]);
         ropeTail(kv, rd, cr, sr, 1.0);
         if (d.fake_quant) fakeQuantFp8(kv, 32);
@@ -586,10 +587,10 @@ pub fn attention(model: *const Model, layer: *const Layer, li: usize, ws: *Works
             .rows = d.o_lora_rank,
             .cols = per_group,
         };
-        try tensor.matmulT(model.pool, gpa, gout, gin, n, block, null);
+        try compute.matmulT(model.pool, gpa, gout, gin, n, block, null);
         for (0..n) |t| @memcpy(grouped[t * d.o_groups * d.o_lora_rank + g * d.o_lora_rank ..][0..d.o_lora_rank], gout[t * d.o_lora_rank ..][0..d.o_lora_rank]);
     }
-    try tensor.matmulT(model.pool, gpa, ws.o, grouped, n, layer.o, if (layer.o_delta) |*dl| dl else null);
+    try compute.matmulT(model.pool, gpa, ws.o, grouped, n, layer.o, if (layer.o_delta) |*dl| dl else null);
 }
 
 // ---------------------------------------------------------------------------
@@ -613,10 +614,10 @@ fn compressorUpdate(model: *const Model, comp: Compressor, li: usize, cc: *Compr
 
     const kvp = try gpa.alloc(f32, n * width);
     defer gpa.free(kvp);
-    try tensor.matmulT(model.pool, gpa, kvp, h, n, comp.kv, null);
+    try compute.matmulT(model.pool, gpa, kvp, h, n, comp.kv, null);
     const gatep = try gpa.alloc(f32, n * width);
     defer gpa.free(gatep);
-    if (comp.gate) |g| try tensor.matmulT(model.pool, gpa, gatep, h, n, g, null) else @memset(gatep, 0);
+    if (comp.gate) |g| try compute.matmulT(model.pool, gpa, gatep, h, n, g, null) else @memset(gatep, 0);
 
     const n_slots = if (branch == .csa) 2 * ratio else ratio;
     const slot_kv = try gpa.alloc(f32, n_slots * hd);
@@ -713,7 +714,7 @@ fn compressorUpdate(model: *const Model, comp: Compressor, li: usize, cc: *Compr
                 entry[k] = acc / sum;
             }
         }
-        tensor.rmsnorm(tmp, entry, comp.norm, c.rms_norm_eps, false);
+        compute.rmsnorm(tmp, entry, comp.norm, c.rms_norm_eps, false);
         const gpos = @min(g * ratio, model.rope.len - 1);
         ropeTail(tmp, rd, model.rope_cos_compress[gpos * half ..][0..half], model.rope_sin_compress[gpos * half ..][0..half], 1.0);
         if (d.fake_quant) fakeQuantFp4(tmp, 16, true);
@@ -863,7 +864,7 @@ pub fn engramApply(model: *const Model, eg: *const EngramWeights, cc: *CompressC
     // Keys per stream and one value, then the normalised-dot gate per stream.
     const kv = try gpa.alloc(f32, n * hidden * (hc + 1));
     defer gpa.free(kv);
-    try tensor.matmulT(model.pool, gpa, kv, rows_flat, n, eg.wkv, null);
+    try compute.matmulT(model.pool, gpa, kv, rows_flat, n, eg.wkv, null);
     const inv_sqrt_h = 1.0 / @sqrt(@as(f32, @floatFromInt(hidden)));
     for (0..n) |t| {
         const streams = x[t * sw ..][0..sw];

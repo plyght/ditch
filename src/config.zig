@@ -5,6 +5,7 @@ const toml = @import("toml.zig");
 const lua = @import("lua.zig");
 const abliterate = @import("abliterate.zig");
 const directions = @import("directions.zig");
+const compute = @import("compute.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -175,8 +176,18 @@ pub const Settings = struct {
     max_shard_size: u64 = 5 * 1024 * 1024 * 1024,
     /// Resident-memory budget in bytes for ditch-owned buffers (0 = unlimited; weights are memory-mapped).
     max_ram: u64 = 0,
-    /// Accepted for CLI compatibility with heretic; unused (there is no GPU backend).
+    /// Accepted for CLI compatibility with heretic; unused (the memory budget
+    /// of a GPU backend is `gpu_memory`).
     max_vram: u64 = 0,
+    /// Compute backend: "cpu" (the default and the reference), "metal", or
+    /// "auto" to probe for a GPU and fall back to the CPU. Also DITCH_DEVICE.
+    device: []const u8 = "cpu",
+    /// Device memory a GPU backend may keep hot weights in (0 = upload every
+    /// tile, compute and drop it). Ignored by the CPU backend.
+    gpu_memory: u64 = 0,
+    /// `ditch selftest`: check the selected backend against the CPU reference
+    /// kernels instead of running a study.
+    selftest: bool = false,
     /// Directory for spilled activations / KV caches (default: <cache_dir>/scratch or ./scratch).
     scratch_dir: ?[]const u8 = null,
     /// Wall-clock limit for the whole run in seconds (null = none).
@@ -255,6 +266,11 @@ pub const Settings = struct {
     http_timeout_seconds: u64 = 30,
     /// `ditch help <topic>`.
     help_topic: ?[]const u8 = null,
+
+    /// The parsed `--device`, or null when it names no known backend.
+    pub fn deviceKind(self: *const Settings) ?compute.Kind {
+        return compute.Kind.parse(self.device);
+    }
 };
 
 /// One heading and its body of the help text; `writeHelp` renders the
@@ -268,6 +284,7 @@ pub const usage_text =
     \\  ditch [OPTIONS] <MODEL>          run the abliteration study on a model
     \\  ditch bench [OPTIONS] <MODEL>    measure throughput, timings and memory
     \\  ditch probe [OPTIONS] <MODEL> --prompt TEXT   show tokens, first-token logits, greedy reply
+    \\  ditch selftest [--device D]      check a compute backend against the CPU reference kernels
     \\  ditch help [bench]               this help (or the benchmark options)
     \\
     \\<MODEL> is a Hugging Face model id (Qwen/Qwen2.5-0.5B-Instruct), a local directory, a .gguf
@@ -308,6 +325,12 @@ pub const help_sections = [_]HelpSection{
     \\  --threads <n>                  Worker threads (default: number of CPUs; also DITCH_THREADS).
     \\  --cache-dir <path>             Download cache (default: $DITCH_CACHE or ~/.cache/ditch).
     \\  --chat-template <name>         Force a chat template: chatml, llama3, llama2, mistral, gemma, raw.
+    \\  --device <auto|cpu|metal>      Compute backend (default: cpu, the reference implementation;
+    \\                                 auto probes for a GPU and falls back to the CPU with a note;
+    \\                                 metal needs a -Dmetal build on Apple silicon). Also DITCH_DEVICE.
+    \\  --gpu-memory <size>            Device memory a GPU backend may keep hot weights in, e.g. 4GB
+    \\                                 (default: 0 = upload each weight tile, compute, drop it).
+    \\                                 Also DITCH_GPU_MEMORY.
     \\  --max-batch-size <n>           Upper bound for batch-size auto-detection (default: 32).
     \\  --max-response-length <n>      Tokens generated per response (default: 100).
     \\  --response-prefix <text>       Text appended to every prompt (default: auto-detect).
@@ -319,7 +342,7 @@ pub const help_sections = [_]HelpSection{
     \\                                 weights are memory-mapped). With a budget, weights are streamed layer
     \\                                 by layer from disk and caches spill to --scratch-dir when needed.
     \\                                 Also DITCH_MAX_RAM.
-    \\  --max-vram <size>              Accepted for compatibility; unused (CPU-only, no GPU backend).
+    \\  --max-vram <size>              Accepted for compatibility; unused (see --device, --gpu-memory).
     \\  --scratch-dir <path>           Spill directory (default: <cache-dir>/scratch, else $TMPDIR/ditch-scratch).
     \\  --time-limit <duration>        Stop cleanly after this long, e.g. 90m, 2h, 1h30m (default: none).
     \\  --budget-headroom <size>       Memory reserved for everything ditch does not allocate itself
@@ -412,6 +435,11 @@ pub const help_sections = [_]HelpSection{
     \\                                 Print the rendered prompt, token ids, the top first-token
     \\                                 logits and the greedy reply (--json: the full logit vector),
     \\                                 for checking against tools/probe_reference.py.
+    \\  ditch selftest [--device D]    Check every kernel of a compute backend against the CPU
+    \\                                 reference on random inputs and a sweep of shapes, printing
+    \\                                 the largest absolute and relative error per kernel (--json
+    \\                                 for machine-readable output). Exit 1 when a kernel is
+    \\                                 outside its tolerance, 2 when the device is unavailable.
     \\
     },
     .{ .title = "Output and interaction", .body =
@@ -441,7 +469,7 @@ pub const help_sections = [_]HelpSection{
     \\  --config <path>                Configuration file, .lua or .toml (default: ./config.lua, else
     \\                                 ./config.toml). See config.default.lua for every option.
     \\  Precedence: flags > DITCH_* environment variables (DITCH_THREADS, DITCH_MAX_RAM, DITCH_CACHE,
-    \\  DITCH_NO_COLOR) > ./config.lua > $XDG_CONFIG_HOME/ditch/config.lua (~/.config/ditch/config.lua).
+    \\  DITCH_DEVICE, DITCH_GPU_MEMORY, DITCH_NO_COLOR) > ./config.lua > $XDG_CONFIG_HOME/ditch/config.lua (~/.config/ditch/config.lua).
     \\  Every option accepts --name value or --name=value; flags and subcommands may come in any order.
     \\
     },
@@ -618,7 +646,7 @@ fn applyConfigFile(gpa: Allocator, io: std.Io, a: Allocator, settings: *Settings
     return true;
 }
 
-pub const subcommands = [_][]const u8{ "bench", "probe", "help" };
+pub const subcommands = [_][]const u8{ "bench", "probe", "selftest", "help" };
 
 /// Parses the configuration: the user file ($XDG_CONFIG_HOME/ditch/config.lua),
 /// the project file (./config.lua, ./config.toml or --config), the DITCH_*
@@ -665,7 +693,7 @@ pub fn load(gpa: Allocator, io: std.Io, args: []const []const u8, environ: ?*std
 
     // Environment variables.
     if (environ) |env| {
-        const vars = [_][2][]const u8{ .{ "DITCH_THREADS", "threads" }, .{ "DITCH_MAX_RAM", "max_ram" } };
+        const vars = [_][2][]const u8{ .{ "DITCH_THREADS", "threads" }, .{ "DITCH_MAX_RAM", "max_ram" }, .{ "DITCH_DEVICE", "device" }, .{ "DITCH_GPU_MEMORY", "gpu_memory" } };
         for (vars) |v| if (env.get(v[0])) |value| {
             applyOption(a, &settings, v[1], value) catch |err| {
                 try errors.append(a, try std.fmt.allocPrint(a, "invalid value for {s}: {s}", .{ v[0], @errorName(err) }));
@@ -715,6 +743,10 @@ pub fn load(gpa: Allocator, io: std.Io, args: []const []const u8, environ: ?*std
             }
             if (std.mem.eql(u8, arg, "probe")) {
                 settings.probe = true;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "selftest")) {
+                settings.selftest = true;
                 continue;
             }
             if (std.mem.eql(u8, arg, "help")) {
@@ -790,7 +822,7 @@ fn normalizeKey(a: Allocator, name: []const u8) ![]u8 {
 }
 
 fn isBoolKey(key: []const u8) bool {
-    const bools = [_][]const u8{ "print_debug_information", "print_residual_geometry", "orthogonalize_direction", "keyword_rate_print_responses", "ignore_mismatches", "early_stop", "no_early_stop", "visited_experts_only", "remote_weights", "hotlist", "no_hotlist", "ablate_inputs", "fast_search", "raw", "help", "version", "quiet", "dry_run", "no_input", "interactive", "force", "json", "plain", "no_color", "debug", "token" };
+    const bools = [_][]const u8{ "print_debug_information", "print_residual_geometry", "orthogonalize_direction", "keyword_rate_print_responses", "ignore_mismatches", "early_stop", "no_early_stop", "visited_experts_only", "remote_weights", "hotlist", "no_hotlist", "ablate_inputs", "fast_search", "selftest", "raw", "help", "version", "quiet", "dry_run", "no_input", "interactive", "force", "json", "plain", "no_color", "debug", "token" };
     for (bools) |b| if (std.mem.eql(u8, b, key)) return true;
     return false;
 }
@@ -867,7 +899,10 @@ fn applyOption(a: Allocator, s: *Settings, key: []const u8, value: []const u8) !
     } else if (eql(u8, key, "fast_search")) s.fast_search = try parseBool(value) else if (eql(u8, key, "select")) s.select = Select.parse(value) orelse return error.InvalidEnum else if (eql(u8, key, "select_lambda")) {
         s.select_lambda = try std.fmt.parseFloat(f64, value);
         if (!(s.select_lambda >= 0)) return error.InvalidValue;
-    } else if (eql(u8, key, "early_stop")) s.early_stop = try parseBool(value) else if (eql(u8, key, "no_early_stop")) s.early_stop = !(try parseBool(value)) else if (eql(u8, key, "warm_start")) s.warm_start = try a.dupe(u8, value) else if (eql(u8, key, "n_trials")) s.n_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_startup_trials")) s.n_startup_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "seed")) s.seed = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "study_checkpoint_dir")) s.study_checkpoint_dir = try a.dupe(u8, value) else if (eql(u8, key, "max_shard_size")) s.max_shard_size = try parseSize(value) else if (eql(u8, key, "max_ram")) s.max_ram = try parseSize(value) else if (eql(u8, key, "max_vram")) s.max_vram = try parseSize(value) else if (eql(u8, key, "scratch_dir")) s.scratch_dir = try a.dupe(u8, value) else if (eql(u8, key, "time_limit")) s.time_limit_seconds = try parseDuration(value) else if (eql(u8, key, "time_limit_seconds")) s.time_limit_seconds = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "budget_headroom")) s.budget_headroom = try parseSize(value) else if (eql(u8, key, "expert_cache")) s.expert_cache = try parseSize(value) else if (eql(u8, key, "visited_experts_only")) s.visited_experts_only = try parseBool(value) else if (eql(u8, key, "remote_weights")) s.remote_weights = try parseBool(value) else if (eql(u8, key, "remote_chunk_size")) s.remote_chunk_size = try parseSize(value) else if (eql(u8, key, "hotlist")) s.hotlist = try parseBool(value) else if (eql(u8, key, "no_hotlist")) s.hotlist = !(try parseBool(value)) else if (eql(u8, key, "checkpoint_action")) s.checkpoint_action = try a.dupe(u8, value) else if (eql(u8, key, "trial_index")) s.trial_index = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_additional_trials")) s.n_additional_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "model_action")) s.model_action = try a.dupe(u8, value) else if (eql(u8, key, "save_directory")) s.save_directory = try a.dupe(u8, value) else if (eql(u8, key, "export_dtype")) s.export_dtype = try a.dupe(u8, value) else if (eql(u8, key, "export_format")) s.export_format = try a.dupe(u8, value) else if (eql(u8, key, "gguf_dtype")) s.gguf_dtype = try a.dupe(u8, value) else if (eql(u8, key, "config")) {
+    } else if (eql(u8, key, "early_stop")) s.early_stop = try parseBool(value) else if (eql(u8, key, "no_early_stop")) s.early_stop = !(try parseBool(value)) else if (eql(u8, key, "warm_start")) s.warm_start = try a.dupe(u8, value) else if (eql(u8, key, "n_trials")) s.n_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_startup_trials")) s.n_startup_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "seed")) s.seed = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "study_checkpoint_dir")) s.study_checkpoint_dir = try a.dupe(u8, value) else if (eql(u8, key, "max_shard_size")) s.max_shard_size = try parseSize(value) else if (eql(u8, key, "max_ram")) s.max_ram = try parseSize(value) else if (eql(u8, key, "max_vram")) s.max_vram = try parseSize(value) else if (eql(u8, key, "device")) {
+        if (compute.Kind.parse(value) == null) return error.InvalidEnum;
+        s.device = try a.dupe(u8, value);
+    } else if (eql(u8, key, "gpu_memory")) s.gpu_memory = try parseSize(value) else if (eql(u8, key, "selftest")) s.selftest = try parseBool(value) else if (eql(u8, key, "scratch_dir")) s.scratch_dir = try a.dupe(u8, value) else if (eql(u8, key, "time_limit")) s.time_limit_seconds = try parseDuration(value) else if (eql(u8, key, "time_limit_seconds")) s.time_limit_seconds = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "budget_headroom")) s.budget_headroom = try parseSize(value) else if (eql(u8, key, "expert_cache")) s.expert_cache = try parseSize(value) else if (eql(u8, key, "visited_experts_only")) s.visited_experts_only = try parseBool(value) else if (eql(u8, key, "remote_weights")) s.remote_weights = try parseBool(value) else if (eql(u8, key, "remote_chunk_size")) s.remote_chunk_size = try parseSize(value) else if (eql(u8, key, "hotlist")) s.hotlist = try parseBool(value) else if (eql(u8, key, "no_hotlist")) s.hotlist = !(try parseBool(value)) else if (eql(u8, key, "checkpoint_action")) s.checkpoint_action = try a.dupe(u8, value) else if (eql(u8, key, "trial_index")) s.trial_index = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_additional_trials")) s.n_additional_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "model_action")) s.model_action = try a.dupe(u8, value) else if (eql(u8, key, "save_directory")) s.save_directory = try a.dupe(u8, value) else if (eql(u8, key, "export_dtype")) s.export_dtype = try a.dupe(u8, value) else if (eql(u8, key, "export_format")) s.export_format = try a.dupe(u8, value) else if (eql(u8, key, "gguf_dtype")) s.gguf_dtype = try a.dupe(u8, value) else if (eql(u8, key, "config")) {
         // handled in the first pass
     } else if (eql(u8, key, "reproduce")) s.reproduce = try a.dupe(u8, value) else if (eql(u8, key, "ignore_mismatches")) s.ignore_mismatches = try parseBool(value) else if (eql(u8, key, "bench_prompts")) s.bench_prompts = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "bench_tokens")) s.bench_tokens = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "bench_output")) s.bench_output = try a.dupe(u8, value) else if (eql(u8, key, "prompt")) {
         const list = try a.alloc([]const u8, s.probe_prompts.len + 1);

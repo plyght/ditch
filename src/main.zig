@@ -30,6 +30,8 @@ const stream = @import("stream.zig");
 const reproduce = @import("reproduce.zig");
 const bench = @import("bench.zig");
 const probe = @import("probe.zig");
+const compute = @import("compute.zig");
+const selftest = @import("selftest.zig");
 const directions = @import("directions.zig");
 const remote = @import("remote.zig");
 
@@ -1398,7 +1400,8 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         reproduce.applySettings(&manifest.?, settings);
         try out.print("* Recorded by ditch {s}: model {s}, trial {d}\n", .{ manifest.?.ditch_version, manifest.?.model, manifest.?.trial_index });
     }
-    if (settings.model.len == 0) {
+    // `ditch selftest` checks the compute kernels themselves and needs no model.
+    if (settings.model.len == 0 and !settings.selftest) {
         try out.writeAll("No model specified.\n\n");
         try out.writeAll(config.help_text);
         try out.flush();
@@ -1421,6 +1424,29 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     try out.flush();
     installSigint();
 
+    // Compute backend. The CPU backend is the default and the reference; any
+    // other backend is checked against it by `ditch selftest`.
+    const device_kind = settings.deviceKind() orelse {
+        std.log.err("unknown device: {s} (expected {s})", .{ settings.device, compute.Kind.names });
+        std.process.exit(2);
+    };
+    if (settings.selftest) {
+        try selftest.run(gpa, settings, pool, out, con.result);
+        return;
+    }
+    const device_note = compute.selectInto(gpa, device_kind, .{ .memory_budget = settings.gpu_memory }) catch {
+        std.log.err("device {s} is not available on this build or machine (build with -Dmetal on Apple silicon, or use --device auto)", .{settings.device});
+        std.process.exit(2);
+    };
+    defer compute.shutdown();
+    if (device_note) |n| try out.print("{s}\n", .{n});
+    if (!compute.active.isCpu()) {
+        try out.print("Compute device: {s}", .{compute.active.name});
+        if (compute.active.memory_budget > 0) try out.print(" (up to {f} of resident weights)", .{budget_mod.fmtBytes(compute.active.memory_budget)});
+        try out.writeAll("\n");
+    }
+    try out.flush();
+
     // Memory / time budget. Every large runtime buffer comes from the budget's
     // allocator (unlimited when no --max-ram is given, but still accounted).
     var budget = try budget_mod.Budget.fromSettingsEnv(gpa, io, settings, init.environ_map);
@@ -1429,9 +1455,12 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     // Remote weights and an explicit expert cache imply streaming.
     const is_remote = remote.isRemoteId(settings.model) or settings.remote_weights;
     const store_mode: stream.Mode = if (settings.max_ram > 0 or settings.expert_cache != null or is_remote) .streamed else .mapped;
+    // Only memory-mapped weights keep a stable address for the whole run, so
+    // only they may stay resident on a device (see compute.Residency).
+    compute.setWeightsStable(store_mode == .mapped);
     if (budget.limited()) try out.print("Memory budget: {f} (headroom {f}, scratch directory {s})\n", .{ budget_mod.fmtBytes(budget.max_ram), budget_mod.fmtBytes(budget.headroom), budget.scratch_dir });
     if (budget.time_limit) |t| try out.print("Time limit: {f}\n", .{budget_mod.fmtDuration(t)});
-    if (settings.max_vram > 0) try out.writeAll("Note: --max-vram is accepted for compatibility but unused (ditch runs on the CPU).\n");
+    if (settings.max_vram > 0) try out.writeAll("Note: --max-vram is accepted for compatibility but unused; a GPU backend is bounded by --gpu-memory.\n");
     defer {
         if (budget.limited() or budget.time_limit != null or settings.print_debug_information) {
             budget.report().print(out, "\nMemory") catch {};
