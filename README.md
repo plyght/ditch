@@ -94,7 +94,13 @@ a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
   attention): `qwen3_next` (Qwen3-Next, Qwen3-Coder-Next),
   `qwen3_5` / `qwen3_5_moe` (Qwen3.5, Qwen3.8 dense and MoE, text configs;
   the linear recurrence runs sequentially, so long prefills are slower
-  than on dense models)
+  than on dense models), `qwen4_exp` (Qwen3.8-Flash-Next, text config:
+  gated hyper-connections over `hc_count` residual streams instead of a
+  plain residual, a QSA indexer on the full-attention layers (run as its
+  exact dense equivalent while every complete key block fits
+  `indexer_budget`; longer prompts are refused, not approximated),
+  per-layer n-gram embeddings (PLE) whose huge sharded tables are read one
+  row at a time, and a gated shared expert on every MoE layer)
 * Mamba (selective state-space) families: `mamba2` (Mamba-Codestral,
   `state-spaces/mamba2-*-hf`), `nemotron_h` (Nemotron-H and Nemotron 3 Nano:
   Mamba2, attention, relu² MLP and non-gated MoE blocks laid out by
@@ -122,9 +128,15 @@ a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
   proportional RoPE, keys reused as values, KV-shared layers, per-layer
   inputs; the MoE block of gemma-4-26B-A4B is not implemented), GLM-4
   (`glm4`, `glm`) and ChatGLM3 / GLM-4-9B (`chatglm`), GLM-4.5 dense and
-  MoE (`glm4_moe`, also the `glm4v_moe` image/video text config), GLM-5
-  family (`glm_moe_dsa`, whose sparse indexer runs as dense attention,
-  exact for the short contexts ditch scores), Phi-1/1.5/2 (`phi`),
+  MoE (`glm4_moe`, also the `glm4v_moe` image/video text config), GLM-4.7-Flash
+  (`glm4_moe_lite`, also spelled `glm_moe_lite`: DeepSeek V3 MLA with the
+  GLM-4.5 router), GLM-5 family (`glm_moe_dsa`, whose sparse indexer runs as
+  dense attention, exact for the short contexts ditch scores), GLM-5.3-Flash
+  (`glm5_next`, text config: Kimi Delta Attention 3:1 with NoPE MLA layers
+  behind a k-pool DSA indexer (run as its exact dense equivalent while
+  every complete pool fits `index_topk`; longer prompts are refused),
+  manifold-constrained hyper-connections collapsed by an unweighted mean,
+  clamped SwiGLU), Phi-1/1.5/2 (`phi`),
   Phi-3 / 3.5 / 4 (`phi3`)
 * GPT-2, GPT-NeoX / Pythia, GPT-BigCode (StarCoder 1), Falcon (7B layout),
   BLOOM, OPT, MPT, GPT-J (`gptj`), CodeGen (`codegen`, tensor-parallel qkv
@@ -164,13 +176,15 @@ a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
   Pro layout's fused `qkv_proj` chunked per kv head). The V2.5 / V2.6 omni
   checkpoints run through their text layers: the vision and audio encoders,
   `speech_embeddings` and the MTP layers (`model.mtp.*`) pass through
-  exports untouched. The released V2.6 checkpoints store the experts as
-  MXFP4 (`store_dtype`), which ditch refuses until they are dequantised to
-  bf16; the FP8 V2.5 checkpoints are dequantised on load. What is verified
-  is the transcription: the fixtures follow the transformers module and the
-  vLLM / llama.cpp loaders, not a released checkpoint, and MiMo-V2.6's own
-  `config.json` was not reachable to confirm that it adds nothing beyond
-  `store_dtype` and `moe_router_dtype`
+  exports untouched. The released V2.6 checkpoints (`quant_method = "fp8"`
+  with `store_dtype = "mxfp4"` and a bf16 router) are dequantised on load
+  like the FP8 V2.5 ones: the dense weights from their block scales, the
+  routed experts from the packed MXFP4 `weight` / `weight_scale` pairs (see
+  Quantised checkpoints below). What is verified is the transcription: the
+  fixtures follow the transformers module and the vLLM / SGLang / llama.cpp
+  loaders, not a released checkpoint; MiMo-V2.6's `config.json` and the
+  dtypes and shapes of its expert tensors were read from a published census
+  of `MiMo-V2.6-Flash-RL`, but no released checkpoint was decoded
 * DeepSeek V4 (`deepseek_v4`) and V4.1-Flash (`deepseek_v41`, text config):
   manifold-constrained hyper-connections, shared-KV sliding attention with
   sinks and grouped output projection, compressed-KV branches (V4 CSA/HCA,
@@ -202,8 +216,7 @@ GPT-NeoX Japanese, CPM-Ant, CTRL, OpenAI GPT-1, Command A MoE, GraniteMoE
 SWA.
 
 Also not supported: Mamba1-only models (`mamba`, FalconMamba) and RWKV, Kimi
-K2 (`kimi_k2` standalone config), Qwen3.8-Flash-Next (`qwen4_exp`),
-GLM-5.3-Flash (`glm5_next`), encoder-decoder models, Gemma 4 MoE
+K2 (`kimi_k2` standalone config), encoder-decoder models, Gemma 4 MoE
 (`enable_moe_block`), LFM2-MoE,
 MiniCPM3, HunYuan cross-layer attention (`use_cla`), OPT-350m (projection
 layers), quantisation formats other than the ones listed below (GPTQ, AWQ,
@@ -286,6 +299,15 @@ model:
   natural `[out, in]` layout and `weight_scale` U8 E8M0 exponents per 32
   elements; a different packing from gpt-oss's `*_blocks` / `*_scales`,
   decoded row by row.
+* **MXFP4 `store_dtype`** (MiMo-V2.6 Pro / Flash as released): a mixed
+  checkpoint, `quant_method = "fp8"` (block scales for the dense weights,
+  `ignored_layers` left in bf16) with `store_dtype = "mxfp4"` for the routed
+  experts, which are stored per projection as `weight` U8 `[out, in / 2]`
+  and `weight_scale` U8 `[out, in / 32]` — the same bytes as
+  mxfp4-pack-quantized (E2M1 nibble pairs, low nibble first; `w = code *
+  2^(scale - 127)`) under the plain tensor names, `mxfp4_block_size` giving
+  the 32-element group. Decoded row by row like the other packed layout, and
+  the bf16 MoE router (`moe_router_dtype`) is read as it is.
 
 Values are decoded to bf16, which is what the Hugging Face integrations
 produce. With `--max-ram` (streamed weights) a tensor is decoded row-chunk
@@ -447,12 +469,13 @@ RAM. The Pareto fronts are close.
    minus harmless prompts, normalised (optionally projected orthogonal to
    the harmless direction). With `--n-directions K`, further principal
    components of the harmful residuals are added from a streaming covariance
-   sketch. For the hyper-connection families (DeepSeek V4 / V4.1), whose
-   residual is several parallel streams, "the residual at layer L" is the
-   single mixed vector that enters layer L's attention block (the collapsed
-   block input, before its norm) and the last entry is the final collapse
-   that enters the output norm; the edited weights are the same output and
-   down projections as everywhere else.
+   sketch. For the hyper-connection families (DeepSeek V4 / V4.1,
+   GLM-5.3-Flash and Qwen3.8-Flash-Next), whose residual is several
+   parallel streams, "the residual at layer L" is the single mixed vector
+   that enters layer L's attention block (the collapsed block input, before
+   its norm where the family has one) and the last entry is the final
+   collapse that enters the output norm; the edited weights are the same
+   output and down projections as everywhere else.
 2. **Edit.** For every attention output and MLP down projection, the
    direction is projected out with a per-layer weight from a small kernel
    (maximum weight at a position, decaying to a minimum over a distance),

@@ -28,6 +28,8 @@ pub const arch = @import("arch.zig");
 const expert_cache = @import("expert_cache.zig");
 const remote = @import("remote.zig");
 pub const dsv4 = @import("deepseek_v4.zig");
+pub const hyper = @import("hyper.zig");
+pub const qwen4 = @import("qwen4_exp.zig");
 const dequant = @import("dequant.zig");
 
 const Allocator = std.mem.Allocator;
@@ -97,11 +99,21 @@ pub const Slot = enum {
     d_q_b,
     d_kv,
     d_o_a,
-    d_hc_attn,
-    d_hc_ffn,
     d_comp_kv,
     d_comp_gate,
     d_engram_wkv,
+    // Hyper-connection sites (hyper.zig) and Qwen4-Exp per-layer embeddings
+    hc_attn_fn,
+    hc_attn_down,
+    hc_attn_up,
+    hc_attn_inject,
+    hc_ffn_fn,
+    hc_ffn_down,
+    hc_ffn_up,
+    hc_ffn_inject,
+    ple_key,
+    ple_value,
+    ple_conv,
     // LFM2 short convolution, Gemma 3n / 4 per-layer inputs, AltUp and Laurel
     conv_in,
     conv_kernel,
@@ -126,7 +138,7 @@ pub const LayerRefs = struct {
     transposed: [max]bool = [_]bool{false} ** max,
     n: usize = 0,
 
-    pub const max = 20;
+    pub const max = 24;
 
     pub fn add(self: *LayerRefs, slot: Slot, ref: WeightRef, transposed: bool) void {
         std.debug.assert(self.n < max);
@@ -342,6 +354,10 @@ pub const Layer = struct {
     /// DeepSeek V4 / V4.1 weights (hyper-connections, low-rank and grouped
     /// projections, compressor, engram); null for other families.
     dsv4: ?dsv4.LayerWeights = null,
+    /// Hyper-connection sites around this layer's blocks (`hc_mult > 1`).
+    hyper: ?hyper.LayerWeights = null,
+    /// Qwen4-Exp per-layer n-gram embedding block (null on other layers).
+    ngram: ?qwen4.NgramWeights = null,
     /// Dense MLP (null for mixture-of-experts layers).
     ///
     /// In mapped mode the `Weight` fields of a layer view the mapping (or an
@@ -435,11 +451,20 @@ pub const Layer = struct {
             .d_q_b => self.dsv4.?.q_b = w,
             .d_kv => self.dsv4.?.kv = w,
             .d_o_a => self.dsv4.?.o_a = w,
-            .d_hc_attn => self.dsv4.?.attn_hc.fn_w = w,
-            .d_hc_ffn => self.dsv4.?.ffn_hc.fn_w = w,
             .d_comp_kv => self.dsv4.?.compressor.?.kv = w,
             .d_comp_gate => self.dsv4.?.compressor.?.gate = w,
             .d_engram_wkv => self.dsv4.?.engram.?.wkv = w,
+            .hc_attn_fn => self.hyper.?.attn.mhc.fn_w = w,
+            .hc_attn_down => self.hyper.?.attn.gated.down = w,
+            .hc_attn_up => self.hyper.?.attn.gated.up = w,
+            .hc_attn_inject => self.hyper.?.attn.gated.inject = w,
+            .hc_ffn_fn => self.hyper.?.ffn.mhc.fn_w = w,
+            .hc_ffn_down => self.hyper.?.ffn.gated.down = w,
+            .hc_ffn_up => self.hyper.?.ffn.gated.up = w,
+            .hc_ffn_inject => self.hyper.?.ffn.gated.inject = w,
+            .ple_key => self.ngram.?.key = w,
+            .ple_value => self.ngram.?.value = w,
+            .ple_conv => self.ngram.?.conv = w,
         }
     }
 };
@@ -548,6 +573,36 @@ pub const ExportEdit = union(enum) {
 };
 
 /// Expands a name template: `{p}` → prefix, `{i}` → layer index, `{e}` → expert index.
+/// Loads a matrix of exactly `rows` x `cols`, registering it in `layer.refs`
+/// under `slot`; an error names the tensor and the shapes when it does not
+/// match, so a mis-declared config fails at load instead of silently running.
+pub fn loadMatChecked(model: *Model, layer: *Layer, slot: Slot, name: []const u8, rows: usize, cols: usize) !Weight {
+    const r = try model.ref(name);
+    if (!r.dtype.isFloat()) {
+        std.log.err("{s} is stored as {s}; ditch reads F32/F16/BF16 weights (dequantise the checkpoint first)", .{ name, r.dtype.safetensorsName() });
+        return error.UnsupportedArchitecture;
+    }
+    if (r.rows != rows or r.cols != cols) {
+        std.log.err("{s} is [{d}][{d}], expected [{d}][{d}]", .{ name, r.rows, r.cols, rows, cols });
+        return error.InvalidConfig;
+    }
+    layer.refs.add(slot, r, false);
+    return model.loadMat(name);
+}
+
+/// Loads a vector of exactly `len` entries (norms, biases and scales).
+pub fn loadVecChecked(model: *Model, name: []const u8, len: usize) ![]const f32 {
+    const v = model.loadVecOpt(name) orelse {
+        std.log.err("missing tensor: {s}", .{name});
+        return error.MissingWeights;
+    };
+    if (v.len != len) {
+        std.log.err("{s} has {d} elements, expected {d}", .{ name, v.len, len });
+        return error.InvalidConfig;
+    }
+    return v;
+}
+
 pub fn resolveName(arena: Allocator, template: []const u8, prefix: []const u8, layer: usize, expert: usize) ![]const u8 {
     var out: Io.Writer.Allocating = .init(arena);
     const w = &out.writer;
@@ -631,7 +686,8 @@ pub const Model = struct {
     total_expert_bytes: u64,
     largest_tensor_bytes: u64,
     spill_always: bool,
-    final_norm: Norm,
+    /// Final norm before the LM head (null for a family without one).
+    final_norm: ?Norm,
     /// Attention Residual: the output aggregation feeding `final_norm` (Kimi K3).
     output_res: ?AttnResScorer = null,
     layers: []Layer,
@@ -661,8 +717,11 @@ pub const Model = struct {
     rope_cos_compress: []f32,
     rope_sin_compress: []f32,
     /// DeepSeek V4 final stream collapse and V4.1 engram hash state.
-    dsv4_head: ?dsv4.HyperHead,
+    /// Final stream collapse of a hyper-connection family (hyper.zig).
+    hyper_head: hyper.Head,
     engram: ?dsv4.EngramState,
+    /// Qwen4-Exp n-gram hash state (null for other families).
+    ngram: ?qwen4.NgramState,
 
     pub fn deinit(self: *Model) void {
         self.resetDeltas();
@@ -1312,7 +1371,11 @@ pub const Model = struct {
         }
         const nonparametric = c.norm == .none or c.norm == .rms_none;
         self.embed_norm = if (names.embed_norm) |t| (if (nonparametric) Norm{ .w = &.{} } else try self.loadNormOpt(try self.name(t))) else null;
-        self.final_norm = if (nonparametric) Norm{ .w = &.{} } else try self.loadNorm(try self.name(names.final_norm));
+        // Qwen4-Exp has no final norm: its stream mixer already normalises.
+        self.final_norm = if (names.final_norm) |t|
+            (if (nonparametric) Norm{ .w = &.{} } else try self.loadNorm(try self.name(t)))
+        else
+            null;
         self.lm_head_bias = null;
         var lm: ?WeightRef = null;
         for (names.lm_head) |t| {
@@ -1445,6 +1508,8 @@ pub const Model = struct {
             const hd = c.layer_head_dim[i];
             const nkv = c.layer_kv_heads[i];
             const kv_shared = c.kvShared(i);
+            if (c.hyper != null) try hyper.loadLayer(self, layer, arena, lp);
+            try qwen4.loadLayer(self, layer, arena, i, lp);
             if (c.dsv4 != null) {
                 try dsv4.loadLayer(self, layer, arena, i, lp);
             } else if (c.linear_layers[i]) {
@@ -1671,9 +1736,11 @@ pub const Model = struct {
                 return error.InvalidConfig;
             }
         }
-        self.dsv4_head = null;
         self.engram = null;
+        self.ngram = null;
         if (c.dsv4 != null) try dsv4.loadModel(self, arena);
+        if (c.ngram_ple) |ng| self.ngram = try qwen4.buildState(arena, ng);
+        self.hyper_head = if (c.hyper != null) try hyper.loadModel(self, arena) else .none;
     }
 
     /// Resolves each model-level template of `templates` with the detected prefix.
@@ -2427,6 +2494,8 @@ pub const KvCache = struct {
     linear: ?LinearCache = null,
     /// Compressed-KV entries and engram look-back (DeepSeek V4 / V4.1).
     compress: ?dsv4.CompressCache = null,
+    /// Qwen4-Exp n-gram look-back and PLE convolution state.
+    ngram: ?qwen4.NgramCache = null,
 
     pub fn init(gpa: Allocator, layers: usize, batch: usize, max_len: usize, kv_dim: usize) !KvCache {
         const n = layers * batch * max_len * kv_dim;
@@ -2462,7 +2531,7 @@ pub const KvCache = struct {
         const kvd = c.kvDim();
         var use_scratch = model.spill_always;
         if (model.budget) |b| {
-            const need = bytesFor(c.num_layers, batch, max_len, kvd) + LinearCache.bytesFor(c, batch) + model.residentWeightNeed();
+            const need = bytesFor(c.num_layers, batch, max_len, kvd) + LinearCache.bytesFor(c, batch) + qwen4.NgramCache.bytesFor(c, batch) + model.residentWeightNeed();
             if (b.limited() and b.available() + model.expertCacheEvictable() < need) use_scratch = true;
         }
         var cache: KvCache = undefined;
@@ -2476,6 +2545,7 @@ pub const KvCache = struct {
         }
         if (c.hasRecurrent()) cache.linear = try LinearCache.init(gpa, c, batch);
         if (c.dsv4 != null) cache.compress = try dsv4.CompressCache.init(gpa, c, batch, max_len);
+        if (c.ngram_ple != null) cache.ngram = try qwen4.NgramCache.init(gpa, c, batch);
         return cache;
     }
 
@@ -2486,6 +2556,7 @@ pub const KvCache = struct {
         if (self.layer_written.len > 0) self.gpa.free(self.layer_written);
         if (self.linear) |*l| l.deinit();
         if (self.compress) |*cc| cc.deinit();
+        if (self.ngram) |*nc| nc.deinit();
     }
 
     pub fn spilled(self: *const KvCache) bool {
@@ -2976,7 +3047,7 @@ fn applyNorm(c: *const Config, out: []f32, x: []const f32, nm: Norm) void {
 }
 
 /// `out[i] = norm(x[i])` for `n` rows, or a copy when there is no norm.
-fn normRows(c: *const Config, out: []f32, x: []const f32, n: usize, hidden: usize, nm: ?Norm) void {
+pub fn normRows(c: *const Config, out: []f32, x: []const f32, n: usize, hidden: usize, nm: ?Norm) void {
     if (nm) |norm| {
         var i: usize = 0;
         while (i < n) : (i += 1) applyNorm(c, out[i * hidden ..][0..hidden], x[i * hidden ..][0..hidden], norm);
@@ -3326,7 +3397,11 @@ fn linearForward(model: *const Model, layer: *const Layer, li: usize, ws: *Works
             for (o) |v| variance += v * v;
             variance = variance / @as(f32, @floatFromInt(vd)) + eps;
             const inv = 1.0 / @sqrt(variance);
-            for (o, 0..) |*v, jj| v.* = v.* * inv * lin.norm[jj] * tensor.silu(z[jj]);
+            if (c.linear_gate_sigmoid) {
+                for (o, 0..) |*v, jj| v.* = v.* * inv * lin.norm[jj] / (1.0 + @exp(-z[jj]));
+            } else {
+                for (o, 0..) |*v, jj| v.* = v.* * inv * lin.norm[jj] * tensor.silu(z[jj]);
+            }
         }
         next.* = pos + 1;
     }
@@ -3562,7 +3637,7 @@ fn lightningForward(model: *const Model, layer: *const Layer, li: usize, ws: *Wo
     if (layer.o_bias) |bias| addBias(ws.o, n, hidden, bias);
 }
 
-fn elemAt(dtype: tensor.DType, data: []const u8, idx: usize) f32 {
+pub fn elemAt(dtype: tensor.DType, data: []const u8, idx: usize) f32 {
     return switch (dtype) {
         .f32 => @bitCast(std.mem.readInt(u32, data[idx * 4 ..][0..4], .little)),
         .bf16 => tensor.bf16ToF32(std.mem.readInt(u16, data[idx * 2 ..][0..2], .little)),
@@ -4039,6 +4114,7 @@ fn attentionTail(model: *const Model, layer: *const Layer, li: usize, ws: *Works
     const c = &model.config;
     const gpa = model.gpa;
     const n = rows.len;
+    try checkIndexBound(c, li, rows);
     const hidden = c.hidden_size;
     const hd = c.layer_head_dim[li];
     const nkv = c.layer_kv_heads[li];
@@ -4219,6 +4295,21 @@ fn gaussianTopk(gate: []f32, n: usize, width: usize, sparsity: f32) void {
     }
 }
 
+/// A sparse-attention indexer (Qwen4-Exp QSA, GLM-5.3-Flash DSA) scores blocks
+/// of consecutive keys and keeps the best `max_blocks` complete ones plus the
+/// incomplete tail. Dense attention is therefore exactly the reference while
+/// every complete block is selected; beyond that ditch refuses rather than
+/// silently approximating.
+fn checkIndexBound(c: *const Config, li: usize, rows: []const Row) !void {
+    const b = c.index_bound orelse return;
+    if (c.linear_layers[li] or c.conv_layers[li]) return;
+    var worst: usize = 0;
+    for (rows) |row| worst = @max(worst, (row.pos + 1) / b.block);
+    if (worst <= b.max_blocks) return;
+    std.log.err("layer {d}: {d} complete key blocks are reachable but the indexer keeps {d}; the dense equivalent is only exact for contexts up to {d} tokens", .{ li, worst, b.max_blocks, b.block * b.max_blocks });
+    return error.ContextExceedsSparseIndexer;
+}
+
 /// MLP sublayer (dense or mixture of experts): reads `h_in`, writes `ws.m`.
 pub fn mlpBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace, h_in: []const f32, n: usize, tokens: ?[]const u32) !void {
     const c = &model.config;
@@ -4236,6 +4327,13 @@ pub fn mlpBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Worksp
             if (layer.up_bias) |b| addBias(ws.up, n, inter, b);
             if (c.mult.mlp_gate != 1.0) tensor.scale(ws.gate[0 .. n * inter], c.mult.mlp_gate);
             if (c.activation_sparsity[li] > 0) gaussianTopk(ws.gate, n, inter, c.activation_sparsity[li]);
+            if (c.moe.swiglu_limit) |limit| {
+                // The gate is clamped from above, the up projection on both sides.
+                for (ws.gate[0 .. n * inter], 0..) |*g, j| {
+                    g.* = @min(g.*, limit);
+                    ws.up[j] = std.math.clamp(ws.up[j], -limit, limit);
+                }
+            }
             if (c.moe.swiglu) |sw| swigluOai(sw, ws.gate, ws.gate, ws.up, n, inter, inter) else if (c.moe.situ) |st| moe.situGlu(st, ws.gate, ws.gate, ws.up, n, inter, inter) else tensor.gatedActivation(model.pool, c.activation, ws.gate, ws.gate, ws.up, n, inter, inter, inter);
         },
         .gated_fused => {
@@ -4433,6 +4531,10 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
     }
     // Model-level projections of the embedding stage and the final fold.
     const store: *stream.WeightStore = @constCast(&model.store);
+    // The final stream collapse of a gated hyper-connection family reads two
+    // model-level matrices; acquire them once for the whole call.
+    var head_lease = try hyper.acquireHead(model);
+    defer head_lease.release(model);
     var ple_proj: ?stream.Lease = null;
     defer if (ple_proj) |l| store.release(l);
     if (ple_w > 0) ple_proj = try store.acquire(model.ple_proj_ref.?);
@@ -4526,7 +4628,7 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
             const xs = if (single) ws.x[0 .. n * sw] else try act.?.chunk(start, cn, ws.x);
             if (hc > 1) {
                 const pm: ?[]f32 = if (pre_mix) |p| p[start * hc ..][0 .. cn * hc] else null;
-                try dsv4.layerBlock(model, layer, li, ws, cache, xs, rows[start..][0..cn], tokens[start..][0..cn], pm, capture_buf);
+                try hyper.layerBlock(model, layer, li, ws, cache, xs, rows[start..][0..cn], tokens[start..][0..cn], pm, capture_buf);
                 if (capture_buf) |cb| captureResiduals(opts, li, hidden, start, cn, cb);
             } else if (nb > 0) {
                 try layerBlockAttnRes(model, layer, li, ws, cache, xs, rows[start..][0..cn], bank[start * nb * hidden ..][0 .. cn * nb * hidden], mix[0 .. cn * hidden]);
@@ -4551,7 +4653,7 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
             for (opts.capture_rows, 0..) |r, ci| {
                 if (single) @memcpy(row, ws.x[r * sw ..][0..sw]) else try act.?.readRow(r, row);
                 const pm: ?[]const f32 = if (pre_mix) |p| p[r * hc ..][0..hc] else null;
-                dsv4.finalCollapse(model, row, pm, res[(c.num_layers * opts.capture_rows.len + ci) * hidden ..][0..hidden]);
+                try hyper.finalCollapse(model, &head_lease, row, pm, res[(c.num_layers * opts.capture_rows.len + ci) * hidden ..][0..hidden]);
             }
         }
     }
@@ -4612,10 +4714,10 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
             }
             if (hc > 1) {
                 const pm: ?[]const f32 = if (pre_mix) |p| p[r * hc ..][0..hc] else null;
-                dsv4.finalCollapse(model, src, pm, ws.h2[0..hidden]);
+                try hyper.finalCollapse(model, &head_lease, src, pm, ws.h2[0..hidden]);
                 src = ws.h2[0..hidden];
             }
-            applyNorm(c, dst, src, model.final_norm);
+            if (model.final_norm) |nm| applyNorm(c, dst, src, nm) else @memcpy(dst, src[0..hidden]);
         }
         const lm = try model.acquireLmHead();
         defer store.release(lm);
@@ -4735,7 +4837,7 @@ fn layerBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Workspac
 
 /// The sequence-mixing sublayer of a layer: attention, one of the linear
 /// attention recurrences or a short convolution. Reads `h`, writes `ws.o`.
-fn mixer(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace, cache: *KvCache, h: []const f32, rows: []const Row) !void {
+pub fn mixer(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace, cache: *KvCache, h: []const f32, rows: []const Row) !void {
     const c = &model.config;
     if (c.linear_layers[li]) {
         return switch (c.linear_kind) {
