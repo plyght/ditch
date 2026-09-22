@@ -1713,3 +1713,22 @@ the whole pipeline — template, tokenizer, forward, edit, export — runs on it
 | `hf-tiny-v2/tiny-random-Gemma3nModel` | same bare prefix; now loads. The reference needs `timm` (installed, with the matching CPU torchvision). On the renamed copy: all 5 residuals agree (3.7e-07) and the logits to 2.2e-07 — the first numerical check of `gemma3n` against transformers, whose release is gated. `tools/probe_reference.py` needed two fixes for it: Gemma 3n's `hidden_states` are stacked `[streams, batch, seq, hidden]` (stream 0 is the residual), and its last entry is recorded before the streams are combined and normalised, so the pre-norm hook must not replace it. |
 | `hf-tiny-v2/tiny-random-Kimi_K25Model` | stub artifact: the text layers are saved as `language_model.blocks.N`, a layout no Kimi checkpoint and no transformers mapping uses (the release is `language_model.model.layers.N`, which the second pass config-checked). |
 | `hf-tiny-v2/tiny-random-MiMoV2FlashForCausalLM`, `…DeepseekV4ForCausalLM`, `…Gemma4Model` | see below. |
+
+The last three:
+
+* **`hf-tiny-v2/tiny-random-MiMoV2FlashForCausalLM`** — its `v_head_dim` (16)
+  is *wider* than `head_dim` (8). ditch keeps values in the keys' cache
+  stride, so it supports narrower values (every MiMo V2 release: 192 / 128,
+  on both layer kinds) but not wider ones. That is a real limitation, not a
+  bug, but it was reported as a bare `error: InvalidConfig`; it now says
+  `unsupported model: MiMo v_head_dim 16 is wider than head_dim 8`.
+* **`hf-tiny-v2/tiny-random-DeepseekV4ForCausalLM`** — saved in DeepSeek's
+  *native* naming (`attn.wq_a`, `attn_norm`, `ffn_norm`, `ffn.gate.bias`,
+  `head.weight`), the same naming the V4 / V4.1 releases use and the second
+  pass already recorded as unsupported (together with their FP4 experts and
+  `.scale` FP8 siblings). transformers loads it through a 40-rule rename table
+  in `conversion_mapping.py`. Supporting it means that table plus its inverse
+  for exports; the stub would be the way to verify it, but no release could be
+  run here even then (FP4), so it stays a recorded gap.
+* **`hf-tiny-v2/tiny-random-Gemma4Model`** — a Gemma 4 MoE block, the
+  documented limitation.

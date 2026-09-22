@@ -3036,7 +3036,13 @@ fn extraMiMoV2(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
         std.log.err("unsupported model: MiMo sliding layers with their own head count or head size (swa_num_attention_heads / swa_head_dim / swa_v_head_dim)", .{});
         return error.UnsupportedArchitecture;
     }
-    if (c.v_head_dim > c.head_dim or c.v_head_dim == 0 or kv_full == 0 or kv_swa == 0) return error.InvalidConfig;
+    if (c.v_head_dim > c.head_dim) {
+        // Values share the keys' cache stride, so they may be narrower (every
+        // release: 192 / 128) but not wider.
+        std.log.err("unsupported model: MiMo v_head_dim {d} is wider than head_dim {d}", .{ c.v_head_dim, c.head_dim });
+        return error.UnsupportedArchitecture;
+    }
+    if (c.v_head_dim == 0 or kv_full == 0 or kv_swa == 0) return error.InvalidConfig;
     if (c.num_heads % kv_full != 0 or c.num_heads % kv_swa != 0) return error.InvalidConfig;
     for (c.layer_kv_heads, 0..) |*k, i| k.* = if (c.sliding_layers[i]) kv_swa else kv_full;
     c.num_kv_heads = kv_full;
