@@ -89,6 +89,17 @@ a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
   `qwen3_5` / `qwen3_5_moe` (Qwen3.5, Qwen3.8 dense and MoE, text configs;
   the linear recurrence runs sequentially, so long prefills are slower
   than on dense models)
+* Mamba (selective state-space) families: `mamba2` (Mamba-Codestral,
+  `state-spaces/mamba2-*-hf`), `nemotron_h` (Nemotron-H and Nemotron 3 Nano:
+  Mamba2, attention, relu² MLP and non-gated MoE blocks laid out by
+  `hybrid_override_pattern`), `falcon_h1` (Mamba2 and attention side by side
+  in every layer, with the muP multipliers), `jamba` (Mamba1 with the
+  RMS-normalised dt/B/C path, attention and MoE layers by period) and
+  `granitemoehybrid` (Granite 4.0 H: Mamba2, attention, fused experts next
+  to the shared MLP). The selective scan runs one token at a time (heads
+  and channels in parallel) and its state is kept per sequence through
+  prefill and decoding like the KV cache; a Mamba block's `out_proj` is
+  abliterated like an attention output projection.
 * Kimi: `kimi_linear` (Kimi-Linear-48B-A3B: Kimi Delta Attention with
   per-channel decay, 3:1 with MLA layers without RoPE, DeepSeek-V3-style
   MoE with a shared expert; both the original checkpoint layout and the
@@ -118,8 +129,7 @@ a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
   (top-1 routing, NoPE layers), gpt-oss (attention sinks, interleaved
   fused experts, BF16 or MXFP4 checkpoints), ERNIE 4.5 MoE
   (`ernie4_5_moe`), Hunyuan-A13B (`hunyuan_v1_moe`), GraniteMoE /
-  GraniteMoeShared (`granitemoe`) and the attention-only Granite 4 layout
-  (`granitemoehybrid` without Mamba layers)
+  GraniteMoeShared (`granitemoe`; Granite 4.0 H is `granitemoehybrid` above)
 * MiniMax: M2 (`minimax_m2`), MiniMax-Text-01 / M1 (`minimax`: lightning
   linear attention alternating with softmax attention; the recurrence runs
   sequentially) and M3 (`minimax_m3_vl` text config, also `minimax_m3`;
@@ -148,11 +158,10 @@ Implemented from the Hugging Face reference but without a fixture: Falcon
 LayerNorm), Gemma 2 logit softcapping, `dynamic` and `longrope` scaling
 beyond the original context (treated as static / short factors).
 
-Not supported: state-space and hybrid models (Mamba, Jamba, Falcon-H1,
-Nemotron-H, RWKV, Granite 4 `granitemoehybrid` checkpoints with Mamba-2
-layers), Kimi K2 (`kimi_k2` standalone config),
-Qwen3.8-Flash-Next (`qwen4_exp`), GLM-5.3-Flash (`glm5_next`),
-encoder-decoder models, Gemma 4 MoE (`enable_moe_block`), LFM2-MoE,
+Not supported: Mamba1-only models (`mamba`, FalconMamba) and RWKV, Kimi
+K2 (`kimi_k2` standalone config), Qwen3.8-Flash-Next (`qwen4_exp`),
+GLM-5.3-Flash (`glm5_next`), encoder-decoder models, Gemma 4 MoE
+(`enable_moe_block`), LFM2-MoE,
 MiniCPM3, HunYuan cross-layer attention (`use_cla`), OPT-350m (projection
 layers), quantisation formats other than the ones listed below (GPTQ, AWQ,
 bitsandbytes, ...), and SentencePiece-only tokenizers (Baichuan; generate
@@ -203,9 +212,10 @@ Weights are read from safetensors (F32/F16/BF16, or the quantised formats
 below) or GGUF (llama, Mistral, Mixtral, Qwen2/3, Qwen MoE and Gemma 2/3
 families; the registry carries the llama.cpp architecture name of every
 family for the GGUF writer). Abliteration edits each family's attention
-output projection and MLP down projection (per expert on MoE layers) and
-exports preserve every tensor name and layout, including GPT-2's Conv1D
-transposes and fused expert tensors.
+output projection (the `out_proj` of a Mamba block) and MLP down
+projection (per expert on MoE layers) and exports preserve every tensor
+name and layout, including GPT-2's Conv1D transposes and fused expert
+tensors.
 
 ### Quantised checkpoints
 

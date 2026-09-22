@@ -6,7 +6,9 @@ Usage: make_fixture.py <family> [<out_dir>] [--gguf]
     family: llama | qwen2 | qwen3 | gemma3 | qwen3_moe | qwen3_moe_fused | qwen3_moe_fused_t
             or any family of the registry-driven generator (`SPECS` below:
             phi3, phi, gpt_neox, gpt2, falcon, ... , gpt_oss, deepseek_v3, kimi_linear,
-            and the quantised variants qwen2_fp8, qwen2_int4, gpt_oss_mxfp4)
+            the Mamba families mamba2, nemotron_h, falcon_h1, jamba, granitemoehybrid
+            and their variants, and the quantised variants qwen2_fp8, qwen2_int4,
+            gpt_oss_mxfp4)
             | deepseek_v4 | deepseek_v41 (hyper-connection families, own generator)
             | qwen3_moe_big
     --gguf: additionally write <out_dir>_gguf/model.gguf, the same model as a
@@ -391,6 +393,12 @@ def base(**kw):
         residual_mult=1.0, logit_scale=1.0, embed_scale=1.0, lm_bias=False, sinks=None, temp=None, pos_offset=0,
         sliding=None, sliding_layers=None, mla=None, moe=None, linear=None, linear_layers=None, full_interval=0,
         gated_q=False, gate_swish=False,
+        # Mamba blocks: `ssm` describes the block, `ssm_layers` / `attn_layers` /
+        # `mlp_layers` which layers hold which block (None: attention everywhere
+        # except Mamba / linear layers, an MLP everywhere). `parallel_ssm` runs
+        # the Mamba block and attention side by side (Falcon-H1); `mult` holds
+        # its muP multipliers.
+        ssm=None, ssm_layers=None, attn_layers=None, mlp_layers=None, parallel_ssm=False, mult=None,
         # Gemma 3n / 4 and LFM2 features: per-layer head size / KV heads, KV
         # sharing, keys reused as values, weightless value norm, a local rope
         # table (theta, rotary dim) and a global (rotary dim, freq dim) pair,
@@ -417,6 +425,9 @@ def base(**kw):
         config={}, extra_config={},
     )
     d.update(kw)
+    m = dict(ssm_in=1.0, ssm_out=1.0, attn_in=1.0, attn_out=1.0, key=1.0, mlp_gate=1.0, mlp_down=1.0, ssm_proj=[1.0] * 5)
+    m.update(d["mult"] or {})
+    d["mult"] = m
     if d["VD"] is None:
         d["VD"] = d["HD"]
     if d["rotary_dim"] is None:
@@ -851,12 +862,91 @@ GRANITE_CONFIG = {"hidden_size": 32, "intermediate_size": 12, "num_attention_hea
 spec("granitemoe", tok="starcoder", L=2, embed_scale=2.0, attn_scale=0.25, residual_mult=0.5, logit_scale=0.25, lm_head=None,
      moe=dict(GRANITE_MOE, layers=[0, 1]),
      config=dict(GRANITE_CONFIG, model_type="granitemoe", num_hidden_layers=2))
-spec("granitemoehybrid", tok="starcoder", L=3, embed_scale=2.0, attn_scale=0.25, residual_mult=0.5, logit_scale=0.25, lm_head=None,
+spec("granitemoehybrid_attn", tok="starcoder", L=3, embed_scale=2.0, attn_scale=0.25, residual_mult=0.5, logit_scale=0.25, lm_head=None,
      moe=dict(GRANITE_MOE, layers=[0, 1, 2], shared=1, shared_inter=16, shared_name="shared_mlp.", shared_at_layer=True,
               shared_fused=("input_linear.weight", "output_linear.weight")),
      config=dict(GRANITE_CONFIG, model_type="granitemoehybrid", num_hidden_layers=3, shared_intermediate_size=16, position_embedding_type="rope",
                  layer_types=["attention", "attention", "attention"], mamba_n_heads=4, mamba_d_state=8, mamba_d_conv=4, mamba_expand=2))
 
+# Mamba families. `Infinity` in time_step_limit is what json.dump writes for
+# float("inf"), as transformers does; ditch's config reader must accept it.
+INF = float("inf")
+MAMBA2_SSM = {"kind": "mamba2", "prefix": "mixer.", "heads": 4, "hd": 16, "N": 8, "G": 2, "K": 4, "norm_groups": 1, "rms_norm": True,
+              "norm_before_gate": False, "dt_min": 0.0, "dt_max": INF, "conv_bias": True, "proj_bias": False, "dt_bias_mean": 0.0}
+spec("mamba2", L=3, NH=1, NKV=1, HD=1, prefix="backbone.", embed="embeddings.weight", final_norm="norm_f.weight", in_norm="norm.weight", pre_ff_norm=None,
+     eps=1e-5, pos="none", ssm=MAMBA2_SSM, ssm_layers=[1, 1, 1], attn_layers=[0, 0, 0], mlp_layers=[0, 0, 0],
+     config={"model_type": "mamba2", "hidden_size": 32, "num_hidden_layers": 3, "num_heads": 4, "head_dim": 16, "state_size": 8, "n_groups": 2,
+             "expand": 2, "conv_kernel": 4, "use_bias": False, "use_conv_bias": True, "hidden_act": "silu", "layer_norm_epsilon": 1e-5,
+             "time_step_limit": [0.0, INF], "chunk_size": 256, "tie_word_embeddings": False})
+spec("nemotron_h", tok="llama3", L=4, prefix="backbone.", embed="embeddings.weight", final_norm="norm_f.weight", in_norm="norm.weight", pre_ff_norm=None,
+     eps=1e-5, pos="none", q="mixer.q_proj.weight", k="mixer.k_proj.weight", v="mixer.v_proj.weight", o="mixer.o_proj.weight",
+     mlp="dense", up="mixer.up_proj.weight", down="mixer.down_proj.weight", act="relu2",
+     ssm=dict(MAMBA2_SSM, norm_groups=2, dt_min=0.1, dt_bias_mean=-3.0), ssm_layers=[1, 0, 0, 0], attn_layers=[0, 1, 0, 0], mlp_layers=[0, 0, 1, 1],
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "shared_inter": 16, "scoring": "sigmoid", "group_limited": True, "n_group": 1, "topk_group": 1,
+          "rsf": 1.5, "norm": True, "layers": [3], "corr_bias": True, "layout": "separate", "prefix": "mixer.", "router": "gate.weight",
+          "shared_name": "shared_experts.", "dense": True},
+     config={"model_type": "nemotron_h", "hidden_size": 32, "num_hidden_layers": 4, "hybrid_override_pattern": "M*-E", "num_attention_heads": 4,
+             "num_key_value_heads": 2, "head_dim": 8, "intermediate_size": 32, "mlp_hidden_act": "relu2", "mlp_bias": False, "attention_bias": False,
+             "mamba_num_heads": 4, "mamba_head_dim": 16, "ssm_state_size": 8, "n_groups": 2, "conv_kernel": 4, "expand": 2, "use_bias": False,
+             "use_conv_bias": True, "mamba_hidden_act": "silu", "layer_norm_epsilon": 1e-5, "time_step_min": 0.1, "chunk_size": 128,
+             "n_routed_experts": 4, "num_experts_per_tok": 2, "moe_intermediate_size": 12, "moe_shared_expert_intermediate_size": 16,
+             "routed_scaling_factor": 1.5, "n_group": 1, "topk_group": 1, "norm_topk_prob": True, "moe_latent_size": None,
+             "max_position_embeddings": 128, "tie_word_embeddings": False})
+FALCON_CFG = {"model_type": "falcon_h1", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4,
+              "num_key_value_heads": 2, "head_dim": 8, "hidden_act": "silu", "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "max_position_embeddings": 128,
+              "mamba_d_ssm": 64, "mamba_n_heads": 4, "mamba_d_head": "auto", "mamba_n_groups": 2, "mamba_d_state": 8, "mamba_d_conv": 4,
+              "mamba_expand": 2, "mamba_chunk_size": 256, "mamba_conv_bias": True, "mamba_proj_bias": False, "mamba_norm_before_gate": True,
+              "mamba_rms_norm": True, "projectors_bias": False, "lm_head_multiplier": 0.5, "embedding_multiplier": 2.0,
+              "mlp_multipliers": [1.5, 0.5], "key_multiplier": 0.8, "attention_out_multiplier": 0.7, "attention_in_multiplier": 1.2,
+              "ssm_multipliers": [0.9, 1.1, 0.8, 1.2, 1.3], "ssm_in_multiplier": 1.1, "ssm_out_multiplier": 0.6, "attention_bias": False,
+              "mlp_bias": False, "tie_word_embeddings": False}
+FALCON_MULT = {"ssm_in": 1.1, "ssm_out": 0.6, "attn_in": 1.2, "attn_out": 0.7, "key": 0.8, "mlp_gate": 1.5, "mlp_down": 0.5, "ssm_proj": [0.9, 1.1, 0.8, 1.2, 1.3]}
+spec("falcon_h1", tok="qwen2", L=2, eps=1e-5, final_norm="final_layernorm.weight", pre_ff_norm="pre_ff_layernorm.weight",
+     gate="feed_forward.gate_proj.weight", up="feed_forward.up_proj.weight", down="feed_forward.down_proj.weight",
+     embed_scale=2.0, logit_scale=0.5, mult=FALCON_MULT, parallel_ssm=True,
+     ssm=dict(MAMBA2_SSM, prefix="mamba.", norm_groups=2, norm_before_gate=True), ssm_layers=[1, 1], attn_layers=[1, 1],
+     config=FALCON_CFG)
+spec("falcon_h1_nonorm", tok="qwen2", L=2, eps=1e-5, final_norm="final_layernorm.weight", pre_ff_norm="pre_ff_layernorm.weight",
+     gate="feed_forward.gate_proj.weight", up="feed_forward.up_proj.weight", down="feed_forward.down_proj.weight",
+     embed_scale=2.0, logit_scale=0.5, mult=FALCON_MULT, parallel_ssm=True,
+     ssm=dict(MAMBA2_SSM, prefix="mamba.", norm_groups=2, rms_norm=False), ssm_layers=[1, 1], attn_layers=[1, 1],
+     config=dict(FALCON_CFG, mamba_rms_norm=False, mamba_norm_before_gate=False, time_step_limit=[0.0, INF]))
+spec("jamba", tok="llama3", L=4, pos="none", final_norm="final_layernorm.weight", pre_ff_norm="pre_ff_layernorm.weight",
+     gate="feed_forward.gate_proj.weight", up="feed_forward.up_proj.weight", down="feed_forward.down_proj.weight",
+     ssm={"kind": "mamba1", "prefix": "mamba.", "inter": 64, "N": 8, "K": 4, "R": 4, "conv_bias": True, "proj_bias": False},
+     ssm_layers=[1, 0, 1, 0], attn_layers=[0, 1, 0, 1],
+     moe={"E": 4, "K": 2, "MI": 32, "shared": 0, "scoring": "softmax", "group_limited": False, "rsf": 1.0, "norm": False,
+          "layers": [0, 2], "corr_bias": False, "layout": "separate", "prefix": "feed_forward.", "router": "router.weight"},
+     config={"model_type": "jamba", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 4, "num_attention_heads": 4,
+             "num_key_value_heads": 2, "hidden_act": "silu", "rms_norm_eps": 1e-6, "max_position_embeddings": 128, "num_experts": 4,
+             "num_experts_per_tok": 2, "expert_layer_period": 2, "expert_layer_offset": 0, "attn_layer_period": 2, "attn_layer_offset": 1,
+             "mamba_d_state": 8, "mamba_d_conv": 4, "mamba_expand": 2, "mamba_dt_rank": 4, "mamba_conv_bias": True, "mamba_proj_bias": False,
+             "use_mamba_kernels": False, "tie_word_embeddings": False})
+GRANITE_SSM = dict(MAMBA2_SSM, prefix="mamba.", G=1)
+spec("granitemoehybrid", tok="starcoder", L=3, pos="none", embed_scale=2.0, attn_scale=0.25, residual_mult=0.5, logit_scale=0.25, lm_head=None,
+     mlp="gated_fused", gate_up="shared_mlp.input_linear.weight", down="shared_mlp.output_linear.weight",
+     ssm=GRANITE_SSM, ssm_layers=[1, 0, 1], attn_layers=[0, 1, 0],
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "shared_inter": 16, "shared_fused": ("input_linear.weight", "output_linear.weight"), "shared_at_layer": True,
+          "scoring": "softmax", "group_limited": False, "rsf": 1.0, "norm": True, "layers": [0, 1, 2], "corr_bias": False, "layout": "fused_rows",
+          "prefix": "block_sparse_moe.", "router": "router.layer.weight", "fused_names": ("input_linear.weight", "output_linear.weight"),
+          "shared_name": "shared_mlp."},
+     config={"model_type": "granitemoehybrid", "hidden_size": 32, "intermediate_size": 12, "num_hidden_layers": 3, "num_attention_heads": 4,
+             "num_key_value_heads": 2, "hidden_act": "silu", "rms_norm_eps": 1e-6, "max_position_embeddings": 128, "embedding_multiplier": 2.0,
+             "logits_scaling": 4.0, "residual_multiplier": 0.5, "attention_multiplier": 0.25, "num_local_experts": 4, "num_experts_per_tok": 2,
+             "shared_intermediate_size": 16, "position_embedding_type": None, "layers_block_type": ["mamba", "attention", "mamba"],
+             "mamba_n_heads": 4, "mamba_n_groups": 1, "mamba_d_state": 8, "mamba_d_head": "auto", "mamba_d_conv": 4, "mamba_expand": 2,
+             "mamba_chunk_size": 256, "mamba_conv_bias": True, "mamba_proj_bias": False, "time_step_limit": [0.0, INF],
+             "attention_bias": False, "tie_word_embeddings": True})
+spec("granitemoehybrid_dense", tok="starcoder", L=2, embed_scale=2.0, attn_scale=0.25, residual_mult=0.5, logit_scale=0.25, lm_head=None,
+     mlp="gated_fused", gate_up="shared_mlp.input_linear.weight", down="shared_mlp.output_linear.weight",
+     ssm=GRANITE_SSM, ssm_layers=[1, 0], attn_layers=[0, 1],
+     config={"model_type": "granitemoehybrid", "hidden_size": 32, "intermediate_size": 12, "shared_intermediate_size": 32, "num_hidden_layers": 2,
+             "num_attention_heads": 4, "num_key_value_heads": 2, "hidden_act": "silu", "rms_norm_eps": 1e-6, "rope_theta": 10000.0,
+             "max_position_embeddings": 128, "embedding_multiplier": 2.0, "logits_scaling": 4.0, "residual_multiplier": 0.5,
+             "attention_multiplier": 0.25, "num_local_experts": 0, "num_experts_per_tok": 0, "position_embedding_type": "rope",
+             "layer_types": ["linear_attention", "full_attention"], "mamba_n_heads": 4, "mamba_n_groups": 1, "mamba_d_state": 8,
+             "mamba_d_head": 16, "mamba_d_conv": 4, "mamba_expand": 2, "mamba_conv_bias": True, "mamba_proj_bias": False,
+             "attention_bias": False, "tie_word_embeddings": True})
 spec("seed_oss", tok="llama3", HD=16, attn_bias=True, o_bias=False, lm_head="lm_head.weight",
      config={"model_type": "seed_oss", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4,
              "num_key_value_heads": 2, "head_dim": 16, "rms_norm_eps": 1e-6, "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0},
@@ -1012,6 +1102,50 @@ def generate_generic(family, out_dir):
     if altup:
         altup_proj = [mat(P + f"altup_projections.{e}.weight", H, H) for e in range(altup["A"] - 1)]
         altup_unembed = [mat(P + f"altup_unembed_projections.{e}.weight", H, H) for e in range(altup["A"] - 1)]
+    ssm_layers = [bool(x) for x in (s["ssm_layers"] or [0] * L)]
+    attn_layers = [bool(x) for x in s["attn_layers"]] if s["attn_layers"] is not None else [not (lin_layers[i] or ssm_layers[i] or conv_layers[i]) for i in range(L)]
+    mlp_layers = [bool(x) for x in (s["mlp_layers"] or [1] * L)]
+
+    def raw(name, arr):
+        """Registers an explicit (bf16-rounded) array."""
+        w = bf16_round(np.asarray(arr, dtype=np.float32))
+        weights[name] = w
+        return w
+
+    def ssm_weights(lp):
+        """Weights of one Mamba block under `lp`."""
+        ss = s["ssm"]
+        sp = lp + ss["prefix"]
+        d = {}
+        if ss["kind"] == "mamba2":
+            inter, gn = ss["heads"] * ss["hd"], ss["G"] * ss["N"]
+            conv_dim = inter + 2 * gn
+            in_rows = inter + conv_dim + ss["heads"]
+            d["dt_bias"] = raw(sp + "dt_bias", ss["dt_bias_mean"] + rng.normal(0, 1.0, size=(ss["heads"],)))
+            d["A_log"] = raw(sp + "A_log", np.log(1.0 + rng.uniform(0, 3, size=(ss["heads"],))))
+            d["D"] = raw(sp + "D", 1.0 + rng.normal(0, 0.2, size=(ss["heads"],)))
+            d["norm"] = normw(sp + "norm.weight", inter)[0] if ss["rms_norm"] else None
+        else:
+            inter, conv_dim = ss["inter"], ss["inter"]
+            in_rows = 2 * inter
+            d["x_proj"] = mat(sp + "x_proj.weight", ss["R"] + 2 * ss["N"], inter)
+            d["dt_proj"] = mat(sp + "dt_proj.weight", inter, ss["R"], 0.5)
+            d["dt_bias"] = raw(sp + "dt_proj.bias", rng.normal(-1.0, 1.0, size=(inter,)))
+            d["A_log"] = raw(sp + "A_log", np.log(np.arange(1, ss["N"] + 1, dtype=np.float32))[None, :] * (1.0 + rng.normal(0, 0.1, size=(inter, 1))))
+            d["D"] = raw(sp + "D", 1.0 + rng.normal(0, 0.2, size=(inter,)))
+            d["dt_norm"] = normw(sp + "dt_layernorm.weight", ss["R"])[0]
+            d["b_norm"] = normw(sp + "b_layernorm.weight", ss["N"])[0]
+            d["c_norm"] = normw(sp + "c_layernorm.weight", ss["N"])[0]
+        d["in_proj"] = mat(sp + "in_proj.weight", in_rows, H)
+        d["in_b"] = bias_for(sp + "in_proj.weight", in_rows, ss["proj_bias"])
+        conv = bf16_round(rng.normal(0, 0.3, size=(conv_dim, 1, ss["K"])))
+        weights[sp + "conv1d.weight"] = conv  # the Hugging Face [channels, 1, kernel] layout
+        d["conv"] = conv[:, 0, :]
+        d["conv_b"] = vec(sp + "conv1d.bias", conv_dim, 0.1) if ss["conv_bias"] else None
+        d["out"] = mat(sp + "out_proj.weight", H, inter)
+        d["out_b"] = bias_for(sp + "out_proj.weight", H, ss["proj_bias"])
+        return d
+
     for i in range(L):
         lp = P + s["layer"].format(i=i)
         d = {}
@@ -1086,6 +1220,8 @@ def generate_generic(family, out_dir):
             d["lnorm"] = normw(lp + ap + "norm.weight", ln["VD"])[0]
             d["o"] = mat(lp + ap + "out_proj.weight", H, vd_tot)
             d["ob"] = None
+        elif not attn_layers[i]:
+            pass  # a Mamba, MLP or MoE block without attention
         elif s["mla"]:
             m = s["mla"]
             if m["q_lora_rank"]:
@@ -1114,10 +1250,12 @@ def generate_generic(family, out_dir):
             d["qb"] = bias_for(lp + s["q"], qd, s["attn_bias"])
             d["kb"] = bias_for(lp + s["k"], kvd, s["attn_bias"]) if own_kv else None
             d["vb"] = bias_for(lp + s["v"], kvd, s["attn_bias"]) if has_v else None
-        if not lin_layers[i] and not conv_layers[i]:
+        if attn_layers[i]:
             d["o"] = mat(lp + s["o"], H, NH * vd_l)
             d["ob"] = bias_for(lp + s["o"], H, s["attn_bias"] if s["o_bias"] is None else s["o_bias"])
-        if not lin_layers[i] and not conv_layers[i] and s["qk_norm"] in ("head", "heads", "full"):
+        if ssm_layers[i]:
+            d["ssm"] = ssm_weights(lp)
+        if attn_layers[i] and s["qk_norm"] in ("head", "heads", "full"):
             qn = {"head": hd_l, "heads": NH * hd_l, "full": NH * hd_l}[s["qk_norm"]]
             kn = {"head": hd_l, "heads": nkv_l * hd_l, "full": nkv_l * hd_l}[s["qk_norm"]]
             d["qn"] = normw(lp + s["q_norm"], qn)
@@ -1128,7 +1266,7 @@ def generate_generic(family, out_dir):
                 weights[lp + s["k_norm"]] = weights[lp + s["k_norm"]].reshape(nkv_l, hd_l)
         elif conv_layers[i] and s["qk_norm"] == "head":
             pass
-        if not lin_layers[i] and s["sinks"]:
+        if attn_layers[i] and s["sinks"]:
             d["sinks"] = vec(lp + s["sinks"], NH, 1.0)
         if s["attn_res"]:
             d["attn_res"] = res_scorer(lp + "self_attention_res_")
@@ -1151,7 +1289,7 @@ def generate_generic(family, out_dir):
             d["layer_scale"] = bf16_round(1.0 + rng.normal(0, 0.1, size=(1,)))
             weights[lp + "layer_scalar"] = d["layer_scale"]
         moe = s["moe"]
-        if moe and i in moe["layers"]:
+        if moe and i in moe["layers"] and mlp_layers[i]:
             mp = lp + moe["prefix"]
             E, K, MI = moe["E"], moe["K"], moe["MI"]
             # Latent MoE: the routed experts read and write `EW` (the latent width) instead of H.
@@ -1172,6 +1310,8 @@ def generate_generic(family, out_dir):
             for e in range(E):
                 ex = {"gate": bf16_round(rng.normal(0, 0.2, size=(MI, EW))), "up": bf16_round(rng.normal(0, 0.2, size=(MI, EW))),
                       "down": bf16_round(rng.normal(0, 0.2, size=(EW, MI))), "gb": None, "ub": None, "db": None}
+                if moe.get("dense"):
+                    ex["gate"] = None  # `down(act(up(x)))`, no gate projection
                 if moe.get("bias"):
                     ex["gb"], ex["ub"], ex["db"] = (bf16_round(rng.normal(0, 0.1, size=(n,))) for n in (MI, MI, EW))
                 experts.append(ex)
@@ -1179,6 +1319,8 @@ def generate_generic(family, out_dir):
                 names = moe.get("expert_names", ("gate_proj.weight", "up_proj.weight", "down_proj.weight"))
                 for e, ex in enumerate(experts):
                     for key, nm in zip(("gate", "up", "down"), names):
+                        if ex[key] is None:
+                            continue
                         weights[f"{mp}experts.{e}.{nm}"] = ex[key]
                         if s["quant"] and s["quant"]["kind"] == "mxfp4_packed":
                             # Only the routed experts are packed (the compressor ignores everything else).
@@ -1241,9 +1383,13 @@ def generate_generic(family, out_dir):
                     gu = mat(sp + gu_name, 2 * si, H, register=False)
                     weights[sp + gu_name] = gu
                     d["shared"] = {"gate": gu[:si], "up": gu[si:], "down": mat(sp + dn_name, H, si), "gate_vec": None}
+                elif moe.get("dense"):
+                    d["shared"] = {"gate": None, "up": mat(sp + "up_proj.weight", si, H), "down": mat(sp + "down_proj.weight", H, si), "gate_vec": None}
                 else:
                     d["shared"] = {"gate": mat(sp + "gate_proj.weight", si, H), "up": mat(sp + "up_proj.weight", si, H), "down": mat(sp + "down_proj.weight", H, si),
                                    "gate_vec": mat(lp + "mlp.shared_expert_gate.weight", 1, H)[0] if moe.get("shared_gate") else None}
+        elif not mlp_layers[i]:
+            pass  # single-block layer without an MLP
         else:
             inter = s["layer_inter"][i] if s["layer_inter"] else I
             if s["mlp"] == "gated":
@@ -1492,6 +1638,7 @@ def generate_generic(family, out_dir):
                         k = k + d["kb"]
                     if d["vb"] is not None:
                         v = v + d["vb"]
+                    k = k * np.float32(s["mult"]["key"])
                 else:
                     k = v = None
                 gate = None
@@ -1723,7 +1870,108 @@ def generate_generic(family, out_dir):
         o = o * (z.reshape(T, VH, VD) / (1 + np.exp(-z.reshape(T, VH, VD))))
         return o.reshape(T, vd_tot) @ d["o"].T
 
+    def causal_conv(w, b, x, K):
+        """Depthwise causal convolution (+ bias, activation) over x [T, channels]."""
+        T = x.shape[0]
+        y = np.zeros_like(x)
+        for t in range(T):
+            acc = np.zeros(x.shape[1], np.float32) if b is None else b.copy()
+            for i in range(K):
+                if t - i >= 0:
+                    acc += w[:, K - 1 - i] * x[t - i]
+            y[t] = acc / (1 + np.exp(-acc))
+        return y
+
+    def softplus(x):
+        return np.where(x > 20, x, np.log1p(np.exp(np.minimum(x, 20))))
+
+    def silu(x):
+        return x / (1 + np.exp(-x))
+
+    def mamba2_block(d, h):
+        """Mamba2 (SSD) block as in transformers' Mamba2Mixer / FalconH1Mixer torch path."""
+        ss, m = s["ssm"], s["mult"]
+        heads, hd, N, G, K = ss["heads"], ss["hd"], ss["N"], ss["G"], ss["K"]
+        inter, gn = heads * hd, G * N
+        conv_dim = inter + 2 * gn
+        T = h.shape[0]
+        proj = (h * np.float32(m["ssm_in"])) @ d["in_proj"].T
+        if d["in_b"] is not None:
+            proj = proj + d["in_b"]
+        mup = np.concatenate([np.full(inter, m["ssm_proj"][0]), np.full(inter, m["ssm_proj"][1]), np.full(gn, m["ssm_proj"][2]),
+                              np.full(gn, m["ssm_proj"][3]), np.full(heads, m["ssm_proj"][4])]).astype(np.float32)
+        proj = proj * mup
+        gate, xbc, dt = proj[:, :inter], proj[:, inter:inter + conv_dim], proj[:, inter + conv_dim:]
+        y = causal_conv(d["conv"], d["conv_b"], xbc, K)
+        x = y[:, :inter].reshape(T, heads, hd)
+        B = y[:, inter:inter + gn].reshape(T, G, N)
+        C = y[:, inter + gn:].reshape(T, G, N)
+        dt = np.clip(softplus(dt + d["dt_bias"]), ss["dt_min"], ss["dt_max"])
+        A = -np.exp(d["A_log"])
+        S = np.zeros((heads, hd, N), np.float32)
+        out = np.zeros((T, heads, hd), np.float32)
+        for t in range(T):
+            for hh in range(heads):
+                g = hh // (heads // G)
+                S[hh] = S[hh] * np.exp(dt[t, hh] * A[hh]) + dt[t, hh] * np.outer(x[t, hh], B[t, g])
+                out[t, hh] = S[hh] @ C[t, g] + d["D"][hh] * x[t, hh]
+        y = out.reshape(T, inter)
+        if ss["rms_norm"]:
+            if not ss["norm_before_gate"]:
+                y = y * silu(gate)
+            yg = y.reshape(T, ss["norm_groups"], inter // ss["norm_groups"])
+            yg = yg / np.sqrt(np.mean(yg * yg, -1, keepdims=True) + eps)
+            y = yg.reshape(T, inter) * d["norm"]
+            if ss["norm_before_gate"]:
+                y = y * silu(gate)
+        else:
+            y = y * silu(gate)
+        o = y @ d["out"].T
+        if d["out_b"] is not None:
+            o = o + d["out_b"]
+        return o
+
+    def mamba1_block(d, h):
+        """Mamba1 block as in transformers' JambaMambaMixer torch path."""
+        ss = s["ssm"]
+        inter, N, K, R = ss["inter"], ss["N"], ss["K"], ss["R"]
+        T = h.shape[0]
+        proj = h @ d["in_proj"].T
+        if d["in_b"] is not None:
+            proj = proj + d["in_b"]
+        xr, z = proj[:, :inter], proj[:, inter:]
+        xa = causal_conv(d["conv"], d["conv_b"], xr, K)
+        xdbc = xa @ d["x_proj"].T
+        dt_r, B, C = xdbc[:, :R], xdbc[:, R:R + N], xdbc[:, R + N:]
+
+        def rms(v, w):
+            return v / np.sqrt(np.mean(v * v, -1, keepdims=True) + eps) * w
+        dt_r, B, C = rms(dt_r, d["dt_norm"]), rms(B, d["b_norm"]), rms(C, d["c_norm"])
+        dt = softplus(dt_r @ d["dt_proj"].T + d["dt_bias"])  # [T, inter]
+        A = -np.exp(d["A_log"])  # [inter, N]
+        S = np.zeros((inter, N), np.float32)
+        y = np.zeros((T, inter), np.float32)
+        for t in range(T):
+            S = np.exp(dt[t][:, None] * A) * S + (dt[t] * xa[t])[:, None] * B[t][None, :]
+            y[t] = S @ C[t] + d["D"] * xa[t]
+        y = y * silu(z)
+        o = y @ d["out"].T
+        if d["out_b"] is not None:
+            o = o + d["out_b"]
+        return o
+
+    def ssm_block(d, h):
+        return mamba2_block(d["ssm"], h) if s["ssm"]["kind"] == "mamba2" else mamba1_block(d["ssm"], h)
+
     def expert_out(ex, x, biases=True):
+        if ex["gate"] is None:
+            u = x @ ex["up"].T
+            if biases and ex.get("ub") is not None:
+                u = u + ex["ub"]
+            y = act_fn(u) @ ex["down"].T
+            if biases and ex.get("db") is not None:
+                y = y + ex["db"]
+            return y
         g, u = x @ ex["gate"].T, x @ ex["up"].T
         if biases and ex.get("gb") is not None:
             g, u = g + ex["gb"], u + ex["ub"]
@@ -1805,7 +2053,7 @@ def generate_generic(family, out_dir):
                 g, u = g + d["gb"], u + d["ub"]
             if s["sparsity"] and s["sparsity"][li] > 0:
                 g = gaussian_topk(g, s["sparsity"][li])
-            m = glu(g, u)
+            m = glu(g * np.float32(s["mult"]["mlp_gate"]), u)
         elif s["mlp"] == "gated_fused":
             gu = h @ d["gate_up"].T
             if d["gub"] is not None:
@@ -1826,7 +2074,7 @@ def generate_generic(family, out_dir):
         y = m @ d["down"].T
         if d["db"] is not None:
             y = y + d["db"]
-        return y
+        return y * np.float32(s["mult"]["mlp_down"])
 
     def rms_magnitude(x):
         return np.sqrt(np.mean(x * x, -1, keepdims=True))
@@ -1849,12 +2097,16 @@ def generate_generic(family, out_dir):
         return np.tanh(r @ d["altup_router"].T)
 
     def layer_std(d, li, x, h_fn, ple_li):
-        # Standard layer; returns the new residual.
+        # Standard layer; returns the new residual. Single-block layers (Mamba2,
+        # Nemotron-H) hold either the mixer or the MLP behind the layer's one norm.
         rm = np.float32(s["residual_mult"])
-        h = norm(x, d["in_norm"]) if (d["in_norm"] is not None or s["norm"] == "none") and s["in_norm"] is not None else x
-        a = h_fn(h)
-        if d["post_attn_norm"] is not None:
-            a = norm(a, d["post_attn_norm"])
+        has_mixer = attn_layers[li] or ssm_layers[li] or lin_layers[li] or conv_layers[li]
+        h, a = x, None
+        if has_mixer:
+            h = norm(x, d["in_norm"]) if (d["in_norm"] is not None or s["norm"] == "none") and s["in_norm"] is not None else x
+            a = h_fn(h)
+            if d["post_attn_norm"] is not None:
+                a = norm(a, d["post_attn_norm"])
         if s["residual_layout"] == "minimax":
             # h = norm(x); x = alpha * h + beta * f(h) for both sublayers.
             sa = s["mm_scales"]["linear" if lin_layers[li] else "full"]
@@ -1869,12 +2121,15 @@ def generate_generic(family, out_dir):
                 m = norm(m, d["post_ff_norm"])
             x = x + rm * (a + m)
         else:
-            x = x + rm * a
-            h2 = norm(x, d["pre_ff_norm"]) if (d["pre_ff_norm"] is not None or s["norm"] == "none") and s["pre_ff_norm"] is not None else x
-            m = mlp(d, h2, li)
-            if d["post_ff_norm"] is not None:
-                m = norm(m, d["post_ff_norm"])
-            x = x + rm * m
+            if has_mixer:
+                x = x + rm * a
+            if mlp_layers[li]:
+                nw, tmpl = (d["pre_ff_norm"], s["pre_ff_norm"]) if has_mixer else (d["in_norm"], s["in_norm"])
+                h2 = norm(x, nw) if (nw is not None or s["norm"] == "none") and tmpl is not None else x
+                m = mlp(d, h2, li)
+                if d["post_ff_norm"] is not None:
+                    m = norm(m, d["post_ff_norm"])
+                x = x + rm * m
         if "ple_gate" in d:
             x = x + ple_block(d, x, ple_li)
         if "layer_scale" in d:
@@ -1934,7 +2189,14 @@ def generate_generic(family, out_dir):
                     return conv_block(d, h)
                 if lin_layers[li] and s["linear_kind"] == "lightning":
                     return lightning_attn(d, li, h)
-                return linear_attn(d, h) if lin_layers[li] else attention(d, li, h, c_, s_)
+                if lin_layers[li]:
+                    return linear_attn(d, h)
+                if ssm_layers[li] and attn_layers[li]:
+                    mult = s["mult"]
+                    return ssm_block(d, h) * np.float32(mult["ssm_out"]) + attention(d, li, h * np.float32(mult["attn_in"]), c_, s_) * np.float32(mult["attn_out"])
+                if ssm_layers[li]:
+                    return ssm_block(d, h)
+                return attention(d, li, h, c_, s_)
             ple_li = ple[:, li] if ple is not None else None
             if altup:
                 streams = layer_altup(d, li, streams, h_fn, ple_li)

@@ -86,6 +86,11 @@ pub const Slot = enum {
     lin_g,
     light_qkv,
     light_gate,
+    // Mamba blocks
+    ssm_in,
+    ssm_x,
+    ssm_dt,
+    ssm_out,
     // DeepSeek V4 / V4.1 (deepseek_v4.zig)
     d_q_a,
     d_q_b,
@@ -218,6 +223,39 @@ pub const LinearWeights = struct {
     light_gate: ?Weight = null,
 };
 
+/// Mamba block weights (Mamba2 or Mamba1, see `arch.SsmKind`). When the
+/// block replaces attention its output projection lives in `Layer.o` (with
+/// `o_delta`), so abliteration and export treat it like any attention
+/// output; in the parallel layout (Falcon-H1) it is `out` with
+/// `Layer.ssm_out_delta`, next to the attention's o_proj.
+pub const SsmWeights = struct {
+    /// Mamba2: `[inter + conv_dim + heads][hidden]` (gate, conv channels, dt).
+    /// Mamba1: `[2 inter][hidden]` (conv channels, gate).
+    in_proj: Weight,
+    in_bias: ?[]const f32,
+    /// Depthwise causal convolution `[conv_dim][kernel]`.
+    conv: []const f32,
+    conv_bias: ?[]const f32,
+    /// Mamba2: `[heads]`; Mamba1: the `dt_proj` bias `[inter]`.
+    dt_bias: []const f32,
+    /// `-exp(A_log)`: Mamba2 `[heads]`, Mamba1 `[inter][state]`.
+    a: []const f32,
+    /// Skip connection: Mamba2 `[heads]`, Mamba1 `[inter]`.
+    d: []const f32,
+    /// Gated RMSNorm weight `[inter]` (null: the gate alone scales the scan output).
+    norm: ?[]const f32,
+    /// Mamba1: `[dt_rank + 2 state][inter]`, `[inter][dt_rank]` and the RMS
+    /// norms of the dt / B / C parts (Jamba).
+    x_proj: ?Weight = null,
+    dt_proj: ?Weight = null,
+    dt_norm: ?[]const f32 = null,
+    b_norm: ?[]const f32 = null,
+    c_norm: ?[]const f32 = null,
+    /// Output projection of the parallel layout (null: `Layer.o`).
+    out: ?Weight = null,
+    out_bias: ?[]const f32 = null,
+};
+
 /// Gated short convolution of an LFM2 conv layer (`in_proj` produces the B, C
 /// and x thirds; the depthwise causal kernel is `[hidden][taps]`); its output
 /// projection lives in `Layer.o`.
@@ -284,6 +322,8 @@ pub const Layer = struct {
     mla: ?MlaWeights,
     /// Gated DeltaNet weights (null for full-attention layers).
     linear: ?LinearWeights = null,
+    /// Mamba block weights (null for layers without one).
+    ssm: ?SsmWeights = null,
     /// Short-convolution weights (LFM2 conv layers).
     conv: ?ConvWeights = null,
     /// Per-layer input embedding block (Gemma 3n / 4).
@@ -314,6 +354,8 @@ pub const Layer = struct {
     /// Abliteration deltas (null = identity). Expert deltas live in `moe`.
     o_delta: ?Delta = null,
     down_delta: ?Delta = null,
+    /// Delta on `ssm.out` (parallel layout only; otherwise the Mamba output projection is `o`).
+    ssm_out_delta: ?Delta = null,
 
     /// Bytes that must be resident to run this layer (attention, MLP or
     /// router plus every expert, and the transient needed to transpose fused
@@ -357,6 +399,10 @@ pub const Layer = struct {
             .lin_a => self.linear.?.a = w,
             .lin_ba => self.linear.?.ba = w,
             .lin_conv => self.linear.?.conv = w,
+            .ssm_in => self.ssm.?.in_proj = w,
+            .ssm_x => self.ssm.?.x_proj = w,
+            .ssm_dt => self.ssm.?.dt_proj = w,
+            .ssm_out => self.ssm.?.out = w,
             .conv_in => self.conv.?.in = w,
             .conv_kernel => self.conv.?.kernel = w,
             .ple_gate => self.ple.?.gate = w,
@@ -863,6 +909,90 @@ pub const Model = struct {
         layer.linear = lin;
     }
 
+    /// Loads a Mamba block (Mamba2 or Mamba1) of layer `li`: the input
+    /// projection, the causal convolution and the small time-step / skip
+    /// vectors as f32, the gated norm and the output projection, which goes
+    /// to `layer.o` unless the layer also has attention (`separate_out`).
+    fn loadSsm(self: *Model, layer: *Layer, arena: Allocator, li: usize, lp: []const u8, separate_out: bool) !void {
+        const c = &self.config;
+        const d = &c.ssm;
+        const hidden = c.hidden_size;
+        const sp = try cat(arena, lp, c.arch.names.ssm orelse return error.InvalidConfig);
+        const conv_dim = ssmConvDim(c);
+        const in_name = try cat(arena, sp, "in_proj.weight");
+        var s = SsmWeights{
+            .in_proj = try self.loadMat(in_name),
+            .in_bias = self.loadVecOpt(try biasName(arena, in_name)),
+            .conv = try self.loadVec(try cat(arena, sp, "conv1d.weight")),
+            .conv_bias = self.loadVecOpt(try cat(arena, sp, "conv1d.bias")),
+            .dt_bias = &.{},
+            .a = &.{},
+            .d = try self.loadVec(try cat(arena, sp, "D")),
+            .norm = null,
+        };
+        layer.refs.add(.ssm_in, try self.ref(in_name), false);
+        const want_in: usize = switch (d.kind) {
+            .mamba2 => d.inter + conv_dim + d.heads,
+            .mamba1 => 2 * d.inter,
+            .none => unreachable,
+        };
+        if (s.in_proj.rows != want_in or s.in_proj.cols != hidden) {
+            std.log.err("layer {d}: Mamba in_proj is [{d}][{d}], expected [{d}][{d}]", .{ li, s.in_proj.rows, s.in_proj.cols, want_in, hidden });
+            return error.InvalidConfig;
+        }
+        if (s.conv.len != conv_dim * d.conv_kernel or (s.conv_bias != null and s.conv_bias.?.len != conv_dim)) {
+            std.log.err("layer {d}: Mamba conv1d has {d} weights, expected [{d}][{d}]", .{ li, s.conv.len, conv_dim, d.conv_kernel });
+            return error.InvalidConfig;
+        }
+        const a_log = try self.loadVec(try cat(arena, sp, "A_log"));
+        switch (d.kind) {
+            .mamba2 => {
+                s.dt_bias = try self.loadVec(try cat(arena, sp, "dt_bias"));
+                if (d.rms_norm) s.norm = try self.loadVec(try cat(arena, sp, "norm.weight"));
+                if (s.dt_bias.len != d.heads or a_log.len != d.heads or s.d.len != d.heads or (s.norm != null and s.norm.?.len != d.inter)) {
+                    std.log.err("layer {d}: Mamba2 per-head vectors do not match {d} heads", .{ li, d.heads });
+                    return error.InvalidConfig;
+                }
+            },
+            .mamba1 => {
+                const x_name = try cat(arena, sp, "x_proj.weight");
+                const dt_name = try cat(arena, sp, "dt_proj.weight");
+                s.x_proj = try self.loadMat(x_name);
+                s.dt_proj = try self.loadMat(dt_name);
+                layer.refs.add(.ssm_x, try self.ref(x_name), false);
+                layer.refs.add(.ssm_dt, try self.ref(dt_name), false);
+                s.dt_bias = try self.loadVec(try biasName(arena, dt_name));
+                s.dt_norm = self.loadVecOpt(try cat(arena, sp, "dt_layernorm.weight"));
+                s.b_norm = self.loadVecOpt(try cat(arena, sp, "b_layernorm.weight"));
+                s.c_norm = self.loadVecOpt(try cat(arena, sp, "c_layernorm.weight"));
+                if (s.x_proj.?.rows != d.dt_rank + 2 * d.state or s.x_proj.?.cols != d.inter or s.dt_proj.?.rows != d.inter or s.dt_proj.?.cols != d.dt_rank or s.dt_bias.len != d.inter or a_log.len != d.inter * d.state or s.d.len != d.inter) {
+                    std.log.err("layer {d}: Mamba1 projections do not match inter {d}, state {d}, dt_rank {d}", .{ li, d.inter, d.state, d.dt_rank });
+                    return error.InvalidConfig;
+                }
+            },
+            .none => unreachable,
+        }
+        const a = try arena.alloc(f32, a_log.len);
+        for (a, a_log) |*dst, v| dst.* = -@exp(v);
+        s.a = a;
+        const o_name = try cat(arena, sp, "out_proj.weight");
+        const ow = try self.loadMat(o_name);
+        if (ow.rows != hidden or ow.cols != d.inter) {
+            std.log.err("layer {d}: Mamba out_proj is [{d}][{d}], expected [{d}][{d}]", .{ li, ow.rows, ow.cols, hidden, d.inter });
+            return error.InvalidConfig;
+        }
+        if (separate_out) {
+            s.out = ow;
+            s.out_bias = self.loadVecOpt(try biasName(arena, o_name));
+            layer.refs.add(.ssm_out, try self.ref(o_name), false);
+        } else {
+            layer.o = ow;
+            layer.o_bias = self.loadVecOpt(try biasName(arena, o_name));
+            layer.refs.add(.o, try self.ref(o_name), false);
+        }
+        layer.ssm = s;
+    }
+
     /// Loads an LFM2 short-convolution layer: `in_proj` `[3 hidden][hidden]`,
     /// the depthwise kernel `[hidden][taps]` and `out_proj` into `layer.o`.
     fn loadConv(self: *Model, layer: *Layer, arena: Allocator, li: usize, lp: []const u8) !void {
@@ -1269,6 +1399,7 @@ pub const Model = struct {
             }
 
             // Attention projections.
+            layer.o = .{ .data = &.{}, .dtype = self.dtype, .rows = 0, .cols = 0 };
             const hd = c.layer_head_dim[i];
             const nkv = c.layer_kv_heads[i];
             const kv_shared = c.kvShared(i);
@@ -1282,6 +1413,8 @@ pub const Model = struct {
                 }
             } else if (c.conv_layers[i]) {
                 try self.loadConv(layer, arena, i, lp);
+            } else if (!c.attn_layers[i]) {
+                // A Mamba, MLP or MoE block (loaded below).
             } else if (c.mla) |m| {
                 const kv_a_name = try cat(arena, lp, names.kv_a orelse return error.InvalidConfig);
                 const kv_b_name = try cat(arena, lp, names.kv_b orelse return error.InvalidConfig);
@@ -1393,7 +1526,7 @@ pub const Model = struct {
                 }
                 layer.k_norm = null;
             }
-            if (!c.linear_layers[i] and !c.conv_layers[i] and c.dsv4 == null) {
+            if (c.attn_layers[i] and c.dsv4 == null) {
                 const o_name = try cat(arena, lp, names.o);
                 layer.o = try self.loadMatT(o_name, c.arch.conv1d);
                 layer.o_bias = self.loadVecOpt(try biasName(arena, o_name));
@@ -1404,6 +1537,7 @@ pub const Model = struct {
                     return error.InvalidConfig;
                 }
             }
+            if (c.ssm_layers[i]) try self.loadSsm(layer, arena, i, lp, c.attn_layers[i]);
             if (c.ple_dim > 0) try self.loadPle(layer, arena, i, lp);
             if (c.altup_inputs > 0) try self.loadAltUp(layer, arena, i, lp);
             if (names.layer_scale) |t| {
@@ -1414,7 +1548,9 @@ pub const Model = struct {
             }
 
             // MLP.
-            if (c.moe_layers[i]) {
+            if (!c.mlp_layers[i]) {
+                // Single-block layer without an MLP (Mamba2, Nemotron-H).
+            } else if (c.moe_layers[i]) {
                 layer.moe = try moe.loadLayer(self, arena, i, lp);
                 layer.refs.add(.router, layer.moe.?.router_ref, false);
             } else {
@@ -1959,6 +2095,12 @@ pub const Model = struct {
         const names = &self.config.arch.names;
         if (std.mem.eql(u8, ls.suffix, names.o)) return wholeEdit(layer.o_delta, layer.refs.isTransposed(.o));
         if (names.lin_out) |lo| if (std.mem.eql(u8, ls.suffix, lo)) return wholeEdit(layer.o_delta, false);
+        if (names.ssm) |sp| {
+            if (std.mem.startsWith(u8, ls.suffix, sp) and std.mem.eql(u8, ls.suffix[sp.len..], "out_proj.weight")) {
+                const s = layer.ssm orelse return null;
+                return wholeEdit(if (s.out != null) layer.ssm_out_delta else layer.o_delta, false);
+            }
+        }
         if (names.conv_out) |co| if (std.mem.eql(u8, ls.suffix, co)) return wholeEdit(layer.o_delta, false);
         if (names.light_out) |lo| if (std.mem.eql(u8, ls.suffix, lo)) return wholeEdit(layer.o_delta, false);
         if (layer.moe) |*m| {
@@ -1991,8 +2133,50 @@ pub const Model = struct {
                 self.gpa.free(d.b);
                 l.down_delta = null;
             }
+            if (l.ssm_out_delta) |d| {
+                self.gpa.free(d.a);
+                self.gpa.free(d.b);
+                l.ssm_out_delta = null;
+            }
             if (l.moe) |*m| m.resetDeltas(self.gpa);
         }
+    }
+
+    /// Whether layer `layer` has the component at all: single-block layers
+    /// (Mamba2, Nemotron-H) hold either an attention / Mamba block or an MLP.
+    pub fn hasComponent(self: *const Model, layer: usize, comp: Component) bool {
+        const l = &self.layers[layer];
+        return switch (comp) {
+            .attn_o_proj => l.refs.get(.o) != null,
+            .mlp_down_proj => l.moe != null or l.down != null,
+        };
+    }
+
+    /// Whether layer `layer` has a Mamba output projection separate from its
+    /// attention output (parallel layout); it is edited together with
+    /// `.attn_o_proj`.
+    pub fn hasSsmOut(self: *const Model, layer: usize) bool {
+        return self.layers[layer].refs.get(.ssm_out) != null;
+    }
+
+    /// Makes the separate Mamba output projection resident; release with `self.store.release`.
+    pub fn acquireSsmOut(self: *const Model, layer: usize) !stream.Lease {
+        const store: *stream.WeightStore = @constCast(&self.store);
+        const r = self.layers[layer].refs.get(.ssm_out) orelse return error.NotDenseLayer;
+        return store.acquire(r);
+    }
+
+    pub fn setSsmOutDelta(self: *Model, layer: usize, delta: Delta) void {
+        const l = &self.layers[layer];
+        if (l.ssm_out_delta) |d| {
+            self.gpa.free(d.a);
+            self.gpa.free(d.b);
+        }
+        l.ssm_out_delta = delta;
+    }
+
+    pub fn getSsmOutDelta(self: *const Model, layer: usize) ?Delta {
+        return self.layers[layer].ssm_out_delta;
     }
 
     /// The matrix view for a dense abliterable component. Valid data only in
@@ -2231,7 +2415,7 @@ pub const KvCache = struct {
                 break :blk try initScratch(gpa, model.io, model.scratch_dir, model.budget, c.num_layers, batch, max_len, kvd);
             };
         }
-        if (c.has_linear or c.has_conv) cache.linear = try LinearCache.init(gpa, c, batch);
+        if (c.hasRecurrent()) cache.linear = try LinearCache.init(gpa, c, batch);
         if (c.dsv4 != null) cache.compress = try dsv4.CompressCache.init(gpa, c, batch, max_len);
         return cache;
     }
@@ -2325,12 +2509,13 @@ pub const LinearCache = struct {
 
     fn slotLenOf(c: *const Config, li: usize) usize {
         if (c.linear_layers[li]) return linearStateLen(c) + linearConvLen(c);
+        if (c.ssm_layers[li]) return ssmStateLen(c) + ssmConvLen(c);
         if (c.conv_layers[li]) return c.hidden_size * (c.conv_kernel - 1);
         return 0;
     }
 
     pub fn bytesFor(c: *const Config, batch: usize) u64 {
-        if (!c.has_linear and !c.has_conv) return 0;
+        if (!c.hasRecurrent()) return 0;
         var floats: u64 = 0;
         var n_rec: u64 = 0;
         for (0..c.num_layers) |li| {
@@ -2375,8 +2560,8 @@ pub const LinearCache = struct {
             .rec_index = rec_index,
             .offsets = offsets,
             .lens = lens,
-            .state_len = if (c.has_linear) linearStateLen(c) else 0,
-            .conv_len = if (c.has_linear) linearConvLen(c) else 0,
+            .state_len = if (c.has_linear) linearStateLen(c) else if (c.has_ssm) ssmStateLen(c) else 0,
+            .conv_len = if (c.has_linear) linearConvLen(c) else if (c.has_ssm) ssmConvLen(c) else 0,
             .buf = buf,
             .next_pos = next_pos,
         };
@@ -2418,6 +2603,33 @@ pub const LinearCache = struct {
 
 fn linearConvDim(c: *const Config) usize {
     return 2 * c.linear_k_heads * c.linear_k_dim + c.linear_v_heads * c.linear_v_dim;
+}
+
+/// Channels of a Mamba block's causal convolution: x, B and C for Mamba2
+/// (`inter + 2 groups * state`), the inner projection for Mamba1.
+fn ssmConvDim(c: *const Config) usize {
+    const d = &c.ssm;
+    return switch (d.kind) {
+        .mamba2 => d.inter + 2 * d.groups * d.state,
+        .mamba1 => d.inter,
+        .none => 0,
+    };
+}
+
+/// Floats of recurrent state per (Mamba layer, sequence): `[heads][head_dim][state]`
+/// for Mamba2, `[inter][state]` for Mamba1.
+fn ssmStateLen(c: *const Config) usize {
+    const d = &c.ssm;
+    return switch (d.kind) {
+        .mamba2 => d.heads * d.head_dim * d.state,
+        .mamba1 => d.inter * d.state,
+        .none => 0,
+    };
+}
+
+/// Floats of convolution history per (Mamba layer, sequence).
+fn ssmConvLen(c: *const Config) usize {
+    return if (c.ssm.kind == .none) 0 else ssmConvDim(c) * (c.ssm.conv_kernel - 1);
 }
 
 /// Floats of recurrent state per (linear layer, sequence): `[v_heads][k_dim][v_dim]`
@@ -3274,6 +3486,323 @@ fn softplus(x: f32) f32 {
     return @log(1.0 + @exp(x));
 }
 
+/// Mamba sublayer (Mamba2 or Mamba1): the input projection over every row
+/// at once, then the causal convolution and the selective scan per batch
+/// slot in row order against `cache.linear`, the gate / gated norm and the
+/// output projection (with its delta). Reads `h`, writes `out[n][hidden]`.
+/// The scan runs sequentially over tokens; heads (Mamba2) or channels
+/// (Mamba1) are independent and spread over the thread pool.
+fn ssmForward(model: *const Model, layer: *const Layer, li: usize, cache: *KvCache, h: []const f32, rows: []const Row, out: []f32) !void {
+    const c = &model.config;
+    const d = &c.ssm;
+    const gpa = model.gpa;
+    const s = &layer.ssm.?;
+    const rc = &(cache.linear orelse return error.MissingLinearCache);
+    const n = rows.len;
+    const hidden = c.hidden_size;
+    const inter = d.inter;
+
+    var hin: []const f32 = h[0 .. n * hidden];
+    var scaled: ?[]f32 = null;
+    defer if (scaled) |b| gpa.free(b);
+    if (c.mult.ssm_in != 1.0) {
+        const b = try gpa.alloc(f32, n * hidden);
+        @memcpy(b, hin);
+        tensor.scale(b, c.mult.ssm_in);
+        scaled = b;
+        hin = b;
+    }
+    const proj_cols = s.in_proj.rows;
+    const proj = try gpa.alloc(f32, n * proj_cols);
+    defer gpa.free(proj);
+    try tensor.matmulT(model.pool, gpa, proj, hin, n, s.in_proj, null);
+    if (s.in_bias) |b| addBias(proj, n, proj_cols, b);
+
+    // Sequence bookkeeping: a slot restarts at position 0 and otherwise
+    // continues where the previous call left it; within one call a slot's
+    // rows must be consecutive positions.
+    const seen = try gpa.alloc(bool, rc.batch);
+    defer gpa.free(seen);
+    @memset(seen, false);
+    for (rows) |row| {
+        const next = rc.nextPos(li, row.b);
+        if (row.pos == 0) {
+            if (seen[row.b]) return error.NonContiguousRows;
+            @memset(rc.state(li, row.b), 0);
+            @memset(rc.conv(li, row.b), 0);
+            next.* = 0;
+        }
+        if (row.pos != next.*) return error.NonContiguousRows;
+        next.* = row.pos + 1;
+        seen[row.b] = true;
+    }
+
+    const core = try gpa.alloc(f32, n * inter);
+    defer gpa.free(core);
+    switch (d.kind) {
+        .mamba2 => try mamba2Scan(model, s, li, rc, proj, rows, core),
+        .mamba1 => try mamba1Scan(model, s, li, rc, proj, rows, core),
+        .none => unreachable,
+    }
+    const separate = s.out != null;
+    const ow = s.out orelse layer.o;
+    const delta: ?*const Delta = if (separate) (if (layer.ssm_out_delta) |*dl| dl else null) else (if (layer.o_delta) |*dl| dl else null);
+    try tensor.matmulT(model.pool, gpa, out, core, n, ow, delta);
+    const bias = if (separate) s.out_bias else layer.o_bias;
+    if (bias) |b| addBias(out, n, hidden, b);
+}
+
+/// One step of a depthwise causal convolution over `conv_dim` channels:
+/// `y[j] = act(bias[j] + Σ_i w[j][K-1-i] · x_{t-i})`, with `hist` holding the
+/// previous `K - 1` inputs of every channel (oldest first), which it advances.
+fn causalConvStep(w: []const f32, bias: ?[]const f32, kc: usize, conv_dim: usize, hist: []f32, x: []const f32, y: []f32, act: tensor.Activation) void {
+    for (0..conv_dim) |j| {
+        var acc: f32 = if (bias) |b| b[j] else 0;
+        acc += w[j * kc + kc - 1] * x[j];
+        if (kc > 1) {
+            const hj = hist[j * (kc - 1) ..][0 .. kc - 1];
+            for (1..kc) |i| acc += w[j * kc + kc - 1 - i] * hj[kc - 1 - i];
+            @memmove(hj[0 .. kc - 2], hj[1 .. kc - 1]);
+            hj[kc - 2] = x[j];
+        }
+        y[j] = act.apply(acc);
+    }
+}
+
+/// `y = norm(y ⊙ silu(z)) ⊙ w`, or `norm(y) ⊙ w ⊙ silu(z)` when the norm
+/// comes first, the RMS taken over `norm_groups` equal groups of channels;
+/// without a norm weight only the gate applies.
+fn gatedNorm(d: *const arch.SsmDims, w: ?[]const f32, eps: f32, y: []f32, z: []const f32) void {
+    const nw = w orelse {
+        for (y, 0..) |*v, j| v.* *= tensor.silu(z[j]);
+        return;
+    };
+    if (!d.norm_before_gate) {
+        for (y, 0..) |*v, j| v.* *= tensor.silu(z[j]);
+    }
+    const gs = y.len / d.norm_groups;
+    for (0..d.norm_groups) |g| {
+        const yg = y[g * gs ..][0..gs];
+        var ss: f32 = 0;
+        for (yg) |v| ss += v * v;
+        const inv = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(gs)) + eps);
+        for (yg, 0..) |*v, j| v.* = v.* * inv * nw[g * gs + j];
+    }
+    if (d.norm_before_gate) {
+        for (y, 0..) |*v, j| v.* *= tensor.silu(z[j]);
+    }
+}
+
+const Mamba2Ctx = struct {
+    rows: []const Row,
+    /// Convolved, activated x / B / C channels `[n][conv_dim]`.
+    xbc: []const f32,
+    /// Discretised time steps `[n][heads]`.
+    dt: []const f32,
+    s: *const SsmWeights,
+    rc: *LinearCache,
+    li: usize,
+    /// Scan output `[n][inter]`.
+    core: []f32,
+    inter: usize,
+    hd: usize,
+    state: usize,
+    groups: usize,
+    heads: usize,
+    conv_dim: usize,
+};
+
+/// The Mamba2 recurrence for heads `[start, end)`, every row in order:
+/// `S_h = exp(dt A_h) S_h + dt x_h Bᵀ`, `y_h = S_h C + D_h x_h`, with the
+/// `[head_dim][state]` state of each head kept per batch slot.
+fn mamba2Worker(ctx: *const Mamba2Ctx, start: usize, end: usize) void {
+    const N = ctx.state;
+    const hd = ctx.hd;
+    const inter = ctx.inter;
+    const gn = ctx.groups * N;
+    const per_group = ctx.heads / ctx.groups;
+    for (start..end) |h| {
+        const g = h / per_group;
+        const a_h = ctx.s.a[h];
+        const d_h = ctx.s.d[h];
+        for (ctx.rows, 0..) |row, t| {
+            const S = ctx.rc.state(ctx.li, row.b)[h * hd * N ..][0 .. hd * N];
+            const x = ctx.xbc[t * ctx.conv_dim + h * hd ..][0..hd];
+            const B = ctx.xbc[t * ctx.conv_dim + inter + g * N ..][0..N];
+            const C = ctx.xbc[t * ctx.conv_dim + inter + gn + g * N ..][0..N];
+            const dt = ctx.dt[t * ctx.heads + h];
+            const da = @exp(dt * a_h);
+            const y = ctx.core[t * inter + h * hd ..][0..hd];
+            for (0..hd) |p| {
+                const srow = S[p * N ..][0..N];
+                tensor.scale(srow, da);
+                tensor.axpy(srow, dt * x[p], B);
+                y[p] = tensor.dot(srow, C) + d_h * x[p];
+            }
+        }
+    }
+}
+
+/// Mamba2 (SSD) block body on the projected rows `proj[n][inter + conv_dim + heads]`
+/// (gate, conv channels, dt): writes the gated, normalised scan output to `core[n][inter]`.
+fn mamba2Scan(model: *const Model, s: *const SsmWeights, li: usize, rc: *LinearCache, proj: []f32, rows: []const Row, core: []f32) !void {
+    const c = &model.config;
+    const d = &c.ssm;
+    const gpa = model.gpa;
+    const n = rows.len;
+    const inter = d.inter;
+    const heads = d.heads;
+    const N = d.state;
+    const gn = d.groups * N;
+    const kc = d.conv_kernel;
+    const conv_dim = inter + 2 * gn;
+    const proj_cols = inter + conv_dim + heads;
+
+    // Falcon-H1 muP: per-section multipliers on the projection (gate, x, B, C, dt).
+    const mp = c.mult.ssm_proj;
+    const bounds = [_]usize{ 0, inter, 2 * inter, 2 * inter + gn, 2 * inter + 2 * gn, proj_cols };
+    for (0..5) |k| {
+        if (mp[k] == 1.0) continue;
+        for (0..n) |t| tensor.scale(proj[t * proj_cols + bounds[k] .. t * proj_cols + bounds[k + 1]], mp[k]);
+    }
+    // Causal convolution over the x / B / C channels, in row order per sequence.
+    const xbc = try gpa.alloc(f32, n * conv_dim);
+    defer gpa.free(xbc);
+    for (rows, 0..) |row, t| {
+        causalConvStep(s.conv, s.conv_bias, kc, conv_dim, rc.conv(li, row.b), proj[t * proj_cols + inter ..][0..conv_dim], xbc[t * conv_dim ..][0..conv_dim], d.act);
+    }
+    // Time steps: softplus(dt + dt_bias), clamped to the family's limits.
+    const dt = try gpa.alloc(f32, n * heads);
+    defer gpa.free(dt);
+    for (0..n) |t| {
+        for (0..heads) |hh| dt[t * heads + hh] = std.math.clamp(softplus(proj[t * proj_cols + inter + conv_dim + hh] + s.dt_bias[hh]), d.dt_min, d.dt_max);
+    }
+    const ctx = Mamba2Ctx{
+        .rows = rows,
+        .xbc = xbc,
+        .dt = dt,
+        .s = s,
+        .rc = rc,
+        .li = li,
+        .core = core,
+        .inter = inter,
+        .hd = d.head_dim,
+        .state = N,
+        .groups = d.groups,
+        .heads = heads,
+        .conv_dim = conv_dim,
+    };
+    model.pool.parallelFor(heads, &ctx, mamba2Worker);
+    for (0..n) |t| gatedNorm(d, s.norm, c.rms_norm_eps, core[t * inter ..][0..inter], proj[t * proj_cols ..][0..inter]);
+}
+
+const Mamba1Ctx = struct {
+    rows: []const Row,
+    /// Convolved, activated inner channels `[n][inter]`.
+    xa: []const f32,
+    /// `softplus(dt_proj(dt) + bias)` `[n][inter]`.
+    dt: []const f32,
+    /// Normalised B then C per row `[n][2 state]`.
+    bc: []const f32,
+    /// The projection rows (`[n][2 inter]`); the gate is the second half.
+    proj: []const f32,
+    s: *const SsmWeights,
+    rc: *LinearCache,
+    li: usize,
+    core: []f32,
+    inter: usize,
+    state: usize,
+};
+
+/// The Mamba1 recurrence for channels `[start, end)`, every row in order:
+/// `S_c = exp(dt_c A_c) ⊙ S_c + dt_c x_c B`, `y_c = S_c · C + D_c x_c`,
+/// gated by `silu(z_c)`, with the `[state]` vector of each channel kept per batch slot.
+fn mamba1Worker(ctx: *const Mamba1Ctx, start: usize, end: usize) void {
+    const N = ctx.state;
+    const inter = ctx.inter;
+    for (start..end) |ch| {
+        const a = ctx.s.a[ch * N ..][0..N];
+        const d_c = ctx.s.d[ch];
+        for (ctx.rows, 0..) |row, t| {
+            const S = ctx.rc.state(ctx.li, row.b)[ch * N ..][0..N];
+            const dt = ctx.dt[t * inter + ch];
+            const x = ctx.xa[t * inter + ch];
+            const B = ctx.bc[t * 2 * N ..][0..N];
+            const C = ctx.bc[t * 2 * N + N ..][0..N];
+            const dtx = dt * x;
+            var y: f32 = 0;
+            for (0..N) |i| {
+                S[i] = S[i] * @exp(dt * a[i]) + dtx * B[i];
+                y += S[i] * C[i];
+            }
+            const z = ctx.proj[t * 2 * inter + inter + ch];
+            ctx.core[t * inter + ch] = (y + d_c * x) * tensor.silu(z);
+        }
+    }
+}
+
+/// Mamba1 block body on the projected rows `proj[n][2 inter]` (conv channels,
+/// gate): writes the gated scan output to `core[n][inter]`.
+fn mamba1Scan(model: *const Model, s: *const SsmWeights, li: usize, rc: *LinearCache, proj: []f32, rows: []const Row, core: []f32) !void {
+    const c = &model.config;
+    const d = &c.ssm;
+    const gpa = model.gpa;
+    const n = rows.len;
+    const inter = d.inter;
+    const N = d.state;
+    const R = d.dt_rank;
+    const kc = d.conv_kernel;
+    const proj_cols = 2 * inter;
+    const eps = c.rms_norm_eps;
+
+    const xa = try gpa.alloc(f32, n * inter);
+    defer gpa.free(xa);
+    for (rows, 0..) |row, t| {
+        causalConvStep(s.conv, s.conv_bias, kc, inter, rc.conv(li, row.b), proj[t * proj_cols ..][0..inter], xa[t * inter ..][0..inter], d.act);
+    }
+    // x_proj → dt | B | C, each RMS-normalised when the family has the norms (Jamba).
+    const xcols = R + 2 * N;
+    const xp = try gpa.alloc(f32, n * xcols);
+    defer gpa.free(xp);
+    try tensor.matmulT(model.pool, gpa, xp, xa, n, s.x_proj.?, null);
+    const dtr = try gpa.alloc(f32, n * R);
+    defer gpa.free(dtr);
+    const bc = try gpa.alloc(f32, n * 2 * N);
+    defer gpa.free(bc);
+    for (0..n) |t| {
+        const row = xp[t * xcols ..][0..xcols];
+        const dt_part = row[0..R];
+        const b_part = row[R..][0..N];
+        const c_part = row[R + N ..][0..N];
+        if (s.dt_norm) |w| tensor.rmsnorm(dt_part, dt_part, w, eps, false);
+        if (s.b_norm) |w| tensor.rmsnorm(b_part, b_part, w, eps, false);
+        if (s.c_norm) |w| tensor.rmsnorm(c_part, c_part, w, eps, false);
+        @memcpy(dtr[t * R ..][0..R], dt_part);
+        @memcpy(bc[t * 2 * N ..][0..N], b_part);
+        @memcpy(bc[t * 2 * N + N ..][0..N], c_part);
+    }
+    // dt = softplus(dt_proj(dt) + bias).
+    const dt = try gpa.alloc(f32, n * inter);
+    defer gpa.free(dt);
+    try tensor.matmulT(model.pool, gpa, dt, dtr, n, s.dt_proj.?, null);
+    addBias(dt, n, inter, s.dt_bias);
+    for (dt) |*v| v.* = softplus(v.*);
+    const ctx = Mamba1Ctx{
+        .rows = rows,
+        .xa = xa,
+        .dt = dt,
+        .bc = bc,
+        .proj = proj,
+        .s = s,
+        .rc = rc,
+        .li = li,
+        .core = core,
+        .inter = inter,
+        .state = N,
+    };
+    model.pool.parallelFor(inter, &ctx, mamba1Worker);
+}
+
 /// Gated short-convolution sublayer (LFM2 conv layers): `in_proj` splits into
 /// B, C and x; `B * x` runs through a depthwise causal convolution whose
 /// history lives in `cache.linear`; the result is gated by C and projected by
@@ -3419,6 +3948,7 @@ fn attentionTail(model: *const Model, layer: *const Layer, li: usize, ws: *Works
             clampAll(ws.v[0 .. n * kvd], clip);
         }
     }
+    if (c.mult.key != 1.0) tensor.scale(ws.k[0 .. n * kvd], c.mult.key);
 
     const use_rope = c.rope_layers[li];
     const sliding = c.sliding_layers[li];
@@ -3573,6 +4103,7 @@ pub fn mlpBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Worksp
             try tensor.matmulT(model.pool, gpa, ws.up, h_in, n, layer.up.?, null);
             if (layer.gate_bias) |b| addBias(ws.gate, n, inter, b);
             if (layer.up_bias) |b| addBias(ws.up, n, inter, b);
+            if (c.mult.mlp_gate != 1.0) tensor.scale(ws.gate[0 .. n * inter], c.mult.mlp_gate);
             if (c.activation_sparsity[li] > 0) gaussianTopk(ws.gate, n, inter, c.activation_sparsity[li]);
             if (c.moe.swiglu) |sw| swigluOai(sw, ws.gate, ws.gate, ws.up, n, inter, inter) else if (c.moe.situ) |st| moe.situGlu(st, ws.gate, ws.gate, ws.up, n, inter, inter) else tensor.gatedActivation(model.pool, c.activation, ws.gate, ws.gate, ws.up, n, inter, inter, inter);
         },
@@ -3591,6 +4122,7 @@ pub fn mlpBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Worksp
     }
     try tensor.matmulT(model.pool, gpa, ws.m, din, n, down, if (layer.down_delta) |*d| d else null);
     if (layer.down_bias) |b| addBias(ws.m, n, hidden, b);
+    if (c.mult.mlp_down != 1.0) tensor.scale(ws.m[0 .. n * hidden], c.mult.mlp_down);
 }
 
 /// Per-layer input block (Gemma 3n / 4): `norm(out(act(gate(src)) * ple[li]))`
@@ -3965,20 +4497,54 @@ fn captureResiduals(opts: ForwardOptions, entry: usize, hidden: usize, start: us
 /// norms on the sublayer outputs (Gemma, OLMo 2, GLM-4) and no input norm for
 /// the post-norm families. Parallel layout (GPT-NeoX, Falcon, Phi, Cohere):
 /// `x += attn(h) + mlp(h)` with `h = norm(x)` (or a second norm for the MLP).
-/// Gemma 4 then adds the per-layer input block and its output scalar; Gemma 3n
-/// takes the AltUp path.
+///
+/// The "attention" half may be a linear-attention, short-convolution or
+/// Mamba block instead, or (Falcon-H1) a Mamba block and attention side by
+/// side on the same input whose outputs are summed; single-block layers
+/// (Mamba2, Nemotron-H) run only one of the two halves behind the layer
+/// norm. Gemma 4 then adds the per-layer input block and its output scalar;
+/// Gemma 3n takes the AltUp path.
 fn layerBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace, cache: *KvCache, x: []f32, alt: []f32, ple: []const f32, rows: []const Row) !void {
     if (layer.altup != null) return altupLayer(model, layer, li, ws, cache, x, alt, ple, rows);
     const c = &model.config;
+    const gpa = model.gpa;
     const n = rows.len;
     const hidden = c.hidden_size;
     const h = ws.h[0 .. n * hidden];
     const rm = c.residual_multiplier;
-
-    normRows(c, h, x, n, hidden, layer.input_norm);
-    try mixer(model, layer, li, ws, cache, h, rows);
+    const has_attn = c.attn_layers[li];
+    const has_ssm = c.ssm_layers[li];
+    const has_mixer = has_attn or has_ssm or c.linear_layers[li] or c.conv_layers[li];
+    const has_mlp = c.mlp_layers[li];
     const attn_out = ws.o[0 .. n * hidden];
-    if (layer.post_attn_norm) |nm| normRowsInPlace(c, attn_out, n, hidden, nm, ws.h2);
+
+    if (has_mixer) {
+        normRows(c, h, x, n, hidden, layer.input_norm);
+        if (has_attn and has_ssm) {
+            // Parallel Mamba + attention with the muP multipliers.
+            var attn_in: []const f32 = h;
+            var scaled: ?[]f32 = null;
+            defer if (scaled) |b| gpa.free(b);
+            if (c.mult.attn_in != 1.0) {
+                const b = try gpa.alloc(f32, n * hidden);
+                @memcpy(b, h);
+                tensor.scale(b, c.mult.attn_in);
+                scaled = b;
+                attn_in = b;
+            }
+            try attention(model, layer, li, ws, cache, attn_in, rows);
+            if (c.mult.attn_out != 1.0) tensor.scale(attn_out, c.mult.attn_out);
+            const ssm_out = try gpa.alloc(f32, n * hidden);
+            defer gpa.free(ssm_out);
+            try ssmForward(model, layer, li, cache, h, rows, ssm_out);
+            tensor.axpy(attn_out, c.mult.ssm_out, ssm_out);
+        } else if (has_ssm) {
+            try ssmForward(model, layer, li, cache, h, rows, attn_out);
+        } else {
+            try mixer(model, layer, li, ws, cache, h, rows);
+        }
+        if (layer.post_attn_norm) |nm| normRowsInPlace(c, attn_out, n, hidden, nm, ws.h2);
+    }
 
     if (c.residual_layout == .minimax) {
         // MiniMax-01: the normalised input is the residual of each sublayer.
@@ -4002,12 +4568,15 @@ fn layerBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Workspac
         tensor.axpy(x[0 .. n * hidden], rm, attn_out);
         tensor.axpy(x[0 .. n * hidden], rm, m);
     } else {
-        tensor.axpy(x[0 .. n * hidden], rm, attn_out);
-        normRows(c, h, x, n, hidden, layer.pre_ff_norm);
-        try mlpBlock(model, layer, li, ws, h, n, null);
-        const m = ws.m[0 .. n * hidden];
-        if (layer.post_ff_norm) |nm| normRowsInPlace(c, m, n, hidden, nm, ws.h2);
-        tensor.axpy(x[0 .. n * hidden], rm, m);
+        if (has_mixer) tensor.axpy(x[0 .. n * hidden], rm, attn_out);
+        if (has_mlp) {
+            // A single-block MLP layer is normalised by the layer's only norm.
+            normRows(c, h, x, n, hidden, if (has_mixer) layer.pre_ff_norm else layer.input_norm);
+            try mlpBlock(model, layer, li, ws, h, n, null);
+            const m = ws.m[0 .. n * hidden];
+            if (layer.post_ff_norm) |nm| normRowsInPlace(c, m, n, hidden, nm, ws.h2);
+            tensor.axpy(x[0 .. n * hidden], rm, m);
+        }
     }
     if (layer.ple) |*p| {
         try pleBlock(model, p, li, ws, x, ple, n);
