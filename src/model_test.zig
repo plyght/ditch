@@ -213,6 +213,27 @@ test "glm4_moe fixture" {
 test "glm_moe_dsa fixture" {
     try checkFixture("glm_moe_dsa");
 }
+test "minimax_m2 fixture" {
+    try checkFixture("minimax_m2");
+}
+test "minimax fixture (lightning attention, renormalised residual)" {
+    try checkFixture("minimax");
+}
+test "minimax_m3 fixture" {
+    try checkFixture("minimax_m3");
+}
+test "ernie4_5_moe fixture" {
+    try checkFixture("ernie4_5_moe");
+}
+test "hunyuan_v1_moe fixture" {
+    try checkFixture("hunyuan_v1_moe");
+}
+test "granitemoe fixture" {
+    try checkFixture("granitemoe");
+}
+test "granitemoehybrid fixture (attention only, fused shared_mlp)" {
+    try checkFixture("granitemoehybrid");
+}
 
 // ---------------------------------------------------------------------------
 // Abliteration, export and streaming on the registry layouts
@@ -356,4 +377,25 @@ test "glm4_moe edit, export and streamed reload (per-head q/k norms, sigmoid MoE
 }
 test "glm_moe_dsa edit, export and streamed reload (MLA sparse indexer as dense)" {
     try checkEditExportStream("glm_moe_dsa");
+}
+test "minimax_m2 edit, export and streamed reload (full-projection q/k norm, Mixtral expert names)" {
+    try checkEditExportStream("minimax_m2");
+}
+test "minimax edit, export and streamed reload (lightning attention out_proj)" {
+    try checkEditExportStream("minimax");
+}
+test "minimax_m3 edit, export and streamed reload (fused shared expert, pass-through indexer tensors)" {
+    try checkEditExportStream("minimax_m3");
+}
+test "ernie4_5_moe edit, export and streamed reload (moe_statics bias, shared experts)" {
+    try checkEditExportStream("ernie4_5_moe");
+}
+test "hunyuan_v1_moe edit, export and streamed reload (q/k norm after rope, shared_mlp)" {
+    try checkEditExportStream("hunyuan_v1_moe");
+}
+test "granitemoe edit, export and streamed reload (fused input_linear / output_linear experts)" {
+    try checkEditExportStream("granitemoe");
+}
+test "granitemoehybrid edit, export and streamed reload (fused shared_mlp)" {
+    try checkEditExportStream("granitemoehybrid");
 }
