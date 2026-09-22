@@ -3297,7 +3297,11 @@ fn linearForward(model: *const Model, layer: *const Layer, li: usize, ws: *Works
             for (o) |v| variance += v * v;
             variance = variance / @as(f32, @floatFromInt(vd)) + eps;
             const inv = 1.0 / @sqrt(variance);
-            for (o, 0..) |*v, jj| v.* = v.* * inv * lin.norm[jj] * tensor.silu(z[jj]);
+            if (c.linear_gate_sigmoid) {
+                for (o, 0..) |*v, jj| v.* = v.* * inv * lin.norm[jj] / (1.0 + @exp(-z[jj]));
+            } else {
+                for (o, 0..) |*v, jj| v.* = v.* * inv * lin.norm[jj] * tensor.silu(z[jj]);
+            }
         }
         next.* = pos + 1;
     }
@@ -4006,6 +4010,7 @@ fn attentionTail(model: *const Model, layer: *const Layer, li: usize, ws: *Works
     const c = &model.config;
     const gpa = model.gpa;
     const n = rows.len;
+    try checkIndexBound(c, li, rows);
     const hidden = c.hidden_size;
     const hd = c.layer_head_dim[li];
     const nkv = c.layer_kv_heads[li];
@@ -4159,6 +4164,21 @@ fn gaussianTopk(gate: []f32, n: usize, width: usize, sparsity: f32) void {
     }
 }
 
+/// A sparse-attention indexer (Qwen4-Exp QSA, GLM-5.3-Flash DSA) scores blocks
+/// of consecutive keys and keeps the best `max_blocks` complete ones plus the
+/// incomplete tail. Dense attention is therefore exactly the reference while
+/// every complete block is selected; beyond that ditch refuses rather than
+/// silently approximating.
+fn checkIndexBound(c: *const Config, li: usize, rows: []const Row) !void {
+    const b = c.index_bound orelse return;
+    if (c.linear_layers[li] or c.conv_layers[li]) return;
+    var worst: usize = 0;
+    for (rows) |row| worst = @max(worst, (row.pos + 1) / b.block);
+    if (worst <= b.max_blocks) return;
+    std.log.err("layer {d}: {d} complete key blocks are reachable but the indexer keeps {d}; the dense equivalent is only exact for contexts up to {d} tokens", .{ li, worst, b.max_blocks, b.block * b.max_blocks });
+    return error.ContextExceedsSparseIndexer;
+}
+
 /// MLP sublayer (dense or mixture of experts): reads `h_in`, writes `ws.m`.
 pub fn mlpBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace, h_in: []const f32, n: usize, tokens: ?[]const u32) !void {
     const c = &model.config;
@@ -4176,6 +4196,13 @@ pub fn mlpBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Worksp
             if (layer.up_bias) |b| addBias(ws.up, n, inter, b);
             if (c.mult.mlp_gate != 1.0) tensor.scale(ws.gate[0 .. n * inter], c.mult.mlp_gate);
             if (c.activation_sparsity[li] > 0) gaussianTopk(ws.gate, n, inter, c.activation_sparsity[li]);
+            if (c.moe.swiglu_limit) |limit| {
+                // The gate is clamped from above, the up projection on both sides.
+                for (ws.gate[0 .. n * inter], 0..) |*g, j| {
+                    g.* = @min(g.*, limit);
+                    ws.up[j] = std.math.clamp(ws.up[j], -limit, limit);
+                }
+            }
             if (c.moe.swiglu) |sw| swigluOai(sw, ws.gate, ws.gate, ws.up, n, inter, inter) else if (c.moe.situ) |st| moe.situGlu(st, ws.gate, ws.gate, ws.up, n, inter, inter) else tensor.gatedActivation(model.pool, c.activation, ws.gate, ws.gate, ws.up, n, inter, inter, inter);
         },
         .gated_fused => {

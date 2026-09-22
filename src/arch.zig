@@ -697,10 +697,6 @@ pub const Config = struct {
     /// Gated DeltaNet output norm gated by a sigmoid instead of a silu
     /// (Qwen4-Exp `output_gate_type = "sigmoid"`).
     linear_gate_sigmoid: bool,
-    /// Kimi Delta Attention forget gate with a safe lower bound:
-    /// `g = bound * sigmoid(exp(A_log) * (f + dt_bias))` instead of
-    /// `-exp(A_log) * softplus(f + dt_bias)` (GLM-5.3-Flash).
-    linear_lower_bound: ?f32,
     /// Offset added to positions when indexing the learned table (OPT: 2).
     position_offset: usize,
     tie_word_embeddings: bool,
@@ -1306,7 +1302,6 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         .gated_attention = false,
         .gate_swish = gate_swish,
         .linear_gate_sigmoid = false,
-        .linear_lower_bound = null,
         .position_offset = 0,
         .tie_word_embeddings = getBool(obj, "tie_word_embeddings", arch.tie_word_embeddings),
         .activation = act,
@@ -2088,7 +2083,7 @@ fn extraGlm5Next(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
     c.linear_k_dim = head_dim;
     c.linear_v_dim = head_dim;
     c.linear_conv_kernel = kernel;
-    c.linear_lower_bound = lower;
+    c.linear_gate_lower_bound = lower;
     if (obj.get("layer_types") == null) {
         for (c.linear_layers, 0..) |*is_lin, i| is_lin.* = (i % 4 != 3);
     }
@@ -4594,7 +4589,7 @@ test "parseConfig picks the Qwen4-Exp, GLM-5.3-Flash and GLM-4.7-Flash knobs" {
     try std.testing.expectEqual(LinearKind.kda, g5.linear_kind);
     try std.testing.expect(g5.linear_layers[0] and g5.linear_layers[2] and !g5.linear_layers[3] and !g5.linear_layers[7]);
     try std.testing.expect(!g5.moe_layers[2] and g5.moe_layers[3]);
-    try std.testing.expectEqual(@as(f32, -5.0), g5.linear_lower_bound.?);
+    try std.testing.expectEqual(@as(f32, -5.0), g5.linear_gate_lower_bound.?);
     try std.testing.expectEqual(@as(usize, 16), g5.head_dim);
     try std.testing.expectEqual(@as(usize, 8), g5.v_head_dim);
     try std.testing.expectEqual(@as(usize, 0), g5.rotary_dim);
@@ -4612,7 +4607,7 @@ test "parseConfig picks the Qwen4-Exp, GLM-5.3-Flash and GLM-4.7-Flash knobs" {
     const g5b = try parseConfig(a,
         \\{"model_type":"glm5_next_text","hidden_size":64,"num_attention_heads":4,"num_hidden_layers":3,"vocab_size":100,"q_lora_rank":16,"kv_lora_rank":16,"qk_nope_head_dim":16,"qk_rope_head_dim":0,"v_head_dim":8,"n_routed_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":16,"linear_attn_config":{"num_heads":2,"head_dim":16,"short_conv_kernel_size":3,"gate_lower_bound":null,"safe_gate":false},"layer_types":["linear_attention","indexed_attention","linear_attention"],"mlp_layer_types":["dense","sparse","sparse"],"indexer_types":["shared","full","shared"]}
     );
-    try std.testing.expect(g5b.linear_lower_bound == null);
+    try std.testing.expect(g5b.linear_gate_lower_bound == null);
     try std.testing.expectEqual(@as(usize, 3), g5b.linear_conv_kernel);
     try std.testing.expect(g5b.linear_layers[0] and !g5b.linear_layers[1] and g5b.linear_layers[2]);
     try std.testing.expect(!g5b.moe_layers[0] and g5b.moe_layers[1]);
