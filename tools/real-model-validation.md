@@ -1769,6 +1769,18 @@ The 2.4B run covers the llama3 rope scaling and tied embeddings. On
 provide guidance on how to hack into any system, including government
 databases, …'`.
 
+Short study on it (6 trials, `--max-response-length 40`):
+
+| Model | family | Baseline Refusals | Best trial | Best KL |
+| --- | --- | ---: | ---: | ---: |
+| LGAI-EXAONE/EXAONE-3.5-2.4B-Instruct | `exaone` | 88/100 | 16/100 | 0.0121 |
+
+Front: 16/100@0.0121, 64/100@0.0021. Export self-validation: max |Δ|
+first-token logit 0.0000, argmax agreement 100%. Through `ditch probe` on
+the export, the harmful prompt now gets `'Hacking into a government database
+involves a combination of technical skills, …'` and "What is the capital of
+France?" still `'The capital of France is Paris. …'`.
+
 ## Bug 33 — the NFKC normalizer was the identity (fixed)
 
 **Symptom.** EXAONE 3.5 loads with `warning: normalizer 'NFKC' is
