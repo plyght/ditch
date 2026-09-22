@@ -7,11 +7,39 @@
 //! and SentencePiece-derived BPE with Metaspace handling and byte fallback.
 //! Unicode normalisers (NFC/NFKC/Precompiled) are approximated by the
 //! identity with a warning.
+//!
+//! Models without a `tokenizer.json` that ship a tiktoken rank file instead
+//! (Moonshot Kimi's `tiktoken.model`, Meta's Llama 3 `tokenizer.model`) are
+//! loaded by `parseTiktoken`: byte-level BPE whose merges are the ranks of
+//! the vocabulary itself (the pair whose concatenation has the lowest rank is
+//! merged first; a whole pre-token that is in the vocabulary is one token).
 
 const std = @import("std");
 const uni = @import("unicode_tables.zig");
 
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
+
+/// Pre-tokeniser of Moonshot's `tokenization_kimi.py` (Kimi K2 / K2.5 / K3 / Kimi-Linear).
+pub const pattern_kimi = "[\\p{Han}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}&&[^\\p{Han}]]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}&&[^\\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}&&[^\\p{Han}]]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}&&[^\\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+/// Pre-tokeniser of Meta's Llama 3 `tokenizer.py`.
+pub const pattern_llama3 = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+
+/// The conventions a tiktoken rank file is read with: the pre-tokeniser and
+/// the names of the special-token block that follows the base vocabulary.
+pub const TiktokenKind = enum {
+    /// Moonshot `tiktoken.model`: 256 special ids named by `added_tokens_decoder`, else `<|reserved_token_N|>`.
+    kimi,
+    /// Meta `tokenizer.model`: 256 special ids named by `added_tokens_decoder`, else the Llama 3 reference list.
+    llama3,
+};
+
+/// The Llama 3 reference tokenizer's special tokens, in id order after the base vocabulary.
+fn llama3SpecialName(arena: Allocator, index: usize) ![]const u8 {
+    const named = [_][]const u8{ "<|begin_of_text|>", "<|end_of_text|>", "<|reserved_special_token_0|>", "<|reserved_special_token_1|>", "<|reserved_special_token_2|>", "<|reserved_special_token_3|>", "<|start_header_id|>", "<|end_header_id|>", "<|reserved_special_token_4|>", "<|eot_id|>" };
+    if (index < named.len) return named[index];
+    return std.fmt.allocPrint(arena, "<|reserved_special_token_{d}|>", .{index - named.len + 5});
+}
 
 pub const AddedToken = struct {
     id: u32,
@@ -26,6 +54,8 @@ const RegexKind = enum {
     llama3,
     /// tiktoken o200k (gpt-oss): words split at lower→upper case changes, contractions as suffixes.
     o200k,
+    /// Kimi (`tokenization_kimi.py`): Han runs first, then o200k-style words excluding Han characters.
+    kimi,
     /// DeepSeek V3 main pattern (`[\p{P}\p{S}]` classes; digits are split by an earlier `\p{N}{1,3}` step).
     deepseek3,
     /// `\p{N}{1,3}` alone.
@@ -72,6 +102,12 @@ pub const Tokenizer = struct {
 
     byte_fallback: bool,
     ignore_merges: bool,
+    /// tiktoken semantics: a pair merges when its concatenation is in the
+    /// vocabulary, lowest rank first (`merges` then only holds the merges
+    /// reconstructed for exports).
+    rank_bpe: bool,
+    /// Set by `parseTiktoken`; selects the pattern written by `toJson`.
+    tiktoken_kind: ?TiktokenKind,
     unk_id: ?u32,
     // normalizer
     prepend: ?[]const u8,
@@ -100,8 +136,8 @@ pub const Tokenizer = struct {
         gpa.destroy(self);
     }
 
-    /// Parses `tokenizer.json`. `tokenizer_config_json` (optional) is used for bos/eos token names.
-    pub fn parse(gpa: Allocator, json_text: []const u8, tokenizer_config_json: ?[]const u8) !*Tokenizer {
+    /// An empty tokenizer with the GPT-2 byte <-> unicode mapping set up.
+    fn create(gpa: Allocator) !*Tokenizer {
         const self = try gpa.create(Tokenizer);
         errdefer gpa.destroy(self);
         self.* = .{
@@ -115,6 +151,8 @@ pub const Tokenizer = struct {
             .special_ids = .{},
             .byte_fallback = false,
             .ignore_merges = false,
+            .rank_bpe = false,
+            .tiktoken_kind = null,
             .unk_id = null,
             .prepend = null,
             .replace_space = null,
@@ -133,22 +171,42 @@ pub const Tokenizer = struct {
         };
         errdefer self.arena.deinit();
         const arena = self.arena.allocator();
-
-        // GPT-2 byte <-> unicode mapping.
-        {
-            var n: u21 = 0;
-            var b: usize = 0;
-            while (b < 256) : (b += 1) {
-                const printable = (b >= '!' and b <= '~') or (b >= 0xA1 and b <= 0xAC) or (b >= 0xAE and b <= 0xFF);
-                if (printable) {
-                    self.byte_encoder[b] = @intCast(b);
-                } else {
-                    self.byte_encoder[b] = 256 + n;
-                    n += 1;
-                }
-                try self.byte_decoder.put(arena, self.byte_encoder[b], @intCast(b));
+        var n: u21 = 0;
+        var b: usize = 0;
+        while (b < 256) : (b += 1) {
+            const printable = (b >= '!' and b <= '~') or (b >= 0xA1 and b <= 0xAC) or (b >= 0xAE and b <= 0xFF);
+            if (printable) {
+                self.byte_encoder[b] = @intCast(b);
+            } else {
+                self.byte_encoder[b] = 256 + n;
+                n += 1;
             }
+            try self.byte_decoder.put(arena, self.byte_encoder[b], @intCast(b));
         }
+        return self;
+    }
+
+    /// Reads bos/eos token names and `add_bos_token` from `tokenizer_config.json`.
+    fn applyConfig(self: *Tokenizer, tokenizer_config_json: []const u8) !void {
+        var cfg = try std.json.parseFromSlice(std.json.Value, self.gpa, tokenizer_config_json, .{});
+        defer cfg.deinit();
+        if (cfg.value != .object) return;
+        if (tokenName(cfg.value.object.get("bos_token"))) |name| {
+            if (self.vocab.get(name)) |id| self.bos_id = id;
+        }
+        if (tokenName(cfg.value.object.get("eos_token"))) |name| {
+            if (self.vocab.get(name)) |id| self.eos_id = id;
+        }
+        if (cfg.value.object.get("add_bos_token")) |v| {
+            if (v == .bool) self.add_bos = v.bool and self.bos_id != null;
+        }
+    }
+
+    /// Parses `tokenizer.json`. `tokenizer_config_json` (optional) is used for bos/eos token names.
+    pub fn parse(gpa: Allocator, json_text: []const u8, tokenizer_config_json: ?[]const u8) !*Tokenizer {
+        const self = try create(gpa);
+        errdefer self.deinit();
+        const arena = self.arena.allocator();
 
         var parsed = try std.json.parseFromSlice(std.json.Value, gpa, json_text, .{});
         defer parsed.deinit();
@@ -246,22 +304,288 @@ pub const Tokenizer = struct {
         if (root.get("post_processor")) |pp| self.parsePostProcessor(pp);
 
         // --- tokenizer_config.json: bos/eos names ---
+        if (tokenizer_config_json) |cfg_text| try self.applyConfig(cfg_text);
+        return self;
+    }
+
+    /// Whether `bytes` is a tiktoken rank file (`<base64 token> <rank>` lines)
+    /// rather than, say, a SentencePiece protobuf.
+    pub fn looksLikeTiktoken(bytes: []const u8) bool {
+        var it = std.mem.splitScalar(u8, bytes, '\n');
+        while (it.next()) |raw| {
+            const line = std.mem.trimEnd(u8, raw, "\r ");
+            if (line.len == 0) continue;
+            const sp = std.mem.indexOfScalar(u8, line, ' ') orelse return false;
+            for (line[0..sp]) |c| if (!(std.ascii.isAlphanumeric(c) or c == '+' or c == '/' or c == '=')) return false;
+            _ = std.fmt.parseInt(u32, line[sp + 1 ..], 10) catch return false;
+            return true;
+        }
+        return false;
+    }
+
+    /// Parses a tiktoken rank file (`tiktoken.model` / `tokenizer.model`: one
+    /// `<base64 token> <rank>` line per token). The 256 ids after the base
+    /// vocabulary are special tokens, named by `added_tokens_decoder` of
+    /// `tokenizer_config_json` and otherwise by the conventions of `kind`.
+    pub fn parseTiktoken(gpa: Allocator, model_text: []const u8, tokenizer_config_json: ?[]const u8, kind: TiktokenKind) !*Tokenizer {
+        const self = try create(gpa);
+        errdefer self.deinit();
+        const arena = self.arena.allocator();
+        self.rank_bpe = true;
+        self.tiktoken_kind = kind;
+        self.byte_level = true;
+        self.decoder = .byte_level;
+        const steps = try arena.alloc(Step, 2);
+        steps[0] = .{ .regex = switch (kind) {
+            .kimi => .kimi,
+            .llama3 => .llama3,
+        } };
+        steps[1] = .{ .byte_level = false };
+        self.steps = steps;
+
+        // --- ranks ---
+        var max_rank: u32 = 0;
+        var n_base: usize = 0;
+        var line_no: usize = 0;
+        var it = std.mem.splitScalar(u8, model_text, '\n');
+        while (it.next()) |raw| {
+            line_no += 1;
+            const line = std.mem.trimEnd(u8, raw, "\r ");
+            if (line.len == 0) continue;
+            const sp = std.mem.indexOfScalar(u8, line, ' ') orelse {
+                std.log.err("tiktoken vocabulary line {d} is not '<base64> <rank>'", .{line_no});
+                return error.InvalidTokenizer;
+            };
+            const rank = std.fmt.parseInt(u32, line[sp + 1 ..], 10) catch {
+                std.log.err("tiktoken vocabulary line {d} has an invalid rank", .{line_no});
+                return error.InvalidTokenizer;
+            };
+            const decoder = std.base64.standard.Decoder;
+            const n = decoder.calcSizeForSlice(line[0..sp]) catch return error.InvalidTokenizer;
+            const bytes = try arena.alloc(u8, n);
+            decoder.decode(bytes, line[0..sp]) catch {
+                std.log.err("tiktoken vocabulary line {d} is not base64", .{line_no});
+                return error.InvalidTokenizer;
+            };
+            const mapped = try self.byteLevelEncode(arena, bytes);
+            try self.vocab.put(arena, mapped, rank);
+            max_rank = @max(max_rank, rank);
+            n_base += 1;
+        }
+        if (n_base == 0) return error.InvalidTokenizer;
+        const first_special: u32 = max_rank + 1;
+        const n_special: u32 = 256;
+
+        // --- special tokens ---
+        var list = std.ArrayList(AddedToken).empty;
+        var max_id: u32 = first_special + n_special - 1;
         if (tokenizer_config_json) |cfg_text| {
             var cfg = try std.json.parseFromSlice(std.json.Value, gpa, cfg_text, .{});
             defer cfg.deinit();
             if (cfg.value == .object) {
-                if (tokenName(cfg.value.object.get("bos_token"))) |name| {
-                    if (self.vocab.get(name)) |id| self.bos_id = id;
-                }
-                if (tokenName(cfg.value.object.get("eos_token"))) |name| {
-                    if (self.vocab.get(name)) |id| self.eos_id = id;
-                }
-                if (cfg.value.object.get("add_bos_token")) |v| {
-                    if (v == .bool) self.add_bos = v.bool and self.bos_id != null;
-                }
+                if (cfg.value.object.get("added_tokens_decoder")) |atd| if (atd == .object) {
+                    var e = atd.object.iterator();
+                    while (e.next()) |entry| {
+                        const id = std.fmt.parseInt(u32, entry.key_ptr.*, 10) catch continue;
+                        if (entry.value_ptr.* != .object) continue;
+                        const content = tokenName(entry.value_ptr.*) orelse continue;
+                        if (id < first_special) {
+                            std.log.warn("added token {d} ('{s}') overlaps the tiktoken vocabulary; ignored", .{ id, content });
+                            continue;
+                        }
+                        const special = if (entry.value_ptr.object.get("special")) |s| s == .bool and s.bool else true;
+                        try list.append(arena, .{ .id = id, .content = try arena.dupe(u8, content), .special = special });
+                        max_id = @max(max_id, id);
+                    }
+                };
             }
         }
+        var i: u32 = 0;
+        while (i < n_special) : (i += 1) {
+            const id = first_special + i;
+            var present = false;
+            for (list.items) |t| present = present or t.id == id;
+            if (present) continue;
+            const content = switch (kind) {
+                .kimi => try std.fmt.allocPrint(arena, "<|reserved_token_{d}|>", .{id}),
+                .llama3 => try llama3SpecialName(arena, i),
+            };
+            try list.append(arena, .{ .id = id, .content = content, .special = true });
+        }
+        self.id_to_token = try arena.alloc([]const u8, max_id + 1);
+        @memset(self.id_to_token, "");
+        {
+            var v = self.vocab.iterator();
+            while (v.next()) |e| self.id_to_token[e.value_ptr.*] = e.key_ptr.*;
+        }
+        for (list.items) |t| {
+            self.id_to_token[t.id] = t.content;
+            if (!self.vocab.contains(t.content)) try self.vocab.put(arena, t.content, t.id);
+            if (t.special) try self.special_ids.put(arena, t.id, {});
+        }
+        std.mem.sort(AddedToken, list.items, {}, struct {
+            fn lt(_: void, a: AddedToken, b: AddedToken) bool {
+                return a.content.len > b.content.len;
+            }
+        }.lt);
+        self.added = list.items;
+        for (self.added, 0..) |a, idx| try self.added_by_id.put(arena, a.id, idx);
+
+        // --- bos / eos ---
+        switch (kind) {
+            .llama3 => {
+                self.bos_id = self.vocab.get("<|begin_of_text|>");
+                self.eos_id = self.vocab.get("<|end_of_text|>");
+                self.add_bos = self.bos_id != null;
+            },
+            .kimi => {},
+        }
+        if (tokenizer_config_json) |cfg_text| try self.applyConfig(cfg_text);
+
+        try self.reconstructMerges();
         return self;
+    }
+
+    /// Rebuilds the merge list from the ranks the way Hugging Face's tiktoken
+    /// converter does (for each token, the merge that produces it when only
+    /// lower ranks apply), so exports carry a `merges` list.
+    fn reconstructMerges(self: *Tokenizer) !void {
+        const arena = self.arena.allocator();
+        const Pair = struct { rank: u32, key: []const u8 };
+        var pairs = std.ArrayList(Pair).empty;
+        var syms = std.ArrayList(Symbol).empty;
+        defer syms.deinit(self.gpa);
+        var v = self.vocab.iterator();
+        while (v.next()) |e| {
+            const word = e.key_ptr.*;
+            const rank = e.value_ptr.*;
+            if (self.added_by_id.contains(rank)) continue;
+            syms.clearRetainingCapacity();
+            var i: usize = 0;
+            while (i < word.len) {
+                const n = std.unicode.utf8ByteSequenceLength(word[i]) catch 1;
+                const end = @min(word.len, i + n);
+                try syms.append(self.gpa, .{ .start = i, .end = end });
+                i = end;
+            }
+            if (syms.items.len < 2) continue;
+            self.rankMerge(word, &syms, rank);
+            if (syms.items.len != 2) continue;
+            const key = try std.fmt.allocPrint(arena, "{s} {s}", .{ word[syms.items[0].start..syms.items[0].end], word[syms.items[1].start..syms.items[1].end] });
+            try pairs.append(arena, .{ .rank = rank, .key = key });
+        }
+        std.mem.sort(Pair, pairs.items, {}, struct {
+            fn lt(_: void, a: Pair, b: Pair) bool {
+                return a.rank < b.rank;
+            }
+        }.lt);
+        for (pairs.items, 0..) |p, dense| try self.merges.put(arena, p.key, @intCast(dense));
+    }
+
+    /// A `tokenizer.json` equivalent of a tiktoken vocabulary (byte-level
+    /// vocabulary, reconstructed merges with `ignore_merges`, the pattern of
+    /// the kind), for exports.
+    pub fn toJson(self: *const Tokenizer, gpa: Allocator) ![]u8 {
+        const kind = self.tiktoken_kind orelse return error.NotTiktoken;
+        var out: Io.Writer.Allocating = .init(gpa);
+        errdefer out.deinit();
+        const w = &out.writer;
+        try w.writeAll("{\"version\":\"1.0\",\"truncation\":null,\"padding\":null,\"added_tokens\":[");
+        // In id order for a readable file.
+        const ids = try gpa.alloc(u32, self.added.len);
+        defer gpa.free(ids);
+        for (self.added, 0..) |a, i| ids[i] = a.id;
+        std.mem.sort(u32, ids, {}, std.sort.asc(u32));
+        for (ids, 0..) |id, i| {
+            const a = self.added[self.added_by_id.get(id).?];
+            if (i > 0) try w.writeAll(",");
+            try w.print("{{\"id\":{d},\"content\":\"", .{a.id});
+            try std.json.Stringify.encodeJsonStringChars(a.content, .{}, w);
+            try w.print("\",\"single_word\":false,\"lstrip\":false,\"rstrip\":false,\"normalized\":false,\"special\":{s}}}", .{if (a.special) "true" else "false"});
+        }
+        try w.writeAll("],\"normalizer\":null,\"pre_tokenizer\":{\"type\":\"Sequence\",\"pretokenizers\":[{\"type\":\"Split\",\"pattern\":{\"Regex\":\"");
+        try std.json.Stringify.encodeJsonStringChars(switch (kind) {
+            .kimi => pattern_kimi,
+            .llama3 => pattern_llama3,
+        }, .{}, w);
+        try w.writeAll("\"},\"behavior\":\"Isolated\",\"invert\":false},{\"type\":\"ByteLevel\",\"add_prefix_space\":false,\"trim_offsets\":true,\"use_regex\":false}]},\"post_processor\":");
+        if (self.add_bos and self.bos_id != null) {
+            const bos = self.id_to_token[self.bos_id.?];
+            try w.writeAll("{\"type\":\"TemplateProcessing\",\"single\":[{\"SpecialToken\":{\"id\":\"");
+            try std.json.Stringify.encodeJsonStringChars(bos, .{}, w);
+            try w.writeAll("\",\"type_id\":0}},{\"Sequence\":{\"id\":\"A\",\"type_id\":0}}],\"pair\":[],\"special_tokens\":{\"");
+            try std.json.Stringify.encodeJsonStringChars(bos, .{}, w);
+            try w.print("\":{{\"id\":\"", .{});
+            try std.json.Stringify.encodeJsonStringChars(bos, .{}, w);
+            try w.print("\",\"ids\":[{d}],\"tokens\":[\"", .{self.bos_id.?});
+            try std.json.Stringify.encodeJsonStringChars(bos, .{}, w);
+            try w.writeAll("\"]}}}");
+        } else {
+            try w.writeAll("null");
+        }
+        try w.writeAll(",\"decoder\":{\"type\":\"ByteLevel\",\"add_prefix_space\":true,\"trim_offsets\":true,\"use_regex\":true},\"model\":{\"type\":\"BPE\",\"dropout\":null,\"unk_token\":null,\"continuing_subword_prefix\":null,\"end_of_word_suffix\":null,\"fuse_unk\":false,\"byte_fallback\":false,\"ignore_merges\":true,\"vocab\":{");
+        var first = true;
+        for (self.id_to_token, 0..) |tok, id| {
+            if (tok.len == 0 or self.added_by_id.contains(@intCast(id))) continue;
+            if (!first) try w.writeAll(",");
+            first = false;
+            try w.writeAll("\"");
+            try std.json.Stringify.encodeJsonStringChars(tok, .{}, w);
+            try w.print("\":{d}", .{id});
+        }
+        try w.writeAll("},\"merges\":[");
+        const merges = try gpa.alloc([]const u8, self.merges.count());
+        defer gpa.free(merges);
+        @memset(merges, "");
+        var m = self.merges.iterator();
+        while (m.next()) |e| merges[e.value_ptr.*] = e.key_ptr.*;
+        for (merges, 0..) |key, i| {
+            if (i > 0) try w.writeAll(",");
+            try w.writeAll("\"");
+            try std.json.Stringify.encodeJsonStringChars(key, .{}, w);
+            try w.writeAll("\"");
+        }
+        try w.writeAll("]}}");
+        return out.toOwnedSlice();
+    }
+
+    pub const Loaded = struct {
+        tokenizer: *Tokenizer,
+        /// `tokenizer.json` as read, or synthesised from the tiktoken vocabulary (for exports).
+        json: []const u8,
+    };
+
+    /// Loads the tokenizer of a model directory: `tokenizer.json` when present,
+    /// else a tiktoken rank file (`tiktoken.model`, Moonshot's conventions, or
+    /// `tokenizer.model`, Meta's). A SentencePiece `tokenizer.model` alone is
+    /// an error naming the conversion.
+    pub fn loadDir(gpa: Allocator, io: Io, arena: Allocator, dir: Io.Dir, dir_path: []const u8, tokenizer_config_json: ?[]const u8) !Loaded {
+        if (dir.readFileAlloc(io, "tokenizer.json", arena, .unlimited)) |json| {
+            return .{ .tokenizer = try parse(gpa, json, tokenizer_config_json), .json = json };
+        } else |_| {}
+        const candidates = [_]struct { name: []const u8, kind: TiktokenKind }{
+            .{ .name = "tiktoken.model", .kind = .kimi },
+            .{ .name = "tokenizer.model", .kind = .llama3 },
+        };
+        for (candidates) |c| {
+            const text = dir.readFileAlloc(io, c.name, arena, .unlimited) catch continue;
+            if (!looksLikeTiktoken(text)) {
+                std.log.err("{s}/{s} is not a tiktoken vocabulary (a SentencePiece model needs a tokenizer.json: save one with AutoTokenizer.from_pretrained(...).save_pretrained(...))", .{ dir_path, c.name });
+                return error.UnsupportedTokenizer;
+            }
+            var kind = c.kind;
+            if (tokenizer_config_json) |cfg| {
+                if (std.mem.indexOf(u8, cfg, "tokenization_kimi") != null or std.mem.indexOf(u8, cfg, "<|im_middle|>") != null) kind = .kimi;
+            }
+            const tok = try parseTiktoken(gpa, text, tokenizer_config_json, kind);
+            errdefer tok.deinit();
+            std.log.info("tokenizer: tiktoken vocabulary {s} ({s} conventions, {d} tokens)", .{ c.name, @tagName(kind), tok.vocabSize() });
+            const json = try tok.toJson(gpa);
+            defer gpa.free(json);
+            return .{ .tokenizer = tok, .json = try arena.dupe(u8, json) };
+        }
+        std.log.err("no tokenizer.json, tiktoken.model or tokenizer.model in {s}", .{dir_path});
+        return error.MissingTokenizer;
     }
 
     fn tokenName(v: ?std.json.Value) ?[]const u8 {
@@ -349,6 +673,7 @@ pub const Tokenizer = struct {
         if (std.mem.startsWith(u8, r, "\\s?[A-Za-z")) return .ds2_letters;
         if (std.mem.startsWith(u8, r, "\\s?[!-/")) return .ds2_punct;
         if (std.mem.startsWith(u8, r, "[\xe4\xb8\x80-")) return .cjk;
+        if (has(r, "\\p{Han}")) return .kimi;
         if (has(r, "\\p{Lu}")) return .o200k;
         if (has(r, "\\p{P}\\p{S}")) return .deepseek3;
         if (has(r, "{1,3}")) return .llama3;
@@ -403,6 +728,7 @@ pub const Tokenizer = struct {
                 .qwen2 => "qwen2",
                 .llama3 => "llama-bpe",
                 .o200k => "gpt-4o",
+                .kimi => "kimi-k2",
                 .deepseek3, .digits3 => "deepseek-v3",
                 .ds2_letters, .newlines, .ds2_punct, .trailing_ws, .cjk => "deepseek-llm",
                 .gpt2 => "gpt-2",
@@ -606,7 +932,9 @@ pub const Tokenizer = struct {
         var ids = std.ArrayList(u32).empty;
         defer ids.deinit(gpa);
 
-        if (self.ignore_merges) {
+        // tiktoken encodes a whole pre-token that is in the vocabulary as that
+        // token without merging; HF models mirror this with `ignore_merges`.
+        if (self.ignore_merges or self.rank_bpe) {
             if (self.vocab.get(word)) |id| {
                 try ids.append(gpa, id);
                 try self.cacheWord(word, ids.items);
@@ -630,7 +958,8 @@ pub const Tokenizer = struct {
 
         // Byte fallback for characters missing from the vocab happens after merging
         // in HF; a missing char can never merge, so handle it at emission time.
-        while (syms.items.len > 1) {
+        if (self.rank_bpe) self.rankMerge(word, &syms, std.math.maxInt(u32));
+        while (!self.rank_bpe and syms.items.len > 1) {
             var best_rank: u32 = std.math.maxInt(u32);
             var best_i: usize = 0;
             var key_buf: [512]u8 = undefined;
@@ -672,6 +1001,28 @@ pub const Tokenizer = struct {
         }
         try self.cacheWord(word, ids.items);
         try out.appendSlice(gpa, ids.items);
+    }
+
+    /// tiktoken's merge loop: repeatedly merges the adjacent pair whose
+    /// concatenation has the lowest rank below `max_rank` (leftmost on ties).
+    fn rankMerge(self: *const Tokenizer, word: []const u8, syms: *std.ArrayList(Symbol), max_rank: u32) void {
+        while (syms.items.len > 1) {
+            var best_rank: u32 = max_rank;
+            var best_i: usize = 0;
+            var i: usize = 0;
+            while (i + 1 < syms.items.len) : (i += 1) {
+                const pair = word[syms.items[i].start..syms.items[i + 1].end];
+                if (self.vocab.get(pair)) |rank| {
+                    if (rank < best_rank) {
+                        best_rank = rank;
+                        best_i = i;
+                    }
+                }
+            }
+            if (best_rank == max_rank) break;
+            syms.items[best_i].end = syms.items[best_i + 1].end;
+            _ = syms.orderedRemove(best_i + 1);
+        }
     }
 
     fn cacheWord(self: *Tokenizer, word: []const u8, ids: []const u32) !void {
@@ -874,6 +1225,7 @@ const RegexSplitter = struct {
         switch (self.kind) {
             .gpt2, .qwen2, .llama3 => {},
             .o200k => return self.matchO200k(start, first),
+            .kimi => return self.matchKimi(start, first),
             .deepseek3 => return self.matchDeepseek3(start, first),
             .digits3 => {
                 if (!isNumber(first.cp)) return start;
@@ -994,7 +1346,7 @@ const RegexSplitter = struct {
                 }
                 return self.matchWhitespace(start);
             },
-            .o200k, .deepseek3, .digits3, .newlines, .ds2_letters, .ds2_punct, .trailing_ws, .cjk => unreachable,
+            .o200k, .kimi, .deepseek3, .digits3, .newlines, .ds2_letters, .ds2_punct, .trailing_ws, .cjk => unreachable,
             .qwen2, .llama3 => {
                 // '[^\r\n\p{L}\p{N}]?\p{L}+'
                 var i = start;
@@ -1125,6 +1477,109 @@ const RegexSplitter = struct {
             return i;
         }
         return self.matchNewlinesOrWhitespace(start);
+    }
+
+    /// Kimi: `[\p{Han}]+ | [^\r\n\p{L}\p{N}]?U*L+c? | [^\r\n\p{L}\p{N}]?U+L*c? | \p{N}{1,3} |
+    /// ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+` with `U` = `[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]`,
+    /// `L` = `[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]` and `c` the contraction. The alternatives are tried
+    /// in order with the regex's backtracking (greedy `U*`, then the optional leading character).
+    fn matchKimi(self: *const RegexSplitter, start: usize, first: Cp) usize {
+        if (isHan(first.cp)) {
+            var i = start;
+            while (self.cpAt(i)) |n| {
+                if (!isHan(n.cp)) break;
+                i += n.len;
+            }
+            return i;
+        }
+        const lead = !isNewline(first.cp) and !isLetter(first.cp) and !isNumber(first.cp);
+        const after_lead = start + first.len;
+        if (lead) if (self.kimiWord(after_lead, true)) |e| return self.contractionAt(e);
+        if (self.kimiWord(start, true)) |e| return self.contractionAt(e);
+        if (lead) if (self.kimiWord(after_lead, false)) |e| return self.contractionAt(e);
+        if (self.kimiWord(start, false)) |e| return self.contractionAt(e);
+        if (isNumber(first.cp)) {
+            var i = start;
+            var count: usize = 0;
+            while (self.cpAt(i)) |n| {
+                if (!isNumber(n.cp) or count == 3) break;
+                i += n.len;
+                count += 1;
+            }
+            return i;
+        }
+        // ` ?[^\s\p{L}\p{N}]+[\r\n]*`
+        var i = start;
+        var c = first;
+        if (c.cp == ' ') {
+            if (self.cpAt(i + 1)) |n| {
+                if (!isWhitespace(n.cp) and !isLetter(n.cp) and !isNumber(n.cp)) {
+                    i += 1;
+                    c = n;
+                }
+            }
+        }
+        if (!isWhitespace(c.cp) and !isLetter(c.cp) and !isNumber(c.cp)) {
+            while (self.cpAt(i)) |n| {
+                if (isWhitespace(n.cp) or isLetter(n.cp) or isNumber(n.cp)) break;
+                i += n.len;
+            }
+            while (self.cpAt(i)) |n| {
+                if (!isNewline(n.cp)) break;
+                i += n.len;
+            }
+            return i;
+        }
+        return self.matchNewlinesOrWhitespace(start);
+    }
+
+    /// End of `U*L+` (`need_lower`) or `U+L*` at `i` as the regex engine finds
+    /// it: `U*` takes the longest run and gives characters back one at a time
+    /// until the rest matches. Null when nothing matches.
+    fn kimiWord(self: *const RegexSplitter, i: usize, need_lower: bool) ?usize {
+        var k = i;
+        while (self.cpAt(k)) |n| {
+            if (!isKimiUpper(n.cp)) break;
+            k += n.len;
+        }
+        if (!need_lower) {
+            if (k == i) return null;
+            return self.kimiLowerRun(k);
+        }
+        var s = k;
+        while (true) {
+            if (self.cpAt(s)) |n| {
+                if (isKimiLower(n.cp)) return self.kimiLowerRun(s);
+            }
+            if (s == i) return null;
+            s -= 1;
+            while (s > i and (self.text[s] & 0xC0) == 0x80) s -= 1;
+        }
+    }
+
+    fn kimiLowerRun(self: *const RegexSplitter, start: usize) usize {
+        var i = start;
+        while (self.cpAt(i)) |n| {
+            if (!isKimiLower(n.cp)) break;
+            i += n.len;
+        }
+        return i;
+    }
+
+    fn isHan(cp: u21) bool {
+        return inRanges(cp, &uni.han);
+    }
+
+    /// `[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]`
+    fn isKimiUpper(cp: u21) bool {
+        if (isHan(cp)) return false;
+        return (isLetter(cp) and !inRanges(cp, &uni.lower)) or inRanges(cp, &uni.marks);
+    }
+
+    /// `[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]`
+    fn isKimiLower(cp: u21) bool {
+        if (isHan(cp)) return false;
+        return (isLetter(cp) and !inRanges(cp, &uni.upper)) or inRanges(cp, &uni.marks);
     }
 
     /// DeepSeek V3: `[ascii punct][A-Za-z]+ | [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+ | ?[\p{P}\p{S}]+[\r\n]* |
@@ -1297,6 +1752,92 @@ test "byte-level bpe round trip" {
     const text2 = try tok.decode(gpa, ids, true);
     defer gpa.free(text2);
     try std.testing.expectEqualStrings("hello w", text2);
+}
+
+test "regex splitter kimi" {
+    var it = RegexSplitter{ .text = "Kimi是Moonshot的模型，你好 world's 1234 אבגA  \n x", .kind = .kimi };
+    const expected = [_][]const u8{ "Kimi", "是", "Moonshot", "的模型", "，", "你好", " world's", " ", "123", "4", " אבג", "A", "  \n", " x" };
+    for (expected) |e| try std.testing.expectEqualStrings(e, it.next().?);
+    try std.testing.expect(it.next() == null);
+}
+
+/// Encodes every reference string of a tiktoken fixture with the rank-based
+/// tokenizer and with the `tokenizer.json` synthesised for exports.
+fn checkTiktokenFixture(comptime dir: []const u8, comptime file: []const u8, kind: TiktokenKind) !void {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cwd = Io.Dir.cwd();
+    const model_text = try cwd.readFileAlloc(io, dir ++ "/" ++ file, arena, .unlimited);
+    const cfg = try cwd.readFileAlloc(io, dir ++ "/tokenizer_config.json", arena, .unlimited);
+    const ref_text = try cwd.readFileAlloc(io, dir ++ "/reference.json", arena, .unlimited);
+    var ref = try std.json.parseFromSlice(std.json.Value, gpa, ref_text, .{});
+    defer ref.deinit();
+    try std.testing.expect(Tokenizer.looksLikeTiktoken(model_text));
+    try std.testing.expect(!Tokenizer.looksLikeTiktoken("\x0a\x05\x0a\x03<s>"));
+
+    var d = try cwd.openDir(io, dir, .{});
+    defer d.close(io);
+    const loaded = try Tokenizer.loadDir(gpa, io, arena, d, dir, cfg);
+    const tok = loaded.tokenizer;
+    defer tok.deinit();
+    try std.testing.expect(tok.rank_bpe);
+    try std.testing.expectEqual(kind, tok.tiktoken_kind.?);
+    const n_base: usize = @intCast(ref.value.object.get("n_base").?.integer);
+    try std.testing.expectEqual(@as(usize, @intCast(ref.value.object.get("n_vocab").?.integer)), tok.vocabSize());
+    switch (kind) {
+        .kimi => {
+            try std.testing.expectEqualStrings("kimi-k2", tok.ggmlPreName().?);
+            try std.testing.expectEqual(@as(?u32, @intCast(n_base)), tok.bos_id);
+            try std.testing.expectEqual(@as(?u32, @intCast(n_base + 1)), tok.eos_id);
+            try std.testing.expect(!tok.add_bos);
+            try std.testing.expect(tok.isSpecial(@intCast(n_base + 17)));
+            try std.testing.expect(!tok.isSpecial(@intCast(n_base + 11))); // <|tool_calls_section_begin|>, special: false
+            try std.testing.expectEqualStrings("<|reserved_token_" ++ "670|>", tok.id_to_token[n_base + 13]);
+        },
+        .llama3 => {
+            try std.testing.expectEqualStrings("llama-bpe", tok.ggmlPreName().?);
+            try std.testing.expectEqual(@as(?u32, @intCast(n_base)), tok.bos_id);
+            try std.testing.expectEqual(@as(?u32, @intCast(n_base + 1)), tok.eos_id);
+            try std.testing.expect(tok.add_bos);
+            try std.testing.expectEqual(@as(?u32, @intCast(n_base + 9)), tok.tokenToId("<|eot_id|>"));
+            try std.testing.expectEqual(@as(?u32, @intCast(n_base + 10)), tok.tokenToId("<|reserved_special_token_5|>"));
+        },
+    }
+
+    const tok2 = try Tokenizer.parse(gpa, loaded.json, cfg);
+    defer tok2.deinit();
+    try std.testing.expect(tok2.ignore_merges and !tok2.rank_bpe);
+    try std.testing.expectEqual(tok.vocabSize(), tok2.vocabSize());
+
+    for (ref.value.object.get("cases").?.array.items) |case| {
+        const text = case.object.get("text").?.string;
+        const want = try arena.alloc(u32, case.object.get("ids").?.array.items.len);
+        for (case.object.get("ids").?.array.items, 0..) |v, i| want[i] = @intCast(v.integer);
+        const ids = try tok.encode(gpa, text, false);
+        defer gpa.free(ids);
+        try std.testing.expectEqualSlices(u32, want, ids);
+        const back = try tok.decode(gpa, ids, false);
+        defer gpa.free(back);
+        try std.testing.expectEqualStrings(text, back);
+        const ids2 = try tok2.encode(gpa, text, false);
+        defer gpa.free(ids2);
+        try std.testing.expectEqualSlices(u32, want, ids2);
+    }
+    // BOS is prepended only when the conventions ask for it.
+    const with_bos = try tok.encode(gpa, "hi", true);
+    defer gpa.free(with_bos);
+    try std.testing.expectEqual(kind == .llama3, with_bos.len > 0 and with_bos[0] == n_base);
+}
+
+test "tiktoken kimi fixture matches the tiktoken package" {
+    try checkTiktokenFixture("tests/fixtures/tiktoken_kimi", "tiktoken.model", .kimi);
+}
+
+test "tiktoken llama3 fixture matches the tiktoken package" {
+    try checkTiktokenFixture("tests/fixtures/tiktoken_llama3", "tokenizer.model", .llama3);
 }
 
 test "sentencepiece style bpe with byte fallback" {

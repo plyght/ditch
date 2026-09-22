@@ -256,6 +256,18 @@ fn saveModelInner(gpa: Allocator, io: Io, model: *const Model, dir: Io.Dir, opts
         copyIfExists(io, s.*, dir, "chat_template.jinja");
         copyIfExists(io, s.*, dir, "added_tokens.json");
         copyIfExists(io, s.*, dir, "preprocessor_config.json");
+        // A tiktoken vocabulary (and the tokenizer code that reads it) travels with the
+        // tokenizer.json synthesised from it, so the export loads either way.
+        if (model.tokenizer.tiktoken_kind != null) {
+            copyIfExists(io, s.*, dir, "tiktoken.model");
+            copyIfExists(io, s.*, dir, "tokenizer.model");
+            var it = s.iterate();
+            while (it.next(io) catch null) |entry| {
+                if (entry.kind == .file and std.mem.startsWith(u8, entry.name, "tokenization_") and std.mem.endsWith(u8, entry.name, ".py")) {
+                    copyIfExists(io, s.*, dir, entry.name);
+                }
+            }
+        }
     }
     if (opts.readme_body) |body| try dir.writeFile(io, .{ .sub_path = "README.md", .data = body });
 }

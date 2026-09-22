@@ -452,7 +452,7 @@ pub fn lookup(model_type: []const u8) ?*const Arch {
 fn rejectKnownHybrid(model_type: []const u8) !void {
     const table = .{
         .{ "kimi_k3", "Kimi K3 (its weights format and AttnRes are not implemented yet)" },
-        .{ "kimi_k2", "Kimi K2 (FP8 E4M3 block-quantised weights, no tokenizer.json)" },
+        .{ "kimi_k2", "Kimi K2 (FP8 E4M3 block-quantised weights)" },
         .{ "qwen4_exp", "Qwen3.8-Flash-Next hybrid (linear attention with sparse indexer and hyper-connections)" },
         .{ "qwen4_exp_text", "Qwen3.8-Flash-Next hybrid (linear attention with sparse indexer and hyper-connections)" },
         .{ "glm5_next", "GLM-5.3-Flash hybrid (linear attention with sparse indexer and hyper-connections)" },
@@ -1950,10 +1950,10 @@ pub const registry = [_]Arch{
     .{
         .model_type = "kimi_k25",
         .llama_cpp = "deepseek2",
-        .chat = "deepseek",
+        .chat = "kimi",
         .verified = true,
         .names = deepseek_v3_names,
-        .notes = "fixture: the Kimi K2.5 / K2.6 image-video wrapper (Kimi_K25ForConditionalGeneration) around a DeepSeek V3 text config (model_type kimi_k2 or deepseek_v3 under text_config): MLA, sigmoid routing with correction bias and group-limited top-k, shared experts, language_model prefix. The vision tower and projector pass through exports untouched. Needs BF16 weights (compressed-tensors INT4 must be dequantised first) and a tokenizer.json.",
+        .notes = "fixture: the Kimi K2.5 / K2.6 image-video wrapper (Kimi_K25ForConditionalGeneration) around a DeepSeek V3 text config (model_type kimi_k2 or deepseek_v3 under text_config): MLA, sigmoid routing with correction bias and group-limited top-k, shared experts, language_model prefix. The vision tower and projector pass through exports untouched. Needs BF16 weights (compressed-tensors INT4 must be dequantised first).",
         .extra = extraDeepseek,
     },
 };
