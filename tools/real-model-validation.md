@@ -2428,3 +2428,20 @@ own pre-rounding tensors (364 vectors), ditch's FP8 and FP4 rules give
 bit-identical results to the kernels'. A rounding boundary is a
 discontinuity no float32 implementation can match across a 1e-6 accumulation
 difference; the model is exact everywhere else.
+
+## Kimi-Linear: verified on real weights
+
+`moonshotai/Kimi-Linear-48B-A3B-Instruct`, first 4 layers: layer 0 KDA with
+the dense MLP, layers 1-2 KDA with the MoE, layer 3 MLA (no RoPE) with the MoE
+(`kda_layers` / `full_attn_layers` are 1-based ids and are cut with the
+layers). Routed experts lazy; the reference is transformers'
+`modeling_kimi_linear.py` through `tools/ref_lazy_moe.py`: `from_pretrained`
+loads everything but the routed experts with transformers' own renames and
+conv1d stacking, and the experts module reads expert `e` on demand under
+transformers' own `forward`.
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (5) | all 5 agree, worst 1.95e-06 | 1.87e-06 | match |
+| "Explain how rainbows form, …" | match (14) | all 5 agree, worst 2.12e-06 | 2.30e-06 | match |
+| 318-token passage | match (318) | all 5 agree, worst 2.56e-06 | 3.13e-06 | match |

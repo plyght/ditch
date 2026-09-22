@@ -255,7 +255,7 @@ def main():
                 for _ in range(args.max_new_tokens):
                     nxt = model(input_ids=gen, use_cache=False).logits[:, -1].argmax(-1, keepdim=True)
                     gen = torch.cat([gen, nxt], dim=-1)
-        ref_text = tok.decode(gen[0, input_ids.shape[1]:], skip_special_tokens=False)
+        ref_text = tok.decode(gen[0, input_ids.shape[1]:].tolist(), skip_special_tokens=False)
         print(f"  greedy transformers: {ref_text!r}")
         resp = entry["response"]
         if isinstance(resp, list):  # bytes that are not valid UTF-8 on their own

@@ -26,9 +26,11 @@ unprefixed `layers.N.` of DeepSeek's own naming.
 
 --drop PREFIX   leave out tensors whose name starts with PREFIX (e.g. `mtp.`,
                 the multi-token-prediction layers, which no forward pass reads)
---lazy REGEX    write the tensors whose name matches as holes of a sparse file
-                (no disk space, read as zeros) and record where each comes from
-                in `lazy.json` next to it. tools/lazy_checkpoint.py fills a
+--lazy REGEX    write the tensors whose name matches into `model-lazy.safetensors`
+                as holes of a sparse file (no disk space, read as zeros) and
+                record where each comes from in `lazy.json` next to it. Keeping
+                them in a file of their own lets a transformers reference load
+                the rest with `from_pretrained` (tools/ref_lazy_moe.py). tools/lazy_checkpoint.py fills a
                 hole from the Hub the first time a reference reads it, one
                 tensor (or one row of a large table) at a time, so after one
                 reference run the file holds exactly the routed experts and
@@ -128,10 +130,15 @@ for sh in shards:
         a, b = v['data_offsets']
         plan.append((renamed(k), v['dtype'], v['shape'], url, 8 + n + a, b - a))
 
-header, off = {}, 0
-for k, dt, shp, url, start, nb in plan:
-    header[k] = {'dtype': dt, 'shape': shp, 'data_offsets': [off, off + nb]}; off += nb
-hb = json.dumps(header).encode(); hb += b' ' * ((8 - len(hb) % 8) % 8)
+def layout(entries):
+    header, off = {}, 0
+    for k, dt, shp, url, start, nb in entries:
+        header[k] = {'dtype': dt, 'shape': shp, 'data_offsets': [off, off + nb]}; off += nb
+    hb = json.dumps(header).encode(); hb += b' ' * ((8 - len(hb) % 8) % 8)
+    return header, hb, off
+
+is_lazy = lambda k: any(p.search(k) for p in lazy)
+header, hb, off = layout([e for e in plan if not is_lazy(e[0])])
 base = 8 + len(hb)
 
 # Jobs: (url, source start, bytes, destination). Tensors stored next to each
@@ -141,10 +148,9 @@ base = 8 + len(hb)
 CH = 32 << 20
 jobs, holes = [], {}
 for k, dt, shp, url, start, nb in plan:
-    dst = base + header[k]['data_offsets'][0]
-    if any(p.search(k) for p in lazy):
-        holes[k] = {'url': url, 'src': start, 'dst': dst, 'bytes': nb, 'shape': shp, 'dtype': dt}
+    if is_lazy(k):
         continue
+    dst = base + header[k]['data_offsets'][0]
     done = 0
     while done < nb:
         m = min(CH, nb - done)
@@ -181,6 +187,17 @@ with ThreadPoolExecutor(16) as ex:
         fetched += m
         if i % 50 == 0: print(f'{fetched/1e9:.2f} GB of {total/1e9:.2f}', flush=True)
 os.close(fd)
-if holes:
-    json.dump({'file': 'model.safetensors', 'holes': holes, 'filled': {}}, open(f"{out}/lazy.json", 'w'))
-print(out, len(plan), 'tensors', off / 1e9, 'GB logical,', fetched / 1e9, 'GB fetched,', len(holes), 'lazy')
+lazy_plan = [e for e in plan if is_lazy(e[0])]
+lazy_bytes = 0
+if lazy_plan:
+    lheader, lhb, lazy_bytes = layout(lazy_plan)
+    lbase = 8 + len(lhb)
+    fd = os.open(f"{out}/model-lazy.safetensors", os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+    os.pwrite(fd, struct.pack('<Q', len(lhb)) + lhb, 0)
+    os.ftruncate(fd, lbase + lazy_bytes)
+    os.close(fd)
+    for k, dt, shp, url, start, nb in lazy_plan:
+        holes[k] = {'file': 'model-lazy.safetensors', 'url': url, 'src': start,
+                    'dst': lbase + lheader[k]['data_offsets'][0], 'bytes': nb, 'shape': shp, 'dtype': dt}
+    json.dump({'holes': holes, 'filled': {}}, open(f"{out}/lazy.json", 'w'))
+print(out, len(plan), 'tensors', (off + lazy_bytes) / 1e9, 'GB logical,', fetched / 1e9, 'GB fetched,', len(holes), 'lazy')

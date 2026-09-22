@@ -29,13 +29,21 @@ DTYPES = {
 class LazyCheckpoint:
     def __init__(self, model_dir):
         self.dir = model_dir
-        path = os.path.join(model_dir, "model.safetensors")
-        with open(path, "rb") as f:
-            n = struct.unpack("<Q", f.read(8))[0]
-            self.header = json.loads(f.read(n))
-        self.header.pop("__metadata__", None)
-        self.base = 8 + n
-        self.fd = os.open(path, os.O_RDWR)
+        self.header, self.where = {}, {}  # name -> info; name -> (fd, base)
+        self.fds = {}
+        for fn in sorted(os.listdir(model_dir)):
+            if not fn.endswith(".safetensors"):
+                continue
+            path = os.path.join(model_dir, fn)
+            with open(path, "rb") as f:
+                n = struct.unpack("<Q", f.read(8))[0]
+                h = json.loads(f.read(n))
+            h.pop("__metadata__", None)
+            fd = os.open(path, os.O_RDWR)
+            self.fds[fn] = fd
+            for k, v in h.items():
+                self.header[k] = v
+                self.where[k] = (fd, 8 + n)
         lazy_path = os.path.join(model_dir, "lazy.json")
         self.lazy = json.load(open(lazy_path)) if os.path.exists(lazy_path) else {"holes": {}, "filled": {}}
         self.lazy_path = lazy_path
@@ -46,7 +54,8 @@ class LazyCheckpoint:
         return self.header.keys()
 
     def _save(self):
-        json.dump(self.lazy, open(self.lazy_path, "w"))
+        if self.lazy["holes"]:
+            json.dump(self.lazy, open(self.lazy_path, "w"))
 
     def _fill(self, name, start, length):
         """Fetches bytes [start, start + length) of lazy tensor `name` unless already filled."""
@@ -65,7 +74,8 @@ class LazyCheckpoint:
                 pass
         else:
             raise RuntimeError(f"could not fetch {name} [{start}, {start + length})")
-        os.pwrite(self.fd, data, h["dst"] + start)
+        fd = self.where[name][0]
+        os.pwrite(fd, data, h["dst"] + start)
         done.append(key)
         self.dirty += 1
         if self.dirty % 64 == 0:
@@ -78,7 +88,8 @@ class LazyCheckpoint:
         info = self.header[name]
         if name in self.lazy["holes"]:
             self._fill(name, start, length)
-        return os.pread(self.fd, length, self.base + info["data_offsets"][0] + start)
+        fd, base = self.where[name]
+        return os.pread(fd, length, base + info["data_offsets"][0] + start)
 
     def tensor(self, name):
         info = self.header[name]
