@@ -280,6 +280,15 @@ ditch selftest --device cpu    # the backend harness against itself (zero error)
 zig fmt --check src build.zig
 ```
 
+Two tools check a family against a real checkpoint rather than a fixture.
+`ditch probe MODEL --prompt TEXT --residuals --json` reports the rendered
+prompt, its token ids, the first-token logits and the last token's residual at
+every layer, and `tools/probe_reference.py MODEL probe.json` compares all of it
+with transformers on the CPU, naming the layer a forward pass first diverges
+at. Config and tensor names can be checked without the weights: `ditch
+--dry-run hf://owner/name --max-ram 6GB` fetches the index and the shard
+headers only, runs the loader and stops at the memory estimate.
+
 Exit codes: 0 success (including `--dry-run` and a clean stop at
 `--time-limit`), 1 failure, 2 usage error or a memory budget too small for the
 model. Releases are built by `.github/workflows/release.yml` (dispatch it with a
