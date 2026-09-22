@@ -156,6 +156,22 @@ pub const Names = struct {
     qkv: ?[]const u8 = null,
     o: []const u8 = "self_attn.o_proj.weight",
     sinks: ?[]const u8 = null,
+    /// Gated DeltaNet linear-attention projections (Qwen hybrids). Qwen3-Next
+    /// fuses q/k/v/z into `lin_qkvz` and b/a into `lin_ba`; Qwen3.5 splits
+    /// them into `lin_qkv`, `lin_z`, `lin_b`, `lin_a`.
+    lin_qkvz: ?[]const u8 = null,
+    lin_qkv: ?[]const u8 = null,
+    lin_z: ?[]const u8 = null,
+    lin_b: ?[]const u8 = null,
+    lin_a: ?[]const u8 = null,
+    lin_ba: ?[]const u8 = null,
+    /// Depthwise causal convolution, time-step bias, decay and gated norm of a
+    /// linear-attention layer; its output projection is `lin_out`.
+    lin_conv: ?[]const u8 = null,
+    lin_dt_bias: ?[]const u8 = null,
+    lin_a_log: ?[]const u8 = null,
+    lin_norm: ?[]const u8 = null,
+    lin_out: ?[]const u8 = null,
     // MLA
     q_a: ?[]const u8 = null,
     q_a_norm: ?[]const u8 = null,
@@ -235,6 +251,20 @@ pub const Config = struct {
     /// Per layer: whether rotary embeddings are applied.
     rope_layers: []bool,
     positional: Positional,
+    /// Per layer: true for Gated DeltaNet linear-attention layers (Qwen
+    /// hybrids); false for full-attention layers.
+    linear_layers: []bool,
+    /// Any linear-attention layer present.
+    has_linear: bool,
+    linear_k_heads: usize,
+    linear_k_dim: usize,
+    linear_v_heads: usize,
+    linear_v_dim: usize,
+    linear_conv_kernel: usize,
+    /// Full-attention `q_proj` carries q rows then gate rows; the gate
+    /// (sigmoid, or silu when `gate_swish`) multiplies the attention output.
+    gated_attention: bool,
+    gate_swish: bool,
     /// Offset added to positions when indexing the learned table (OPT: 2).
     position_offset: usize,
     tie_word_embeddings: bool,
@@ -380,6 +410,64 @@ pub fn lookup(model_type: []const u8) ?*const Arch {
     return null;
 }
 
+fn rejectKnownHybrid(model_type: []const u8) !void {
+    const table = .{
+        .{ "kimi_linear", "Kimi K3 hybrid (gated linear attention with MXFP4 weights, no tokenizer.json)" },
+        .{ "kimi_k3", "Kimi K3 hybrid (gated linear attention with MXFP4 weights, no tokenizer.json)" },
+        .{ "kimi_k25", "Kimi K2.5+ hybrid (gated linear attention with compressed-tensors INT4 weights)" },
+        .{ "kimi_k2", "Kimi K2 (FP8 E4M3 block-quantised weights, no tokenizer.json)" },
+        .{ "qwen4_exp", "Qwen3.8-Flash-Next hybrid (linear attention with sparse indexer and hyper-connections)" },
+        .{ "qwen4_exp_text", "Qwen3.8-Flash-Next hybrid (linear attention with sparse indexer and hyper-connections)" },
+        .{ "glm5_next", "GLM-5.3-Flash hybrid (linear attention with sparse indexer and hyper-connections)" },
+        .{ "glm5_next_text", "GLM-5.3-Flash hybrid (linear attention with sparse indexer and hyper-connections)" },
+        .{ "glm_moe_lite", "GLM-4.7-Flash (not yet verified against a reference forward pass)" },
+        .{ "deepseek_v4", "DeepSeek V4 (sparse indexer, hash layers, hyper-connections, FP4/FP8 weights)" },
+        .{ "deepseek_v41", "DeepSeek V4.1 (sparse indexer, hash layers, hyper-connections, FP4/FP8 weights)" },
+    };
+    inline for (table) |e| {
+        if (std.mem.eql(u8, model_type, e[0])) {
+            std.log.err("unsupported model: {s}", .{e[1]});
+            return error.UnsupportedArchitecture;
+        }
+    }
+}
+
+fn rejectUnsupportedMath(top: std.json.ObjectMap, obj: std.json.ObjectMap) !void {
+    if (getObj(top, "quantization_config")) |qc| {
+        const method = getStr(qc, "quant_method") orelse "";
+        const fmt = getStr(qc, "format") orelse getStr(qc, "fmt") orelse "";
+        if (std.mem.eql(u8, method, "compressed-tensors") or std.mem.indexOf(u8, fmt, "mxfp4") != null or std.mem.indexOf(u8, fmt, "pack-quantized") != null) {
+            std.log.err("unsupported model: compressed/MXFP4 quantised weights cannot be dequantised", .{});
+            return error.UnsupportedArchitecture;
+        }
+        if (std.mem.eql(u8, method, "fp8")) {
+            std.log.err("unsupported model: FP8 block-quantised weights cannot be dequantised yet", .{});
+            return error.UnsupportedArchitecture;
+        }
+    }
+    if (getStr(obj, "expert_dtype")) |dt| {
+        if (!std.mem.eql(u8, dt, "bfloat16") and !std.mem.eql(u8, dt, "float32")) {
+            std.log.err("unsupported model: '{s}' expert dtype cannot be dequantised yet", .{dt});
+            return error.UnsupportedArchitecture;
+        }
+    }
+    if (getNum(obj, "num_hash_layers") != null or getBool(obj, "mhc", false) or getNum(obj, "hc_mult") != null) {
+        std.log.err("unsupported model: hyper-connections and hash layers are not implemented", .{});
+        return error.UnsupportedArchitecture;
+    }
+    if (getStr(obj, "scoring_func")) |s| {
+        if (std.mem.eql(u8, s, "sqrtsoftplus")) {
+            std.log.err("unsupported model: 'sqrtsoftplus' MoE routing is not implemented", .{});
+            return error.UnsupportedArchitecture;
+        }
+    }
+    const act = getStr(obj, "hidden_activation") orelse getStr(obj, "hidden_act") orelse getStr(obj, "activation_function") orelse "";
+    if (std.mem.eql(u8, act, "situ")) {
+        std.log.err("unsupported model: 'situ' activation is not implemented", .{});
+        return error.UnsupportedArchitecture;
+    }
+}
+
 pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
     var parsed = try std.json.parseFromSlice(std.json.Value, arena, json_text, .{});
     defer parsed.deinit();
@@ -393,6 +481,9 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         if (getStr(obj, "model_type")) |m| model_type = m;
     }
     const arch = lookup(model_type) orelse lookup(top_type) orelse {
+        try rejectKnownHybrid(model_type);
+        try rejectKnownHybrid(top_type);
+        try rejectUnsupportedMath(parsed.value.object, obj);
         var names: std.Io.Writer.Allocating = .init(arena);
         for (&registry, 0..) |*a, i| {
             if (i > 0) try names.writer.writeAll(", ");
@@ -523,12 +614,38 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
     };
     const sliding_layers = try arena.alloc(bool, layers);
     @memset(sliding_layers, false);
+    const linear_layers = try arena.alloc(bool, layers);
+    @memset(linear_layers, false);
+    var has_linear = false;
     if (obj.get("layer_types")) |lt| {
         if (lt == .array) {
             for (lt.array.items, 0..) |v, i| {
-                if (i < layers and v == .string) sliding_layers[i] = std.mem.eql(u8, v.string, "sliding_attention") or std.mem.eql(u8, v.string, "chunked_attention");
+                if (i < layers and v == .string) {
+                    const t = v.string;
+                    if (std.mem.eql(u8, t, "sliding_attention") or std.mem.eql(u8, t, "chunked_attention")) {
+                        sliding_layers[i] = true;
+                    } else if (std.mem.eql(u8, t, "linear_attention")) {
+                        linear_layers[i] = true;
+                        has_linear = true;
+                    } else if (std.mem.eql(u8, t, "full_attention")) {} else if (std.mem.eql(u8, t, "deepseek_sparse_attention")) {
+                        // Zhipu's sparse indexer selects a top-k over the keys; for
+                        // the short calibration contexts ditch scores, the top-k
+                        // covers the whole context, so dense attention is exact.
+                        std.log.warn("deepseek_sparse_attention runs as dense attention (exact for short contexts)", .{});
+                    } else {
+                        std.log.err("unsupported layer type '{s}' (only full/sliding/linear attention are implemented)", .{t});
+                        return error.UnsupportedArchitecture;
+                    }
+                }
             }
         }
+    } else if (getNum(obj, "full_attention_interval")) |_| {
+        // Qwen3-Next style hybrid: every Nth layer is full attention, the rest linear.
+        const interval = getInt(obj, "full_attention_interval", 4);
+        if (interval > 0) for (linear_layers, 0..) |*l, i| {
+            l.* = ((i + 1) % interval != 0);
+            has_linear = has_linear or l.*;
+        };
     } else if (sliding_window != null and getNum(obj, "sliding_window_pattern") == null) {
         @memset(sliding_layers, true);
     }
@@ -567,6 +684,23 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
     }
     const intermediate_size = getIntAny(obj, &.{ "intermediate_size", "n_inner", "ffn_dim", "ffn_hidden_size" }, 0);
 
+    const linear_k_heads = getInt(obj, "linear_num_key_heads", 0);
+    const linear_k_dim = getInt(obj, "linear_key_head_dim", 0);
+    const linear_v_heads = getInt(obj, "linear_num_value_heads", 0);
+    const linear_v_dim = getInt(obj, "linear_value_head_dim", 0);
+    const linear_conv_kernel = getInt(obj, "linear_conv_kernel_dim", 0);
+    if (has_linear and (linear_k_heads == 0 or linear_k_dim == 0 or linear_v_heads == 0 or linear_v_dim == 0 or linear_conv_kernel == 0)) {
+        std.log.err("linear_attention layers need linear_num_key_heads/key_head_dim/num_value_heads/value_head_dim/conv_kernel_dim", .{});
+        return error.InvalidConfig;
+    }
+    const gate_swish = blk: {
+        const t = getStr(obj, "output_gate_type") orelse break :blk false;
+        if (std.mem.eql(u8, t, "swish") or std.mem.eql(u8, t, "silu")) break :blk true;
+        if (std.mem.eql(u8, t, "sigmoid")) break :blk false;
+        std.log.err("unsupported output_gate_type '{s}'", .{t});
+        return error.UnsupportedArchitecture;
+    };
+
     const rope_layers = try arena.alloc(bool, layers);
     @memset(rope_layers, arch.positional == .rope);
 
@@ -589,6 +723,15 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         .rope_style = arch.rope_style,
         .rope_layers = rope_layers,
         .positional = arch.positional,
+        .linear_layers = linear_layers,
+        .has_linear = has_linear,
+        .linear_k_heads = linear_k_heads,
+        .linear_k_dim = linear_k_dim,
+        .linear_v_heads = linear_v_heads,
+        .linear_v_dim = linear_v_dim,
+        .linear_conv_kernel = linear_conv_kernel,
+        .gated_attention = false,
+        .gate_swish = gate_swish,
         .position_offset = 0,
         .tie_word_embeddings = getBool(obj, "tie_word_embeddings", arch.tie_word_embeddings),
         .activation = act,
@@ -880,6 +1023,35 @@ fn extraBaichuan(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
 
 fn extraQwenVl(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
     if (std.mem.startsWith(u8, c.model_type, "qwen2")) c.attention_bias = getBool(obj, "attention_bias", true);
+}
+
+fn extraQwenHybrid(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
+    c.qk_norm = .head;
+    c.gated_attention = true;
+    if (c.num_experts > 0 and getNum(obj, "norm_topk_prob") == null and std.mem.startsWith(u8, c.model_type, "qwen3_5_moe")) {
+        c.norm_topk_prob = true;
+    }
+}
+
+fn extraGlm4Moe(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
+    if (getBool(obj, "use_qk_norm", false)) c.qk_norm = .head;
+    c.moe.scoring = .sigmoid;
+    c.moe.topk_method = .group_limited;
+    c.moe.n_group = @max(1, getInt(obj, "n_group", 1));
+    c.moe.topk_group = @max(1, getInt(obj, "topk_group", 1));
+    c.moe.routed_scaling_factor = getF32(obj, "routed_scaling_factor", 1.0);
+}
+
+fn extraGlmMoeDsa(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
+    c.rope_style = if (getBool(obj, "rope_interleave", true)) .gptj else .neox;
+    c.moe.scoring = .sigmoid;
+    c.moe.topk_method = .group_limited;
+    c.moe.n_group = @max(1, getInt(obj, "n_group", 1));
+    c.moe.topk_group = @max(1, getInt(obj, "topk_group", 1));
+    c.moe.routed_scaling_factor = getF32(obj, "routed_scaling_factor", 1.0);
+    if (getNum(obj, "index_topk") != null) {
+        std.log.warn("sparse indexer runs as dense attention (exact for short contexts)", .{});
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1516,6 +1688,111 @@ pub const registry = [_]Arch{
         .names = .{ .q = null, .k = null, .v = null, .qkv = "self_attn.W_pack.weight" },
         .notes = "fixture: fused W_pack (7B, RoPE). The 13B ALiBi variant (detected by model_max_length) is unverified. Needs a tokenizer.json (the SentencePiece-only checkpoints must be converted).",
         .extra = extraBaichuan,
+    },
+    .{
+        .model_type = "qwen3_next",
+        .llama_cpp = null,
+        .chat = "chatml",
+        .verified = true,
+        .qk_norm = .head,
+        .names = .{
+            .q_norm = "self_attn.q_norm.weight",
+            .k_norm = "self_attn.k_norm.weight",
+            .lin_qkvz = "linear_attn.in_proj_qkvz.weight",
+            .lin_ba = "linear_attn.in_proj_ba.weight",
+            .lin_conv = "linear_attn.conv1d.weight",
+            .lin_dt_bias = "linear_attn.dt_bias",
+            .lin_a_log = "linear_attn.A_log",
+            .lin_norm = "linear_attn.norm.weight",
+            .lin_out = "linear_attn.out_proj.weight",
+            .shared_expert = "mlp.shared_expert.",
+            .shared_expert_gate = "mlp.shared_expert_gate.weight",
+        },
+        .notes = "fixture: Gated DeltaNet linear layers (fused projections, full_attention_interval), sigmoid-gated full attention with per-head q/k norms, partial rotary, softmax MoE with shared expert.",
+        .extra = extraQwenHybrid,
+    },
+    .{
+        .model_type = "qwen3_5",
+        .aliases = &.{"qwen3_5_text"},
+        .llama_cpp = null,
+        .chat = "chatml",
+        .verified = true,
+        .qk_norm = .head,
+        .names = .{
+            .q_norm = "self_attn.q_norm.weight",
+            .k_norm = "self_attn.k_norm.weight",
+            .lin_qkv = "linear_attn.in_proj_qkv.weight",
+            .lin_z = "linear_attn.in_proj_z.weight",
+            .lin_b = "linear_attn.in_proj_b.weight",
+            .lin_a = "linear_attn.in_proj_a.weight",
+            .lin_conv = "linear_attn.conv1d.weight",
+            .lin_dt_bias = "linear_attn.dt_bias",
+            .lin_a_log = "linear_attn.A_log",
+            .lin_norm = "linear_attn.norm.weight",
+            .lin_out = "linear_attn.out_proj.weight",
+        },
+        .notes = "fixture: Gated DeltaNet linear layers (split projections, explicit layer_types), gated full attention, partial rotary. Multimodal wrappers keep the text config nested; vision weights pass through exports untouched.",
+        .extra = extraQwenHybrid,
+    },
+    .{
+        .model_type = "qwen3_5_moe",
+        .aliases = &.{"qwen3_5_moe_text"},
+        .llama_cpp = null,
+        .chat = "chatml",
+        .verified = true,
+        .qk_norm = .head,
+        .names = .{
+            .q_norm = "self_attn.q_norm.weight",
+            .k_norm = "self_attn.k_norm.weight",
+            .lin_qkv = "linear_attn.in_proj_qkv.weight",
+            .lin_z = "linear_attn.in_proj_z.weight",
+            .lin_b = "linear_attn.in_proj_b.weight",
+            .lin_a = "linear_attn.in_proj_a.weight",
+            .lin_conv = "linear_attn.conv1d.weight",
+            .lin_dt_bias = "linear_attn.dt_bias",
+            .lin_a_log = "linear_attn.A_log",
+            .lin_norm = "linear_attn.norm.weight",
+            .lin_out = "linear_attn.out_proj.weight",
+            .shared_expert = "mlp.shared_expert.",
+            .shared_expert_gate = "mlp.shared_expert_gate.weight",
+        },
+        .notes = "fixture: split-projection linear layers with a swish output gate, fused softmax MoE with shared expert.",
+        .extra = extraQwenHybrid,
+    },
+    .{
+        .model_type = "glm4_moe",
+        .aliases = &.{"glm4v_moe_text"},
+        .llama_cpp = null,
+        .chat = "glm4",
+        .verified = true,
+        .attention_bias = true,
+        .names = .{
+            .prefixes = &.{ "model.", "model.language_model.", "language_model.model.", "" },
+            .q_norm = "self_attn.q_norm.weight",
+            .k_norm = "self_attn.k_norm.weight",
+            .router_correction_bias = "mlp.gate.e_score_correction_bias",
+            .shared_expert = "mlp.shared_experts.",
+        },
+        .notes = "fixture: dense attention with per-head q/k norms (use_qk_norm), partial rotary, sigmoid MoE with correction bias and shared experts. The glm4v_moe image/video wrapper runs its text config; vision weights pass through exports untouched.",
+        .extra = extraGlm4Moe,
+    },
+    .{
+        .model_type = "glm_moe_dsa",
+        .llama_cpp = null,
+        .chat = "glm4",
+        .verified = true,
+        .names = .{
+            .q_a = "self_attn.q_a_proj.weight",
+            .q_a_norm = "self_attn.q_a_layernorm.weight",
+            .q_b = "self_attn.q_b_proj.weight",
+            .kv_a = "self_attn.kv_a_proj_with_mqa.weight",
+            .kv_a_norm = "self_attn.kv_a_layernorm.weight",
+            .kv_b = "self_attn.kv_b_proj.weight",
+            .router_correction_bias = "mlp.gate.e_score_correction_bias",
+            .shared_expert = "mlp.shared_experts.",
+        },
+        .notes = "fixture: MLA with a sparse indexer (run as dense attention: exact for short contexts), sigmoid MoE with correction bias and shared experts.",
+        .extra = extraGlmMoeDsa,
     },
 };
 
