@@ -86,6 +86,11 @@ a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
   `qwen3_5` / `qwen3_5_moe` (Qwen3.5, Qwen3.8 dense and MoE, text configs;
   the linear recurrence runs sequentially, so long prefills are slower
   than on dense models)
+* Kimi: `kimi_linear` (Kimi-Linear-48B-A3B: Kimi Delta Attention with
+  per-channel decay, 3:1 with MLA layers without RoPE, DeepSeek-V3-style
+  MoE with a shared expert; both the original checkpoint layout and the
+  transformers module layout), `kimi_k25` (Kimi K2.5 / K2.6: the DeepSeek
+  V3 text config of the image-video wrapper)
 * Gemma 2 / Gemma 3 (text), GLM-4 (`glm4`, `glm`) and ChatGLM3 / GLM-4-9B
   (`chatglm`), GLM-4.5 dense and MoE (`glm4_moe`, also the `glm4v_moe`
   image/video text config), GLM-5 family (`glm_moe_dsa`, whose sparse
@@ -106,9 +111,8 @@ LayerNorm), Gemma 2 logit softcapping, `dynamic` and `longrope` scaling
 beyond the original context (treated as static / short factors).
 
 Not supported: state-space and hybrid models (Mamba, Jamba, Falcon-H1,
-Nemotron-H, RWKV), Kimi K3 / K2.5+ (gated linear attention with MXFP4 or
-compressed-tensors weights, no `tokenizer.json`), Kimi K2 (FP8 weights, no
-`tokenizer.json`), Qwen3.8-Flash-Next (`qwen4_exp`), GLM-5.3-Flash
+Nemotron-H, RWKV), Kimi K3 (its weights format and AttnRes), Kimi K2 (FP8
+weights, no `tokenizer.json`), Qwen3.8-Flash-Next (`qwen4_exp`), GLM-5.3-Flash
 (`glm5_next`) and DeepSeek V4 (sparse indexers with hyper-connections and
 hash layers, FP4/FP8 weights), encoder-decoder models, Gemma 3n (per-layer
 inputs), MiniCPM3, GraniteMoE, OPT-350m (projection layers), FP8
@@ -120,7 +124,7 @@ unknown layer types, quantisation formats and activations are errors, not
 silent fallbacks. Unicode normalisers (NFKC, Precompiled) are
 approximated by the identity.
 
-Image and video models (Qwen2/3-VL, Qwen3.5, GLM-4.5V, Llama 4) run
+Image and video models (Qwen2/3-VL, Qwen3.5, GLM-4.5V, Llama 4, Kimi K2.5) run
 through their text config: the vision tower is never executed, its
 weights pass through exports byte for byte, and refusal directions are
 measured on text prompts.
