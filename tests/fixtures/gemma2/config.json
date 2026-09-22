@@ -1,0 +1,19 @@
+{
+ "model_type": "gemma2",
+ "hidden_size": 32,
+ "intermediate_size": 32,
+ "num_hidden_layers": 3,
+ "num_attention_heads": 4,
+ "num_key_value_heads": 2,
+ "head_dim": 8,
+ "sliding_window": 4,
+ "query_pre_attn_scalar": 16,
+ "attn_logit_softcapping": 1.0,
+ "final_logit_softcapping": 20.0,
+ "rms_norm_eps": 1e-06,
+ "rope_theta": 10000.0,
+ "hidden_activation": "gelu_pytorch_tanh",
+ "max_position_embeddings": 128,
+ "tie_word_embeddings": true,
+ "vocab_size": 374
+}

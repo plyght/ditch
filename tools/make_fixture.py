@@ -404,6 +404,9 @@ def base(**kw):
         attn_bias=False, o_bias=None, conv1d=False,
         mlp="gated", gate="mlp.gate_proj.weight", up="mlp.up_proj.weight", gate_up=None, down="mlp.down_proj.weight", mlp_bias=False, act="silu",
         parallel=False, pos="rope", rope_style="neox", rotary_dim=None, theta=10000.0, scaling=None, rope_layers=None, attn_scale=None,
+        # `tanh` softcap on the attention logits, applied to the scaled scores
+        # before the causal / sliding mask (Gemma 2).
+        attn_softcap=None,
         qk_norm=None, q_norm="self_attn.q_norm.weight", k_norm="self_attn.k_norm.weight", clip=None,
         residual_mult=1.0, logit_scale=1.0, embed_scale=1.0, lm_bias=False, sinks=None, temp=None, pos_offset=0,
         sliding=None, sliding_layers=None, mla=None, moe=None, linear=None, linear_layers=None, full_interval=0,
@@ -567,6 +570,30 @@ spec("deepseek_v3", tok="deepseek3", NKV=4, HD=12, VD=8, L=3, rope_style="gptj",
              "scoring_func": "sigmoid", "topk_method": "noaux_tc", "n_group": 2, "topk_group": 1, "routed_scaling_factor": 2.5,
              "norm_topk_prob": True, "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "max_position_embeddings": 128, "hidden_act": "silu",
              "tie_word_embeddings": False, "rope_interleave": True})
+# DeepSeek V3.2-Exp: the V3 layout with every layer an `indexed_attention`
+# layer whose lightning indexer keeps the best `index_topk` keys. While the
+# prompt fits `index_topk` the indexer selects every key, so the reference is
+# the plain dense V3 forward pass; the indexer's own tensors are never read and
+# must survive exports untouched. `index_topk` is 16 here, which covers the
+# fixture prompts and the tokens generated from them; a longer prompt is
+# refused rather than silently approximated.
+DSV32_INDEXER = [("self_attn.indexer.wq_b.weight", (2 * 4, 12)), ("self_attn.indexer.wk.weight", (4, 32)),
+                 ("self_attn.indexer.k_norm.weight", (4,)), ("self_attn.indexer.k_norm.bias", (4,)),
+                 ("self_attn.indexer.weights_proj.weight", (2, 32))]
+spec("deepseek_v32", tok="deepseek3", NKV=4, HD=12, VD=8, L=3, rope_style="gptj", rotary_dim=4, lm_head="lm_head.weight",
+     mla={"q_lora_rank": 12, "kv_lora_rank": 16, "nope": 8, "rope": 4, "v": 8},
+     scaling={"type": "yarn", "factor": 40.0, "beta_fast": 32, "beta_slow": 1, "mscale": 1.0, "mscale_all_dim": 1.0, "original_max_position_embeddings": 32},
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "scoring": "sigmoid", "group_limited": True, "n_group": 2, "topk_group": 1, "rsf": 2.5, "norm": True,
+          "layers": [1, 2], "corr_bias": True, "layout": "separate", "prefix": "mlp.", "router": "gate.weight", "shared_name": "shared_experts."},
+     extra_layer_tensors={i: DSV32_INDEXER for i in range(3)},
+     config={"model_type": "deepseek_v32", "hidden_size": 32, "intermediate_size": 32, "moe_intermediate_size": 12, "num_hidden_layers": 3,
+             "num_attention_heads": 4, "num_key_value_heads": 4, "q_lora_rank": 12, "kv_lora_rank": 16, "qk_nope_head_dim": 8, "qk_rope_head_dim": 4,
+             "v_head_dim": 8, "n_routed_experts": 4, "n_shared_experts": 1, "num_experts_per_tok": 2, "first_k_dense_replace": 1,
+             "mlp_layer_types": ["dense", "sparse", "sparse"], "layer_types": ["indexed_attention"] * 3,
+             "index_topk": 16, "index_n_heads": 2, "index_head_dim": 4,
+             "scoring_func": "sigmoid", "topk_method": "noaux_tc", "n_group": 2, "topk_group": 1, "routed_scaling_factor": 2.5,
+             "norm_topk_prob": True, "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "max_position_embeddings": 128, "hidden_act": "silu",
+             "tie_word_embeddings": False, "rope_interleave": True})
 spec("llama4", tok="llama3", L=3, prefix="language_model.model.", lm_head="language_model.lm_head.weight", rope_style="gptj", rope_layers=[1, 0, 1],
      qk_norm="l2", temp={"floor_scale": 2.0, "attn_scale": 0.1}, gate="feed_forward.gate_proj.weight", up="feed_forward.up_proj.weight", down="feed_forward.down_proj.weight",
      moe={"E": 4, "K": 1, "MI": 12, "shared": 1, "scoring": "sigmoid", "group_limited": False, "rsf": 1.0, "norm": False, "scale_input": True,
@@ -668,10 +695,17 @@ spec("gpt_bigcode", tok="starcoder", NKV=1, I=64, prefix="transformer.", layer="
 spec("baichuan", tok="spm", NKV=4, qkv="self_attn.W_pack.weight", lm_head=None,
      config={"model_type": "baichuan", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4, "rms_norm_eps": 1e-6,
              "max_position_embeddings": 128, "hidden_act": "silu", "tie_word_embeddings": True})
-spec("mistral", tok="llama3", sliding=4, sliding_layers=[1, 1], lm_head=None,
+# Mistral: the llama layout with a sliding window on every layer and an
+# explicit head_dim. The window (4) is shorter than the fixture prompts, so the
+# local mask bites, and head_dim (12) is not hidden_size / num_attention_heads,
+# so the explicit key is what sizes the projections.
+spec("mistral", tok="llama3", HD=12, sliding=4, sliding_layers=[1, 1], lm_head=None,
      config={"model_type": "mistral", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
-             "head_dim": 8, "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "sliding_window": 4, "hidden_act": "silu", "max_position_embeddings": 128,
+             "head_dim": 12, "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "sliding_window": 4, "hidden_act": "silu", "max_position_embeddings": 128,
              "tie_word_embeddings": True})
+# Mixtral: softmax top-k routing with renormalisation over separate expert
+# tensors named the way released Mixtral checkpoints store them
+# (block_sparse_moe.experts.{e}.w1 / w2 / w3).
 spec("mixtral", tok="llama3", L=2, lm_head=None,
      moe={"E": 4, "K": 2, "MI": 12, "shared": 0, "scoring": "softmax", "group_limited": False, "rsf": 1.0, "norm": True,
           "layers": [0, 1], "corr_bias": False, "layout": "separate", "prefix": "block_sparse_moe.", "router": "gate.weight",
@@ -679,12 +713,16 @@ spec("mixtral", tok="llama3", L=2, lm_head=None,
      config={"model_type": "mixtral", "hidden_size": 32, "intermediate_size": 12, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
              "num_local_experts": 4, "num_experts_per_tok": 2, "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "silu",
              "max_position_embeddings": 128, "tie_word_embeddings": True})
-spec("qwen2_moe", tok="qwen2", L=2, attn_bias=True, o_bias=False, lm_head=None,
+# Qwen2-MoE: softmax top-k routing over experts of `moe_intermediate_size`
+# (12) plus a shared expert of `shared_expert_intermediate_size` (16) behind a
+# sigmoid gate, all three widths different from the dense `intermediate_size`
+# (32) that layer 0 keeps through `mlp_only_layers`.
+spec("qwen2_moe", tok="qwen2", L=3, attn_bias=True, o_bias=False, lm_head=None,
      moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "shared_inter": 16, "shared_gate": True, "scoring": "softmax", "group_limited": False, "rsf": 1.0, "norm": False,
-          "layers": [0, 1], "corr_bias": False, "layout": "separate", "prefix": "mlp.", "router": "gate.weight", "shared_name": "shared_expert."},
+          "layers": [1, 2], "corr_bias": False, "layout": "separate", "prefix": "mlp.", "router": "gate.weight", "shared_name": "shared_expert."},
      config={"model_type": "qwen2_moe", "hidden_size": 32, "intermediate_size": 32, "moe_intermediate_size": 12, "shared_expert_intermediate_size": 16,
-             "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2, "num_experts": 4, "num_experts_per_tok": 2, "norm_topk_prob": False,
-             "decoder_sparse_step": 1, "mlp_only_layers": [], "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "silu",
+             "num_hidden_layers": 3, "num_attention_heads": 4, "num_key_value_heads": 2, "num_experts": 4, "num_experts_per_tok": 2, "norm_topk_prob": False,
+             "decoder_sparse_step": 1, "mlp_only_layers": [0], "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "silu",
              "max_position_embeddings": 128, "tie_word_embeddings": True})
 spec("qwen3_next", tok="qwen2", H=32, I=32, L=4, NH=4, NKV=2, HD=8, rotary_dim=2, qk_norm="head", gated_q=True,
      linear={"KH": 2, "KD": 4, "VH": 4, "VD": 4, "KC": 2, "fused": True}, full_interval=4,
@@ -1024,6 +1062,21 @@ spec("mistral4", tok="llama3", NKV=4, HD=12, VD=8, L=3, prefix="model.language_m
                                                  "beta_fast": 32.0, "beta_slow": 1.0, "mscale": 1.0, "mscale_all_dim": 1.0, "llama_4_scaling_beta": 0.1,
                                                  "partial_rotary_factor": 4 / 12}},
              "vision_config": {"model_type": "pixtral"}})
+# Gemma 2: the Gemma layout with (1 + w) norms, four norms per layer,
+# alternating local (sliding) and global layers, `query_pre_attn_scalar`
+# instead of 1/sqrt(head_dim), and tanh softcapping on both the attention
+# logits and the output logits. The window (4) is shorter than the prompts, so
+# the local mask bites, and the caps are small enough that the tanh is well
+# inside its non-linear range.
+spec("gemma2", tok="spm", L=3, NH=4, NKV=2, HD=8, lm_head=None, act="gelu_tanh", norm="rms1p",
+     post_attn_norm="post_attention_layernorm.weight", pre_ff_norm="pre_feedforward_layernorm.weight",
+     post_ff_norm="post_feedforward_layernorm.weight", embed_scale=np.sqrt(32.0),
+     attn_scale=1.0 / np.sqrt(16.0), attn_softcap=1.0, final_softcap=20.0, sliding=4, sliding_layers=[1, 0, 1],
+     config={"model_type": "gemma2", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 3,
+             "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8, "sliding_window": 4,
+             "query_pre_attn_scalar": 16, "attn_logit_softcapping": 1.0, "final_logit_softcapping": 20.0,
+             "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_activation": "gelu_pytorch_tanh",
+             "max_position_embeddings": 128, "tie_word_embeddings": True})
 spec("gemma4", tok="spm", L=5, NH=4, NKV=2, HD=8, prefix="model.language_model.", lm_head=None, act="gelu_tanh", attn_scale=1.0,
      post_attn_norm="post_attention_layernorm.weight", pre_ff_norm="pre_feedforward_layernorm.weight", post_ff_norm="post_feedforward_layernorm.weight",
      embed_scale=np.sqrt(32.0), qk_norm="head", v_norm=True, k_eq_v=True, sliding=4, sliding_layers=[1, 0, 1, 1, 0], layer_hd=[8, 16, 8, 8, 16],
@@ -2058,6 +2111,9 @@ def generate_generic(family, out_dir):
         for hh in range(NH):
             kv = hh // groups
             sc_ = (q[:, hh, :] @ k[:, kv, :].T) * attn_scale
+            if s["attn_softcap"]:
+                cap = np.float32(s["attn_softcap"])
+                sc_ = cap * np.tanh(sc_ / cap)
             if slopes:
                 sc_ = sc_ + slopes[hh] * np.arange(T)[None, :]
             mask = np.triu(np.ones((T, T), dtype=bool), k=1)
