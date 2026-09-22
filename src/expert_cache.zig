@@ -281,7 +281,8 @@ pub const ExpertCache = struct {
 
     // -- loading --------------------------------------------------------------------
 
-    /// Reads all three matrices of `ex` into `e` through the store (synchronously).
+    /// Reads the matrices of `ex` (three, or two for a non-gated expert)
+    /// into `e` through the store (synchronously).
     fn loadEntry(self: *ExpertCache, e: *Entry, ex: *const moe.Expert) !void {
         const store = self.store;
         var n: usize = 0;
@@ -293,15 +294,17 @@ pub const ExpertCache = struct {
         } else {
             e.leases[0] = try ex.gate_ref.acquire(store);
             n = 1;
-            e.leases[1] = try ex.up_ref.acquire(store);
-            n = 2;
+            if (ex.gated) {
+                e.leases[1] = try ex.up_ref.acquire(store);
+                n = 2;
+            }
         }
-        e.leases[2] = try ex.down_ref.acquire(store);
-        n = 3;
-        e.n_leases = 3;
+        e.leases[n] = try ex.down_ref.acquire(store);
+        n += 1;
+        e.n_leases = n;
         e.gate = e.leases[0].weight;
-        e.up = e.leases[1].weight;
-        e.down = e.leases[2].weight;
+        e.up = if (ex.gated) e.leases[1].weight else e.gate;
+        e.down = e.leases[n - 1].weight;
         _ = @atomicRmw(u64, &self.bytes_read, .Add, e.bytes, .monotonic);
     }
 

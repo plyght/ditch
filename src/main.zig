@@ -879,7 +879,7 @@ const App = struct {
         const ids = try model.tokenizer.encode(gpa, text, true);
         defer gpa.free(ids);
         const max_len = ids.len + max_new + 1;
-        const kv_bytes = model_mod.KvCache.bytesFor(c.num_layers, 1, max_len, c.num_kv_heads * c.head_dim);
+        const kv_bytes = model_mod.KvCache.bytesFor(c.num_layers, 1, max_len, c.kvDim());
         var ws = try model_mod.Workspace.init(gpa, c, stream.workspaceRows(model, @max(ids.len, 1), 1, kv_bytes), 1);
         defer ws.deinit();
         var cache = try model_mod.KvCache.initFor(model, gpa, 1, max_len);
@@ -961,7 +961,7 @@ fn detectBatchSize(gpa: Allocator, io: Io, engine: *Engine, settings: *config.Se
         // workspace could not be resident (it would only spill and slow down).
         if (batch_size > 1) {
             const c = &engine.model.config;
-            const kv = model_mod.KvCache.bytesFor(c.num_layers, batch_size, longest + settings.max_response_length + 1, c.num_kv_heads * c.head_dim);
+            const kv = model_mod.KvCache.bytesFor(c.num_layers, batch_size, longest + settings.max_response_length + 1, c.kvDim());
             const rows = batch_size * longest;
             if (engine.workspaceRows(rows, batch_size, kv) < rows) {
                 try out.print("* Batch size {d} would exceed the memory budget; keeping {d}\n", .{ batch_size, best_batch_size });

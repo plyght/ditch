@@ -28,7 +28,7 @@ fn lastLogits(gpa: std.mem.Allocator, model: *Model, texts: []const []const u8, 
     const c = &model.config;
     var ws = try model_mod.Workspace.init(gpa, c, 64, 8);
     defer ws.deinit();
-    var cache = try model_mod.KvCache.init(gpa, c.num_layers, texts.len, 64, c.num_kv_heads * c.head_dim);
+    var cache = try model_mod.KvCache.init(gpa, c.num_layers, texts.len, 64, c.kvDim());
     defer cache.deinit();
     var prompts = std.ArrayList([]const u32).empty;
     defer {

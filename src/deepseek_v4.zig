@@ -716,8 +716,8 @@ fn attention(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace
     const half = rd / 2;
     const qlr = d.q_lora_rank;
     const compress_rope = d.branch[li] != .none;
-    const cos = if (compress_rope) model.rope_cos_compress else model.rope_cos;
-    const sin = if (compress_rope) model.rope_sin_compress else model.rope_sin;
+    const cos = if (compress_rope) model.rope_cos_compress else model.rope.cos;
+    const sin = if (compress_rope) model.rope_sin_compress else model.rope.sin;
 
     // Queries: low-rank projection, norm, expansion, (V4) unweighted head norm, rope on the tail.
     const q_res = try gpa.alloc(f32, n * qlr);
@@ -734,7 +734,7 @@ fn attention(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace
     // Keys/values: one latent per token, normed, roped, (V4.1) FP8-rounded.
     try tensor.matmulT(model.pool, gpa, ws.k, h, n, w.kv, null);
     for (0..n) |t| {
-        const pos = @min(rows[t].pos, model.rope_len - 1);
+        const pos = @min(rows[t].pos, model.rope.len - 1);
         const cr = cos[pos * half ..][0..half];
         const sr = sin[pos * half ..][0..half];
         for (0..nh) |hh| {
@@ -825,7 +825,7 @@ fn attention(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace
     const gout = try gpa.alloc(f32, n * d.o_lora_rank);
     defer gpa.free(gout);
     for (0..n) |t| {
-        const pos = @min(rows[t].pos, model.rope_len - 1);
+        const pos = @min(rows[t].pos, model.rope.len - 1);
         const cr = cos[pos * half ..][0..half];
         const sr = sin[pos * half ..][0..half];
         for (0..nh) |hh| ropeTail(ws.attn[t * nh * hd + hh * hd ..][0..hd], rd, cr, sr, -1.0);
@@ -967,7 +967,7 @@ fn compressorUpdate(model: *const Model, comp: Compressor, li: usize, cc: *Compr
             }
         }
         tensor.rmsnorm(tmp, entry, comp.norm, c.rms_norm_eps, false);
-        const gpos = @min(g * ratio, model.rope_len - 1);
+        const gpos = @min(g * ratio, model.rope.len - 1);
         ropeTail(tmp, rd, model.rope_cos_compress[gpos * half ..][0..half], model.rope_sin_compress[gpos * half ..][0..half], 1.0);
         if (d.fake_quant) fakeQuantFp4(tmp, 16, true);
         @memcpy(cc.entriesOf(ci, b)[g * hd ..][0..hd], tmp);

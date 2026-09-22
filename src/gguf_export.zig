@@ -298,7 +298,7 @@ fn addArchKeys(w: *gguf.Writer, a: Allocator, model: *const Model, file_type: u3
                 break;
             };
             if (pattern > 0) try w.addU32(try k.key("attention.sliding_window_pattern"), @intCast(pattern));
-            try w.addF32(try k.key("rope.freq_base_swa"), c.rope_local_theta);
+            try w.addF32(try k.key("rope.freq_base_swa"), if (c.rope_local) |l| l.theta else c.rope_theta);
         }
     }
     if (c.num_experts > 0) {

@@ -294,6 +294,7 @@ test "template detection and rendering" {
     try std.testing.expectEqualStrings("<bos><start_of_turn>user\nSys.\n\nHi<end_of_turn>\n<start_of_turn>model\n", g);
     try std.testing.expectEqual(Template.kimi, detect("{{ '<|im_user|>user<|im_middle|>' }}", "deepseek_v3"));
     try std.testing.expectEqual(Template.kimi, detect(null, "kimi_k25"));
+    try std.testing.expectEqual(Template.kimi_k3, detect(null, "kimi_k3"));
     try std.testing.expectEqual(Template.kimi_k3, detect("<|open|>message<|sep|><|close|>message<|sep|><|end_of_msg|>", "kimi_k3"));
     const k = try renderPrompt(gpa, .kimi, "Sys.", "Hi");
     defer gpa.free(k);

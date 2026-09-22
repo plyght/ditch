@@ -20,6 +20,10 @@
 //!   holding E2M1 nibble pairs (low nibble first) and `*_scales` U8
 //!   `[..., R, C/32]` E8M0 exponents (bias 127). The bf16 tensor is the
 //!   `[..., C, R]` transpose, the layout of the bf16 gpt-oss checkpoints.
+//! * compressed-tensors `mxfp4-pack-quantized` (Kimi K3 experts): `weight_packed`
+//!   U8 `[..., R, C/2]` holding E2M1 nibble pairs (low nibble first, in the
+//!   natural `[out][in]` layout) and `weight_scale` U8 `[..., R, C/32]` E8M0
+//!   exponents (bias 127). `w = code * 2^(scale - 127)`.
 //! * compressed-tensors `pack-quantized` (Kimi K2.5): `weight_packed` I32 with
 //!   `num_bits`-wide fields packed densely from the low end, `weight_scale`
 //!   per group of `group_size` columns (or per row / per tensor),
@@ -44,7 +48,7 @@ pub const chunk_bytes: usize = 4 << 20;
 // Config
 // ---------------------------------------------------------------------------
 
-pub const Method = enum { none, fp8, mxfp4, int_packed };
+pub const Method = enum { none, fp8, mxfp4, mxfp4_packed, int_packed };
 
 /// The `quantization_config` of a config.json, reduced to what the decoders need.
 pub const QuantConfig = struct {
@@ -94,6 +98,29 @@ pub fn parseQuantConfig(qc: ?std.json.ObjectMap) !QuantConfig {
     if (std.mem.eql(u8, method, "compressed-tensors")) {
         if (std.mem.eql(u8, format, "float-quantized")) return .{ .method = .fp8, .label = "compressed-tensors float-quantized" };
         if (std.mem.eql(u8, format, "dense") or format.len == 0) return .{};
+        if (std.mem.eql(u8, format, "mxfp4-pack-quantized")) {
+            // Kimi K3: 4-bit float weights in groups of 32 with E8M0 scales;
+            // the compressor only ever writes this layout for that scheme.
+            if (obj.get("config_groups")) |groups| {
+                if (groups == .object) {
+                    var it = groups.object.iterator();
+                    while (it.next()) |g| {
+                        if (g.value_ptr.* != .object) continue;
+                        const w = g.value_ptr.object.get("weights") orelse continue;
+                        if (w != .object) continue;
+                        const t = objStr(w.object, "type") orelse "float";
+                        const bits = objInt(w.object, "num_bits") orelse 4;
+                        const group = objInt(w.object, "group_size") orelse 32;
+                        if (!std.mem.eql(u8, t, "float") or bits != 4 or group != 32) {
+                            std.log.err("unsupported model: mxfp4-pack-quantized weights of type '{s}', {d} bits, group {d} (float, 4 bits, groups of 32 are supported)", .{ t, bits, group });
+                            return error.UnsupportedArchitecture;
+                        }
+                        break;
+                    }
+                }
+            }
+            return .{ .method = .mxfp4_packed, .label = "compressed-tensors mxfp4-pack-quantized" };
+        }
         if (std.mem.eql(u8, format, "pack-quantized")) {
             var out = QuantConfig{ .method = .int_packed, .label = "compressed-tensors pack-quantized" };
             if (obj.get("config_groups")) |groups| {
@@ -122,11 +149,11 @@ pub fn parseQuantConfig(qc: ?std.json.ObjectMap) !QuantConfig {
             }
             return out;
         }
-        std.log.err("unsupported model: compressed-tensors format '{s}' cannot be dequantised (pack-quantized and float-quantized are supported)", .{format});
+        std.log.err("unsupported model: compressed-tensors format '{s}' cannot be dequantised (pack-quantized, mxfp4-pack-quantized and float-quantized are supported)", .{format});
         return error.UnsupportedArchitecture;
     }
     const shown = if (method.len > 0) method else if (format.len > 0) format else "unknown";
-    std.log.err("unsupported model: '{s}' quantised weights cannot be dequantised (fp8, mxfp4 and compressed-tensors pack-quantized/float-quantized are supported)", .{shown});
+    std.log.err("unsupported model: '{s}' quantised weights cannot be dequantised (fp8, mxfp4 and compressed-tensors pack-quantized/mxfp4-pack-quantized/float-quantized are supported)", .{shown});
     return error.UnsupportedArchitecture;
 }
 
@@ -298,6 +325,7 @@ pub const Dequant = struct {
             .fp8 => try self.readFp8(io, slab, a, n, out),
             .int_packed => try self.readPacked(io, slab, a, n, out),
             .mxfp4 => try self.readMxfp4(io, slab, a, n, out),
+            .mxfp4_packed => try self.readMxfp4Packed(io, slab, a, n, out),
             .none => unreachable,
         }
     }
@@ -450,6 +478,41 @@ pub const Dequant = struct {
         }
     }
 
+    /// compressed-tensors `mxfp4-pack-quantized`: the natural `[rows][cols]`
+    /// layout, a nibble pair per byte and one E8M0 scale per 32 columns, so a
+    /// row range decodes just its rows.
+    fn readMxfp4Packed(self: *Dequant, io: Io, slab: usize, a: usize, n: usize, out: []u8) !void {
+        const pa = std.heap.page_allocator;
+        const src_rb = self.cols / 2;
+        const nblk = self.cols / 32;
+        const per_chunk = @max(1, chunk_bytes / src_rb);
+        var r = a;
+        while (r < a + n) {
+            const cn = @min(per_chunk, a + n - r);
+            const raw = try pa.alloc(u8, cn * src_rb);
+            defer pa.free(raw);
+            try self.data.read(io, (@as(u64, slab) * self.rows + r) * src_rb, raw);
+            const scales = try pa.alloc(u8, cn * nblk);
+            defer pa.free(scales);
+            try self.scale.read(io, (@as(u64, slab) * self.rows + r) * nblk, scales);
+            const dst = std.mem.bytesAsSlice(u16, out[(r - a) * self.rowBytes() ..][0 .. cn * self.rowBytes()]);
+            for (0..cn) |i| {
+                const prow = raw[i * src_rb ..][0..src_rb];
+                const srow = scales[i * nblk ..][0..nblk];
+                const drow = dst[i * self.cols ..][0..self.cols];
+                for (0..nblk) |k| {
+                    const e: i32 = @as(i32, srow[k]) - 127;
+                    for (0..16) |j| {
+                        const b = prow[k * 16 + j];
+                        drow[k * 32 + 2 * j] = tensor.f32ToBf16(std.math.ldexp(e2m1_table[b & 0x0f], e));
+                        drow[k * 32 + 2 * j + 1] = tensor.f32ToBf16(std.math.ldexp(e2m1_table[b >> 4], e));
+                    }
+                }
+            }
+            r += cn;
+        }
+    }
+
     fn readMxfp4(self: *Dequant, io: Io, slab: usize, a: usize, n: usize, out: []u8) !void {
         if (a == 0 and n == self.rows) return self.decodeMxfp4Slab(io, slab, out);
         // A row range needs the whole slab (the source is the transpose): keep
@@ -548,6 +611,12 @@ pub fn register(gpa: Allocator, io: Io, files: []const *safetensors.File, cfg: Q
             if (try registerMxfp4(gpa, io, files, found)) out.mxfp4 += 1;
         } else if (std.mem.eql(u8, dt, "I32") and std.mem.endsWith(u8, name, ".weight_packed")) {
             if (try registerPacked(gpa, io, files, found, cfg)) out.int_packed += 1;
+        } else if (std.mem.eql(u8, dt, "U8") and std.mem.endsWith(u8, name, ".weight_packed")) {
+            if (cfg.method != .mxfp4_packed) {
+                std.log.err("{s}: U8 weight_packed tensors need a compressed-tensors mxfp4-pack-quantized quantization_config (found: {s})", .{ name, cfg.label });
+                return error.UnsupportedArchitecture;
+            }
+            if (try registerMxfp4Packed(gpa, io, files, found)) out.mxfp4 += 1;
         }
     }
     out.count = out.fp8 + out.mxfp4 + out.int_packed;
@@ -664,6 +733,47 @@ fn registerMxfp4(gpa: Allocator, io: Io, files: []const *safetensors.File, b: Fo
     removeRaw(files, bname);
     removeRaw(files, sname);
     try install(gpa, io, b.file, dq, shape);
+    return true;
+}
+
+fn registerMxfp4Packed(gpa: Allocator, io: Io, files: []const *safetensors.File, p: FoundRaw) !bool {
+    const pname = p.info.name;
+    const module = pname[0 .. pname.len - ".weight_packed".len];
+    const scale_name = try withPrefix(gpa, module, ".weight_scale");
+    defer gpa.free(scale_name);
+    const sc = findRaw(files, scale_name) orelse {
+        std.log.err("{s}: MXFP4 packed weights without a U8 {s} tensor", .{ pname, scale_name });
+        return error.UnsupportedArchitecture;
+    };
+    const ps = p.info.shape;
+    if (ps.len < 2) return false;
+    const rows = ps[ps.len - 2];
+    const cols = ps[ps.len - 1] * 2;
+    const slabs = leading(ps, 2);
+    if (cols % 32 != 0 or !std.mem.eql(u8, sc.info.dtype, "U8") or sc.info.numel() != slabs * rows * (cols / 32)) {
+        std.log.err("{s}: unexpected mxfp4-pack-quantized layout (packed {any}, scales {s} {any})", .{ pname, ps, sc.info.dtype, sc.info.shape });
+        return error.InvalidConfig;
+    }
+    const dq = try gpa.create(Dequant);
+    errdefer gpa.destroy(dq);
+    dq.* = .{
+        .name = try withPrefix(p.file.arena.allocator(), module, ".weight"),
+        .method = .mxfp4_packed,
+        .slabs = slabs,
+        .rows = rows,
+        .cols = cols,
+        .src_rows = rows,
+        .src_cols = cols,
+        .data = piece(p.file, p.info.offset, p.info.byte_len, .f32),
+        .scale = piece(sc.file, sc.info.offset, sc.info.byte_len, .f32),
+    };
+    const shape = try p.file.arena.allocator().alloc(usize, ps.len);
+    @memcpy(shape[0 .. ps.len - 1], ps[0 .. ps.len - 1]);
+    shape[ps.len - 1] = cols;
+    removeRaw(files, pname);
+    removeRaw(files, scale_name);
+    try dropModuleAux(gpa, files, module);
+    try install(gpa, io, p.file, dq, shape);
     return true;
 }
 
@@ -910,5 +1020,8 @@ test "quant config parsing" {
     var r = try std.json.parseFromSlice(std.json.Value, gpa, "{\"quant_method\": \"compressed-tensors\", \"format\": \"dense\"}", .{});
     defer r.deinit();
     try std.testing.expectEqual(Method.none, (try parseQuantConfig(r.value.object)).method);
+    var s = try std.json.parseFromSlice(std.json.Value, gpa, "{\"quant_method\": \"compressed-tensors\", \"format\": \"mxfp4-pack-quantized\", \"config_groups\": {\"group_0\": {\"weights\": {\"num_bits\": 4, \"group_size\": 32, \"type\": \"float\", \"scale_dtype\": \"torch.uint8\"}}}}", .{});
+    defer s.deinit();
+    try std.testing.expectEqual(Method.mxfp4_packed, (try parseQuantConfig(s.value.object)).method);
     try std.testing.expectEqual(Method.none, (try parseQuantConfig(null)).method);
 }
