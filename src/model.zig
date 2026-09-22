@@ -49,7 +49,7 @@ pub const Norm = struct {
 };
 
 /// Which matrix of a layer a `LayerRefs` entry describes.
-pub const Slot = enum { q, k, v, qkv, o, gate, up, gate_up, down, router, q_a, q_b, kv_a, kv_b, lin_qkvz, lin_qkv, lin_z, lin_b, lin_a, lin_ba, lin_conv, lin_q, lin_k, lin_v, lin_conv_q, lin_conv_k, lin_conv_v, lin_f_a, lin_f_b, lin_g_a, lin_g_b, light_qkv, light_gate };
+pub const Slot = enum { q, k, v, qkv, o, gate, up, gate_up, down, router, q_a, q_b, kv_a, kv_b, attn_gate, lin_qkvz, lin_qkv, lin_z, lin_b, lin_a, lin_ba, lin_conv, lin_q, lin_k, lin_v, lin_conv_q, lin_conv_k, lin_conv_v, lin_f_a, lin_f_b, lin_g_a, lin_g_b, lin_g, light_qkv, light_gate };
 
 /// Where a layer's matrices live on disk. `Model.acquireLayer` turns these
 /// into resident `Weight` views for the duration of one layer's compute.
@@ -142,6 +142,8 @@ pub const LinearWeights = struct {
     f_b: ?Weight = null,
     g_a: ?Weight = null,
     g_b: ?Weight = null,
+    /// Full-rank KDA output gate `[heads * head_dim][hidden]` (Kimi K3), replacing `g_a`/`g_b`.
+    g: ?Weight = null,
     /// Depthwise causal convolution `[conv_dim][1][kernel]` (read as
     /// `[conv_dim][kernel]`), or one tensor per q/k/v projection (original
     /// Kimi Linear checkpoints).
@@ -183,6 +185,11 @@ pub const Layer = struct {
     o_bias: ?[]const f32,
     /// Per-head attention sink logits (gpt-oss).
     sinks: ?[]const f32,
+    /// Sigmoid output gate `[heads * v_head_dim][hidden]` on the full-attention
+    /// output (Kimi K3 MLA layers).
+    attn_gate: ?Weight = null,
+    /// Attention Residual scorers of this layer (Kimi K3; null otherwise).
+    attn_res: ?AttnResLayer = null,
     mla: ?MlaWeights,
     /// Gated DeltaNet weights (null for full-attention layers).
     linear: ?LinearWeights = null,
@@ -239,6 +246,8 @@ pub const Layer = struct {
             .q_b => self.mla.?.q_b = w,
             .kv_a => self.mla.?.kv_a = w,
             .kv_b => self.mla.?.kv_b = w,
+            .attn_gate => self.attn_gate = w,
+            .lin_g => self.linear.?.g = w,
             .lin_qkvz => self.linear.?.qkvz = w,
             .lin_qkv => self.linear.?.qkv = w,
             .lin_z => self.linear.?.z = w,
@@ -260,6 +269,23 @@ pub const Layer = struct {
             .light_gate => self.linear.?.light_gate = w,
         }
     }
+};
+
+/// One Attention Residual aggregation point (Kimi K3): the score of a
+/// candidate row `r` is `rmsnorm(r; norm) · proj`, i.e. `(r · cw) / rms(r)`
+/// with `cw = norm ⊙ proj`; the rows (the banked block prefixes and the
+/// running prefix) are mixed by the softmax of their scores.
+pub const AttnResScorer = struct {
+    norm: []const f32,
+    /// The `[1][hidden]` projection as a vector.
+    proj: []const f32,
+};
+
+/// The two aggregation points of a layer: before the attention (its result
+/// feeds `input_norm`) and before the MLP (feeding `pre_ff_norm`).
+pub const AttnResLayer = struct {
+    attn: AttnResScorer,
+    mlp: AttnResScorer,
 };
 
 /// A layer whose matrices are resident. `layer` is a copy of the model's
@@ -412,6 +438,8 @@ pub const Model = struct {
     largest_tensor_bytes: u64,
     spill_always: bool,
     final_norm: Norm,
+    /// Attention Residual: the output aggregation feeding `final_norm` (Kimi K3).
+    output_res: ?AttnResScorer = null,
     layers: []Layer,
     eos_ids: []u32,
     pad_id: u32,
@@ -721,26 +749,35 @@ pub const Model = struct {
             .a_log = &.{},
             .norm = &.{},
         };
-        const proj_names = .{ names.lin_q, names.lin_k, names.lin_v, names.lin_b, names.lin_g_a, names.lin_g_b };
-        const proj_slots = .{ Slot.lin_q, Slot.lin_k, Slot.lin_v, Slot.lin_b, Slot.lin_g_a, Slot.lin_g_b };
-        const proj_rows = .{ dim, dim, dim, heads, hd, dim };
-        const proj_cols = .{ hidden, hidden, hidden, hidden, hidden, hd };
+        const proj_names = .{ names.lin_q, names.lin_k, names.lin_v, names.lin_b, names.lin_g_a, names.lin_g_b, names.lin_g };
+        const proj_slots = .{ Slot.lin_q, Slot.lin_k, Slot.lin_v, Slot.lin_b, Slot.lin_g_a, Slot.lin_g_b, Slot.lin_g };
+        const proj_rows = .{ dim, dim, dim, heads, hd, dim, dim };
+        const proj_cols = .{ hidden, hidden, hidden, hidden, hidden, hd, hidden };
         inline for (proj_names, proj_slots, proj_rows, proj_cols) |t, slot, rows, cols| {
-            const n = try cat(arena, lp, t orelse return error.InvalidConfig);
-            const w = try self.loadMat(n);
-            layer.refs.add(slot, try self.ref(n), false);
-            if (w.rows != rows or w.cols != cols) {
-                std.log.err("layer {d}: {s} is [{d}][{d}], expected [{d}][{d}]", .{ li, n, w.rows, w.cols, rows, cols });
-                return error.InvalidConfig;
-            }
-            switch (slot) {
-                .lin_q => lin.q = w,
-                .lin_k => lin.k = w,
-                .lin_v => lin.v = w,
-                .lin_b => lin.b = w,
-                .lin_g_a => lin.g_a = w,
-                .lin_g_b => lin.g_b = w,
-                else => unreachable,
+            // The output gate is the full-rank `g` or the low-rank `g_a`/`g_b` pair.
+            const wanted = switch (slot) {
+                .lin_g => c.linear_full_rank_gate,
+                .lin_g_a, .lin_g_b => !c.linear_full_rank_gate,
+                else => true,
+            };
+            if (wanted) {
+                const n = try cat(arena, lp, t orelse return error.InvalidConfig);
+                const w = try self.loadMat(n);
+                layer.refs.add(slot, try self.ref(n), false);
+                if (w.rows != rows or w.cols != cols) {
+                    std.log.err("layer {d}: {s} is [{d}][{d}], expected [{d}][{d}]", .{ li, n, w.rows, w.cols, rows, cols });
+                    return error.InvalidConfig;
+                }
+                switch (slot) {
+                    .lin_q => lin.q = w,
+                    .lin_k => lin.k = w,
+                    .lin_v => lin.v = w,
+                    .lin_b => lin.b = w,
+                    .lin_g_a => lin.g_a = w,
+                    .lin_g_b => lin.g_b = w,
+                    .lin_g => lin.g = w,
+                    else => unreachable,
+                }
             }
         }
         const fa_name = try self.requireFirst(arena, lp, names.lin_f_a);
@@ -788,6 +825,9 @@ pub const Model = struct {
         lin.dt_bias = try self.loadVec(try self.requireFirst(arena, lp, names.lin_dt_bias));
         lin.a_log = try self.loadVec(try self.requireFirst(arena, lp, names.lin_a_log));
         lin.norm = try self.loadVec(try cat(arena, lp, names.lin_norm orelse return error.InvalidConfig));
+        // Kimi K3 checkpoints store A_log with `head_dim` entries of which the
+        // first `num_heads` are the per-head decays (what every loader reads).
+        if (lin.a_log.len > heads) lin.a_log = lin.a_log[0..heads];
         if (lin.dt_bias.len != dim or lin.a_log.len != heads or lin.norm.len != hd) {
             std.log.err("layer {d}: dt_bias / A_log / o_norm have wrong shapes (expected [{d}], [{d}], [{d}])", .{ li, dim, heads, hd });
             return error.InvalidConfig;
@@ -996,6 +1036,15 @@ pub const Model = struct {
                     return error.InvalidConfig;
                 }
                 layer.mla = mla;
+                if (c.mla_output_gate) {
+                    const g_name = try cat(arena, lp, names.attn_gate orelse return error.InvalidConfig);
+                    layer.attn_gate = try self.loadMat(g_name);
+                    layer.refs.add(.attn_gate, try self.ref(g_name), false);
+                    if (layer.attn_gate.?.rows != c.num_heads * m.v_head_dim or layer.attn_gate.?.cols != c.hidden_size) {
+                        std.log.err("layer {d}: attention output gate {s} is [{d}][{d}], expected [{d}][{d}]", .{ i, g_name, layer.attn_gate.?.rows, layer.attn_gate.?.cols, c.num_heads * m.v_head_dim, c.hidden_size });
+                        return error.InvalidConfig;
+                    }
+                }
             } else if (c.qkv_layout != .separate) {
                 const qkv_name = try cat(arena, lp, names.qkv orelse return error.InvalidConfig);
                 layer.qkv = try self.loadMatT(qkv_name, c.arch.conv1d);
@@ -1025,6 +1074,25 @@ pub const Model = struct {
                     return error.InvalidConfig;
                 }
             }
+            // Attention Residual scorers.
+            if (c.attn_res_block > 0) {
+                layer.attn_res = .{
+                    .attn = .{
+                        .norm = try self.loadVec(try self.requireFirst(arena, lp, names.attn_res_norm)),
+                        .proj = try self.loadVec(try self.requireFirst(arena, lp, names.attn_res_proj)),
+                    },
+                    .mlp = .{
+                        .norm = try self.loadVec(try self.requireFirst(arena, lp, names.mlp_res_norm)),
+                        .proj = try self.loadVec(try self.requireFirst(arena, lp, names.mlp_res_proj)),
+                    },
+                };
+                const ar = layer.attn_res.?;
+                if (ar.attn.norm.len != c.hidden_size or ar.attn.proj.len != c.hidden_size or ar.mlp.norm.len != c.hidden_size or ar.mlp.proj.len != c.hidden_size) {
+                    std.log.err("layer {d}: attention residual scorers must have hidden_size ({d}) entries", .{ i, c.hidden_size });
+                    return error.InvalidConfig;
+                }
+            }
+
             const o_name = try cat(arena, lp, names.o);
             if (!c.linear_layers[i]) {
                 layer.o = try self.loadMatT(o_name, c.arch.conv1d);
@@ -1082,6 +1150,33 @@ pub const Model = struct {
         }
         self.alibi_slopes = &.{};
         if (c.positional == .alibi) self.alibi_slopes = try alibiSlopes(arena, c.num_heads);
+        self.output_res = null;
+        if (c.attn_res_block > 0) {
+            if ((c.num_layers + c.attn_res_block - 1) / c.attn_res_block > max_attn_res_rows) {
+                std.log.err("attn_res_block_size {d} banks more than {d} block prefixes", .{ c.attn_res_block, max_attn_res_rows });
+                return error.UnsupportedArchitecture;
+            }
+            if (c.parallel_residual or c.residual_layout != .pre) {
+                std.log.err("attention residuals are only implemented for the sequential pre-norm layout", .{});
+                return error.UnsupportedArchitecture;
+            }
+            self.output_res = .{
+                .norm = try self.loadVec(try self.requireFirst(arena, "", try self.namesOf(names.output_res_norm))),
+                .proj = try self.loadVec(try self.requireFirst(arena, "", try self.namesOf(names.output_res_proj))),
+            };
+            if (self.output_res.?.norm.len != c.hidden_size or self.output_res.?.proj.len != c.hidden_size) {
+                std.log.err("output attention residual scorer must have hidden_size ({d}) entries", .{c.hidden_size});
+                return error.InvalidConfig;
+            }
+        }
+    }
+
+    /// Resolves each model-level template of `templates` with the detected prefix.
+    fn namesOf(self: *Model, templates: []const []const u8) ![]const []const u8 {
+        const arena = self.arena.allocator();
+        const out = try arena.alloc([]const u8, templates.len);
+        for (templates, 0..) |t, i| out[i] = try self.name(t);
+        return out;
     }
 
     /// Resolves a model-level name template with the detected prefix.
@@ -1200,6 +1295,26 @@ pub const Model = struct {
     /// (the shared expert, if any, is index `experts.len`); release with `DownLease.release`.
     pub fn acquireExpertDown(self: *const Model, layer: usize, expert: usize) !moe.DownLease {
         return self.layers[layer].moe.?.acquireDown(self, expert);
+    }
+
+    /// Makes the latent up projection of a latent-MoE layer resident; release with `DownLease.release`.
+    pub fn acquireLatentUp(self: *const Model, layer: usize) !moe.DownLease {
+        return self.layers[layer].moe.?.acquireLatentUp(self);
+    }
+
+    pub fn setLatentDelta(self: *Model, layer: usize, delta: Delta) void {
+        const lat = &self.layers[layer].moe.?.latent.?;
+        if (lat.up_delta) |d| {
+            self.gpa.free(d.a);
+            self.gpa.free(d.b);
+        }
+        lat.up_delta = delta;
+    }
+
+    pub fn getLatentDelta(self: *const Model, layer: usize) ?Delta {
+        const m = &(self.layers[layer].moe orelse return null);
+        const lat = m.latent orelse return null;
+        return lat.up_delta;
     }
 
     pub fn acquireLmHead(self: *const Model) !stream.Lease {
@@ -1536,6 +1651,7 @@ pub const Model = struct {
             return switch (target) {
                 .expert => |e| wholeEdit(m.getDownDelta(e), false),
                 .fused_down => if (m.anyExpertDelta()) .{ .fused_down = ls.layer } else null,
+                .latent_up => wholeEdit(m.latent.?.up_delta, false),
             };
         }
         if (std.mem.eql(u8, ls.suffix, names.down)) return wholeEdit(layer.down_delta, layer.refs.isTransposed(.down));
@@ -2550,7 +2666,8 @@ fn kdaForward(model: *const Model, layer: *const Layer, li: usize, ws: *Workspac
             for (0..n) |t| @memcpy(mixed[t * conv_dim + s * dim ..][0..dim], tmp[t * dim ..][0..dim]);
         }
     }
-    // Forget gate: g = -exp(A_log[head]) * softplus(f_b(f_a(h)) + dt_bias), per channel.
+    // Forget gate, per channel: g = -exp(A_log[head]) * softplus(f_b(f_a(h)) + dt_bias),
+    // or the Kimi K3 safe gate g = lower_bound * sigmoid(exp(A_log[head]) * (f + dt_bias)).
     const low = try gpa.alloc(f32, n * hd);
     defer gpa.free(low);
     const decay = try gpa.alloc(f32, n * dim);
@@ -2560,18 +2677,26 @@ fn kdaForward(model: *const Model, layer: *const Layer, li: usize, ws: *Workspac
     for (0..n) |t| {
         const g = decay[t * dim ..][0..dim];
         for (0..nh) |hh| {
-            const rate = -@exp(lin.a_log[hh]);
-            for (0..hd) |i| g[hh * hd + i] = rate * softplus(g[hh * hd + i] + lin.dt_bias[hh * hd + i]);
+            const rate = @exp(lin.a_log[hh]);
+            if (c.linear_gate_lower_bound) |lb| {
+                for (0..hd) |i| g[hh * hd + i] = lb / (1.0 + @exp(-rate * (g[hh * hd + i] + lin.dt_bias[hh * hd + i])));
+            } else {
+                for (0..hd) |i| g[hh * hd + i] = -rate * softplus(g[hh * hd + i] + lin.dt_bias[hh * hd + i]);
+            }
         }
     }
     const bbuf = try gpa.alloc(f32, n * nh);
     defer gpa.free(bbuf);
     try tensor.matmulT(model.pool, gpa, bbuf, h, n, lin.b.?, null);
-    // Output gate: g_b(g_a(h)).
+    // Output gate: g(h) (full rank) or g_b(g_a(h)).
     const gate = try gpa.alloc(f32, n * dim);
     defer gpa.free(gate);
-    try tensor.matmulT(model.pool, gpa, low, h, n, lin.g_a.?, null);
-    try tensor.matmulT(model.pool, gpa, gate, low, n, lin.g_b.?, null);
+    if (lin.g) |g| {
+        try tensor.matmulT(model.pool, gpa, gate, h, n, g, null);
+    } else {
+        try tensor.matmulT(model.pool, gpa, low, h, n, lin.g_a.?, null);
+        try tensor.matmulT(model.pool, gpa, gate, low, n, lin.g_b.?, null);
+    }
 
     const core = try gpa.alloc(f32, n * dim);
     defer gpa.free(core);
@@ -2771,6 +2896,14 @@ fn attention(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace
 
     if (layer.mla != null) {
         try mlaProject(model, layer, ws, h, n);
+        if (layer.attn_gate) |g| {
+            // Kimi K3: sigmoid gate on the `[n][heads * v_head_dim]` attention output.
+            const gate = try gpa.alloc(f32, n * g.rows);
+            defer gpa.free(gate);
+            try tensor.matmulT(model.pool, gpa, gate, h, n, g, null);
+            try attentionTail(model, layer, li, ws, cache, rows, gate, true);
+            return;
+        }
     } else if (layer.qkv) |w| {
         const qkv_rows = qd + 2 * kvd;
         try tensor.matmulT(model.pool, gpa, ws.qkv, h, n, w, null);
@@ -2802,7 +2935,7 @@ fn attention(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace
         try tensor.matmulT(model.pool, gpa, ws.v, h, n, layer.v.?, null);
         if (layer.k_bias) |b| addBias(ws.k, n, kvd, b);
         if (layer.v_bias) |b| addBias(ws.v, n, kvd, b);
-        try attentionTail(model, layer, li, ws, cache, rows, gate);
+        try attentionTail(model, layer, li, ws, cache, rows, gate, false);
         return;
     } else {
         try tensor.matmulT(model.pool, gpa, ws.q, h, n, layer.q.?, null);
@@ -2812,13 +2945,15 @@ fn attention(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace
         if (layer.k_bias) |b| addBias(ws.k, n, kvd, b);
         if (layer.v_bias) |b| addBias(ws.v, n, kvd, b);
     }
-    try attentionTail(model, layer, li, ws, cache, rows, null);
+    try attentionTail(model, layer, li, ws, cache, rows, null, false);
 }
 
 /// Norms, RoPE, KV cache update, attention and the output projection shared
 /// by the projection layouts. `gate` (gated full attention) multiplies the
-/// attention output before the output projection.
-fn attentionTail(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace, cache: *KvCache, rows: []const Row, gate: ?[]const f32) !void {
+/// attention output before the output projection: laid out `[n][heads][head_dim]`
+/// like the query, or, with `gate_compact`, `[n][heads * v_head_dim]` like
+/// the compacted attention output (Kimi K3 MLA).
+fn attentionTail(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace, cache: *KvCache, rows: []const Row, gate: ?[]const f32, gate_compact: bool) !void {
     const c = &model.config;
     const gpa = model.gpa;
     const n = rows.len;
@@ -2902,7 +3037,7 @@ fn attentionTail(model: *const Model, layer: *const Layer, li: usize, ws: *Works
         .max_keys = max_keys,
     };
     model.pool.parallelFor(chunks * per, &actx, attentionWorker);
-    if (gate) |g| {
+    if (gate) |g| if (!gate_compact) {
         const swish = c.gate_swish;
         for (0..n) |r| {
             const a = ws.attn[r * qd ..][0..qd];
@@ -2912,7 +3047,7 @@ fn attentionTail(model: *const Model, layer: *const Layer, li: usize, ws: *Works
                 v.* *= if (swish) gg[j] * s else s;
             }
         }
-    }
+    };
     const vd = c.v_head_dim;
     if (vd != hd) {
         // Compact `[n][heads][head_dim]` (v_head_dim valid per head) to `[n][heads * v_head_dim]`.
@@ -2922,6 +3057,10 @@ fn attentionTail(model: *const Model, layer: *const Layer, li: usize, ws: *Works
             dst += vd;
         }
     }
+    if (gate) |g| if (gate_compact) {
+        const od = c.num_heads * vd;
+        for (ws.attn[0 .. n * od], 0..) |*v, j| v.* /= 1.0 + @exp(-g[j]);
+    };
     try tensor.matmulT(model.pool, gpa, ws.o, ws.attn, n, layer.o, if (layer.o_delta) |*d| d else null);
     if (layer.o_bias) |b| addBias(ws.o, n, hidden, b);
 }
@@ -2941,13 +3080,13 @@ fn mlpBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace,
             try tensor.matmulT(model.pool, gpa, ws.up, h_in, n, layer.up.?, null);
             if (layer.gate_bias) |b| addBias(ws.gate, n, inter, b);
             if (layer.up_bias) |b| addBias(ws.up, n, inter, b);
-            if (c.moe.swiglu) |sw| swigluOai(sw, ws.gate, ws.gate, ws.up, n, inter, inter) else tensor.gatedActivation(model.pool, c.activation, ws.gate, ws.gate, ws.up, n, inter, inter, inter);
+            if (c.moe.swiglu) |sw| swigluOai(sw, ws.gate, ws.gate, ws.up, n, inter, inter) else if (c.moe.situ) |st| moe.situGlu(st, ws.gate, ws.gate, ws.up, n, inter, inter) else tensor.gatedActivation(model.pool, c.activation, ws.gate, ws.gate, ws.up, n, inter, inter, inter);
         },
         .gated_fused => {
             const gu = layer.gate_up.?;
             try tensor.matmulT(model.pool, gpa, ws.gate_up, h_in, n, gu, null);
             if (layer.up_bias) |b| addBias(ws.gate_up, n, 2 * inter, b);
-            if (c.moe.swiglu) |sw| swigluOai(sw, ws.gate, ws.gate_up, ws.gate_up[inter..], n, inter, 2 * inter) else tensor.gatedActivation(model.pool, c.activation, ws.gate, ws.gate_up, ws.gate_up[inter..], n, inter, 2 * inter, inter);
+            if (c.moe.swiglu) |sw| swigluOai(sw, ws.gate, ws.gate_up, ws.gate_up[inter..], n, inter, 2 * inter) else if (c.moe.situ) |st| moe.situGlu(st, ws.gate, ws.gate_up, ws.gate_up[inter..], n, inter, 2 * inter) else tensor.gatedActivation(model.pool, c.activation, ws.gate, ws.gate_up, ws.gate_up[inter..], n, inter, 2 * inter, inter);
         },
         .dense => {
             try tensor.matmulT(model.pool, gpa, ws.up, h_in, n, layer.up.?, null);
@@ -3029,6 +3168,20 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
         captureResiduals(opts, 0, hidden, start, cn, xs);
     }
 
+    // Attention Residual (Kimi K3): per token, the bank of block prefixes the
+    // aggregation points retrieve from (`nb` rows, written by the first layer
+    // of every block), kept in RAM for the whole call; `mix` receives one
+    // chunk's aggregated block input, the residual ditch captures.
+    const nb: usize = if (c.attn_res_block > 0) (c.num_layers + c.attn_res_block - 1) / c.attn_res_block else 0;
+    var bank: []f32 = &.{};
+    defer if (bank.len > 0) gpa.free(bank);
+    var mix: []f32 = &.{};
+    defer if (mix.len > 0) gpa.free(mix);
+    if (nb > 0) {
+        bank = try gpa.alloc(f32, n * nb * hidden);
+        mix = try gpa.alloc(f32, chunk_rows * hidden);
+    }
+
     for (0..c.num_layers) |li| {
         if (model.budget) |b| try b.checkTime();
         var lease = try model.acquireLayer(li);
@@ -3039,11 +3192,35 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
         while (start < n) : (start += chunk_rows) {
             const cn = @min(chunk_rows, n - start);
             const xs = if (single) ws.x[0 .. n * hidden] else try act.?.chunk(start, cn, ws.x);
-            try layerBlock(model, layer, li, ws, cache, xs, rows[start..][0..cn]);
-            if (!single) try act.?.commit(start, cn, xs);
-            captureResiduals(opts, li + 1, hidden, start, cn, xs);
+            if (nb > 0) {
+                try layerBlockAttnRes(model, layer, li, ws, cache, xs, rows[start..][0..cn], bank[start * nb * hidden ..][0 .. cn * nb * hidden], mix[0 .. cn * hidden]);
+                if (!single) try act.?.commit(start, cn, xs);
+                captureResiduals(opts, li, hidden, start, cn, mix);
+            } else {
+                try layerBlock(model, layer, li, ws, cache, xs, rows[start..][0..cn]);
+                if (!single) try act.?.commit(start, cn, xs);
+                captureResiduals(opts, li + 1, hidden, start, cn, xs);
+            }
         }
         try cache.endLayer(li);
+    }
+
+    if (nb > 0) {
+        // Output aggregation: the final norm reads the mixture of every banked
+        // block prefix and the running one, which becomes the last residual entry.
+        const scorer = model.output_res.?;
+        start = 0;
+        while (start < n) : (start += chunk_rows) {
+            const cn = @min(chunk_rows, n - start);
+            const xs = if (single) ws.x[0 .. n * hidden] else try act.?.chunk(start, cn, ws.x);
+            for (0..cn) |i| {
+                const t = start + i;
+                attnResMix(c, scorer, bank[t * nb * hidden ..][0 .. nb * hidden], nb, xs[i * hidden ..][0..hidden], mix[i * hidden ..][0..hidden]);
+            }
+            @memcpy(xs[0 .. cn * hidden], mix[0 .. cn * hidden]);
+            if (!single) try act.?.commit(start, cn, xs);
+            captureResiduals(opts, c.num_layers, hidden, start, cn, xs);
+        }
     }
 
     // Final norm + logits for requested rows.
@@ -3137,6 +3314,92 @@ fn layerBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Workspac
         if (layer.post_ff_norm) |nm| normRowsInPlace(c, m, n, hidden, nm, ws.h2);
         tensor.axpy(x[0 .. n * hidden], rm, m);
     }
+}
+
+/// Largest Attention Residual bank (`ceil(num_layers / attn_res_block)` rows) the mixer handles.
+pub const max_attn_res_rows = 255;
+
+/// Attention Residual aggregation of one token: mixes the `nvb` banked rows
+/// and the running prefix `p` by the softmax of their scores under `s`
+/// (`AttnResScorer`), writing the pre-norm mixture to `out`.
+fn attnResMix(c: *const Config, s: AttnResScorer, bank: []const f32, nvb: usize, p: []const f32, out: []f32) void {
+    const hidden = c.hidden_size;
+    if (nvb == 0) {
+        @memcpy(out, p);
+        return;
+    }
+    std.debug.assert(nvb <= max_attn_res_rows);
+    var scores: [max_attn_res_rows + 1]f32 = undefined;
+    for (0..nvb) |j| scores[j] = attnResScore(c, s, bank[j * hidden ..][0..hidden]);
+    scores[nvb] = attnResScore(c, s, p);
+    tensor.softmaxInPlace(scores[0 .. nvb + 1]);
+    @memset(out, 0);
+    for (0..nvb) |j| tensor.axpy(out, scores[j], bank[j * hidden ..][0..hidden]);
+    tensor.axpy(out, scores[nvb], p);
+}
+
+/// `rmsnorm(row; s.norm) · s.proj`, the retrieval score of one candidate row.
+fn attnResScore(c: *const Config, s: AttnResScorer, row: []const f32) f32 {
+    var ss: f32 = 0;
+    var d: f32 = 0;
+    for (row, 0..) |v, i| {
+        ss += v * v;
+        d += v * s.norm[i] * s.proj[i];
+    }
+    return d / @sqrt(ss / @as(f32, @floatFromInt(row.len)) + c.rms_norm_eps);
+}
+
+/// One transformer layer of an Attention Residual model (Kimi K3), applied
+/// to the running block prefix `x` of `rows.len` tokens with their banked
+/// block prefixes `bank` (`[token][nb][hidden]`).
+///
+/// Instead of one accumulated residual stream, each sublayer reads a
+/// softmax-weighted mixture (`attnResMix`) of the prefixes banked at the
+/// start of every earlier block and the running prefix of the current block:
+///
+///     mix = aggregate(bank[0..nvb], x)      // what the attention reads: this layer's residual
+///     if li % B == 0: bank[nvb] = x; x = 0  // a block boundary banks the prefix and restarts it
+///     x += attn(input_norm(mix))
+///     x += mlp(pre_ff_norm(aggregate(bank, x)))
+///
+/// `mix` receives the attention-side mixture, which is what ditch treats as
+/// the layer's residual for direction extraction (entry `li`; the output
+/// aggregation is entry `num_layers`). The scorers (`*_res_norm`,
+/// `*_res_proj`) are never edited.
+fn layerBlockAttnRes(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace, cache: *KvCache, x: []f32, rows: []const Row, bank: []f32, mix: []f32) !void {
+    const c = &model.config;
+    const n = rows.len;
+    const hidden = c.hidden_size;
+    const B = c.attn_res_block;
+    const nb = bank.len / (n * hidden);
+    const write = li % B == 0;
+    var nvb = (li + B - 1) / B;
+    const ar = layer.attn_res.?;
+    const h = ws.h[0 .. n * hidden];
+    const h2 = ws.h2[0 .. n * hidden];
+
+    for (0..n) |i| attnResMix(c, ar.attn, bank[i * nb * hidden ..][0 .. nvb * hidden], nvb, x[i * hidden ..][0..hidden], mix[i * hidden ..][0..hidden]);
+    normRows(c, h, mix, n, hidden, layer.input_norm);
+    if (write) {
+        for (0..n) |i| @memcpy(bank[(i * nb + nvb) * hidden ..][0..hidden], x[i * hidden ..][0..hidden]);
+        nvb += 1;
+    }
+    if (c.linear_layers[li]) {
+        switch (c.linear_kind) {
+            .gated_deltanet => try linearForward(model, layer, li, ws, cache, h, rows),
+            .kda => try kdaForward(model, layer, li, ws, cache, h, rows),
+            .lightning => try lightningForward(model, layer, li, ws, cache, h, rows),
+        }
+    } else {
+        try attention(model, layer, li, ws, cache, h, rows);
+    }
+    const attn_out = ws.o[0 .. n * hidden];
+    if (write) @memcpy(x[0 .. n * hidden], attn_out) else tensor.axpy(x[0 .. n * hidden], 1.0, attn_out);
+
+    for (0..n) |i| attnResMix(c, ar.mlp, bank[i * nb * hidden ..][0 .. nvb * hidden], nvb, x[i * hidden ..][0..hidden], h2[i * hidden ..][0..hidden]);
+    normRows(c, h, h2, n, hidden, layer.pre_ff_norm);
+    try mlpBlock(model, layer, li, ws, h, n);
+    tensor.axpy(x[0 .. n * hidden], 1.0, ws.m[0 .. n * hidden]);
 }
 
 // ---------------------------------------------------------------------------

@@ -175,6 +175,23 @@ def quant_mxfp4(name, w):
     return bf16_round(deq), [(name + "_blocks", "U8", packed), (name + "_scales", "U8", (e + 127).astype(np.uint8))]
 
 
+def quant_mxfp4_packed(name, w):
+    """compressed-tensors `mxfp4-pack-quantized` (Kimi K3 experts) of the natural
+    `[out, in]` tensor `w`: E2M1 nibble pairs (low nibble first) in `weight_packed`
+    and E8M0 group scales (`floor(log2(amax / 6))`, as the compressor stores them)
+    in `weight_scale`."""
+    assert w.shape[-1] % 32 == 0
+    blocks = w.reshape(*w.shape[:-1], w.shape[-1] // 32, 32)
+    amax = np.abs(blocks).max(-1)
+    e = np.where(amax > 0, np.floor(np.log2(np.maximum(amax, 1e-30) / 6.0)), 0).astype(np.int64)
+    e = np.clip(e, -127, 127)
+    codes = nearest_code(np.clip(blocks / (2.0 ** e)[..., None], -6.0, 6.0), E2M1_VALUES).astype(np.uint8)
+    packed = (codes[..., 0::2] | (codes[..., 1::2] << 4)).astype(np.uint8).reshape(*w.shape[:-1], w.shape[-1] // 2)
+    deq = (E2M1_VALUES[codes] * (2.0 ** e)[..., None].astype(np.float32)).reshape(w.shape)
+    module = name[:-len(".weight")]
+    return bf16_round(deq), [(module + ".weight_packed", "U8", packed), (module + ".weight_scale", "U8", (e + 127).astype(np.uint8))]
+
+
 B2U_MAP = None
 
 
@@ -381,6 +398,10 @@ def base(**kw):
         qk_norm_after_rope=False,
         # (alpha, limit) of the clamped swiglu in dense MLPs (MiniMax M3).
         dense_swiglu=None,
+        # Kimi K3: (beta, linear_beta) of the SiTU activation in every gated MLP
+        # (act stays "silu" for the KDA convolution), the Attention Residual
+        # block size (None: a plain residual stream) and the MLA output gate.
+        situ=None, attn_res=None, mla_gate=False,
         # {layer index: [(name relative to the layer, shape), ...]} of tensors the
         # reference never reads (they must survive exports untouched).
         extra_layer_tensors={},
@@ -654,6 +675,46 @@ spec("kimi_linear_hf", tok="deepseek3", NKV=4, HD=12, VD=8, L=4, rotary_dim=4, r
              "mlp_layer_types": ["dense", "sparse", "sparse", "sparse"],
              "linear_head_dim": 4, "linear_num_heads": 4, "linear_conv_kernel_dim": 3,
              "rms_norm_eps": 1e-5, "hidden_act": "silu", "max_position_embeddings": 128, "tie_word_embeddings": False})
+# Kimi K3: the image-video wrapper (KimiK3ForConditionalGeneration) around a
+# kimi_linear text config with Attention Residual (attn_res_block_size 2 over 5
+# layers: prefixes banked at layers 0, 2 and 4), KDA layers with the full-rank
+# output gate and the safe forget gate (gate_lower_bound), MLA layers with
+# q_lora_rank and the sigmoid output gate, latent MoE (routed_expert_hidden_size
+# 32 under hidden_size 48, with routed_expert_norm; w2 spans two MXFP4 blocks),
+# SiTU, two shared experts
+# and the original checkpoint names (block_sparse_moe, w1/w3/w2, q/k/v_conv1d,
+# language_model prefix). `kimi_k3_mxfp4` stores the routed experts in the
+# compressed-tensors mxfp4-pack-quantized format of the released checkpoint.
+_K3_TEXT = {"model_type": "kimi_linear", "architectures": ["KimiLinearForCausalLM"], "hidden_size": 48, "intermediate_size": 32, "moe_intermediate_size": 64,
+            "routed_expert_hidden_size": 32, "latent_moe_use_norm": True, "attn_res_block_size": 2, "num_hidden_layers": 5, "num_attention_heads": 4,
+            "num_key_value_heads": 4, "q_lora_rank": 12, "kv_lora_rank": 16, "qk_nope_head_dim": 8, "qk_rope_head_dim": 4, "v_head_dim": 8,
+            "mla_use_nope": True, "mla_use_output_gate": True, "num_experts": 4, "num_shared_experts": 2, "num_experts_per_token": 2,
+            "num_expert_group": 1, "topk_group": 1, "topk_method": "noaux_tc", "use_grouped_topk": True, "moe_router_activation_func": "sigmoid",
+            "moe_renormalize": True, "routed_scaling_factor": 1.0, "first_k_dense_replace": 1, "moe_layer_freq": 1,
+            "hidden_act": "situ", "activation_situ_beta": 4.0, "activation_situ_linear_beta": 25.0,
+            "linear_attn_config": {"kda_layers": [1, 2, 4], "full_attn_layers": [3, 5], "head_dim": 4, "num_heads": 4, "short_conv_kernel_size": 3,
+                                   "use_full_rank_gate": True, "gate_lower_bound": -5.0},
+            "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "max_position_embeddings": 128, "tie_word_embeddings": False}
+_K3_VISION = {"model_type": "kimi_k3_vision", "vt_hidden_size": 16, "vt_num_hidden_layers": 1, "vt_num_attention_heads": 2, "patch_size": 14, "text_hidden_size": 48}
+_K3_QUANT = {"config_groups": {"group_0": {"format": "mxfp4-pack-quantized", "input_activations": None, "output_activations": None, "targets": ["Linear"],
+                                           "weights": {"actorder": None, "block_structure": None, "dynamic": False, "group_size": 32, "num_bits": 4,
+                                                       "observer": "minmax", "observer_kwargs": {}, "scale_dtype": "torch.uint8", "strategy": "group",
+                                                       "symmetric": True, "type": "float", "zp_dtype": None}}},
+             "format": "mxfp4-pack-quantized", "global_compression_ratio": None,
+             "ignore": ["re:.*self_attn.*", "re:.*shared_experts.*", "re:.*mlp\\.(gate|up|gate_up|down)_proj.*", "re:.*lm_head.*", "re:.*vision_tower.*", "re:.*mm_projector.*"],
+             "kv_cache_scheme": None, "quant_method": "compressed-tensors", "quantization_status": "compressed"}
+_K3 = dict(tok="deepseek3", H=48, I=32, NKV=4, HD=12, VD=8, L=5, rotary_dim=4, rope_layers=[0] * 5, prefix="language_model.model.", lm_head="language_model.lm_head.weight",
+           eps=1e-5, situ=(4.0, 25.0), attn_res=2, mla_gate=True,
+           mla={"q_lora_rank": 12, "kv_lora_rank": 16, "nope": 8, "rope": 4, "v": 8},
+           linear=dict(_KIMI_KDA, layout="checkpoint", full_rank_gate=True, lower_bound=-5.0), linear_layers=[1, 1, 0, 1, 0],
+           moe={"E": 4, "K": 2, "MI": 64, "shared": 2, "latent": 32, "latent_norm": True, "scoring": "sigmoid", "group_limited": True, "n_group": 1, "topk_group": 1,
+                "rsf": 1.0, "norm": True, "layers": [1, 2, 3, 4], "corr_bias": True, "layout": "separate", "prefix": "block_sparse_moe.", "router": "gate.weight",
+                "expert_names": ("w1.weight", "w3.weight", "w2.weight"), "shared_name": "shared_experts."})
+spec("kimi_k3", config={"model_type": "kimi_k3", "architectures": ["KimiK3ForConditionalGeneration"], "tie_word_embeddings": False, "media_placeholder_token_id": 200,
+                        "vision_config": _K3_VISION, "text_config": _K3_TEXT}, **_K3)
+spec("kimi_k3_mxfp4", quant={"kind": "mxfp4_packed"},
+     config={"model_type": "kimi_k3", "architectures": ["KimiK3ForConditionalGeneration"], "tie_word_embeddings": False, "media_placeholder_token_id": 200,
+             "vision_config": _K3_VISION, "text_config": dict(_K3_TEXT, quantization_config=_K3_QUANT)}, **_K3)
 # Kimi K2.5 / K2.6: the image-video wrapper around a DeepSeek V3 text config
 # (model_type kimi_k2 under text_config, language_model prefix).
 spec("kimi_k25", tok="deepseek3", NKV=4, HD=12, VD=8, L=3, prefix="language_model.model.", lm_head="language_model.lm_head.weight",
@@ -812,6 +873,8 @@ def generate_generic(family, out_dir):
             deq, tensors = quant_int_packed(name, w, q["bits"], q["group"], q["symmetric"])
         elif q["kind"] == "mxfp4":
             deq, tensors = quant_mxfp4(name, w)
+        elif q["kind"] == "mxfp4_packed":
+            deq, tensors = quant_mxfp4_packed(name, w)
         else:
             raise ValueError(q["kind"])
         w[...] = deq
@@ -850,6 +913,12 @@ def generate_generic(family, out_dir):
     pos_embed = mat(P + s["pos_embed"], 64 + s["pos_offset"], H, 0.5) if s["pos_embed"] else None
     embed_norm = normw(P + s["embed_norm"], H) if s["embed_norm"] else None
     final_norm = normw(P + s["final_norm"], H) if s["norm"] != "none" else None
+
+    def res_scorer(prefix):
+        """Attention Residual scorer: an RMSNorm weight and a [1, H] projection."""
+        return {"norm": normw(prefix + "norm.weight", H)[0], "proj": mat(prefix + "proj.weight", 1, H, 0.5)[0]}
+
+    output_res = res_scorer(P + "output_attn_res_") if s["attn_res"] else None
     lm_head = mat(s["lm_head"], V, H, 1.0) if s["lm_head"] else embed
     lm_bias = vec(s["lm_head"][:-len(".weight")] + ".bias", V, 0.1) if s["lm_bias"] else None
     layers = []
@@ -898,8 +967,11 @@ def generate_generic(family, out_dir):
             d["alog"] = vec(lp + fp + "A_log", NHl, 0.5)
             weights[lp + fp + "A_log"] = d["alog"].reshape(1, 1, NHl, 1)
             d["b"] = mat(lp + ap + "b_proj.weight", NHl, H)
-            d["g_a"] = mat(lp + ap + "g_a_proj.weight", D, H)
-            d["g_b"] = mat(lp + ap + "g_b_proj.weight", dim, D)
+            if ln.get("full_rank_gate"):
+                d["g"] = mat(lp + ap + "g_proj.weight", dim, H)
+            else:
+                d["g_a"] = mat(lp + ap + "g_a_proj.weight", D, H)
+                d["g_b"] = mat(lp + ap + "g_b_proj.weight", dim, D)
             d["lnorm"] = normw(lp + ap + "o_norm.weight", D)[0]
             d["o"] = mat(lp + ap + "o_proj.weight", H, dim)
             d["ob"] = None
@@ -932,6 +1004,8 @@ def generate_generic(family, out_dir):
             d["kv_a"] = mat(lp + "self_attn.kv_a_proj_with_mqa.weight", m["kv_lora_rank"] + m["rope"], H)
             d["kv_a_norm"] = normw(lp + "self_attn.kv_a_layernorm.weight", m["kv_lora_rank"])[0]
             d["kv_b"] = mat(lp + "self_attn.kv_b_proj.weight", NH * (m["nope"] + m["v"]), m["kv_lora_rank"])
+            if s["mla_gate"]:
+                d["attn_gate"] = mat(lp + "self_attn.g_proj.weight", NH * m["v"], H)
         elif s["qkv"]:
             w = mat(lp + s["qkv"], qd + 2 * kvd, H)
             b = bias_for(lp + s["qkv"], qd + 2 * kvd, s["attn_bias"])
@@ -956,10 +1030,19 @@ def generate_generic(family, out_dir):
                 weights[lp + s["k_norm"]] = weights[lp + s["k_norm"]].reshape(NKV, HD)
         if not lin_layers[i] and s["sinks"]:
             d["sinks"] = vec(lp + s["sinks"], NH, 1.0)
+        if s["attn_res"]:
+            d["attn_res"] = res_scorer(lp + "self_attention_res_")
+            d["mlp_res"] = res_scorer(lp + "mlp_res_")
         moe = s["moe"]
         if moe and i in moe["layers"]:
             mp = lp + moe["prefix"]
             E, K, MI = moe["E"], moe["K"], moe["MI"]
+            # Latent MoE: the routed experts read and write `EW` (the latent width) instead of H.
+            EW = moe.get("latent") or H
+            if moe.get("latent"):
+                d["latent_down"] = mat(mp + "routed_expert_down_proj.weight", EW, H)
+                d["latent_up"] = mat(mp + "routed_expert_up_proj.weight", H, EW)
+                d["latent_norm"] = normw(mp + "routed_expert_norm.weight", EW)[0] if moe.get("latent_norm") else None
             d["router"] = mat(mp + moe["router"], E, H)
             d["router_b"] = bias_for(mp + moe["router"], E, moe.get("router_bias", False))
             d["corr_b"] = None
@@ -970,17 +1053,19 @@ def generate_generic(family, out_dir):
                     weights[cb_name] = weights[cb_name].reshape(moe["corr_bias_shape"])
             experts = []
             for e in range(E):
-                ex = {"gate": bf16_round(rng.normal(0, 0.2, size=(MI, H))), "up": bf16_round(rng.normal(0, 0.2, size=(MI, H))),
-                      "down": bf16_round(rng.normal(0, 0.2, size=(H, MI))), "gb": None, "ub": None, "db": None}
+                ex = {"gate": bf16_round(rng.normal(0, 0.2, size=(MI, EW))), "up": bf16_round(rng.normal(0, 0.2, size=(MI, EW))),
+                      "down": bf16_round(rng.normal(0, 0.2, size=(EW, MI))), "gb": None, "ub": None, "db": None}
                 if moe.get("bias"):
-                    ex["gb"], ex["ub"], ex["db"] = (bf16_round(rng.normal(0, 0.1, size=(n,))) for n in (MI, MI, H))
+                    ex["gb"], ex["ub"], ex["db"] = (bf16_round(rng.normal(0, 0.1, size=(n,))) for n in (MI, MI, EW))
                 experts.append(ex)
             if moe["layout"] == "separate":
                 names = moe.get("expert_names", ("gate_proj.weight", "up_proj.weight", "down_proj.weight"))
                 for e, ex in enumerate(experts):
-                    weights[f"{mp}experts.{e}.{names[0]}"] = ex["gate"]
-                    weights[f"{mp}experts.{e}.{names[1]}"] = ex["up"]
-                    weights[f"{mp}experts.{e}.{names[2]}"] = ex["down"]
+                    for key, nm in zip(("gate", "up", "down"), names):
+                        weights[f"{mp}experts.{e}.{nm}"] = ex[key]
+                        if s["quant"] and s["quant"]["kind"] == "mxfp4_packed":
+                            # Only the routed experts are packed (the compressor ignores everything else).
+                            quantize(f"{mp}experts.{e}.{nm}", ex[key])
             elif moe["layout"] == "fused_rows":
                 # [E, 2I, H] / [E, H, I] (GraniteMoe input_linear / output_linear).
                 gu = np.stack([np.concatenate([ex["gate"], ex["up"]], 0) for ex in experts])
@@ -1121,6 +1206,16 @@ def generate_generic(family, out_dir):
         var = ((x - mu) ** 2).mean(-1, keepdims=True)
         y = (x - mu) / np.sqrt(var + eps) * w
         return y + b if b is not None else y
+
+    def glu(g, u):
+        """The gated MLP product `act(gate) * up`, or Kimi K3's SiTU."""
+        if s["situ"]:
+            beta, linear_beta = s["situ"]
+            a = beta * np.tanh(g / beta) * (1 / (1 + np.exp(-g)))
+            if linear_beta is not None:
+                u = linear_beta * np.tanh(u / linear_beta)
+            return a * u
+        return act_fn(g) * u
 
     def act_fn(x):
         a = s["act"]
@@ -1307,6 +1402,9 @@ def generate_generic(family, out_dir):
             if "sinks" in d:
                 pr = pr[:, :T]
             out[:, hh, :] = pr @ v[:, kv, :]
+        if "attn_gate" in d:
+            # Kimi K3 MLA: sigmoid output gate on the [T, NH * VD] attention output.
+            out = out * (1 / (1 + np.exp(-(h @ d["attn_gate"].T)))).reshape(T, NH, VD)
         o = out.reshape(T, NH * VD) @ d["o"].T
         if d["ob"] is not None:
             o = o + d["ob"]
@@ -1360,7 +1458,11 @@ def generate_generic(family, out_dir):
         k = y[:, dim:2 * dim].reshape(T, NHl, D)
         v = y[:, 2 * dim:].reshape(T, NHl, D)
         g = ((h @ d["f_a"].T) @ d["f_b"].T + d["dt"]).reshape(T, NHl, D)
-        g = -np.exp(d["alog"])[None, :, None] * np.where(g > 20.0, g, np.log1p(np.exp(np.minimum(g, 20.0))))
+        if ln.get("lower_bound") is not None:
+            # Kimi K3 safe gate: lower_bound * sigmoid(exp(A_log) * (f + dt_bias)).
+            g = ln["lower_bound"] * (1 / (1 + np.exp(-np.exp(d["alog"])[None, :, None] * g)))
+        else:
+            g = -np.exp(d["alog"])[None, :, None] * np.where(g > 20.0, g, np.log1p(np.exp(np.minimum(g, 20.0))))
         beta = 1 / (1 + np.exp(-(h @ d["b"].T)))
         q = q / np.sqrt(np.sum(q * q, -1, keepdims=True) + 1e-6) / np.sqrt(D)
         k = k / np.sqrt(np.sum(k * k, -1, keepdims=True) + 1e-6)
@@ -1373,7 +1475,7 @@ def generate_generic(family, out_dir):
                 delta = (v[t, hh] - mem) * beta[t, hh]
                 S[hh] = S[hh] + np.outer(k[t, hh], delta)
                 core[t, hh] = S[hh].T @ q[t, hh]
-        gate = ((h @ d["g_a"].T) @ d["g_b"].T).reshape(T, NHl, D)
+        gate = (h @ d["g"].T if "g" in d else (h @ d["g_a"].T) @ d["g_b"].T).reshape(T, NHl, D)
         o = core / np.sqrt(np.mean(core * core, -1, keepdims=True) + eps) * d["lnorm"]
         o = o * (1 / (1 + np.exp(-gate)))
         return o.reshape(T, dim) @ d["o"].T
@@ -1447,7 +1549,7 @@ def generate_generic(family, out_dir):
             u = np.clip(u, -limit, limit)
             hmid = (u + 1.0) * (g / (1 + np.exp(-alpha * g)))
         else:
-            hmid = act_fn(g) * u
+            hmid = glu(g, u)
         y = hmid @ ex["down"].T
         if biases and ex.get("db") is not None:
             y = y + ex["db"]
@@ -1465,7 +1567,10 @@ def generate_generic(family, out_dir):
                 sc_ = sc_ / sc_.sum(-1, keepdims=True)
             else:
                 sc_ = 1 / (1 + np.exp(-logits))
-            out = np.zeros_like(h)
+            # Latent MoE: the routed experts read `down(h)` and their sum is
+            # normalised and written back through `up`; the shared experts read h.
+            xin = h @ d["latent_down"].T if "latent_down" in d else h
+            out = np.zeros_like(xin)
             for t in range(h.shape[0]):
                 if moe["scoring"] == "topk_softmax":
                     # GraniteMoe: top-k of the logits, softmax over the selected ones.
@@ -1495,9 +1600,13 @@ def generate_generic(family, out_dir):
                 w = w * moe["rsf"]
                 for e, we in zip(idx, w):
                     if moe.get("scale_input"):
-                        out[t] += expert_out(d["experts"][e], h[t] * we)
+                        out[t] += expert_out(d["experts"][e], xin[t] * we)
                     else:
-                        out[t] += we * expert_out(d["experts"][e], h[t])
+                        out[t] += we * expert_out(d["experts"][e], xin[t])
+            if "latent_down" in d:
+                if d["latent_norm"] is not None:
+                    out = out / np.sqrt(np.mean(out * out, -1, keepdims=True) + eps) * d["latent_norm"]
+                out = out @ d["latent_up"].T
             if "shared" in d:
                 sh = d["shared"]
                 so = expert_out(sh, h, biases=False)
@@ -1509,7 +1618,7 @@ def generate_generic(family, out_dir):
             g, u = h @ d["gate"].T, h @ d["up"].T
             if d["gb"] is not None:
                 g, u = g + d["gb"], u + d["ub"]
-            m = act_fn(g) * u
+            m = glu(g, u)
         elif s["mlp"] == "gated_fused":
             gu = h @ d["gate_up"].T
             if d["gub"] is not None:
@@ -1521,7 +1630,7 @@ def generate_generic(family, out_dir):
                 u = np.clip(gu[:, inter:], -limit, limit)
                 m = (u + 1.0) * (g / (1 + np.exp(-alpha * g)))
             else:
-                m = act_fn(gu[:, :inter]) * gu[:, inter:]
+                m = glu(gu[:, :inter], gu[:, inter:])
         else:
             u = h @ d["up"].T
             if d["ub"] is not None:
@@ -1542,6 +1651,8 @@ def generate_generic(family, out_dir):
         hidden = [x.copy()]
         cos, sin = rope_tables(T)
         rm = np.float32(s["residual_mult"])
+        if s["attn_res"]:
+            return forward_attn_res(x, cos, sin)
         for li, d in enumerate(layers):
             h = norm(x, d["in_norm"]) if (d["in_norm"] is not None or s["norm"] == "none") and s["in_norm"] is not None else x
             if lin_layers[li] and s["linear_kind"] == "lightning":
@@ -1578,6 +1689,41 @@ def generate_generic(family, out_dir):
         if lm_bias is not None:
             logits = logits + lm_bias
         logits = logits * np.float32(s["logit_scale"])
+        return logits, hidden
+
+    def attn_res_mix(bank, p, scorer):
+        """Kimi K3 Attention Residual aggregation (aggregate_stream): the banked
+        block prefixes and the running prefix `p` are mixed by the softmax of
+        their scores `rmsnorm(row; norm) · proj`, per token."""
+        rows = bank + [p]
+        scores = np.stack([np.sum(r / np.sqrt(np.mean(r * r, -1, keepdims=True) + eps) * scorer["norm"] * scorer["proj"], -1) for r in rows])  # [R, T]
+        pr = np.exp(scores - scores.max(0, keepdims=True))
+        pr = pr / pr.sum(0, keepdims=True)
+        return sum(pr[j][:, None] * r for j, r in enumerate(rows))
+
+    def forward_attn_res(x, cos, sin):
+        """Kimi K3 decoder (KimiK3DecoderLayer with attn_res): every block boundary
+        banks the running prefix and restarts it; each sublayer reads the mixture
+        of the bank and the running prefix. The recorded hidden state of layer li
+        is that attention-side mixture (ditch's residual definition), and the last
+        entry the output mixture the final norm reads."""
+        B = s["attn_res"]
+        bank = []
+        hidden = []
+        for li, d in enumerate(layers):
+            mix = attn_res_mix(bank, x, d["attn_res"])
+            hidden.append(mix.copy())
+            h = norm(mix, d["in_norm"])
+            if li % B == 0:
+                bank.append(x.copy())
+                x = None
+            a = linear_attn(d, h) if lin_layers[li] else attention(d, li, h, cos, sin)
+            x = a if x is None else x + a
+            h2 = norm(attn_res_mix(bank, x, d["mlp_res"]), d["pre_ff_norm"])
+            x = x + mlp(d, h2)
+        x = attn_res_mix(bank, x, output_res)
+        hidden.append(x.copy())
+        logits = norm(x, final_norm) @ lm_head.T
         return logits, hidden
 
     cases = []

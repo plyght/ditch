@@ -141,6 +141,24 @@ pub const SharedExpert = struct {
     down_ref: MatrixRef,
 };
 
+/// Latent MoE (Kimi K3 `routed_expert_hidden_size`): the routed experts read
+/// `down(x)` and their weighted sum, RMS-normalised when `norm` is set, is
+/// written back into the residual through `up`. `up` is therefore the routed
+/// experts' write into the residual stream and the matrix abliteration edits
+/// on such a layer (the per-expert `w2` matrices live in latent space, where
+/// a residual direction has no meaning); `down` and `norm` are never edited.
+pub const Latent = struct {
+    width: usize,
+    /// `[width][hidden]`.
+    down: Weight,
+    /// `[hidden][width]`.
+    up: Weight,
+    norm: ?[]const f32,
+    down_ref: MatrixRef,
+    up_ref: MatrixRef,
+    up_delta: ?Delta = null,
+};
+
 pub const MoeLayer = struct {
     /// Index of the layer this block belongs to (the expert cache key).
     layer_index: usize,
@@ -159,6 +177,8 @@ pub const MoeLayer = struct {
     layout: Layout,
     experts: []Expert,
     shared: ?SharedExpert,
+    /// Latent MoE projections (null: the experts read and write `hidden`).
+    latent: ?Latent = null,
     /// Tensor-name suffix (after `layers.{i}.`) of the fused down tensor, for export.
     fused_down_suffix: ?[]const u8,
     /// Name templates of the family (for export lookups).
@@ -167,6 +187,25 @@ pub const MoeLayer = struct {
     /// Number of editable down projections: routed experts plus the shared expert.
     pub fn numDown(self: *const MoeLayer) usize {
         return self.experts.len + @as(usize, if (self.shared != null) 1 else 0);
+    }
+
+    /// Width of the routed experts' input and output (`hidden`, or the latent width).
+    pub fn expertWidth(self: *const MoeLayer, hidden: usize) usize {
+        return if (self.latent) |l| l.width else hidden;
+    }
+
+    /// True when the routed experts' down projections cannot carry a residual
+    /// edit (latent MoE); `latent.up` is edited in their place.
+    pub fn routedInLatent(self: *const MoeLayer) bool {
+        return self.latent != null;
+    }
+
+    /// Makes the latent up projection resident; release with `DownLease.release`.
+    pub fn acquireLatentUp(self: *const MoeLayer, model: *const Model) !DownLease {
+        const lat = self.latent.?;
+        if (!model.streamed()) return .{ .weight = lat.up };
+        const lease = try lat.up_ref.acquire(@constCast(&model.store));
+        return .{ .weight = lease.weight, .lease = lease };
     }
 
     /// Index used for the shared expert in `downWeight`/`downDelta` (== experts.len).
@@ -200,12 +239,14 @@ pub const MoeLayer = struct {
         return .{ .weight = lease.weight, .lease = lease };
     }
 
-    /// Bytes of the layer's trunk part in streamed mode: the shared expert (if any).
+    /// Bytes of the layer's trunk part in streamed mode: the shared expert (if
+    /// any) and the latent projections.
     pub fn trunkBytes(self: *const MoeLayer) u64 {
         var total: u64 = 0;
         if (self.shared) |sh| {
             for ([_]MatrixRef{ sh.gate_ref, sh.up_ref, sh.down_ref }) |r| total += r.residentBytes();
         }
+        if (self.latent) |l| total += l.down_ref.residentBytes() + l.up_ref.residentBytes();
         return total;
     }
 
@@ -251,6 +292,11 @@ pub const MoeLayer = struct {
                 slot.* = null;
             }
         }
+        if (self.latent) |*l| if (l.up_delta) |d| {
+            gpa.free(d.a);
+            gpa.free(d.b);
+            l.up_delta = null;
+        };
     }
 
     /// Which down projection a tensor-name suffix (after `layers.{i}.`) refers to.
@@ -259,6 +305,8 @@ pub const MoeLayer = struct {
         expert: usize,
         /// The fused down tensor holding every routed expert.
         fused_down,
+        /// The latent up projection (`Latent.up`).
+        latent_up,
     };
 
     pub fn exportTarget(self: *const MoeLayer, suffix: []const u8) ?ExportTarget {
@@ -266,6 +314,9 @@ pub const MoeLayer = struct {
             if (std.mem.eql(u8, suffix, fd)) return .fused_down;
         }
         const names = self.names;
+        if (self.latent != null) {
+            if (names.latent_up) |lu| if (std.mem.eql(u8, suffix, lu)) return .latent_up;
+        }
         if (self.shared != null) {
             if (names.shared_expert) |sp| {
                 if (std.mem.startsWith(u8, suffix, sp) and std.mem.eql(u8, suffix[sp.len..], names.shared_down orelse names.expert_down)) return .{ .expert = self.experts.len };
@@ -358,33 +409,53 @@ fn acquireInto(store: *stream.WeightStore, r: MatrixRef, leases: []Lease, n: *us
     return leases[n.* - 1].weight;
 }
 
+/// Number of leases the trunk of `m` takes: the shared expert's three
+/// matrices and the two latent projections.
+fn trunkLeaseCount(m: *const MoeLayer) usize {
+    return @as(usize, if (m.shared != null) 3 else 0) + @as(usize, if (m.latent != null) 2 else 0);
+}
+
+/// Acquires the trunk matrices of `m` (shared expert, latent projections) into `lease.layer`.
+fn acquireTrunk(store: *stream.WeightStore, m: *const MoeLayer, lease: *MoeLease, leases: []Lease, n: *usize) !void {
+    if (m.shared) |sh| {
+        var s = sh;
+        s.gate = try acquireInto(store, sh.gate_ref, leases, n);
+        s.up = try acquireInto(store, sh.up_ref, leases, n);
+        s.down = try acquireInto(store, sh.down_ref, leases, n);
+        lease.layer.shared = s;
+    }
+    if (m.latent) |lat| {
+        var l = lat;
+        l.down = try acquireInto(store, lat.down_ref, leases, n);
+        l.up = try acquireInto(store, lat.up_ref, leases, n);
+        lease.layer.latent = l;
+    }
+}
+
 /// Makes every expert matrix of `m` resident through the model's store (only
-/// the shared expert in warp mode). In mapped mode the views are already
-/// valid and nothing is allocated.
+/// the trunk, i.e. the shared expert and the latent projections, in warp
+/// mode). In mapped mode the views are already valid and nothing is allocated.
 pub fn acquireLayer(model: *const Model, m: *const MoeLayer) !MoeLease {
     const gpa = model.gpa;
     var lease = MoeLease{ .layer = m.*, .gpa = gpa, .experts = &.{}, .leases = &.{} };
     if (!model.streamed()) return lease;
     const store: *stream.WeightStore = @constCast(&model.store);
     if (model.expert_cache != null) {
-        const sh = m.shared orelse return lease;
-        const shared_leases = try gpa.alloc(Lease, 3);
-        errdefer gpa.free(shared_leases);
+        const count = trunkLeaseCount(m);
+        if (count == 0) return lease;
+        const trunk_leases = try gpa.alloc(Lease, count);
+        errdefer gpa.free(trunk_leases);
         var n: usize = 0;
-        errdefer store.releaseSet(shared_leases[0..n]);
-        var s = sh;
-        s.gate = try acquireInto(store, sh.gate_ref, shared_leases, &n);
-        s.up = try acquireInto(store, sh.up_ref, shared_leases, &n);
-        s.down = try acquireInto(store, sh.down_ref, shared_leases, &n);
-        lease.layer.shared = s;
-        lease.leases = shared_leases;
+        errdefer store.releaseSet(trunk_leases[0..n]);
+        try acquireTrunk(store, m, &lease, trunk_leases, &n);
+        lease.leases = trunk_leases;
         return lease;
     }
     const experts = try gpa.alloc(Expert, m.experts.len);
     errdefer gpa.free(experts);
     // Three matrices per routed expert (gate and up of a transposed fused block
-    // come out of one read but are still two leases) plus the shared expert.
-    const all_leases = try gpa.alloc(Lease, 3 * m.experts.len + @as(usize, if (m.shared != null) 3 else 0));
+    // come out of one read but are still two leases) plus the trunk.
+    const all_leases = try gpa.alloc(Lease, 3 * m.experts.len + trunkLeaseCount(m));
     errdefer gpa.free(all_leases);
     var n: usize = 0;
     errdefer store.releaseSet(all_leases[0..n]);
@@ -402,13 +473,7 @@ pub fn acquireLayer(model: *const Model, m: *const MoeLayer) !MoeLease {
         }
         experts[e].down = try acquireInto(store, ex.down_ref, all_leases, &n);
     }
-    if (m.shared) |sh| {
-        var s = sh;
-        s.gate = try acquireInto(store, sh.gate_ref, all_leases, &n);
-        s.up = try acquireInto(store, sh.up_ref, all_leases, &n);
-        s.down = try acquireInto(store, sh.down_ref, all_leases, &n);
-        lease.layer.shared = s;
-    }
+    try acquireTrunk(store, m, &lease, all_leases, &n);
     std.debug.assert(n == all_leases.len);
     lease.layer.experts = experts;
     lease.experts = experts;
@@ -528,6 +593,35 @@ pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !Mo
         return error.InvalidConfig;
     }
 
+    // Latent MoE: the routed experts run in `routed_expert_hidden_size` space.
+    if (c.moe_latent > 0) {
+        const down_name = try cat(arena, &.{ lp, names.latent_down orelse return error.InvalidConfig });
+        const up_name = try cat(arena, &.{ lp, names.latent_up orelse return error.InvalidConfig });
+        var lat = Latent{
+            .width = c.moe_latent,
+            .down = try model.loadMat(down_name),
+            .up = try model.loadMat(up_name),
+            .norm = null,
+            .down_ref = .{ .ref = try model.ref(down_name) },
+            .up_ref = .{ .ref = try model.ref(up_name) },
+        };
+        if (lat.down.rows != c.moe_latent or lat.down.cols != hidden or lat.up.rows != hidden or lat.up.cols != c.moe_latent) {
+            std.log.err("layer {d}: latent projections {s} [{d}][{d}] / {s} [{d}][{d}] do not match routed_expert_hidden_size {d}", .{ li, down_name, lat.down.rows, lat.down.cols, up_name, lat.up.rows, lat.up.cols, c.moe_latent });
+            return error.InvalidConfig;
+        }
+        if (c.moe_latent_norm) {
+            const norm_name = try cat(arena, &.{ lp, names.latent_norm orelse return error.InvalidConfig });
+            lat.norm = model.loadVecOpt(norm_name) orelse {
+                std.log.err("missing tensor: {s}", .{norm_name});
+                return error.MissingWeights;
+            };
+            if (lat.norm.?.len != c.moe_latent) return error.InvalidConfig;
+        }
+        self.latent = lat;
+    }
+    // Width of the routed experts' input and output.
+    const ew = self.expertWidth(hidden);
+
     // Fused layout?
     var fused_gu: ?WeightRef = null;
     var fused_gu_name: []const u8 = "";
@@ -536,7 +630,7 @@ pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !Mo
         if (try findStacked(model, full)) |st| {
             const shape = st.shape;
             if (shape[0] != n_experts) return error.InvalidConfig;
-            if (shape[1] == 2 * inter and shape[2] == hidden) self.layout = .fused else if (shape[1] == hidden and shape[2] == 2 * inter) self.layout = .fused_transposed else {
+            if (shape[1] == 2 * inter and shape[2] == ew) self.layout = .fused else if (shape[1] == ew and shape[2] == 2 * inter) self.layout = .fused_transposed else {
                 std.log.err("unexpected fused expert shape [{d}, {d}, {d}]", .{ shape[0], shape[1], shape[2] });
                 return error.InvalidConfig;
             }
@@ -563,7 +657,7 @@ pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !Mo
         const es = gu.dtype.size();
         const interleaved = c.moe.gate_up_interleaved;
         if (interleaved and self.layout != .fused_transposed) {
-            std.log.err("interleaved gate/up experts are only supported in the [E, hidden, 2I] layout", .{});
+            std.log.err("interleaved gate/up experts are only supported in the [E, ew, 2I] layout", .{});
             return error.InvalidConfig;
         }
         // Views of the whole stacked tensors (data valid in mapped mode only).
@@ -573,45 +667,45 @@ pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !Mo
         const dn_bias_name = try model_mod.biasName(arena, down_name);
         switch (self.layout) {
             .fused => {
-                if (down_shape[1] != hidden or down_shape[2] != inter) return error.InvalidConfig;
+                if (down_shape[1] != ew or down_shape[2] != inter) return error.InvalidConfig;
                 for (self.experts, 0..) |*ex, e| {
-                    const gu_block = blockRef(gu, e, 2 * inter, hidden);
+                    const gu_block = blockRef(gu, e, 2 * inter, ew);
                     ex.* = .{
                         .gate_ref = .{ .ref = gu_block.rowSlice(0, inter) },
                         .up_ref = .{ .ref = gu_block.rowSlice(inter, inter) },
-                        .down_ref = .{ .ref = blockRef(dw, e, hidden, inter) },
+                        .down_ref = .{ .ref = blockRef(dw, e, ew, inter) },
                         .gate = undefined,
                         .up = undefined,
                         .down = undefined,
                     };
                     if (mapped) {
-                        ex.gate = blockWeight(gu_w, e, 2 * inter * hidden, inter, hidden, 0);
-                        ex.up = blockWeight(gu_w, e, 2 * inter * hidden, inter, hidden, inter);
-                        ex.down = blockWeight(dw_w, e, hidden * inter, hidden, inter, 0);
+                        ex.gate = blockWeight(gu_w, e, 2 * inter * ew, inter, ew, 0);
+                        ex.up = blockWeight(gu_w, e, 2 * inter * ew, inter, ew, inter);
+                        ex.down = blockWeight(dw_w, e, ew * inter, ew, inter, 0);
                     }
                 }
             },
             .fused_transposed => {
-                if (down_shape[1] != inter or down_shape[2] != hidden) return error.InvalidConfig;
+                if (down_shape[1] != inter or down_shape[2] != ew) return error.InvalidConfig;
                 for (self.experts, 0..) |*ex, e| {
-                    const gu_block = blockRef(gu, e, hidden, 2 * inter);
+                    const gu_block = blockRef(gu, e, ew, 2 * inter);
                     ex.* = .{
                         .gate_ref = if (interleaved) .{ .ref = gu_block, .transposed = .{ 0, 2 * inter }, .stride = 2 } else .{ .ref = gu_block, .transposed = .{ 0, inter } },
                         .up_ref = if (interleaved) .{ .ref = gu_block, .transposed = .{ 1, 2 * inter }, .stride = 2 } else .{ .ref = gu_block, .transposed = .{ inter, 2 * inter } },
-                        .down_ref = .{ .ref = blockRef(dw, e, inter, hidden), .transposed = .{ 0, hidden } },
+                        .down_ref = .{ .ref = blockRef(dw, e, inter, ew), .transposed = .{ 0, ew } },
                         .gate = undefined,
                         .up = undefined,
                         .down = undefined,
                     };
                     if (mapped) {
                         // Transposed once on load into arena-owned copies.
-                        const gu_bytes = gu_w.data[e * hidden * 2 * inter * es ..][0 .. hidden * 2 * inter * es];
-                        const dn_bytes = dw_w.data[e * inter * hidden * es ..][0 .. inter * hidden * es];
+                        const gu_bytes = gu_w.data[e * ew * 2 * inter * es ..][0 .. ew * 2 * inter * es];
+                        const dn_bytes = dw_w.data[e * inter * ew * es ..][0 .. inter * ew * es];
                         const gcols = ex.gate_ref.columns();
                         const ucols = ex.up_ref.columns();
-                        ex.gate = .{ .data = try transposeSub(arena, es, gu_bytes, hidden, 2 * inter, gcols.lo, gcols.hi, gcols.stride), .dtype = gu.dtype, .rows = inter, .cols = hidden };
-                        ex.up = .{ .data = try transposeSub(arena, es, gu_bytes, hidden, 2 * inter, ucols.lo, ucols.hi, ucols.stride), .dtype = gu.dtype, .rows = inter, .cols = hidden };
-                        ex.down = .{ .data = try transposeSub(arena, es, dn_bytes, inter, hidden, 0, hidden, 1), .dtype = dw.dtype, .rows = hidden, .cols = inter };
+                        ex.gate = .{ .data = try transposeSub(arena, es, gu_bytes, ew, 2 * inter, gcols.lo, gcols.hi, gcols.stride), .dtype = gu.dtype, .rows = inter, .cols = ew };
+                        ex.up = .{ .data = try transposeSub(arena, es, gu_bytes, ew, 2 * inter, ucols.lo, ucols.hi, ucols.stride), .dtype = gu.dtype, .rows = inter, .cols = ew };
+                        ex.down = .{ .data = try transposeSub(arena, es, dn_bytes, inter, ew, 0, ew, 1), .dtype = dw.dtype, .rows = ew, .cols = inter };
                     }
                 }
             },
@@ -624,7 +718,7 @@ pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !Mo
                 ex.down = ex.down_ref.shapeOnly();
             }
         }
-        // Expert biases (`gate_up_proj_bias` [E, 2I], `down_proj_bias` [E, hidden]).
+        // Expert biases (`gate_up_proj_bias` [E, 2I], `down_proj_bias` [E, ew]).
         for (self.experts, 0..) |*ex, e| {
             if (try biasRow(model, arena, gu_bias_name, e, 2 * inter)) |gub| {
                 if (interleaved) {
@@ -636,7 +730,7 @@ pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !Mo
                     ex.up_bias = gub[inter..];
                 }
             }
-            ex.down_bias = try biasRow(model, arena, dn_bias_name, e, hidden);
+            ex.down_bias = try biasRow(model, arena, dn_bias_name, e, ew);
         }
     } else {
         for (self.experts, 0..) |*ex, e| {
@@ -658,7 +752,7 @@ pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !Mo
         }
     }
     for (self.experts) |ex| {
-        if (ex.gate.rows != inter or ex.gate.cols != hidden or ex.down.rows != hidden or ex.down.cols != inter) return error.InvalidConfig;
+        if (ex.gate.rows != inter or ex.gate.cols != ew or ex.down.rows != ew or ex.down.cols != inter) return error.InvalidConfig;
     }
 
     // Shared expert(s): one fused block (DeepSeek `shared_experts`, Qwen2-MoE
@@ -740,11 +834,29 @@ fn runExpert(model: *const Model, m: *const MoeLayer, gate_w: Weight, up_w: Weig
             const uc = std.math.clamp(up[j], -sw.limit, sw.limit);
             g.* = (uc + 1.0) * gc * sigmoid(sw.alpha * gc);
         }
+    } else if (m.routing.situ) |st| {
+        situGlu(st, gate, gate, up, ne, inter, inter);
     } else {
         tensor.gatedActivation(model.pool, m.activation, gate, gate, up, ne, inter, inter, inter);
     }
     try tensor.matmulT(model.pool, gpa, out, gate, ne, down_w, delta);
     if (biases[2]) |b| for (0..ne) |i| tensor.axpy(out[i * hidden ..][0..hidden], 1.0, b[0..hidden]);
+}
+
+/// Kimi K3 SiTU on `n` rows of `gate` and `up` (row stride `in_stride`):
+/// `out = beta · tanh(gate / beta) · σ(gate) · up'`, with `up' = linear_beta ·
+/// tanh(up / linear_beta)` when a linear beta is set; written densely (`[n][inter]`).
+pub fn situGlu(st: arch.Situ, out: []f32, gate: []const f32, up: []const f32, n: usize, inter: usize, in_stride: usize) void {
+    for (0..n) |i| {
+        const g = gate[i * in_stride ..][0..inter];
+        const u = up[i * in_stride ..][0..inter];
+        const o = out[i * inter ..][0..inter];
+        for (o, 0..) |*v, j| {
+            const a = st.beta * std.math.tanh(g[j] / st.beta) * sigmoid(g[j]);
+            const x = if (st.linear_beta) |lb| lb * std.math.tanh(u[j] / lb) else u[j];
+            v.* = a * x;
+        }
+    }
 }
 
 /// Picks the top-k experts of one token from `scores` (routing weights) using
@@ -854,7 +966,27 @@ pub fn forward(model: *const Model, m: *const MoeLayer, li: usize, out: []f32, h
     }
 
     @memset(out[0 .. n * hidden], 0);
-    const xg = try gpa.alloc(f32, n * hidden);
+    // Latent MoE: the experts read `down(h)` and accumulate in latent space;
+    // otherwise they read `h` and accumulate straight into `out`.
+    const ew = m.expertWidth(hidden);
+    var xin: []const f32 = h;
+    var acc: []f32 = out;
+    var latent_bufs: ?[2][]f32 = null;
+    defer if (latent_bufs) |bufs| {
+        gpa.free(bufs[0]);
+        gpa.free(bufs[1]);
+    };
+    if (m.latent) |lat| {
+        const xl = try gpa.alloc(f32, n * ew);
+        errdefer gpa.free(xl);
+        const al = try gpa.alloc(f32, n * ew);
+        latent_bufs = .{ xl, al };
+        try tensor.matmulT(model.pool, gpa, xl, h, n, lat.down, null);
+        @memset(al, 0);
+        xin = xl;
+        acc = al;
+    }
+    const xg = try gpa.alloc(f32, n * ew);
     defer gpa.free(xg);
     const gate = try gpa.alloc(f32, n * inter);
     defer gpa.free(gate);
@@ -898,8 +1030,8 @@ pub fn forward(model: *const Model, m: *const MoeLayer, li: usize, out: []f32, h
             }
         }
         for (0..ne) |j| {
-            const dst = xg[j * hidden ..][0..hidden];
-            @memcpy(dst, h[tok[j] * hidden ..][0..hidden]);
+            const dst = xg[j * ew ..][0..ew];
+            @memcpy(dst, xin[tok[j] * ew ..][0..ew]);
             if (r.scale_input) tensor.scale(dst, wts[j]);
         }
         const delta: ?*const Delta = if (ex.down_delta) |*d| d else null;
@@ -911,7 +1043,22 @@ pub fn forward(model: *const Model, m: *const MoeLayer, li: usize, out: []f32, h
         } else {
             try runExpert(model, m, ex.gate, ex.up, ex.down, biases, delta, xg, ne, gate, up, eo);
         }
-        for (0..ne) |j| tensor.axpy(out[tok[j] * hidden ..][0..hidden], if (r.scale_input) 1.0 else wts[j], eo[j * hidden ..][0..hidden]);
+        for (0..ne) |j| tensor.axpy(acc[tok[j] * ew ..][0..ew], if (r.scale_input) 1.0 else wts[j], eo[j * ew ..][0..ew]);
+    }
+
+    if (m.latent) |*lat| {
+        // Latent norm on the summed routed output, then the up projection
+        // (with its delta) writes it into the residual.
+        if (lat.norm) |nw| {
+            const tmp = try gpa.alloc(f32, ew);
+            defer gpa.free(tmp);
+            for (0..n) |t| {
+                const row = acc[t * ew ..][0..ew];
+                tensor.rmsnorm(tmp, row, nw, model.config.rms_norm_eps, false);
+                @memcpy(row, tmp);
+            }
+        }
+        try tensor.matmulT(model.pool, gpa, out, acc, n, lat.up, if (lat.up_delta) |*d| d else null);
     }
 
     if (m.shared) |*sh| {
@@ -965,6 +1112,9 @@ pub fn scoreLayer(pool: *const tensor.Pool, gpa: Allocator, m: *const MoeLayer, 
 /// score -1 and therefore rank last.
 pub fn scoreExperts(model: *const Model, layer: usize, v: []const f32, visited_only: bool) ![]f32 {
     const m = &(model.layers[layer].moe orelse return error.NotMoeLayer);
+    // Latent experts write into latent space, where a residual direction has
+    // no projection; the layer's routed edit goes through `Latent.up` instead.
+    if (m.routedInLatent()) return error.LatentExperts;
     const gpa = model.gpa;
     const scores = try gpa.alloc(f32, m.experts.len);
     errdefer gpa.free(scores);
@@ -1061,6 +1211,13 @@ pub fn printExpertTable(out: *Io.Writer, layer: usize, scores: []const f32, rank
 /// (warp mode) only experts that a forward pass of this run routed to are
 /// scored and edited: the others cannot have influenced any refusal, and
 /// skipping them saves their reads.
+///
+/// On a latent-MoE layer (Kimi K3) the routed experts share one write into
+/// the residual, `routed_expert_up_proj`: there is nothing to rank, so that
+/// matrix takes the edit every routed expert would have received (weight λ
+/// in broad mode, `λ·strength` otherwise, nothing when `n_experts == 0` in a
+/// selective mode would edit nothing); the per-expert `w2` matrices are never
+/// touched.
 pub fn applyExpertSelective(model: *Model, dirs: []const f32, cfg: search.TrialConfig, opts: abliterate.Options) !void {
     if (!model.isMoe()) return error.NotMoeModel;
     const sel = cfg.experts orelse search.ExpertSelection{ .n_experts = 0, .strength = 1.0 };
@@ -1101,7 +1258,26 @@ pub fn applyExpertSelective(model: *Model, dirs: []const f32, cfg: search.TrialC
         });
         const n_candidates = candidateCount(model, li, visited_only);
         const n = @min(sel.n_experts, n_candidates);
-        if (sel.n_experts == 0 or opts.expert_selection == .broad) {
+        const broad = sel.n_experts == 0 or opts.expert_selection == .broad;
+        if (m.routedInLatent()) {
+            const weight = if (broad) lambda else @max(0.0, lambda * sel.strength);
+            if (weight != 0) {
+                const lease = try m.acquireLatentUp(model);
+                defer lease.release(model);
+                const delta = try abliterate.computeDelta(model.pool, gpa, lease.weight, v, weight, opts, opts.seed +% seed_counter);
+                seed_counter += 1;
+                model.setLatentDelta(li, delta);
+            }
+            if (broad) if (m.sharedIndex()) |si| {
+                const lease = try m.acquireDown(model, si);
+                defer lease.release(model);
+                const delta = try abliterate.computeDelta(model.pool, gpa, lease.weight, v, lambda, opts, opts.seed +% seed_counter);
+                seed_counter += 1;
+                model.setExpertDelta(li, si, delta);
+            };
+            continue;
+        }
+        if (broad) {
             var idx: usize = 0;
             while (idx < m.numDown()) : (idx += 1) {
                 if (visited_only and idx < m.experts.len and !model.expertVisited(li, idx)) continue;
@@ -1198,8 +1374,9 @@ fn randomDirs(gpa: Allocator, entries: usize, hidden: usize, seed: u64) ![]f32 {
 
 fn selectiveConfig(n_experts: usize, strength: f32) search.TrialConfig {
     var params = std.EnumMap(model_mod.Component, abliterate.Params){};
-    params.put(.attn_o_proj, .{ .max_weight = 1.0, .max_weight_position = 1, .min_weight = 0.5, .min_weight_distance = 2 });
-    params.put(.mlp_down_proj, .{ .max_weight = 1.0, .max_weight_position = 1, .min_weight = 0.5, .min_weight_distance = 2 });
+    // The kernel reaches every layer of every fixture (at most five layers).
+    params.put(.attn_o_proj, .{ .max_weight = 1.0, .max_weight_position = 1, .min_weight = 0.5, .min_weight_distance = 4 });
+    params.put(.mlp_down_proj, .{ .max_weight = 1.0, .max_weight_position = 1, .min_weight = 0.5, .min_weight_distance = 4 });
     return .{ .direction_index = null, .parameters = params, .experts = .{ .n_experts = n_experts, .strength = strength } };
 }
 
@@ -1244,11 +1421,52 @@ test "selective edit with n=1 edits exactly the top-ranked expert" {
     }
 }
 
+test "selective edit on a latent MoE edits the routed up projection, never the latent experts" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const pool = tensor.Pool.init(io, 1);
+    const model = try Model.load(gpa, io, &pool, "tests/fixtures/kimi_k3");
+    defer model.deinit();
+    const hidden = model.config.hidden_size;
+    const dirs = try randomDirs(gpa, model.config.num_layers + 1, hidden, 13);
+    defer gpa.free(dirs);
+    // Ranked mode: the up projection takes the weighted edit; the shared expert is untouched.
+    try model_mod.applyExpertSelective(model, dirs, selectiveConfig(1, 0.5), .{ .row_normalization = .none });
+    for (model.layers, 0..) |*layer, li| {
+        const m = &(layer.moe orelse continue);
+        try std.testing.expect(m.routedInLatent());
+        try std.testing.expectError(error.LatentExperts, rankExperts(model, li, dirs[(li + 1) * hidden ..][0..hidden]));
+        try std.testing.expect(model.getLatentDelta(li) != null);
+        for (0..m.experts.len) |e| try std.testing.expect(model.getExpertDelta(li, e) == null);
+        try std.testing.expect(model.getExpertDelta(li, m.sharedIndex().?) == null);
+    }
+    // Broad mode: the up projection and the shared expert; the latent experts still never.
+    try model_mod.applyExpertSelective(model, dirs, selectiveConfig(0, 1.0), .{ .row_normalization = .none });
+    for (model.layers, 0..) |*layer, li| {
+        const m = &(layer.moe orelse continue);
+        try std.testing.expect(model.getLatentDelta(li) != null);
+        try std.testing.expect(model.getExpertDelta(li, m.sharedIndex().?) != null);
+        for (0..m.experts.len) |e| try std.testing.expect(model.getExpertDelta(li, e) == null);
+    }
+    // The edit reaches the logits and a reset clears it.
+    const ids = [_]u32{ 40, 100, 200, 7 };
+    const edited = try runLogits(model, gpa, &ids);
+    defer gpa.free(edited);
+    model.resetDeltas();
+    for (model.layers, 0..) |*layer, li| if (layer.moe != null) try std.testing.expect(model.getLatentDelta(li) == null);
+    const base = try runLogits(model, gpa, &ids);
+    defer gpa.free(base);
+    var moved: f32 = 0;
+    for (base, edited) |a, b| moved = @max(moved, @abs(a - b));
+    try std.testing.expect(moved > 1e-4);
+}
+
 fn runLogits(model: *const Model, gpa: Allocator, ids: []const u32) ![]f32 {
     const c = &model.config;
     var ws = try model_mod.Workspace.init(gpa, c, 16, 1);
     defer ws.deinit();
-    var cache = try model_mod.KvCache.init(gpa, c.num_layers, 1, 16, c.num_kv_heads * c.head_dim);
+    // `initFor` adds the recurrent state of linear-attention layers (Kimi K3).
+    var cache = try model_mod.KvCache.initFor(model, gpa, 1, 16);
     defer cache.deinit();
     const logits = try gpa.alloc(f32, c.vocab_size);
     errdefer gpa.free(logits);
@@ -1369,7 +1587,7 @@ fn checkStreamedMatchesMapped(comptime fixture: []const u8) !void {
     try model_mod.applyExpertSelective(streamed, dirs, selectiveConfig(2, 1.1), .{ .row_normalization = .full, .lora_rank = 2 });
     for (mapped.layers, 0..) |*layer, li| {
         const m = &(layer.moe orelse continue);
-        for (0..m.experts.len) |e| {
+        for (0..m.numDown()) |e| {
             const a = mapped.getExpertDelta(li, e);
             const b = streamed.getExpertDelta(li, e);
             try std.testing.expectEqual(a == null, b == null);
@@ -1377,6 +1595,13 @@ fn checkStreamedMatchesMapped(comptime fixture: []const u8) !void {
                 try std.testing.expectEqualSlices(f32, da.a, b.?.a);
                 try std.testing.expectEqualSlices(f32, da.b, b.?.b);
             }
+        }
+        const la = mapped.getLatentDelta(li);
+        const lb = streamed.getLatentDelta(li);
+        try std.testing.expectEqual(la == null, lb == null);
+        if (la) |da| {
+            try std.testing.expectEqualSlices(f32, da.a, lb.?.a);
+            try std.testing.expectEqualSlices(f32, da.b, lb.?.b);
         }
     }
     const l2 = try runLogits(mapped, gpa, &ids);
@@ -1401,6 +1626,9 @@ test "streamed MoE forward and edits match mapped (fused [E, 2I, H] experts, fus
 }
 test "streamed MoE forward and edits match mapped (Mixtral names, fused shared expert, swiglu)" {
     try checkStreamedMatchesMapped("minimax_m3");
+}
+test "streamed MoE forward and edits match mapped (latent MoE, attention residual, packed MXFP4 experts)" {
+    try checkStreamedMatchesMapped("kimi_k3_mxfp4");
 }
 test "selective export round trip (fused [E, 2I, H] experts)" {
     try checkExportRoundTrip("granitemoe");

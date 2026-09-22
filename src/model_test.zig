@@ -243,6 +243,9 @@ test "kimi_linear fixture (Hugging Face layout: forget_gate, fused conv1d, stack
 test "kimi_k25 fixture (DeepSeek V3 text config under a multimodal wrapper)" {
     try checkFixture("kimi_k25");
 }
+test "kimi_k3 fixture (Attention Residual, full-rank and safe KDA gates, MLA output gate, latent MoE, SiTU)" {
+    try checkFixture("kimi_k3");
+}
 
 // Quantised checkpoints (dequantised on load, see dequant.zig): the reference
 // logits were computed on the dequantised weights.
@@ -254,6 +257,9 @@ test "qwen2_int4 fixture (compressed-tensors pack-quantized, zero points)" {
 }
 test "gpt_oss_mxfp4 fixture (MXFP4 expert blocks and scales)" {
     try checkFixture("gpt_oss_mxfp4");
+}
+test "kimi_k3_mxfp4 fixture (compressed-tensors mxfp4-pack-quantized experts)" {
+    try checkFixture("kimi_k3_mxfp4");
 }
 
 // ---------------------------------------------------------------------------
@@ -286,8 +292,9 @@ fn runLogits(model: *const model_mod.Model, gpa: std.mem.Allocator, ids: []const
 
 fn bothComponents() std.EnumMap(model_mod.Component, abliterate.Params) {
     var params = std.EnumMap(model_mod.Component, abliterate.Params){};
-    params.put(.attn_o_proj, .{ .max_weight = 1.0, .max_weight_position = 1, .min_weight = 0.5, .min_weight_distance = 2 });
-    params.put(.mlp_down_proj, .{ .max_weight = 1.0, .max_weight_position = 1, .min_weight = 0.5, .min_weight_distance = 2 });
+    // The kernel reaches every layer of every fixture (at most five layers).
+    params.put(.attn_o_proj, .{ .max_weight = 1.0, .max_weight_position = 1, .min_weight = 0.5, .min_weight_distance = 4 });
+    params.put(.mlp_down_proj, .{ .max_weight = 1.0, .max_weight_position = 1, .min_weight = 0.5, .min_weight_distance = 4 });
     return params;
 }
 
@@ -314,7 +321,14 @@ fn checkEditExportStream(comptime family: []const u8) !void {
     for (model.layers, 0..) |*layer, li| {
         try std.testing.expect(model.getDelta(li, .attn_o_proj) != null);
         if (layer.moe) |*m| {
-            for (0..m.experts.len) |e| try std.testing.expect(model.getExpertDelta(li, e) != null);
+            if (m.routedInLatent()) {
+                // Latent MoE: the routed write matrix carries the edit, the latent-space experts none.
+                try std.testing.expect(model.getLatentDelta(li) != null);
+                for (0..m.experts.len) |e| try std.testing.expect(model.getExpertDelta(li, e) == null);
+                if (m.sharedIndex()) |si| try std.testing.expect(model.getExpertDelta(li, si) != null);
+            } else {
+                for (0..m.experts.len) |e| try std.testing.expect(model.getExpertDelta(li, e) != null);
+            }
         } else {
             try std.testing.expect(model.getDelta(li, .mlp_down_proj) != null);
         }
@@ -410,6 +424,9 @@ test "minimax_m3 edit, export and streamed reload (fused shared expert, pass-thr
 }
 test "ernie4_5_moe edit, export and streamed reload (moe_statics bias, shared experts)" {
     try checkEditExportStream("ernie4_5_moe");
+}
+test "kimi_k3 edit, export and streamed reload (latent MoE up projection, attention residual scorers pass through)" {
+    try checkEditExportStream("kimi_k3");
 }
 test "hunyuan_v1_moe edit, export and streamed reload (q/k norm after rope, shared_mlp)" {
     try checkEditExportStream("hunyuan_v1_moe");

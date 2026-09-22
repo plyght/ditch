@@ -103,7 +103,7 @@ test "streamed forward matches mapped forward bitwise (with chunking, prefetch a
     var paths = try TmpPaths.init(gpa, io);
     defer paths.deinit(gpa);
 
-    inline for (.{ "qwen2", "gemma3", "qwen3_next", "kimi_linear", "qwen2_fp8", "qwen2_int4", "gpt_oss_mxfp4" }) |family| {
+    inline for (.{ "qwen2", "gemma3", "qwen3_next", "kimi_linear", "kimi_k3", "qwen2_fp8", "qwen2_int4", "gpt_oss_mxfp4", "kimi_k3_mxfp4" }) |family| {
         const dir = "tests/fixtures/" ++ family;
         const ref = try loadPrompts(gpa, io, dir);
         defer ref.deinit();

@@ -132,6 +132,10 @@ pub const AttnTemperature = struct { floor_scale: f32, attn_scale: f32 };
 /// gpt-oss gated activation: `(clamp(up) + 1) * clamp(gate) * sigmoid(alpha * gate)`.
 pub const Swiglu = struct { alpha: f32, limit: f32 };
 
+/// Kimi K3 SiTU gated activation: `beta · tanh(gate / beta) · sigmoid(gate) · up'`
+/// with `up' = linear_beta · tanh(up / linear_beta)` when `linear_beta` is set.
+pub const Situ = struct { beta: f32, linear_beta: ?f32 };
+
 pub const MoeConfig = struct {
     scoring: RouterScoring = .softmax,
     topk_method: TopkMethod = .greedy,
@@ -145,6 +149,8 @@ pub const MoeConfig = struct {
     /// Expert projections carry biases (gpt-oss).
     expert_bias: bool = false,
     swiglu: ?Swiglu = null,
+    /// SiTU in every gated MLP (dense layers, routed and shared experts; Kimi K3).
+    situ: ?Situ = null,
     /// Group scores are the sum of the two best selection scores even without
     /// a correction bias (Kimi Linear's router).
     group_score_top2: bool = false,
@@ -201,6 +207,22 @@ pub const Names = struct {
     lin_f_b: []const []const u8 = &.{},
     lin_g_a: ?[]const u8 = null,
     lin_g_b: ?[]const u8 = null,
+    /// Full-rank KDA output gate (Kimi K3 `use_full_rank_gate`), used instead
+    /// of `lin_g_a`/`lin_g_b` when `Config.linear_full_rank_gate` is set.
+    lin_g: ?[]const u8 = null,
+    /// Sigmoid gate on the full-attention output before `o` (Kimi K3 MLA
+    /// `mla_use_output_gate`), read when `Config.mla_output_gate` is set.
+    attn_gate: ?[]const u8 = null,
+    /// Attention Residual (Kimi K3): per layer the RMSNorm and `[1][hidden]`
+    /// score projection of the attention-side and MLP-side aggregations, and
+    /// at model level those of the output aggregation. Lists hold alternative
+    /// spellings (first present wins).
+    attn_res_norm: []const []const u8 = &.{},
+    attn_res_proj: []const []const u8 = &.{},
+    mlp_res_norm: []const []const u8 = &.{},
+    mlp_res_proj: []const []const u8 = &.{},
+    output_res_norm: []const []const u8 = &.{},
+    output_res_proj: []const []const u8 = &.{},
     /// Depthwise causal convolution, time-step bias, decay and gated norm of a
     /// linear-attention layer; its output projection is `lin_out`. Lists hold
     /// the alternatives of families whose checkpoints and Hugging Face
@@ -253,6 +275,13 @@ pub const Names = struct {
     /// Fused `[2I][H]` gate/up tensor of the shared expert (GraniteMoeShared
     /// `input_linear`, MiniMax M3 `gate_up_proj`), relative to `shared_expert`.
     shared_gate_up: ?[]const u8 = null,
+    /// Latent MoE (Kimi K3 `routed_expert_hidden_size`): the routed experts
+    /// read `latent_down(x)` (`[latent][hidden]`) and their weighted sum,
+    /// optionally RMS-normalised by `latent_norm`, is written back through
+    /// `latent_up` (`[hidden][latent]`). Names are relative to the layer.
+    latent_down: ?[]const u8 = null,
+    latent_up: ?[]const u8 = null,
+    latent_norm: ?[]const u8 = null,
     /// Alternative MoE names (router, experts, shared expert) of checkpoints
     /// that predate the family's Hugging Face module layout; picked when the
     /// primary router tensor is absent and this one's is present.
@@ -328,6 +357,24 @@ pub const Config = struct {
     linear_v_heads: usize,
     linear_v_dim: usize,
     linear_conv_kernel: usize,
+    /// KDA output gate is one full-rank projection (`g_proj`) instead of the
+    /// low-rank `g_a`/`g_b` pair (Kimi K3).
+    linear_full_rank_gate: bool = false,
+    /// KDA "safe" forget gate (Kimi K3 `gate_lower_bound`): the per-channel
+    /// log-decay is `lower_bound · sigmoid(exp(A_log) · (f + dt_bias))`
+    /// instead of `-exp(A_log) · softplus(f + dt_bias)`.
+    linear_gate_lower_bound: ?f32 = null,
+    /// Full-attention (MLA) output is multiplied by `sigmoid(g_proj(h))` before
+    /// the output projection (Kimi K3 `mla_use_output_gate`).
+    mla_output_gate: bool = false,
+    /// Attention Residual block size (Kimi K3 `attn_res_block_size`; 0 = a
+    /// plain accumulated residual stream). See `model.zig` (`layerBlockAttnRes`).
+    attn_res_block: usize = 0,
+    /// Latent MoE width (Kimi K3 `routed_expert_hidden_size`; 0 = the routed
+    /// experts read and write `hidden_size` directly) and whether the summed
+    /// latent output is RMS-normalised before the up projection.
+    moe_latent: usize = 0,
+    moe_latent_norm: bool = false,
     /// Full-attention `q_proj` carries q rows then gate rows; the gate
     /// (sigmoid, or silu when `gate_swish`) multiplies the attention output.
     gated_attention: bool,
@@ -485,7 +532,6 @@ pub fn lookup(model_type: []const u8) ?*const Arch {
 
 fn rejectKnownHybrid(model_type: []const u8) !void {
     const table = .{
-        .{ "kimi_k3", "Kimi K3 (AttnRes is not implemented yet)" },
         .{ "kimi_k2", "Kimi K2 (use the kimi_k25 wrapper config or a deepseek_v3 config; the standalone kimi_k2 model_type is untested)" },
         .{ "qwen4_exp", "Qwen3.8-Flash-Next hybrid (linear attention with sparse indexer and hyper-connections)" },
         .{ "qwen4_exp_text", "Qwen3.8-Flash-Next hybrid (linear attention with sparse indexer and hyper-connections)" },
@@ -524,11 +570,6 @@ fn rejectUnsupportedMath(top: std.json.ObjectMap, obj: std.json.ObjectMap) !dequ
             return error.UnsupportedArchitecture;
         }
     }
-    const act = getStr(obj, "hidden_activation") orelse getStr(obj, "hidden_act") orelse getStr(obj, "activation_function") orelse "";
-    if (std.mem.eql(u8, act, "situ")) {
-        std.log.err("unsupported model: 'situ' activation is not implemented", .{});
-        return error.UnsupportedArchitecture;
-    }
     return quant;
 }
 
@@ -540,11 +581,22 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
     const top_type = getStr(obj, "model_type") orelse "llama";
     var model_type = top_type;
     // Multimodal wrappers keep the text config nested.
+    var arch_opt: ?*const Arch = null;
     if (getObj(obj, "text_config")) |tc| {
         obj = tc;
         if (getStr(obj, "model_type")) |m| model_type = m;
-    }
-    const arch = lookup(model_type) orelse lookup(top_type) orelse {
+        arch_opt = lookup(model_type);
+        // A wrapper with its own entry wins over the family of its text
+        // config: Kimi K3 nests a `kimi_linear` config but adds AttnRes,
+        // latent MoE and SiTU on top of it.
+        if (lookup(top_type)) |ta| {
+            if (arch_opt == null or ta != arch_opt.?) {
+                arch_opt = ta;
+                model_type = top_type;
+            }
+        }
+    } else arch_opt = lookup(model_type);
+    const arch = arch_opt orelse {
         try rejectKnownHybrid(model_type);
         try rejectKnownHybrid(top_type);
         _ = try rejectUnsupportedMath(parsed.value.object, obj);
@@ -589,7 +641,12 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
 
     const act_name = getStr(obj, "hidden_activation") orelse getStr(obj, "hidden_act") orelse getStr(obj, "activation_function") orelse "";
     var act = arch.activation;
-    if (act_name.len > 0) {
+    var situ: ?Situ = null;
+    if (std.mem.eql(u8, act_name, "situ")) {
+        // Kimi K3: SiTU in the gated MLPs; the KDA convolution keeps its silu.
+        situ = .{ .beta = getF32(obj, "activation_situ_beta", 1.0), .linear_beta = if (getNum(obj, "activation_situ_linear_beta")) |b| @as(f32, @floatCast(b)) else null };
+        act = .silu;
+    } else if (act_name.len > 0) {
         if (parseActivation(act_name)) |a| act = a else std.log.warn("unknown activation '{s}'; using {s}", .{ act_name, @tagName(act) });
     }
 
@@ -837,7 +894,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         .norm_topk_prob = getBool(obj, "norm_topk_prob", false),
         .moe_intermediate_size = getInt(obj, "moe_intermediate_size", if (intermediate_size > 0) intermediate_size else 4 * hidden),
         .moe_layers = moe_layers,
-        .moe = .{},
+        .moe = .{ .situ = situ },
     };
     if (getNum(obj, "query_pre_attn_scalar")) |q| c.attention_scale = @floatCast(1.0 / @sqrt(q));
     if (getNum(attn_cfg, "clip_qkv")) |v| c.clip_qkv = @floatCast(v);
@@ -1315,6 +1372,11 @@ fn extraHunyuanMoe(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
 /// `moe_renormalize`, `num_expert_group`, `model_max_length`); the Hugging
 /// Face module spells them out (`linear_num_heads`, `layer_types`,
 /// `mlp_layer_types`). Full-attention layers are MLA without RoPE.
+///
+/// Kimi K3 reuses this config with `attn_res_block_size` (Attention
+/// Residual), `routed_expert_hidden_size` / `latent_moe_use_norm` (latent
+/// MoE), `mla_use_output_gate`, `use_full_rank_gate` / `gate_lower_bound` in
+/// `linear_attn_config` and the `situ` activation (parsed generically).
 fn extraKimiLinear(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
     const lac: ?std.json.ObjectMap = getObj(obj, "linear_attn_config");
     var heads = getInt(obj, "linear_num_heads", 32);
@@ -1324,6 +1386,16 @@ fn extraKimiLinear(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
         heads = getInt(l, "num_heads", heads);
         head_dim = getInt(l, "head_dim", head_dim);
         kernel = getInt(l, "short_conv_kernel_size", kernel);
+        c.linear_full_rank_gate = getBool(l, "use_full_rank_gate", false);
+        if (getNum(l, "gate_lower_bound")) |lb| c.linear_gate_lower_bound = @floatCast(lb);
+    }
+    c.mla_output_gate = getBool(obj, "mla_use_output_gate", false);
+    c.attn_res_block = getInt(obj, "attn_res_block_size", 0);
+    c.moe_latent = getInt(obj, "routed_expert_hidden_size", 0);
+    c.moe_latent_norm = getBool(obj, "latent_moe_use_norm", false);
+    if (getBool(obj, "mla_use_nope", true) == false) {
+        std.log.err("kimi_linear: full-attention layers with RoPE (mla_use_nope = false) are not implemented", .{});
+        return error.UnsupportedArchitecture;
     }
     c.linear_k_heads = heads;
     c.linear_v_heads = heads;
@@ -1422,6 +1494,49 @@ const kimi_linear_checkpoint_moe = Names{
     .shared_gate = "gate_proj.weight",
     .shared_up = "up_proj.weight",
     .shared_down = "down_proj.weight",
+    .latent_down = "block_sparse_moe.routed_expert_down_proj.weight",
+    .latent_up = "block_sparse_moe.routed_expert_up_proj.weight",
+    .latent_norm = "block_sparse_moe.routed_expert_norm.weight",
+};
+
+/// Kimi Linear and Kimi K3 (`KimiLinearForCausalLM`): the K3-only tensors
+/// (full-rank KDA gate, MLA output gate, Attention Residual scorers, latent
+/// MoE projections) are read only when the config enables them.
+const kimi_linear_names = Names{
+    .q_a = "self_attn.q_a_proj.weight",
+    .q_a_norm = "self_attn.q_a_layernorm.weight",
+    .q_b = "self_attn.q_b_proj.weight",
+    .kv_a = "self_attn.kv_a_proj_with_mqa.weight",
+    .kv_a_norm = "self_attn.kv_a_layernorm.weight",
+    .kv_b = "self_attn.kv_b_proj.weight",
+    .attn_gate = "self_attn.g_proj.weight",
+    .lin_q = "self_attn.q_proj.weight",
+    .lin_k = "self_attn.k_proj.weight",
+    .lin_v = "self_attn.v_proj.weight",
+    .lin_conv = "self_attn.conv1d.weight",
+    .lin_conv_split = &.{ "self_attn.q_conv1d.weight", "self_attn.k_conv1d.weight", "self_attn.v_conv1d.weight" },
+    .lin_f_a = &.{ "self_attn.forget_gate.f_a_proj.weight", "self_attn.f_a_proj.weight" },
+    .lin_f_b = &.{ "self_attn.forget_gate.f_b_proj.weight", "self_attn.f_b_proj.weight" },
+    .lin_dt_bias = &.{ "self_attn.forget_gate.dt_bias", "self_attn.dt_bias" },
+    .lin_a_log = &.{ "self_attn.forget_gate.A_log", "self_attn.A_log" },
+    .lin_b = "self_attn.b_proj.weight",
+    .lin_g_a = "self_attn.g_a_proj.weight",
+    .lin_g_b = "self_attn.g_b_proj.weight",
+    .lin_g = "self_attn.g_proj.weight",
+    .lin_norm = "self_attn.o_norm.weight",
+    .lin_out = "self_attn.o_proj.weight",
+    .attn_res_norm = &.{ "self_attention_res_norm.weight", "self_attention_res.norm_weight" },
+    .attn_res_proj = &.{ "self_attention_res_proj.weight", "self_attention_res.proj_weight" },
+    .mlp_res_norm = &.{ "mlp_res_norm.weight", "mlp_res.norm_weight" },
+    .mlp_res_proj = &.{ "mlp_res_proj.weight", "mlp_res.proj_weight" },
+    .output_res_norm = &.{ "{p}output_attn_res_norm.weight", "{p}output_attn_res.norm_weight" },
+    .output_res_proj = &.{ "{p}output_attn_res_proj.weight", "{p}output_attn_res.proj_weight" },
+    .router_correction_bias = "mlp.gate.e_score_correction_bias",
+    .shared_expert = "mlp.shared_experts.",
+    .latent_down = "mlp.routed_expert_down_proj.weight",
+    .latent_up = "mlp.routed_expert_up_proj.weight",
+    .latent_norm = "mlp.routed_expert_norm.weight",
+    .moe_alt = &kimi_linear_checkpoint_moe,
 };
 
 const deepseek_v3_names = Names{
@@ -2299,32 +2414,19 @@ pub const registry = [_]Arch{
         .llama_cpp = "kimi-linear",
         .verified = true,
         .linear = .kda,
-        .names = .{
-            .q_a = "self_attn.q_a_proj.weight",
-            .q_a_norm = "self_attn.q_a_layernorm.weight",
-            .q_b = "self_attn.q_b_proj.weight",
-            .kv_a = "self_attn.kv_a_proj_with_mqa.weight",
-            .kv_a_norm = "self_attn.kv_a_layernorm.weight",
-            .kv_b = "self_attn.kv_b_proj.weight",
-            .lin_q = "self_attn.q_proj.weight",
-            .lin_k = "self_attn.k_proj.weight",
-            .lin_v = "self_attn.v_proj.weight",
-            .lin_conv = "self_attn.conv1d.weight",
-            .lin_conv_split = &.{ "self_attn.q_conv1d.weight", "self_attn.k_conv1d.weight", "self_attn.v_conv1d.weight" },
-            .lin_f_a = &.{ "self_attn.forget_gate.f_a_proj.weight", "self_attn.f_a_proj.weight" },
-            .lin_f_b = &.{ "self_attn.forget_gate.f_b_proj.weight", "self_attn.f_b_proj.weight" },
-            .lin_dt_bias = &.{ "self_attn.forget_gate.dt_bias", "self_attn.dt_bias" },
-            .lin_a_log = &.{ "self_attn.forget_gate.A_log", "self_attn.A_log" },
-            .lin_b = "self_attn.b_proj.weight",
-            .lin_g_a = "self_attn.g_a_proj.weight",
-            .lin_g_b = "self_attn.g_b_proj.weight",
-            .lin_norm = "self_attn.o_norm.weight",
-            .lin_out = "self_attn.o_proj.weight",
-            .router_correction_bias = "mlp.gate.e_score_correction_bias",
-            .shared_expert = "mlp.shared_experts.",
-            .moe_alt = &kimi_linear_checkpoint_moe,
-        },
+        .names = kimi_linear_names,
         .notes = "fixtures: Kimi Delta Attention layers (per-channel decay from the low-rank forget gate, q/k/v short convolution, sigmoid-gated output norm) in the original checkpoint layout (linear_attn_config, split q/k/v convolutions, block_sparse_moe with w1/w3/w2 experts) and in the Hugging Face module layout (layer_types, fused conv1d, stacked experts); MLA full-attention layers without RoPE; sigmoid MoE with correction bias, top-2 group scores, routed_scaling_factor and shared experts. Kimi-Linear-48B-A3B.",
+        .extra = extraKimiLinear,
+    },
+    .{
+        .model_type = "kimi_k3",
+        .aliases = &.{"kimi_k3_text"},
+        .llama_cpp = null,
+        .chat = "kimi_k3",
+        .verified = true,
+        .linear = .kda,
+        .names = kimi_linear_names,
+        .notes = "fixtures: the Kimi K3 image-video wrapper (KimiK3ForConditionalGeneration) around a kimi_linear text config with Attention Residual (attn_res_block_size: softmax-weighted retrieval over the banked block prefixes and the running one, at the attention input, the MLP input and the output norm), KDA layers with the full-rank output gate and the safe forget gate (gate_lower_bound), MLA layers with the sigmoid output gate, latent MoE (routed_expert_down_proj / routed_expert_up_proj with routed_expert_norm), SiTU activation, two shared experts, sigmoid routing with correction bias, language_model prefix; bf16 and compressed-tensors mxfp4-pack-quantized experts. The vision tower and projector pass through exports untouched.",
         .extra = extraKimiLinear,
     },
     .{
@@ -2412,6 +2514,22 @@ test "parseConfig picks family knobs" {
     try std.testing.expectEqualStrings("kimi_k25", k25.arch.model_type);
     try std.testing.expect(k25.mla != null and !k25.moe_layers[0] and k25.moe_layers[1]);
     try std.testing.expectEqual(RouterScoring.sigmoid, k25.moe.scoring);
+    // Kimi K3: the wrapper entry wins over the nested kimi_linear text config
+    // and carries AttnRes, latent MoE, SiTU and the K3 attention gates.
+    const k3 = try parseConfig(a,
+        \\{"model_type":"kimi_k3","text_config":{"model_type":"kimi_linear","hidden_size":64,"num_attention_heads":4,"num_hidden_layers":5,"vocab_size":100,"q_lora_rank":32,"kv_lora_rank":16,"qk_nope_head_dim":8,"qk_rope_head_dim":4,"v_head_dim":8,"num_experts":8,"num_experts_per_token":2,"num_shared_experts":2,"moe_intermediate_size":16,"routed_expert_hidden_size":24,"latent_moe_use_norm":true,"attn_res_block_size":2,"hidden_act":"situ","activation_situ_beta":4.0,"activation_situ_linear_beta":25.0,"mla_use_nope":true,"mla_use_output_gate":true,"first_k_dense_replace":1,"linear_attn_config":{"kda_layers":[1,2,4],"full_attn_layers":[3,5],"head_dim":16,"num_heads":2,"short_conv_kernel_size":4,"use_full_rank_gate":true,"gate_lower_bound":-5.0}}}
+    );
+    try std.testing.expectEqualStrings("kimi_k3", k3.arch.model_type);
+    try std.testing.expectEqualStrings("kimi_k3", k3.model_type);
+    try std.testing.expectEqual(@as(usize, 2), k3.attn_res_block);
+    try std.testing.expectEqual(@as(usize, 24), k3.moe_latent);
+    try std.testing.expect(k3.moe_latent_norm and k3.mla_output_gate and k3.linear_full_rank_gate);
+    try std.testing.expectEqual(@as(f32, -5.0), k3.linear_gate_lower_bound.?);
+    try std.testing.expectEqual(tensor.Activation.silu, k3.activation);
+    try std.testing.expectEqual(@as(f32, 4.0), k3.moe.situ.?.beta);
+    try std.testing.expectEqual(@as(f32, 25.0), k3.moe.situ.?.linear_beta.?);
+    try std.testing.expect(k3.linear_layers[0] and !k3.linear_layers[2] and k3.linear_layers[3] and !k3.linear_layers[4]);
+    try std.testing.expect(!k3.moe_layers[0] and k3.moe_layers[4]);
 }
 
 test "parseConfig handles the MiniMax, HunYuan, ERNIE and Granite MoE keys" {

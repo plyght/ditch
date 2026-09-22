@@ -91,7 +91,12 @@ a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
   per-channel decay, 3:1 with MLA layers without RoPE, DeepSeek-V3-style
   MoE with a shared expert; both the original checkpoint layout and the
   transformers module layout), `kimi_k25` (Kimi K2.5 / K2.6: the DeepSeek
-  V3 text config of the image-video wrapper)
+  V3 text config of the image-video wrapper), `kimi_k3` (Kimi K3: the
+  image-video wrapper around a `kimi_linear` text config with Attention
+  Residual, KDA layers with the full-rank output gate and the safe forget
+  gate, MLA layers with a sigmoid output gate, latent MoE with 896 experts,
+  SiTU activation and two shared experts; bf16 or the released
+  compressed-tensors MXFP4 experts; see "Attention Residual" below)
 * Gemma 2 / Gemma 3 (text), GLM-4 (`glm4`, `glm`) and ChatGLM3 / GLM-4-9B
   (`chatglm`), GLM-4.5 dense and MoE (`glm4_moe`, also the `glm4v_moe`
   image/video text config), GLM-5 family (`glm_moe_dsa`, whose sparse
@@ -123,7 +128,7 @@ beyond the original context (treated as static / short factors).
 
 Not supported: state-space and hybrid models (Mamba, Jamba, Falcon-H1,
 Nemotron-H, RWKV, Granite 4 `granitemoehybrid` checkpoints with Mamba-2
-layers), Kimi K3 (AttnRes), Kimi K2 (`kimi_k2` standalone config),
+layers), Kimi K2 (`kimi_k2` standalone config),
 Qwen3.8-Flash-Next (`qwen4_exp`), GLM-5.3-Flash (`glm5_next`) and
 DeepSeek V4 (sparse indexers with hyper-connections and hash layers),
 encoder-decoder models, Gemma 3n (per-layer inputs), MiniCPM3, HunYuan
@@ -137,10 +142,40 @@ unknown layer types, quantisation formats and activations are errors, not
 silent fallbacks. Unicode normalisers (NFKC, Precompiled) are
 approximated by the identity.
 
-Image and video models (Qwen2/3-VL, Qwen3.5, GLM-4.5V, Llama 4, Kimi K2.5) run
-through their text config: the vision tower is never executed, its
-weights pass through exports byte for byte, and refusal directions are
-measured on text prompts.
+Image and video models (Qwen2/3-VL, Qwen3.5, GLM-4.5V, Llama 4, Kimi K2.5,
+Kimi K3) run through their text config: the vision tower is never
+executed, its weights pass through exports byte for byte, and refusal
+directions are measured on text prompts.
+
+### Attention Residual (Kimi K3)
+
+Kimi K3 has no accumulated residual stream. Every `attn_res_block_size`
+layers the running prefix is banked and restarted, and each sublayer reads
+a softmax-weighted mixture of the banked block prefixes and the running one
+(the weights come from a per-layer RMSNorm and a `[1, hidden]` score
+projection: `self_attention_res_*`, `mlp_res_*` and, for the final norm,
+`output_attn_res_*`). ditch follows the reference exactly and defines the
+residual of layer `l`, for direction extraction, as the pre-norm mixture its
+attention reads (the block input); the last entry is the mixture the final
+norm reads. That is the `aggregate_stream` value of the SGLang
+implementation, the quantity on which the layer actually operates, and the
+directions, kernel and expert ranking work on it unchanged. The bank holds
+`ceil(layers / attn_res_block_size)` copies of the hidden state per token
+in RAM for the duration of a forward call (8 for the released 93-layer
+config).
+
+Edits follow the other families: every attention output projection
+(`o_proj` of the KDA and MLA layers) and every MLP down projection. K3's
+routed experts are a *latent* MoE (`routed_expert_hidden_size`): their
+`w2` matrices write into a 3584-wide latent space where a residual
+direction has no meaning, so the shared `routed_expert_up_proj`, which
+writes the summed expert output into the residual, takes the edit that the
+routed experts would have received (with the kernel weight in broad mode,
+`weight × strength` when expert selection is on; there is nothing to rank),
+while `shared_experts.down_proj` and the dense `mlp.down_proj` are edited
+as usual. The Attention Residual scorers, `routed_expert_down_proj` and
+`routed_expert_norm` are never touched and pass through exports byte for
+byte.
 
 Weights are read from safetensors (F32/F16/BF16, or the quantised formats
 below) or GGUF (llama, Mistral, Mixtral, Qwen2/3, Qwen MoE and Gemma 2/3
@@ -169,6 +204,11 @@ model:
   llm-compressor INT4/INT8 models): `weight_packed` with `num_bits`-wide
   fields, per-group `weight_scale`, optional `weight_zero_point` and
   `weight_shape` from `quantization_config`.
+* **compressed-tensors mxfp4-pack-quantized** (Kimi K3 as released: the
+  routed experts only): `weight_packed` U8 holding E2M1 nibble pairs in the
+  natural `[out, in]` layout and `weight_scale` U8 E8M0 exponents per 32
+  elements; a different packing from gpt-oss's `*_blocks` / `*_scales`,
+  decoded row by row.
 
 Values are decoded to bf16, which is what the Hugging Face integrations
 produce. With `--max-ram` (streamed weights) a tensor is decoded row-chunk
@@ -259,8 +299,8 @@ the metadata); `--export-format gguf` writes one with llama.cpp's tensor
 names, metadata and permutations. Untouched tensors are copied byte for
 byte; edited tensors are re-quantised to the source type.
 
-A quantised safetensors source (FP8, MXFP4, pack-quantized INT4; see
-"Quantised checkpoints") is exported as a plain bf16 checkpoint: every
+A quantised safetensors source (FP8, MXFP4, pack-quantized INT4, packed
+MXFP4; see "Quantised checkpoints") is exported as a plain bf16 checkpoint: every
 tensor, edited or not, is written in bf16 (or `--export-dtype`) under its
 model name, the storage tensors (`*_blocks`, `*_scales`, `weight_scale_inv`,
 `weight_packed`, ...) are dropped and `quantization_config` is removed from
