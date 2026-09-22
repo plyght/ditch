@@ -30,6 +30,12 @@
 //!   first, natural `[out][in]` layout) and `weight_scale` U8 `[..., R, C/32]`
 //!   E8M0 exponents (bias 127) — the bytes of `mxfp4-pack-quantized` under the
 //!   plain tensor names, `w = code * 2^(scale - 127)`.
+//! * DeepSeek V4 / V4.1 (`quant_method = "fp8"`, `scale_fmt = "ue8m0"`,
+//!   `expert_dtype = "fp4"`): the FP8 weights' block scales are F8_E8M0
+//!   exponents under the sibling name `<module>.scale`, and the routed experts
+//!   are `weight` I8 `[..., R, C/2]` (E2M1 nibble pairs, low nibble first,
+//!   natural layout) with an F8_E8M0 `scale` `[..., R, C/32]` — the MXFP4
+//!   store bytes again, `w = code * 2^(scale - 127)`.
 //! * compressed-tensors `pack-quantized` (Kimi K2.5): `weight_packed` I32 with
 //!   `num_bits`-wide fields packed densely from the low end, `weight_scale`
 //!   per group of `group_size` columns (or per row / per tensor),
@@ -67,6 +73,9 @@ pub const QuantConfig = struct {
     /// mxfp4 store_dtype: `mxfp4_block_size`, the columns per E8M0 scale.
     num_bits: u8 = 4,
     group_size: usize = 0,
+    /// FP8 with `expert_dtype = "fp4"` (DeepSeek V4 / V4.1): the routed experts
+    /// are I8 E2M1 nibble pairs with an F8_E8M0 `scale` per 32 columns.
+    fp4_experts: bool = false,
     /// Human-readable format name for messages.
     label: []const u8 = "none",
 };
@@ -98,6 +107,17 @@ pub fn parseQuantConfig(qc: ?std.json.ObjectMap) !QuantConfig {
             if (bs == .array and bs.array.items.len == 2 and bs.array.items[0] == .integer and bs.array.items[1] == .integer) {
                 out.block_rows = @intCast(bs.array.items[0].integer);
                 out.block_cols = @intCast(bs.array.items[1].integer);
+            }
+        }
+        // DeepSeek V4.1 declares its FP4 experts here; V4 at the top level
+        // of config.json (arch.zig sets the flag from there).
+        if (objStr(obj, "expert_dtype")) |ed| {
+            if (std.ascii.eqlIgnoreCase(ed, "fp4")) {
+                out.fp4_experts = true;
+                out.label = "fp8 with fp4 experts";
+            } else if (!expertDtypeSupported(ed)) {
+                std.log.err("unsupported model: '{s}' expert dtype cannot be dequantised (bf16/f16/f32, fp8, fp4, mxfp4 and pack-quantized int4 are supported)", .{ed});
+                return error.UnsupportedArchitecture;
             }
         }
         // MiMo V2.6: the dense weights are fp8 as above, but the routed
@@ -201,7 +221,7 @@ pub fn storeFloatDtype(dt: []const u8) bool {
 
 /// Whether an `expert_dtype` config value names a storage format ditch reads.
 pub fn expertDtypeSupported(dt: []const u8) bool {
-    const known = [_][]const u8{ "bfloat16", "float32", "float16", "bf16", "fp32", "fp16", "fp8", "float8", "fp8_e4m3", "float8_e4m3fn", "e4m3", "mxfp4", "int4", "pack-quantized" };
+    const known = [_][]const u8{ "bfloat16", "float32", "float16", "bf16", "fp32", "fp16", "fp8", "float8", "fp8_e4m3", "float8_e4m3fn", "e4m3", "fp4", "mxfp4", "int4", "pack-quantized" };
     for (known) |k| if (std.ascii.eqlIgnoreCase(dt, k)) return true;
     return false;
 }
@@ -209,6 +229,12 @@ pub fn expertDtypeSupported(dt: []const u8) bool {
 // ---------------------------------------------------------------------------
 // Element decoders
 // ---------------------------------------------------------------------------
+
+/// An E8M0 scale byte: `2^(b - 127)` (255 is NaN).
+pub fn e8m0(b: u8) f32 {
+    if (b == 255) return std.math.nan(f32);
+    return std.math.ldexp(@as(f32, 1.0), @as(i32, b) - 127);
+}
 
 /// `2^e` as f32 for normal exponents.
 inline fn pow2(e: i32) f32 {
@@ -298,6 +324,8 @@ pub const Dequant = struct {
     block_rows: usize = 0,
     block_cols: usize = 0,
     e5m2: bool = false,
+    /// FP8: the scales are F8_E8M0 exponents (`2^(byte - 127)`), not floats.
+    scale_e8m0: bool = false,
     /// pack-quantized: field width, columns per scale, words per packed row.
     bits: u8 = 4,
     group: usize = 0,
@@ -393,13 +421,15 @@ pub const Dequant = struct {
             // Scale rows covering [r, r + cn).
             const s0 = r / self.block_rows;
             const s1 = (r + cn - 1) / self.block_rows + 1;
-            const es = self.scale.dtype.size();
+            const es: usize = if (self.scale_e8m0) 1 else self.scale.dtype.size();
             const sraw = try pa.alloc(u8, (s1 - s0) * self.scale_cols * es);
             defer pa.free(sraw);
             try self.scale.read(io, (@as(u64, slab) * self.scale_rows + s0) * self.scale_cols * es, sraw);
             const scales = try pa.alloc(f32, (s1 - s0) * self.scale_cols);
             defer pa.free(scales);
-            tensor.convertToF32(self.scale.dtype, sraw, scales);
+            if (self.scale_e8m0) {
+                for (scales, sraw) |*o, b| o.* = e8m0(b);
+            } else tensor.convertToF32(self.scale.dtype, sraw, scales);
             const dst = std.mem.bytesAsSlice(u16, out[(r - a) * self.rowBytes() ..][0 .. cn * self.rowBytes()]);
             for (0..cn) |i| {
                 const srow = scales[((r + i) / self.block_rows - s0) * self.scale_cols ..][0..self.scale_cols];
@@ -631,7 +661,7 @@ fn withPrefix(gpa: Allocator, base: []const u8, suffix: []const u8) ![]u8 {
 }
 
 /// Names of a module's auxiliary quantisation tensors that have no place in a bf16 export.
-const module_aux = [_][]const u8{ ".weight_scale", ".weight_scale_inv", ".weight_zero_point", ".weight_shape", ".weight_g_idx", ".input_scale", ".input_zero_point", ".weight_global_scale", ".input_global_scale" };
+const module_aux = [_][]const u8{ ".scale", ".weight_scale", ".weight_scale_inv", ".weight_zero_point", ".weight_shape", ".weight_g_idx", ".input_scale", ".input_zero_point", ".weight_global_scale", ".input_global_scale" };
 
 fn dropModuleAux(gpa: Allocator, files: []const *safetensors.File, module: []const u8) !void {
     for (module_aux) |suffix| {
@@ -685,6 +715,18 @@ pub fn register(gpa: Allocator, io: Io, files: []const *safetensors.File, cfg: Q
                 return error.UnsupportedArchitecture;
             }
             if (try registerMxfp4Store(gpa, io, files, found, sc)) out.mxfp4 += 1;
+        } else if (std.mem.eql(u8, dt, "I8") and std.mem.endsWith(u8, name, ".weight")) {
+            // DeepSeek V4's FP4 experts: I8 nibble pairs with an F8_E8M0
+            // `<module>.scale` next to them.
+            const scale_name = try withPrefix(gpa, name[0 .. name.len - ".weight".len], ".scale");
+            defer gpa.free(scale_name);
+            const sc = findRaw(files, scale_name) orelse continue;
+            if (!std.mem.eql(u8, sc.info.dtype, "F8_E8M0")) continue;
+            if (!cfg.fp4_experts) {
+                std.log.err("{s}: I8 weights with F8_E8M0 scales need a quantization_config with expert_dtype fp4 (found: {s})", .{ name, cfg.label });
+                return error.UnsupportedArchitecture;
+            }
+            if (try registerMxfp4Store(gpa, io, files, found, sc)) out.mxfp4 += 1;
         } else if (std.mem.eql(u8, dt, "U8") and std.mem.endsWith(u8, name, ".weight_packed")) {
             if (cfg.method != .mxfp4_packed) {
                 std.log.err("{s}: U8 weight_packed tensors need a compressed-tensors mxfp4-pack-quantized quantization_config (found: {s})", .{ name, cfg.label });
@@ -711,8 +753,23 @@ fn registerFp8(gpa: Allocator, io: Io, files: []const *safetensors.File, w: Foun
     defer gpa.free(scale_inv_name);
     const scale_name = try withPrefix(gpa, name, "_scale");
     defer gpa.free(scale_name);
-    const sc = findFloat(files, scale_inv_name) orelse findFloat(files, scale_name) orelse {
-        std.log.err("{s}: {s} weights without a weight_scale_inv/weight_scale tensor", .{ name, w.info.dtype });
+    // DeepSeek V4 names the block scales `<module>.scale` and stores them as
+    // F8_E8M0 exponents, which the float index does not hold.
+    const module_scale_name = if (std.mem.endsWith(u8, name, ".weight"))
+        try withPrefix(gpa, name[0 .. name.len - ".weight".len], ".scale")
+    else
+        try withPrefix(gpa, name, ".scale");
+    defer gpa.free(module_scale_name);
+    var scale_e8m0 = false;
+    const sc: Found = findFloat(files, scale_inv_name) orelse findFloat(files, scale_name) orelse findFloat(files, module_scale_name) orelse blk: {
+        if (findRaw(files, module_scale_name)) |r| if (std.mem.eql(u8, r.info.dtype, "F8_E8M0")) {
+            scale_e8m0 = true;
+            break :blk .{
+                .file = r.file,
+                .info = .{ .name = r.info.name, .dtype = .f32, .shape = r.info.shape, .offset = r.info.offset, .byte_len = r.info.byte_len, .data = &.{} },
+            };
+        };
+        std.log.err("{s}: {s} weights without a weight_scale_inv/weight_scale/scale tensor", .{ name, w.info.dtype });
         return error.UnsupportedArchitecture;
     };
     const rows = w.info.shape[w.info.shape.len - 2];
@@ -755,12 +812,15 @@ fn registerFp8(gpa: Allocator, io: Io, files: []const *safetensors.File, w: Foun
         .block_rows = block_rows,
         .block_cols = block_cols,
         .e5m2 = std.mem.eql(u8, w.info.dtype, "F8_E5M2"),
+        .scale_e8m0 = scale_e8m0,
     };
     const shape = try w.file.arena.allocator().dupe(usize, w.info.shape);
     removeRaw(files, name);
     if (std.mem.endsWith(u8, name, ".weight")) try dropModuleAux(gpa, files, name[0 .. name.len - ".weight".len]);
     removeFloat(files, scale_inv_name);
     removeFloat(files, scale_name);
+    removeFloat(files, module_scale_name);
+    removeRaw(files, module_scale_name);
     try install(gpa, io, w.file, dq, shape);
     return true;
 }
@@ -881,10 +941,8 @@ fn registerMxfp4Store(gpa: Allocator, io: Io, files: []const *safetensors.File, 
     const shape = try w.file.arena.allocator().alloc(usize, ws.len);
     @memcpy(shape[0 .. ws.len - 1], ws[0 .. ws.len - 1]);
     shape[ws.len - 1] = cols;
-    const scale_name = try withPrefix(gpa, name, "_scale");
-    defer gpa.free(scale_name);
     removeRaw(files, name);
-    removeRaw(files, scale_name);
+    removeRaw(files, sc.info.name);
     try dropModuleAux(gpa, files, name[0 .. name.len - ".weight".len]);
     try install(gpa, io, w.file, dq, shape);
     return true;
@@ -1016,7 +1074,9 @@ fn registerPacked(gpa: Allocator, io: Io, files: []const *safetensors.File, p: F
 pub fn stripQuantizationConfig(gpa: Allocator, json: []const u8) ![]u8 {
     var text = try gpa.dupe(u8, json);
     errdefer gpa.free(text);
-    while (findKey(text, "quantization_config")) |span| {
+    // DeepSeek V4 declares its FP4 experts with a top-level `expert_dtype`,
+    // which would make the bf16 export claim FP4 experts it no longer has.
+    for ([_][]const u8{ "quantization_config", "expert_dtype" }) |key| while (findKey(text, key)) |span| {
         var start = span.start;
         var end = span.end;
         // Remove the separating comma: the following one, else the preceding one.
@@ -1033,7 +1093,7 @@ pub fn stripQuantizationConfig(gpa: Allocator, json: []const u8) ![]u8 {
         const next = try std.mem.concat(gpa, u8, &.{ text[0..start], text[end..] });
         gpa.free(text);
         text = next;
-    }
+    };
     return text;
 }
 
@@ -1142,6 +1202,9 @@ test "strip quantization_config" {
     const d = try stripQuantizationConfig(gpa, "{\"no_quantization_config\": 1}");
     defer gpa.free(d);
     try std.testing.expectEqualStrings("{\"no_quantization_config\": 1}", d);
+    const e = try stripQuantizationConfig(gpa, "{\"expert_dtype\": \"fp4\", \"hc_mult\": 4, \"quantization_config\": {\"quant_method\": \"fp8\"}}");
+    defer gpa.free(e);
+    try std.testing.expectEqualStrings("{\"hc_mult\": 4}", e);
 }
 
 test "quant config parsing" {

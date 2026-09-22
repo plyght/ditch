@@ -2038,6 +2038,11 @@ pub const Model = struct {
 
         // Quantised checkpoints: every recognised group of storage tensors
         // becomes one virtual bf16 tensor; anything left over is skipped.
+        // DeepSeek V4 / V4.1 as released: DeepSeek's own tensor names.
+        if (self.config.dsv4 != null) {
+            const renamed = try @import("deepseek_v4.zig").renameNative(self.files);
+            if (renamed > 0) std.log.info("read {d} tensors under DeepSeek's own names", .{renamed});
+        }
         const reg = try dequant.register(gpa, io, self.files, self.config.quant);
         self.dequantised = reg.count;
         self.export_config_json = self.config_json;

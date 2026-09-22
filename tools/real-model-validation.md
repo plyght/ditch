@@ -1890,3 +1890,97 @@ Token for token against `apply_chat_template` on two system/user pairs, and a
 unit test covers a multi-turn conversation. The forward pass itself (xIELU,
 per-head q/k norm) was already exact on the real weights: all 4 residuals of
 the first 3 layers, logits to 6.3e-07; tokenizer 15 of 15.
+---
+
+# Frontier pass: the arithmetic of the frontier families on their real weights
+
+Until now the frontier families had only the config-and-tensor-name check of
+the second pass: the architecture parses and every weight is where the loader
+looks. None of their arithmetic had been compared with a reference on real
+weights, and the Qwen 3.5, Helium and Cohere bugs show why that matters: a
+fixture written from the same misreading as the code agrees with it.
+
+## Method
+
+Truncated real checkpoints. `tools/truncate_checkpoint.py REPO K OUT` range-reads
+each shard's header, then streams the embedding, the final norm, the LM head
+and layers `0..K-1` into one `model.safetensors` (in parallel, neighbouring
+tensors merged into one request; nothing held in memory), with
+`num_hidden_layers = K` and every per-layer list in config.json cut to `K`.
+Quantisation stays exactly as released. `K` is chosen so every layer kind of
+the family appears at least once. `--drop mtp.` leaves out the
+multi-token-prediction layers; `--rows NAME=FILE` writes a table far larger
+than the disk as a sparse region holding only the rows a prompt reads.
+
+The reference is transformers on the CPU in float32 where it has the family,
+else the repository's own inference code, and
+`tools/probe_reference.py --factory FILE` builds it from a Python file when
+`from_pretrained` cannot hold the checkpoint as it is. For hyper-connection
+models the script compares what ditch reports, each layer's collapsed block
+input, with the reference's own `attn_hc` output. ditch runs streamed
+(`DITCH_NO_MMAP=1`), so a quantised MoE decodes one expert at a time.
+
+Machine as before: 4 cores, 15 GiB RAM, ~28 GiB of free disk, torch
+2.14.0+cpu, transformers 5.17.0.
+
+## Bug 37 — no released DeepSeek V4 could be loaded (fixed)
+
+**Symptom.** Recorded in the second pass as a gap: `deepseek-ai/DeepSeek-V4-Flash`
+stopped with `'fp4' expert dtype cannot be dequantised`, and V4.1-Flash with
+`F8_E4M3 weights without a weight_scale_inv/weight_scale tensor`. Every
+released V4 / V4.1 checkpoint is in DeepSeek's own naming (`embed.weight`,
+`layers.N.attn.wq_a.weight`, `layers.N.ffn.experts.E.w1.weight`), its FP8
+block scales are F8_E8M0 exponents named `<module>.scale`, and its routed
+experts are FP4.
+
+**Cause.** Three gaps, none of which a fixture written in transformers'
+spelling could show: the loader knew only transformers' names; the FP8
+reader looked only for float `weight_scale_inv` / `weight_scale`; and the
+experts' storage (I8 `[out, in / 2]` e2m1 nibble pairs, low nibble first,
+with an F8_E8M0 `scale` `[out, in / 32]`) had no decoder — although it is
+byte for byte MiMo V2.6's MXFP4 `store_dtype` layout, which ditch already
+read.
+
+**Fix.** `deepseek_v4.renameNative` renames the checkpoint's tensors on load
+with transformers' own list for `deepseek_v4` (`conversion_mapping.py`), in the
+same order, into the `model.`-prefixed spelling the loader reads (V4.1's
+engram table `layers.N.engram.embed` becomes `engram_tables.N`). The FP8 reader
+takes an F8_E8M0 `<module>.scale` (`2^(byte - 127)`); I8 weights with an
+F8_E8M0 scale decode through the MXFP4 store path when `expert_dtype` is
+`fp4`, at the top level of config.json (V4) or in `quantization_config`
+(V4.1). An export strips `expert_dtype` with `quantization_config`, so the
+bf16 result reloads — the new fixture's export test caught that one.
+
+**Regression test.** New fixture `deepseek_v4_native`: the V4 fixture's model
+written the way DeepSeek released it — DeepSeek's names, the attention and
+shared-expert matrices in FP8 with ue8m0 block scales, the experts in FP4,
+`expert_dtype: fp4` — with reference outputs from the dequantised weights;
+plus its edit/export/streamed-reload test and a unit test of the name map.
+`tools/make_fixture.py`'s inverse names were checked against transformers'
+forward renames: every tensor round-trips.
+
+**Verification.** `deepseek-ai/DeepSeek-V4-Flash`, first 4 layers (layers 0-1
+sliding window only, layer 2 CSA ratio 4 with its indexer, layer 3 HCA ratio
+128; layers 0-2 hash-routed, layer 3 learned routing), 16.4 GB cut. The
+reference is `tools/ref_deepseek_v4.py`: transformers' `modeling_deepseek_v4.py`
+unmodified, the names through transformers' own `WeightRenaming` objects, FP8
+and FP4 dequantised in torch with transformers' `_dequantize_one` arithmetic,
+and `DeepseekV4Experts` swapped for a module with the same forward that reads
+only the experts a token is routed to (256 experts x 3 matrices a layer do not
+fit in 15 GiB as float32). ditch: streamed, peak RSS 5.7 GB.
+
+    $ DITCH_NO_MMAP=1 ditch probe models/dsv4-flash-L4 --prompt ... --raw --residuals --json > p.json
+    $ python3 tools/probe_reference.py models/dsv4-flash-L4 p.json --dtype float32 --raw --factory tools/ref_deepseek_v4.py
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (5) | all 5 agree, worst 2.82e-06 | 6.52e-07 | match |
+| "Explain how rainbows form, …" | match (14) | all 5 agree, worst 8.61e-06 | 1.94e-06 | match |
+| 317-token passage | match (317) | all 5 agree, worst 1.16e-05 | 2.02e-06 | match |
+
+The long prompt is the one that matters for V4: at 14 tokens the HCA layer
+has not emitted a single compressed entry and the 128-token window never
+slides; at 317 the CSA layer attends 79 pooled entries (inside `index_topk`
+512, where ditch's dense indexer is exact), HCA two, and the window is full.
+The whole checkpoint also loads over `hf://` (69187 tensors renamed; 33792
+FP4 and 375 FP8 matrices registered, nothing skipped).

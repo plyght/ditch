@@ -38,6 +38,7 @@ const stream = @import("stream.zig");
 const arch = @import("arch.zig");
 const uni = @import("unicode_tables.zig");
 const Tokenizer = @import("tokenizer.zig").Tokenizer;
+const safetensors = @import("safetensors.zig");
 
 const Allocator = std.mem.Allocator;
 const Weight = tensor.Weight;
@@ -176,6 +177,110 @@ pub fn loadLayer(model: *Model, layer: *Layer, arena: Allocator, li: usize, lp: 
         }
     }
     layer.dsv4 = w;
+}
+
+// ---------------------------------------------------------------------------
+// DeepSeek's own tensor names
+// ---------------------------------------------------------------------------
+
+/// Mid-name substitutions from DeepSeek's naming (`inference/model.py`) to the
+/// transformers one, in the order transformers' `conversion_mapping.py`
+/// applies them for `deepseek_v4`. A pattern ending in `$` only matches at
+/// the end of the name. The hyper-connection sites keep their flat spelling
+/// (`hc_attn_fn`, ...), which hyper.zig reads as it is.
+const native_renames = [_][2][]const u8{
+    .{ ".attn.", ".self_attn." },
+    .{ ".ffn.", ".mlp." },
+    .{ ".indexer.compressor.", ".compressor.indexer." },
+    .{ ".attn_norm.", ".input_layernorm." },
+    .{ ".ffn_norm.", ".post_attention_layernorm." },
+    .{ ".attn_sink$", ".sinks" },
+    .{ ".norm.", ".kv_norm." },
+    .{ ".ape$", ".position_bias" },
+    .{ ".wq_a.", ".q_a_proj." },
+    .{ ".self_attn.wq_b.", ".self_attn.q_b_proj." },
+    .{ ".wkv.", ".kv_proj." },
+    .{ ".wgate.", ".gate_proj." },
+    .{ ".wo_a.", ".o_a_proj." },
+    .{ ".wo_b.", ".o_b_proj." },
+    .{ ".q_norm.", ".q_a_norm." },
+    .{ ".gate.bias$", ".gate.e_score_correction_bias" },
+    .{ ".gate.bias_vl$", ".gate.e_score_correction_bias_vl" },
+    .{ ".w1.", ".gate_proj." },
+    .{ ".w2.", ".down_proj." },
+    .{ ".w3.", ".up_proj." },
+};
+
+/// The transformers name of a tensor of a checkpoint in DeepSeek's own
+/// naming (`embed.weight`, `layers.N.attn.wq_a.weight`,
+/// `layers.N.ffn.experts.E.w1.weight`, ...), or null when the name is not
+/// one of the decoder's (vision tower, projector) and stays as it is.
+/// V4.1's engram tensors map to the spelling of the transformers port:
+/// `layers.N.engram.embed.*` is the model-level `engram_tables.N.*`, and the
+/// engram's own `wkv` keeps its name.
+pub fn nativeName(arena: Allocator, name: []const u8) !?[]const u8 {
+    if (std.mem.eql(u8, name, "embed.weight")) return "model.embed_tokens.weight";
+    if (std.mem.eql(u8, name, "head.weight")) return "lm_head.weight";
+    if (std.mem.eql(u8, name, "norm.weight")) return "model.norm.weight";
+    if (std.mem.startsWith(u8, name, "hc_head_")) return try cat(arena, "model.", name);
+    const is_layer = std.mem.startsWith(u8, name, "layers.");
+    if (!is_layer and !std.mem.startsWith(u8, name, "mtp.")) return null;
+    if (is_layer) {
+        // layers.N.engram.embed.{weight,scale} -> model.engram_tables.N.{weight,scale}
+        const rest = name["layers.".len..];
+        const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
+        const tail = rest[dot..];
+        if (std.mem.startsWith(u8, tail, ".engram.embed.")) {
+            return try std.fmt.allocPrint(arena, "model.engram_tables.{s}.{s}", .{ rest[0..dot], tail[".engram.embed.".len..] });
+        }
+    }
+    var cur: []const u8 = name;
+    const engram = std.mem.indexOf(u8, name, ".engram.") != null;
+    for (native_renames) |r| {
+        const anchored = std.mem.endsWith(u8, r[0], "$");
+        const pat = if (anchored) r[0][0 .. r[0].len - 1] else r[0];
+        if (engram and std.mem.eql(u8, pat, ".wkv.")) continue;
+        if (anchored) {
+            if (std.mem.endsWith(u8, cur, pat)) cur = try cat(arena, cur[0 .. cur.len - pat.len], r[1]);
+        } else if (std.mem.indexOf(u8, cur, pat) != null) {
+            cur = try std.mem.replaceOwned(u8, arena, cur, pat, r[1]);
+        }
+    }
+    return try cat(arena, "model.", cur);
+}
+
+/// Renames every tensor of a checkpoint in DeepSeek's own naming to the
+/// transformers spelling the loader reads, in place in the files' indexes
+/// (float and raw alike, so the dequantiser pairs the renamed FP8 / FP4
+/// weights with their renamed `scale`). A checkpoint already in transformers
+/// naming is left alone. Returns the number of renamed tensors.
+pub fn renameNative(files: []const *safetensors.File) !usize {
+    var native = false;
+    for (files) |f| {
+        if (f.tensors.contains("embed.weight") or f.raw.contains("layers.0.attn.wkv.weight") or f.tensors.contains("layers.0.attn_norm.weight")) native = true;
+    }
+    if (!native) return 0;
+    var n: usize = 0;
+    for (files) |f| {
+        const arena = f.arena.allocator();
+        for (f.tensors.keys(), f.tensors.values()) |*k, *v| {
+            if (try nativeName(arena, k.*)) |new| {
+                k.* = new;
+                v.name = new;
+                n += 1;
+            }
+        }
+        for (f.raw.keys(), f.raw.values()) |*k, *v| {
+            if (try nativeName(arena, k.*)) |new| {
+                k.* = new;
+                v.name = new;
+                n += 1;
+            }
+        }
+        try f.tensors.reIndex(arena);
+        try f.raw.reIndex(arena);
+    }
+    return n;
 }
 
 /// Model-level state: the checkpoint dtype guard, V4's `hc_head` and V4.1's
@@ -1239,6 +1344,51 @@ test "engram text normalisation" {
         try normalizeText(gpa, cs[0], &out);
         try std.testing.expectEqualStrings(cs[1], out.items);
     }
+}
+
+test "DeepSeek's own tensor names map to the transformers spelling" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const cases = [_][2][]const u8{
+        .{ "embed.weight", "model.embed_tokens.weight" },
+        .{ "head.weight", "lm_head.weight" },
+        .{ "norm.weight", "model.norm.weight" },
+        .{ "hc_head_fn", "model.hc_head_fn" },
+        .{ "layers.0.attn.wq_a.weight", "model.layers.0.self_attn.q_a_proj.weight" },
+        .{ "layers.0.attn.wq_a.scale", "model.layers.0.self_attn.q_a_proj.scale" },
+        .{ "layers.0.attn.wq_b.weight", "model.layers.0.self_attn.q_b_proj.weight" },
+        .{ "layers.0.attn.q_norm.weight", "model.layers.0.self_attn.q_a_norm.weight" },
+        .{ "layers.0.attn.wkv.weight", "model.layers.0.self_attn.kv_proj.weight" },
+        .{ "layers.0.attn.kv_norm.weight", "model.layers.0.self_attn.kv_norm.weight" },
+        .{ "layers.0.attn.wo_a.weight", "model.layers.0.self_attn.o_a_proj.weight" },
+        .{ "layers.0.attn.wo_b.weight", "model.layers.0.self_attn.o_b_proj.weight" },
+        .{ "layers.0.attn.attn_sink", "model.layers.0.self_attn.sinks" },
+        .{ "layers.0.attn_norm.weight", "model.layers.0.input_layernorm.weight" },
+        .{ "layers.0.ffn_norm.weight", "model.layers.0.post_attention_layernorm.weight" },
+        .{ "layers.0.hc_attn_fn", "model.layers.0.hc_attn_fn" },
+        .{ "layers.2.attn.compressor.ape", "model.layers.2.self_attn.compressor.position_bias" },
+        .{ "layers.2.attn.compressor.norm.weight", "model.layers.2.self_attn.compressor.kv_norm.weight" },
+        .{ "layers.2.attn.compressor.wkv.weight", "model.layers.2.self_attn.compressor.kv_proj.weight" },
+        .{ "layers.2.attn.compressor.wgate.weight", "model.layers.2.self_attn.compressor.gate_proj.weight" },
+        .{ "layers.2.attn.indexer.compressor.ape", "model.layers.2.self_attn.compressor.indexer.position_bias" },
+        .{ "layers.0.ffn.gate.weight", "model.layers.0.mlp.gate.weight" },
+        .{ "layers.0.ffn.gate.bias", "model.layers.0.mlp.gate.e_score_correction_bias" },
+        .{ "layers.0.ffn.gate.bias_vl", "model.layers.0.mlp.gate.e_score_correction_bias_vl" },
+        .{ "layers.0.ffn.gate.tid2eid", "model.layers.0.mlp.gate.tid2eid" },
+        .{ "layers.0.ffn.experts.17.w1.weight", "model.layers.0.mlp.experts.17.gate_proj.weight" },
+        .{ "layers.0.ffn.experts.17.w2.scale", "model.layers.0.mlp.experts.17.down_proj.scale" },
+        .{ "layers.0.ffn.experts.17.w3.weight", "model.layers.0.mlp.experts.17.up_proj.weight" },
+        .{ "layers.0.ffn.shared_experts.w2.weight", "model.layers.0.mlp.shared_experts.down_proj.weight" },
+        .{ "layers.1.engram.embed.weight", "model.engram_tables.1.weight" },
+        .{ "layers.1.engram.embed.scale", "model.engram_tables.1.scale" },
+        .{ "layers.1.engram.wkv.weight", "model.layers.1.engram.wkv.weight" },
+        .{ "layers.1.engram.q_weight", "model.layers.1.engram.q_weight" },
+        .{ "mtp.0.attn.wkv.weight", "model.mtp.0.self_attn.kv_proj.weight" },
+    };
+    for (cases) |c| try std.testing.expectEqualStrings(c[1], (try nativeName(a, c[0])).?);
+    try std.testing.expect((try nativeName(a, "vision.blocks.0.attn.qkv.weight")) == null);
+    try std.testing.expect((try nativeName(a, "image_start")) == null);
 }
 
 test "fp8 and fp4 fake quantisation" {

@@ -274,6 +274,16 @@ model:
   (E2M1 nibble pairs, low nibble first; `w = code * 2^(scale - 127)`) under the
   plain tensor names, `mxfp4_block_size` giving the 32-element group. The bf16
   MoE router (`moe_router_dtype`) is read as it is.
+* **DeepSeek V4 / V4.1 as released** (`quant_method = "fp8"`, `scale_fmt =
+  "ue8m0"`, `expert_dtype = "fp4"` at the top level of config.json or inside
+  `quantization_config`): the FP8 weights' block scales are F8_E8M0 exponents
+  named `<module>.scale` (blocks of 128 x 128 on V4, 32 x 32 on V4.1), and the
+  routed experts are `weight` I8 `[out, in / 2]` (E2M1 nibble pairs, low nibble
+  first) with an F8_E8M0 `scale` `[out, in / 32]` — the MXFP4 `store_dtype`
+  bytes once more. The checkpoints are in DeepSeek's own tensor names
+  (`embed.weight`, `layers.N.attn.wq_a.weight`, `layers.N.ffn.experts.E.w1`),
+  which ditch maps to the transformers spelling on load, the same renames as
+  transformers' `conversion_mapping` for `deepseek_v4`.
 
 Values are decoded to bf16, which is what the Hugging Face integrations
 produce. With `--max-ram` (streamed weights) a tensor is decoded row-chunk by
@@ -283,9 +293,7 @@ quantised checkpoint then needs the memory of its bf16 equivalent. Over
 `hf://` the disk side is the opposite: the chunk cache holds the stored
 (quantised) bytes, so its disk estimate and `--remote-cache-size` are in
 stored bytes, not decoded ones. `expert_dtype` values naming one of these formats are accepted. Any other
-`quantization_config` is an error naming the format. The FP4 (e2m1) expert
-weights of the released DeepSeek V4 / V4.1 checkpoints are refused until
-dequantised.
+`quantization_config` is an error naming the format.
 
 **The bf16 export rule.** A quantised safetensors source is exported as a plain
 bf16 checkpoint: every tensor, edited or not, is written in bf16 (or
@@ -394,15 +402,12 @@ FalconMamba) and RWKV, encoder-decoder models, Gemma 4 MoE
 projection layers, and quantisation formats other than the ones above (GPTQ,
 AWQ, bitsandbytes, …).
 
-Two entries below have no released checkpoint they can run, which is worth
-knowing before reaching for them. `minimax` is verified for the `postnorm:
+One entry below has no released checkpoint it can run, which is worth
+knowing before reaching for it. `minimax` is verified for the `postnorm:
 false` layout, but every released MiniMax-Text-01 / M1 checkpoint sets
 `postnorm: true` and is refused by name (`minimax_m2` and `minimax_m3` are
-unaffected). `deepseek_v4` / `deepseek_v41` follow transformers' module
-names, while the released DeepSeek V4 and V4.1 checkpoints use DeepSeek's own
-(`embed.weight`, `layers.N.attn.wq_a.weight`, `layers.N.ffn.experts.E.w1`)
-and store their routed experts in e2m1 FP4, which ditch does not decode;
-both are refused with the reason.
+unaffected). The released DeepSeek V4 and V4.1 checkpoints, in DeepSeek's own
+tensor names with FP4 experts, load as they are (see quantised checkpoints).
 
 Approximations ditch does make, and says so: `dynamic` and `longrope` rope
 scaling beyond the original context are treated as static / short factors

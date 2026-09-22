@@ -1003,11 +1003,20 @@ fn rejectKnownHybrid(model_type: []const u8) !void {
 /// formats ditch cannot decode (the supported ones become `Config.quant`),
 /// expert storage dtypes it cannot read, and unimplemented layer maths.
 fn rejectUnsupportedMath(top: std.json.ObjectMap, obj: std.json.ObjectMap) !dequant.QuantConfig {
-    const quant = try dequant.parseQuantConfig(getObj(top, "quantization_config") orelse getObj(obj, "quantization_config"));
-    if (getStr(obj, "expert_dtype")) |dt| {
+    var quant = try dequant.parseQuantConfig(getObj(top, "quantization_config") orelse getObj(obj, "quantization_config"));
+    if (getStr(obj, "expert_dtype") orelse getStr(top, "expert_dtype")) |dt| {
         if (!dequant.expertDtypeSupported(dt)) {
-            std.log.err("unsupported model: '{s}' expert dtype cannot be dequantised (bf16/f16/f32, fp8, mxfp4 and pack-quantized int4 are supported)", .{dt});
+            std.log.err("unsupported model: '{s}' expert dtype cannot be dequantised (bf16/f16/f32, fp8, fp4, mxfp4 and pack-quantized int4 are supported)", .{dt});
             return error.UnsupportedArchitecture;
+        }
+        // DeepSeek V4 spells its FP4 experts at the top level of config.json.
+        if (std.ascii.eqlIgnoreCase(dt, "fp4")) {
+            if (quant.method != .fp8) {
+                std.log.err("unsupported model: expert_dtype fp4 without an fp8 quantization_config (found: {s})", .{quant.label});
+                return error.UnsupportedArchitecture;
+            }
+            quant.fp4_experts = true;
+            quant.label = "fp8 with fp4 experts";
         }
     }
     return quant;
@@ -4801,7 +4810,7 @@ pub const registry = [_]Arch{
         .verified = true,
         .rope_style = .gptj,
         .names = dsv4_names,
-        .notes = "fixture: hyper-connections (hc_mult streams, Sinkhorn-mixed), low-rank q with unweighted head norm, shared-KV sliding attention with sinks and inverse-roped output, grouped output projection, CSA (overlapping pooled windows; Lightning Indexer as dense: exact while every reachable entry fits index_topk) and HCA branches with their own rope, sqrtsoftplus MoE with correction bias, hash-routed (tid2eid) layers, clamped SwiGLU, shared expert, MTP tensors passed through. FP8 tensors are dequantised on load (dequant.zig); the released checkpoints' FP4 (e2m1) experts are refused until dequantised.",
+        .notes = "fixture: hyper-connections (hc_mult streams, Sinkhorn-mixed), low-rank q with unweighted head norm, shared-KV sliding attention with sinks and inverse-roped output, grouped output projection, CSA (overlapping pooled windows; Lightning Indexer as dense: exact while every reachable entry fits index_topk) and HCA branches with their own rope, sqrtsoftplus MoE with correction bias, hash-routed (tid2eid) layers, clamped SwiGLU, shared expert, MTP tensors passed through. The released checkpoints (DeepSeek's own tensor names, FP8 with ue8m0 block scales, FP4 e2m1 experts) are renamed and dequantised on load; DeepSeek-V4-Flash's first four layers (sliding, CSA and HCA attention, hash and learned routing) match transformers in float32 on the real weights.",
         .extra = extraDeepseekV4,
     },
     .{
@@ -4812,7 +4821,7 @@ pub const registry = [_]Arch{
         .verified = true,
         .rope_style = .gptj,
         .names = dsv4_names,
-        .notes = "fixture: single-pass hyper-connections, CSA2 shared compressed KV (kv_source groups, ratio 1 and pooled branches, indexer as dense), FP8/FP4 fake quantisation of the window KV and latents, engram n-gram hash layers (lazy table rows, tokenizer-derived compressed ids), gate_temp routing, nested text_config with vision tensors passed through. FP8 tensors are dequantised on load (dequant.zig); the released checkpoints' FP4 (e2m1) experts are refused until dequantised.",
+        .notes = "fixture: single-pass hyper-connections, CSA2 shared compressed KV (kv_source groups, ratio 1 and pooled branches, indexer as dense), FP8/FP4 fake quantisation of the window KV and latents, engram n-gram hash layers (lazy table rows, tokenizer-derived compressed ids), gate_temp routing, nested text_config with vision tensors passed through. The released checkpoints (DeepSeek's own tensor names, FP8 with ue8m0 block scales, FP4 e2m1 experts) are renamed and dequantised on load.",
         .extra = extraDeepseekV41,
     },
     // ---- llama-layout dense families -------------------------------------

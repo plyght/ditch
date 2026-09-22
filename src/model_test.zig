@@ -296,6 +296,17 @@ test "deepseek_v41 fixture" {
 test "deepseek_v4 fixture with the released checkpoints' hyper-connection names" {
     try checkFixture("deepseek_v4_hubnames");
 }
+// DeepSeek V4 as released: DeepSeek's own tensor names (`embed.weight`,
+// `layers.N.attn.wq_a.weight`, `layers.N.ffn.experts.E.w1.weight`), FP8
+// matrices with F8_E8M0 block scales under `<module>.scale`, FP4 experts (I8
+// e2m1 nibble pairs, an F8_E8M0 scale per 32 columns), `expert_dtype: fp4` at
+// the top of config.json. Reference outputs from the dequantised weights.
+test "deepseek_v4 fixture in DeepSeek's own names with fp8 and fp4 weights" {
+    try checkFixture("deepseek_v4_native");
+}
+test "deepseek_v4_native edit, export and streamed reload (renamed and dequantised on load)" {
+    try checkEditExportStream("deepseek_v4_native");
+}
 test "minimax_m2 fixture" {
     try checkFixture("minimax_m2");
 }

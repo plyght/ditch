@@ -22,6 +22,13 @@ transformers' last `hidden_states` entry is taken *after* the final norm,
 while ditch reports the residual the final norm reads, so the reference for
 the last entry is captured with a pre-forward hook on the final norm.
 
+`--factory FILE` builds the reference with `load(model_dir, dtype)` from a
+Python file instead of `AutoModelForCausalLM.from_pretrained`: for released
+checkpoints transformers cannot hold on this machine as they are (DeepSeek
+V4's FP4 experts, see tools/ref_deepseek_v4.py), or whose only reference is
+the repository's own inference code. `--trust-remote-code` passes that flag to
+`from_pretrained` for checkpoints that ship their own modeling file.
+
 A checkpoint whose chat template starts with the BOS token renders it into
 the text, while ditch adds the id at tokenisation time; the texts are
 compared with that leading token removed, and the token ids decide.
@@ -50,6 +57,8 @@ def find_final_norm(model):
     found = None
     for name, mod in model.named_modules():
         if any(part in "." + name + "." for part in LAYER_PARTS):
+            continue
+        if "hc_head" in name:  # the hyper-connection head's own norm reads the streams
             continue
         if "norm" in type(mod).__name__.lower() or "norm" in name.rsplit(".", 1)[-1]:
             found = mod
@@ -89,17 +98,25 @@ def install_remote_code_shims():
         DynamicCache.to_legacy_cache = lambda self: tuple((l.keys, l.values) for l in self.layers)
 
 
-def compare_residuals(entry, out, pre_norm, tolerance):
+def compare_residuals(entry, out, pre_norm, tolerance, collapsed=None):
     """Compares ditch's per-layer residuals with transformers' hidden states.
 
     Entry L is the vector layer L reads, so entry 0 is the embedding output
     and entry `num_layers` is what the final norm reads. transformers reports
     the *normalised* last hidden state, so the pre-norm hook supplies it.
+
+    With hyper-connections (DeepSeek V4, GLM-5.3-Flash) the hidden state is
+    `hc_mult` streams, and ditch reports what each layer's block reads: the
+    streams collapsed by the layer's attention-site weights. `collapsed` holds
+    those, captured from the reference's own hyper-connection modules.
     """
     got = [np.asarray(r, dtype=np.float32) for r in entry["residuals"]]
-    # Gemma 3n stacks its AltUp streams first, `[streams, batch, seq, hidden]`;
-    # stream 0 is the residual the next layer reads.
-    hidden = [(h[0, 0, -1] if h.dim() == 4 else h[0, -1]).float().numpy() for h in out.hidden_states]
+    if collapsed:
+        hidden = [c[0, -1].float().numpy() for c in collapsed] + [None]
+    else:
+        # Gemma 3n stacks its AltUp streams first, `[streams, batch, seq, hidden]`;
+        # stream 0 is the residual the next layer reads.
+        hidden = [(h[0, 0, -1] if h.dim() == 4 else h[0, -1]).float().numpy() for h in out.hidden_states]
     if len(got) != len(hidden):
         print(f"  residuals: ditch has {len(got)} entries, transformers {len(hidden)}")
         return False
@@ -140,6 +157,7 @@ def main():
                     help="let transformers run the checkpoint's own modeling code")
     ap.add_argument("--raw", action="store_true",
                     help="the probe was run with --raw: no chat template and no BOS")
+    ap.add_argument("--factory", help="Python file whose load(model_dir, dtype) returns the reference model")
     ap.add_argument("--residual-tolerance", type=float, default=1e-3,
                     help="max |difference| of a per-layer residual, relative to that layer's own"
                          " magnitude, before it counts as a mismatch")
@@ -150,19 +168,31 @@ def main():
     if trc:
         install_remote_code_shims()
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=trc)
-    try:
-        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=getattr(torch, args.dtype), trust_remote_code=trc)
-    except ValueError:
-        # Not registered with AutoModelForCausalLM (Mistral 4): use the class the config names.
-        import transformers
-        cls = getattr(transformers, AutoConfig.from_pretrained(args.model, trust_remote_code=trc).architectures[0])
-        model = cls.from_pretrained(args.model, dtype=getattr(torch, args.dtype))
+    if args.factory:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("reference_factory", args.factory)
+        factory = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(factory)
+        model = factory.load(args.model, getattr(torch, args.dtype))
+    else:
+        try:
+            model = AutoModelForCausalLM.from_pretrained(args.model, dtype=getattr(torch, args.dtype), trust_remote_code=trc)
+        except ValueError:
+            # Not registered with AutoModelForCausalLM (Mistral 4): use the class the config names.
+            import transformers
+            cls = getattr(transformers, AutoConfig.from_pretrained(args.model, trust_remote_code=trc).architectures[0])
+            model = cls.from_pretrained(args.model, dtype=getattr(torch, args.dtype))
     model.eval()
     ok = True
     captured = {}
     final_norm = find_final_norm(model)
     if final_norm is not None:
         final_norm.register_forward_pre_hook(lambda mod, inp: captured.__setitem__("pre_norm", inp[0]))
+    # Hyper-connection sites: `layers.N.attn_hc` returns (post, comb, collapsed).
+    hc_sites = [(int(n.split(".layers.")[-1].split(".")[0]), m) for n, m in model.named_modules()
+                if n.endswith(".attn_hc") and ".layers." in n]
+    for li, m in hc_sites:
+        m.register_forward_hook(lambda mod, inp, outp, li=li: captured.setdefault("hc", {}).__setitem__(li, outp[2]))
     for entry in probe["prompts"]:
         messages = [{"role": "system", "content": args.system_prompt}, {"role": "user", "content": entry["user"]}]
         if args.raw:
@@ -190,12 +220,15 @@ def main():
         else:
             print(f"  token ids match ({len(ids)} tokens)")
         want_residuals = "residuals" in entry
+        captured.pop("hc", None)
         with torch.no_grad():
             input_ids = torch.tensor([entry["ids"]])
             out = model(input_ids=input_ids, output_hidden_states=want_residuals)
             ref = out.logits[0, -1].float().numpy()
         if want_residuals:
-            ok &= compare_residuals(entry, out, captured.get("pre_norm"), args.residual_tolerance)
+            hc = captured.get("hc")
+            collapsed = [hc[i] for i in sorted(hc)] if hc else None
+            ok &= compare_residuals(entry, out, captured.get("pre_norm"), args.residual_tolerance, collapsed)
         got = np.asarray(entry["logits"], dtype=np.float32)
         if got.shape != ref.shape:
             n = min(got.shape[0], ref.shape[0])
@@ -224,7 +257,10 @@ def main():
                     gen = torch.cat([gen, nxt], dim=-1)
         ref_text = tok.decode(gen[0, input_ids.shape[1]:], skip_special_tokens=False)
         print(f"  greedy transformers: {ref_text!r}")
-        print(f"  greedy ditch:        {entry['response']!r}")
+        resp = entry["response"]
+        if isinstance(resp, list):  # bytes that are not valid UTF-8 on their own
+            resp = bytes(resp).decode("utf-8", errors="replace")
+        print(f"  greedy ditch:        {resp!r}")
     print("\nRESULT:", "OK" if ok else "MISMATCH")
     sys.exit(0 if ok else 1)
 

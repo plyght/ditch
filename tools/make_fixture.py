@@ -2956,12 +2956,70 @@ def fake_quant_fp4(x, block, e4m3_scales=False):
     return (FP4_TABLE[e2m1_codes(q)] * scale[..., None]).reshape(x.shape).astype(np.float32)
 
 
-def generate_dsv4(family, out_dir, hub_names=False):
+def quant_fp8_e8m0(w, block):
+    """DeepSeek V4's FP8: e4m3 codes with one ue8m0 (power-of-two) scale per
+    `block` tile, `2^ceil(log2(amax / 448))` as `inference/kernel.py` rounds
+    it. Returns the dequantised weight, the codes and the E8M0 scale bytes."""
+    table = fp8_e4m3_table()
+    br, bc = block
+    out_, in_ = w.shape
+    nb0, nb1 = -(-out_ // br), -(-in_ // bc)
+    e = np.zeros((nb0, nb1), np.int64)
+    codes = np.zeros(w.shape, np.uint8)
+    deq = np.zeros(w.shape, np.float32)
+    for i in range(nb0):
+        for j in range(nb1):
+            blk = w[i * br:(i + 1) * br, j * bc:(j + 1) * bc]
+            e[i, j] = int(np.ceil(np.log2(max(float(np.abs(blk).max()), 1e-30) / 448.0)))
+            s = np.float32(2.0 ** e[i, j])
+            c = nearest_code(blk / s, table)
+            codes[i * br:(i + 1) * br, j * bc:(j + 1) * bc] = c
+            deq[i * br:(i + 1) * br, j * bc:(j + 1) * bc] = table[c] * s
+    return deq, codes, (e + 127).astype(np.uint8)
+
+
+def dsv4_native_name(name):
+    """The name DeepSeek's own checkpoints (`inference/model.py`) give a
+    transformers-named DeepSeek V4 tensor: the inverse of the renames in
+    transformers' `conversion_mapping` for `deepseek_v4`."""
+    if name == "model.embed_tokens.weight":
+        return "embed.weight"
+    if name == "lm_head.weight":
+        return "head.weight"
+    if name == "model.norm.weight":
+        return "norm.weight"
+    if not name.startswith("model."):
+        return name
+    n = name[len("model."):]
+    for a, b in (("self_attn.compressor.indexer.scorer.weights_proj.", "attn.indexer.weights_proj."),
+                 ("self_attn.compressor.indexer.q_b_proj.", "attn.indexer.wq_b."),
+                 ("self_attn.compressor.indexer.", "attn.indexer.compressor."),
+                 ("self_attn.", "attn."), ("mlp.", "ffn."),
+                 ("input_layernorm.", "attn_norm."), ("post_attention_layernorm.", "ffn_norm."),
+                 ("attn.sinks", "attn.attn_sink"), ("q_a_proj.", "wq_a."), ("q_b_proj.", "wq_b."),
+                 ("q_a_norm.", "q_norm."), ("compressor.kv_norm.", "compressor.norm."), ("kv_proj.", "wkv."),
+                 ("gate_proj.", "wgate."), ("o_a_proj.", "wo_a."), ("o_b_proj.", "wo_b."),
+                 ("position_bias", "ape"), ("gate.e_score_correction_bias", "gate.bias"),
+                 ("shared_experts.wgate.", "shared_experts.w1."), ("shared_experts.down_proj.", "shared_experts.w2."),
+                 ("shared_experts.up_proj.", "shared_experts.w3.")):
+        n = n.replace(a, b)
+    return n
+
+
+def generate_dsv4(family, out_dir, hub_names=False, native=False):
     """`hub_names` writes the hyper-connection tensors the way the released
     DeepSeek V4 / GLM-5.3-Flash checkpoints spell them (`layers.N.hc_attn_fn`,
     `hc_head_fn`) instead of transformers' module spelling (`attn_hc.fn`,
     `hc_head.hc_fn`). Everything else, including the reference outputs, is
-    identical, so the fixture pins that both spellings load the same model."""
+    identical, so the fixture pins that both spellings load the same model.
+
+    `native` writes the checkpoint the way DeepSeek released V4: DeepSeek's
+    own tensor names (`embed.weight`, `layers.N.attn.wq_a.weight`,
+    `layers.N.ffn.experts.E.w1.weight`, ...), the attention and shared-expert
+    matrices in FP8 with ue8m0 block scales (`<module>.scale`, F8_E8M0) and the
+    routed experts in FP4 (I8 e2m1 nibble pairs with an F8_E8M0 scale per 32
+    columns), `expert_dtype: fp4` at the top of config.json. The reference
+    runs on the dequantised weights."""
     v41 = family == "deepseek_v41"
     os.makedirs(out_dir, exist_ok=True)
     rng = np.random.default_rng(2026 if v41 else 2025)
@@ -2973,6 +3031,8 @@ def generate_dsv4(family, out_dir, hub_names=False):
         id_to_token[i] = t
     added_ids = set(a["id"] for a in tok_json["added_tokens"])
     H, HC, E, K, MI = 32, 2, 4, 2, 12
+    if native:
+        MI = 32  # FP4 scales cover 32 columns, and `down_proj` has MI of them
     SW, QLR, OG, OLR = 4, 12, 2, 8
     if v41:
         L, NH, HD, RD = 4, 2, 32, 8
@@ -2997,6 +3057,7 @@ def generate_dsv4(family, out_dir, hub_names=False):
     hc_iters, hc_eps = 20, 1e-6
     MIX = (2 + HC) * HC
     weights = {}
+    quantised = {}  # native: DeepSeek name -> (dtype, array) of the stored codes and scales
 
     def mat(name, rows, cols, scale=0.2):
         w = bf16_round(rng.normal(0, scale, size=(rows, cols)))
@@ -3083,12 +3144,34 @@ def generate_dsv4(family, out_dir, hub_names=False):
             gu[e] = np.concatenate([ex["gate"], ex["up"]], 0)
             dn[e] = ex["down"]
             experts.append(ex)
-        weights[lp + "mlp.experts.gate_up_proj"] = gu
-        weights[lp + "mlp.experts.down_proj"] = dn
+        if native:
+            for e, ex in enumerate(experts):
+                for proj, w_ in (("w1", ex["gate"]), ("w3", ex["up"]), ("w2", ex["down"])):
+                    deq, tensors = quant_mxfp4_packed("x.weight", w_)
+                    np.copyto(w_, deq)
+                    quantised[f"layers.{i}.ffn.experts.{e}.{proj}.weight"] = ("I8", tensors[0][2].view(np.int8))
+                    quantised[f"layers.{i}.ffn.experts.{e}.{proj}.scale"] = ("F8_E8M0", tensors[1][2])
+        else:
+            weights[lp + "mlp.experts.gate_up_proj"] = gu
+            weights[lp + "mlp.experts.down_proj"] = dn
         d["experts"] = experts
         sp = lp + "mlp.shared_experts."
         d["shared"] = {"gate": mat(sp + "gate_proj.weight", MI, H), "up": mat(sp + "up_proj.weight", MI, H), "down": mat(sp + "down_proj.weight", H, MI)}
         layers.append(d)
+    if native:
+        # FP8 with ue8m0 block scales for the attention and shared-expert
+        # matrices, as released; the compressor, indexer, router, norms,
+        # embeddings and head stay bf16.
+        fp8_block = [8, 8]
+        for n in list(weights):
+            if ".compressor." in n or not any(s in n for s in ("q_a_proj", "q_b_proj", "self_attn.kv_proj", "o_a_proj", "o_b_proj", "shared_experts.")):
+                continue
+            deq, codes, scale = quant_fp8_e8m0(weights[n], fp8_block)
+            np.copyto(weights[n], deq)
+            base = dsv4_native_name(n)[: -len(".weight")]
+            quantised[base + ".weight"] = ("F8_E4M3", codes)
+            quantised[base + ".scale"] = ("F8_E8M0", scale)
+            del weights[n]
     # Tensors ditch never runs but must carry through exports.
     mat(P + "mtp.0.eh_proj.weight", H, 2 * H)
     vec(P + "mtp.0.norm.weight", H, 0.1, 1.0)
@@ -3122,15 +3205,23 @@ def generate_dsv4(family, out_dir, hub_names=False):
                          "compress_rates": rates, "mlp_layer_types": ["hash_moe" if h else "moe" for h in hash_layers],
                          "num_nextn_predict_layers": 1})
         config = text_cfg
+        if native:
+            # DeepSeek's quantisation spelling. (The released configs name the
+            # layer kinds with the legacy `compress_ratios`, whose 0 / 4 / 128
+            # values the rates of this fixture do not use; config parsing of
+            # those keys has its own test.)
+            text_cfg.update({"expert_dtype": "fp4",
+                             "quantization_config": {"activation_scheme": "dynamic", "fmt": "e4m3", "quant_method": "fp8",
+                                                     "scale_fmt": "ue8m0", "weight_block_size": fp8_block}})
     json.dump(config, open(f"{out_dir}/config.json", "w"), indent=1)
     json.dump({"eos_token_id": vocab[eos], "bos_token_id": None, "do_sample": False}, open(f"{out_dir}/generation_config.json", "w"))
+    stored = {}
+    for n, w in weights.items():
+        stored[dsv4_native_name(n) if native else n] = ("I64", w) if w.dtype == np.int64 else ("BF16", bf16_bits(w))
+    stored.update(quantised)
     header, blobs, offset = {}, [], 0
-    for n in sorted(weights):
-        w = weights[n]
-        if w.dtype == np.int64:
-            u, dtype = w, "I64"
-        else:
-            u, dtype = bf16_bits(w), "BF16"
+    for n in sorted(stored):
+        dtype, u = stored[n]
         header[n] = {"dtype": dtype, "shape": list(u.shape), "data_offsets": [offset, offset + u.nbytes]}
         blobs.append(u.tobytes())
         offset += u.nbytes
@@ -4052,6 +4143,10 @@ if FAMILY in ("qwen4_exp", "glm5_next"):
 
 if FAMILY == "deepseek_v4_hubnames":
     generate_dsv4("deepseek_v4", OUT, hub_names=True)
+    sys.exit(0)
+
+if FAMILY == "deepseek_v4_native":
+    generate_dsv4("deepseek_v4", OUT, hub_names=True, native=True)
     sys.exit(0)
 
 if FAMILY in ("deepseek_v4", "deepseek_v41"):
