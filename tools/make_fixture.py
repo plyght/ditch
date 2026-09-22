@@ -445,6 +445,8 @@ def base(**kw):
         residual_layout="pre", mm_scales=None,
         # HunYuan applies the per-head q/k norm after the rotary embedding.
         qk_norm_after_rope=False,
+        # NanoChat's `rotate_half` is `cat(x2, -x1)`: it rotates by -angle.
+        rope_reverse=False,
         # Sub-layer norms on the attention output and the MLP intermediate (BitNet).
         attn_sub_norm=None, ffn_sub_norm=None,
         # Gate on the attention output from a separate projection (AFMoE, Laguna):
@@ -1257,7 +1259,7 @@ spec("apertus", tok="llama3", qk_norm="head", mlp="dense", up="mlp.up_proj.weigh
      config={"model_type": "apertus", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4,
              "num_key_value_heads": 2, "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "hidden_act": "xielu",
              "max_position_embeddings": 128, "tie_word_embeddings": False})
-spec("nanochat", tok="gpt2", norm="rms_none", qk_norm="weightless", qk_norm_after_rope=True, embed_norm="norm.weight",
+spec("nanochat", tok="gpt2", norm="rms_none", qk_norm="weightless", qk_norm_after_rope=True, rope_reverse=True, embed_norm="norm.weight",
      mlp="dense", up="mlp.fc1.weight", down="mlp.fc2.weight", act="relu2", final_softcap=15.0, lm_head="lm_head.weight",
      config={"model_type": "nanochat", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4,
              "num_key_value_heads": 2, "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "relu2",
@@ -2017,6 +2019,8 @@ def generate_generic(family, out_dir):
         rd = 2 * cos.shape[1]
         rot = x[..., off:off + rd]
         c, sn = cos[:, None, :], sin[:, None, :]
+        if s["rope_reverse"]:
+            sn = -sn
         if s["rope_style"] == "neox":
             x1, x2 = rot[..., :rd // 2], rot[..., rd // 2:]
             out = np.concatenate([x1 * c - x2 * sn, x2 * c + x1 * sn], -1)

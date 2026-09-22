@@ -766,6 +766,9 @@ pub const Config = struct {
     qk_norm_rope_only: bool,
     /// Apply the q/k norm after the rotary embedding (HunYuan).
     qk_norm_after_rope: bool,
+    /// Rotate by `-angle` (NanoChat's `rotate_half` is `cat(x2, -x1)`): the
+    /// sine tables are negated.
+    rope_reverse: bool,
     residual_layout: ResidualLayout,
     /// MiniMax-01 residual scales `[full attention, linear attention, mlp]`
     /// as `[α (residual), β (sublayer output)]`.
@@ -1460,6 +1463,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         .qk_norm = arch.qk_norm,
         .qk_norm_rope_only = false,
         .qk_norm_after_rope = false,
+        .rope_reverse = false,
         .residual_layout = .pre,
         .minimax_scales = .{ .{ 1, 1 }, .{ 1, 1 }, .{ 1, 1 } },
         .qkv_mp = 1,
@@ -2057,10 +2061,17 @@ fn extraHunyuanDense(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
     }
 }
 
-fn extraNanoChat(c: *Config, _: Allocator, _: std.json.ObjectMap) !void {
+fn extraNanoChat(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
     // Weightless RMSNorm everywhere, including the q/k norms, which run after RoPE.
     c.qk_norm = .l2;
     c.qk_norm_after_rope = true;
+    // `rotate_half` returns `cat(x2, -x1)` (karpathy's `apply_rotary_emb`
+    // too): the rotation runs the other way from Llama's.
+    c.rope_reverse = true;
+    // nanochat always softcaps the logits at 15, and transformers'
+    // `NanoChatConfig` defaults `final_logit_softcapping` to it; some
+    // conversions spell the key `logits_soft_cap`, which transformers ignores.
+    if (c.final_logit_softcapping == null and obj.get("final_logit_softcapping") == null) c.final_logit_softcapping = 15.0;
 }
 
 fn extraPersimmon(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
@@ -4877,7 +4888,7 @@ pub const registry = [_]Arch{
     .{
         .model_type = "nanochat",
         .llama_cpp = null,
-        .chat = "chatml",
+        .chat = "nanochat",
         .verified = true,
         .norm = .rms_none,
         .mlp = .dense,
@@ -5422,6 +5433,13 @@ test "parseConfig handles the swept families' keys" {
     try std.testing.expectEqual(AttnGate.softplus, lag.attn_gate);
     try std.testing.expectEqual(@as(?f32, 5.0), lag.moe.router_softcap);
     try std.testing.expectEqualSlices(usize, &.{ 4, 4 }, lag.layer_heads);
+    // nanochat: logits softcapped at 15 even when the config does not say so,
+    // and the rotation runs backwards.
+    const nc = try parseConfig(a,
+        \\{"model_type":"nanochat","hidden_size":32,"num_attention_heads":4,"num_hidden_layers":2,"vocab_size":100,"logits_soft_cap":15.0}
+    );
+    try std.testing.expectEqual(@as(?f32, 15.0), nc.final_logit_softcapping);
+    try std.testing.expect(nc.rope_reverse and !lag.rope_reverse);
     // Released Laguna checkpoints vary the query heads per layer.
     const lag2 = try parseConfig(a,
         \\{"model_type":"laguna","hidden_size":32,"num_attention_heads":4,"num_attention_heads_per_layer":[4,6],"num_key_value_heads":2,"num_hidden_layers":2,"head_dim":8,"vocab_size":100,"num_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":12}

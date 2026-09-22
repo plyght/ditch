@@ -2223,6 +2223,9 @@ pub const Model = struct {
                 sin[pos * half + i] = @floatCast(@sin(angle) * attention_factor);
             }
         }
+        if (self.config.rope_reverse) {
+            for (sin) |*v| v.* = -v.*;
+        }
         return table;
     }
 

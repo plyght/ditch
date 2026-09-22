@@ -1603,3 +1603,88 @@ does; the remote-code types (`minimax_text_01`, `minimax_m1`) need
       weights total            851.85GB (80 layers)
       warp mode:     min 10.62GB (trunk + top-2 experts + workspace), with prefetch + expert cache + RAM caches 27.94GB
     EXIT=2   (loaded; the 8 GB budget is then too small, as it should be)
+
+MiniMax-M1-40k, the remote-code release, now loads the same way:
+
+    $ ditch --dry-run hf://MiniMaxAI/MiniMax-M1-40k --max-ram 8GB --remote-chunk-size 1MB --no-input
+    * 413 safetensors shard(s); headers are fetched now, tensors on demand in 1.0MB chunks
+    * Architecture: minimax_m1 (80 layers, hidden size 6144, vocabulary 200064, BF16 weights)
+      weights total            849.56GB (80 layers)
+    EXIT=2   (loaded; budget too small, as it should be)
+
+## Bug 29 — NanoChat rotated the wrong way (fixed)
+
+**Symptom.** handoff item 5: `hf-tiny-v2/tiny-random-NanoChatForCausalLM`
+off by 4.7e-03 at the first layer on the 5-token prompt and less on the
+2-token one — position-dependent, so attention. Neither the activation nor the
+softcap changed it.
+
+**Cause.** NanoChat's `rotate_half` is
+
+    return torch.cat((x2, -x1), dim=-1)
+
+the negation of Llama's `cat((-x2, x1))` — the same as karpathy's own
+`apply_rotary_emb` (`y1 = x1 cos + x2 sin`, `y2 = -x1 sin + x2 cos`). Queries
+and keys are rotated by `-angle`, so attention sees `-(m - n)` where every
+other family sees `m - n`. ditch rotated the usual way, and so did the
+fixture generator.
+
+**Fix.** `Config.rope_reverse`, set by `extraNanoChat`, negates the sine
+tables when they are built — every attention backend reads those tables, so
+there is nothing else to change. The generator takes `rope_reverse=True` for
+`nanochat` and the fixture is regenerated.
+
+## Bug 30 — NanoChat had no logit softcap when the config did not name it (fixed)
+
+**Symptom.** with bug 29 fixed, the first real HF-format NanoChat,
+`nanochat-students/nanochat-d20` (560M, 20 layers), agreed with transformers
+on all 21 residuals but its first-token logits were off by 0.37 of their
+range.
+
+**Cause.** its `config.json` (written by transformers 5.0.0.dev0) spells the
+cap `logits_soft_cap: 15.0`. transformers ignores that key and uses
+`NanoChatConfig.final_logit_softcapping`, whose default is 15.0 — nanochat
+always caps at 15. ditch read only `final_logit_softcapping` and so applied no
+cap.
+
+**Fix.** `extraNanoChat` defaults the cap to 15 when `final_logit_softcapping`
+is absent.
+
+## Bug 31 — NanoChat's pre-tokenizer fell back to GPT-2's (fixed)
+
+**Symptom.** the d20 prompt tokenized differently from transformers' —
+`.\n\n` was one token (307) there and three in ditch.
+
+**Cause.** its `Split` regex is GPT-4's with pairs of digits,
+`…|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|…`, with possessive
+quantifiers; `classifyRegex` recognised none of it and used GPT-2's.
+
+**Fix.** a `nanochat` regex kind: Llama 3's splitter with digit runs of at
+most two. The other two differences do not change any match — `\s*[\r\n]`
+backtracks to the last line break of a whitespace run exactly as
+`\s*[\r\n]+` does, and no possessive quantifier in the pattern can give back
+anything a match would need. 0 of 15 test strings and 0 of 8 further
+line-break, digit and contraction cases differ from `tokenizers`.
+
+## Bug 32 — NanoChat was prompted with ChatML (fixed)
+
+**Cause and fix.** the registry named `chatml`; nanochat's template is
+`<|bos|><|user_start|>{system}\n\n{user}<|user_end|><|assistant_start|>`
+(the system message joins the first user turn, completed assistant turns end
+in `<|assistant_end|>`). It is now the `nanochat` family, detected by
+`<|user_start|>`.
+
+**Verification of bugs 29–32 together.** the stub:
+
+    residuals: all 3 layers agree (worst 1.05e-07 relative)   (was 4.70e-03)
+
+and the real checkpoint, with its own chat template, in float32:
+
+| Model | family | tokens | residuals | first-token logits | greedy |
+| --- | --- | :---: | :---: | ---: | :---: |
+| nanochat-students/nanochat-d20 | `nanochat` | match | all 21 agree | 1.49e-06 | match (`'Paris.<\|assistant_end\|>'`) |
+
+That also settles the second pass's `nanochat` gap: HF-format NanoChat
+checkpoints do exist (`nanochat-students/nanochat-d20`,
+`Guilherme34/nanochat-d32-retrained-hf`, `pankajmathur/nanochat-d34-sft-hf`)
+and use the registry's names; only the one nanoGPT-named conversion does not.

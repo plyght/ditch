@@ -43,6 +43,9 @@ pub const Template = enum {
     kimi_k3,
     /// Jamba: `<|startoftext|><|bom|><|user|> ...<|eom|><|bom|><|assistant|>`.
     jamba,
+    /// nanochat: `<|user_start|>...<|user_end|><|assistant_start|>`; a system
+    /// message is prepended to the first user turn, followed by a blank line.
+    nanochat,
     /// Laguna (Poolside): `〈|EOS|〉<system>\n\n...\n</system>\n<user>\n...\n</user>\n<assistant>\n</think>`
     /// (a default system message is inserted when the conversation has none;
     /// `</think>` is the non-thinking generation prompt).
@@ -75,6 +78,7 @@ pub fn detect(chat_template: ?[]const u8, model_type: []const u8) Template {
             }
         }.f;
         if (has(t, "<|bom|>")) return .jamba;
+        if (has(t, "<|user_start|>")) return .nanochat;
         if (has(t, "</user>") and has(t, "<assistant>")) return .laguna;
         if (has(t, "<|im_middle|>")) return .kimi;
         if (has(t, "<|end_of_msg|>")) return .kimi_k3;
@@ -288,6 +292,25 @@ pub fn render(gpa: Allocator, template: Template, messages: []const Message) ![]
             }
             try w.writeAll("<assistant>\n</think>");
         },
+        .nanochat => {
+            // Contents verbatim; the template's `bos_token` comes from `templateBos`.
+            var system: ?[]const u8 = null;
+            for (messages, 0..) |m, i| {
+                switch (m.role) {
+                    .system => if (i == 0) {
+                        system = m.content;
+                    },
+                    .user => {
+                        try w.writeAll("<|user_start|>");
+                        if (system) |sys| try w.print("{s}\n\n", .{sys});
+                        system = null;
+                        try w.print("{s}<|user_end|>", .{m.content});
+                    },
+                    .assistant => try w.print("<|assistant_start|>{s}<|assistant_end|>", .{m.content}),
+                }
+            }
+            try w.writeAll("<|assistant_start|>");
+        },
         .llama4 => {
             try w.writeAll("<|begin_of_text|>");
             for (messages) |m| try w.print("<|header_start|>{s}<|header_end|>\n\n{s}<|eot|>", .{ @tagName(m.role), trim(m.content) });
@@ -404,6 +427,15 @@ test "template detection and rendering" {
     const r7 = try render(gpa, .cohere_response, &.{ .{ .role = .user, .content = " Hi " }, .{ .role = .assistant, .content = "Yo" }, .{ .role = .user, .content = "Bye" } });
     defer gpa.free(r7);
     try std.testing.expectEqualStrings("<BOS_TOKEN><|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|><|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>Hi<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|><|START_RESPONSE|>Yo<|END_RESPONSE|><|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>Bye<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|><|START_RESPONSE|>", r7);
+    // nanochat (nanochat-students/nanochat-d20; token-for-token against
+    // apply_chat_template): the system message joins the first user turn.
+    try std.testing.expectEqual(Template.nanochat, detect("{{- '<|user_start|>' }}", "nanochat"));
+    const nc = try renderPrompt(gpa, .nanochat, "Sys.", " Hi ");
+    defer gpa.free(nc);
+    try std.testing.expectEqualStrings("<|user_start|>Sys.\n\n Hi <|user_end|><|assistant_start|>", nc);
+    const nc2 = try render(gpa, .nanochat, &.{ .{ .role = .user, .content = "Hi" }, .{ .role = .assistant, .content = " Yo " }, .{ .role = .user, .content = "Bye" } });
+    defer gpa.free(nc2);
+    try std.testing.expectEqualStrings("<|user_start|>Hi<|user_end|><|assistant_start|> Yo <|assistant_end|><|user_start|>Bye<|user_end|><|assistant_start|>", nc2);
     // A template that emits the BOS in front of a family that does not.
     try std.testing.expectEqualStrings("<|begin_of_text|>", templateBos("{{bos_token}}\n{%- if tools %}<|im_start|>", "<|begin_of_text|>"));
     try std.testing.expectEqualStrings("", templateBos("{% for m in messages %}<|im_start|>{{ bos_token }}", "<|begin_of_text|>"));

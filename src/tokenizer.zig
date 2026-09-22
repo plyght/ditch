@@ -52,6 +52,10 @@ const RegexKind = enum {
     gpt2,
     qwen2,
     llama3,
+    /// nanochat's GPT-4-style split: Llama 3's with digit runs of at most two
+    /// (`\p{N}{1,2}`). Its possessive quantifiers and single-`[\r\n]` line
+    /// break alternative match exactly what Llama 3's pattern does.
+    nanochat,
     /// tiktoken o200k (gpt-oss): words split at lower→upper case changes, contractions as suffixes.
     o200k,
     /// Kimi (`tokenization_kimi.py`): Han runs first, then o200k-style words excluding Han characters.
@@ -729,6 +733,7 @@ pub const Tokenizer = struct {
         if (has(r, "\\p{Han}")) return .kimi;
         if (has(r, "\\p{Lu}")) return .o200k;
         if (has(r, "\\p{P}\\p{S}")) return .deepseek3;
+        if (has(r, "\\p{N}{1,2}") and has(r, "\\p{L}+")) return .nanochat;
         if (has(r, "{1,3}")) return .llama3;
         if (has(r, "[^\\r\\n\\p{L}\\p{N}]?\\p{L}+")) return .qwen2;
         if (!has(r, "'s|'t|'re")) std.log.warn("pre-tokenizer regex is not recognised; using the GPT-2 pattern: {s}", .{r});
@@ -780,6 +785,9 @@ pub const Tokenizer = struct {
             if (st == .regex) return switch (st.regex) {
                 .qwen2 => "qwen2",
                 .llama3 => "llama-bpe",
+                // No llama.cpp pre-tokenizer splits digits in pairs; the nearest
+                // one (nanochat has no llama.cpp architecture to export to anyway).
+                .nanochat => "llama-bpe",
                 .o200k => "gpt-4o",
                 .kimi => "kimi-k2",
                 .deepseek3, .digits3 => "deepseek-v3",
@@ -1443,7 +1451,7 @@ const RegexSplitter = struct {
     fn matchOne(self: *const RegexSplitter, start: usize) usize {
         const first = self.cpAt(start).?;
         switch (self.kind) {
-            .gpt2, .qwen2, .llama3 => {},
+            .gpt2, .qwen2, .llama3, .nanochat => {},
             .o200k => return self.matchO200k(start, first),
             .kimi => return self.matchKimi(start, first),
             .deepseek3 => return self.matchDeepseek3(start, first),
@@ -1567,7 +1575,7 @@ const RegexSplitter = struct {
                 return self.matchWhitespace(start);
             },
             .o200k, .kimi, .deepseek3, .digits3, .newlines, .ds2_letters, .ds2_punct, .trailing_ws, .cjk => unreachable,
-            .qwen2, .llama3 => {
+            .qwen2, .llama3, .nanochat => {
                 // '[^\r\n\p{L}\p{N}]?\p{L}+'
                 var i = start;
                 var c = first;
@@ -1588,7 +1596,11 @@ const RegexSplitter = struct {
                 }
                 // '\p{N}' or '\p{N}{1,3}'
                 if (isNumber(first.cp)) {
-                    const max: usize = if (self.kind == .llama3) 3 else 1;
+                    const max: usize = switch (self.kind) {
+                        .llama3 => 3,
+                        .nanochat => 2,
+                        else => 1,
+                    };
                     i = start;
                     var count: usize = 0;
                     while (self.cpAt(i)) |n| {
@@ -1927,6 +1939,16 @@ test "regex splitter llama3 digits" {
     try std.testing.expectEqualStrings(" ", it.next().?);
     try std.testing.expectEqualStrings("123", it.next().?);
     try std.testing.expectEqualStrings("45", it.next().?);
+}
+
+test "regex splitter nanochat: digit pairs, punctuation keeps its line breaks" {
+    const r = "'(?i:[sdmt]|ll|ve|re)|[^\\r\\n\\p{L}\\p{N}]?+\\p{L}+|\\p{N}{1,2}| ?[^\\s\\p{L}\\p{N}]++[\\r\\n]*|\\s*[\\r\\n]|\\s+(?!\\S)|\\s+";
+    try std.testing.expectEqual(RegexKind.nanochat, Tokenizer.classifyRegex(r));
+    // From `tokenizers`' pre_tokenize_str on nanochat-students/nanochat-d20.
+    var it = RegexSplitter{ .text = "assistant.\n\nThe 12345 capital", .kind = .nanochat };
+    const want = [_][]const u8{ "assistant", ".\n\n", "The", " ", "12", "34", "5", " capital" };
+    for (want) |w| try std.testing.expectEqualStrings(w, it.next().?);
+    try std.testing.expect(it.next() == null);
 }
 
 test "pre-tokenizer steps" {
