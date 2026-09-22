@@ -81,8 +81,16 @@ a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
   `stablelm`, `starcoder2`, `nemotron`
 * Qwen: `qwen2` / `qwen2.5` (also the `qwen2_vl` / `qwen2_5_vl` text configs),
   `qwen3` (also `qwen3_vl` text), `qwen2_moe`, `qwen3_moe`
+* Qwen hybrids (Gated DeltaNet linear attention + sigmoid/swish-gated full
+  attention): `qwen3_next` (Qwen3-Next, Qwen3-Coder-Next),
+  `qwen3_5` / `qwen3_5_moe` (Qwen3.5, Qwen3.8 dense and MoE, text configs;
+  the linear recurrence runs sequentially, so long prefills are slower
+  than on dense models)
 * Gemma 2 / Gemma 3 (text), GLM-4 (`glm4`, `glm`) and ChatGLM3 / GLM-4-9B
-  (`chatglm`), Phi-1/1.5/2 (`phi`), Phi-3 / 3.5 / 4 (`phi3`)
+  (`chatglm`), GLM-4.5 dense and MoE (`glm4_moe`, also the `glm4v_moe`
+  image/video text config), GLM-5 family (`glm_moe_dsa`, whose sparse
+  indexer runs as dense attention, exact for the short contexts ditch
+  scores), Phi-1/1.5/2 (`phi`), Phi-3 / 3.5 / 4 (`phi3`)
 * GPT-2, GPT-NeoX / Pythia, GPT-BigCode (StarCoder 1), Falcon (7B layout),
   BLOOM, OPT, MPT
 * Mixture of experts: Mixtral, Qwen2/3-MoE (separate and fused expert
@@ -98,10 +106,24 @@ LayerNorm), Gemma 2 logit softcapping, `dynamic` and `longrope` scaling
 beyond the original context (treated as static / short factors).
 
 Not supported: state-space and hybrid models (Mamba, Jamba, Falcon-H1,
-Nemotron-H, RWKV), encoder-decoder models, Gemma 3n (per-layer inputs),
-MiniCPM3, GraniteMoE, OPT-350m (projection layers), FP8 checkpoints, and
-tokenizers without a `tokenizer.json` (SentencePiece-only Baichuan). Unicode
-normalisers (NFKC, Precompiled) are approximated by the identity.
+Nemotron-H, RWKV), Kimi K3 / K2.5+ (gated linear attention with MXFP4 or
+compressed-tensors weights, no `tokenizer.json`), Kimi K2 (FP8 weights, no
+`tokenizer.json`), Qwen3.8-Flash-Next (`qwen4_exp`), GLM-5.3-Flash
+(`glm5_next`) and DeepSeek V4 (sparse indexers with hyper-connections and
+hash layers, FP4/FP8 weights), encoder-decoder models, Gemma 3n (per-layer
+inputs), MiniCPM3, GraniteMoE, OPT-350m (projection layers), FP8
+checkpoints, and tokenizers without a `tokenizer.json`
+(SentencePiece-only Baichuan; generate one with
+`AutoTokenizer.from_pretrained(...).save_pretrained(...)` and place it
+next to the model). ditch names the missing piece instead of guessing:
+unknown layer types, quantisation formats and activations are errors, not
+silent fallbacks. Unicode normalisers (NFKC, Precompiled) are
+approximated by the identity.
+
+Image and video models (Qwen2/3-VL, Qwen3.5, GLM-4.5V, Llama 4) run
+through their text config: the vision tower is never executed, its
+weights pass through exports byte for byte, and refusal directions are
+measured on text prompts.
 
 Weights are read from safetensors (F32/F16/BF16) or GGUF (llama, Mistral,
 Mixtral, Qwen2/3, Qwen MoE and Gemma 2/3 families; the registry carries the
