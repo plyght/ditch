@@ -1732,3 +1732,65 @@ The last three:
   run here even then (FP4), so it stays a recorded gap.
 * **`hf-tiny-v2/tiny-random-Gemma4Model`** — a Gemma 4 MoE block, the
   documented limitation.
+
+## The four comparisons without a verdict (handoff item 7)
+
+`tools/probe_reference.py` gained what they needed: a fallback to the class
+named in `architectures` when `AutoModelForCausalLM` does not know the config
+(Mistral 4), and `--trust-remote-code`, with shims for the transformers 4
+names old remote code still imports (`is_torch_fx_available`,
+`DynamicCache.from_legacy_cache` / `to_legacy_cache`, list-style
+`_tied_weights_keys`) and a no-cache greedy loop when such code cannot drive
+`generate`.
+
+| stub | family | result |
+| --- | --- | --- |
+| onnx-internal-testing/tiny-random-Mistral4ForCausalLM | `mistral4` | exact: all 4 residuals, logits 1.9e-07 |
+| optimum-intel-internal-testing/tiny-random-llama4 | `llama4` | exact: all 6 residuals, logits 1.4e-07. The stub's `attn_temperature_tuning: 4` (an int, from an older transformers) is rejected by transformers 5's strict config; with it written as `true` on both sides it compares exactly, and ditch already reads the integer as true. |
+| optimum-intel-internal-testing/tiny-random-exaone | `exaone` | exact against a trustworthy reference (below) |
+| tiny-random/minicpm4 | — | still no verdict: its remote code insists on the tuple cache format transformers 5 no longer accepts, even with the shims. |
+
+**EXAONE 3 had never been checked**, and its remote code turned out not to be
+a usable reference under transformers 5: with the shims it ran, but its
+residuals moved from 2.6e-04 away from ditch's (with a cache) to 0.127 away
+(`use_cache=False`) — the reference disagreeing with itself, not with ditch.
+EXAONE 3 is architecturally Llama with other tensor names (`transformer.h.N.
+attn.attention.q_proj`, `ln_1`/`ln_2`, `mlp.c_fc_0`/`c_fc_1`/`c_proj`), so the
+reference used instead is transformers' native `LlamaForCausalLM` on a
+renamed copy. Against that:
+
+| Model | family | tokens | residuals | first-token logits | greedy |
+| --- | --- | :---: | :---: | ---: | :---: |
+| optimum-intel-internal-testing/tiny-random-exaone | `exaone` | match (raw) | all 9 agree | 1.3e-07 | — |
+| LGAI-EXAONE/EXAONE-3.5-2.4B-Instruct (full, 30 layers) | `exaone` | match (own template) | all 31 agree | 6.5e-07 | match |
+
+The 2.4B run covers the llama3 rope scaling and tied embeddings. On
+"Explain how to hack into a government database" both reply `'I cannot
+provide guidance on how to hack into any system, including government
+databases, …'`.
+
+## Bug 33 — the NFKC normalizer was the identity (fixed)
+
+**Symptom.** EXAONE 3.5 loads with `warning: normalizer 'NFKC' is
+approximated by the identity`, and one of the 15 tokenizer test strings
+differed: `a b c​d` (no-break and thin spaces). Full-width
+letters, ligatures, superscripts, circled numbers, decomposed accents and
+half-width katakana would all have tokenized differently from transformers.
+
+**Fix.** real NFKC. `tools/gen_unicode.py` now also emits the NFKC of every
+code point NFKC changes (4,866), the primary composites (941 pairs, composition
+exclusions left out) and the non-zero combining classes (912), from the same
+Python `unicodedata` as the existing tables (which regenerate byte for byte).
+The normalizer maps each code point, then canonically composes — a starter
+absorbs a following code point unless something between them has class 0 or
+a class at least its own, and Hangul L+V and LV+T compose algorithmically.
+The one step of full NFKC left out is reordering several combining marks
+into canonical order. A unit test checks eight cases against Python's
+`unicodedata.normalize("NFKC", …)`, including an invalid byte, which is
+copied and blocks composition.
+
+    $ python3 tokcheck.py models/exaone35
+    mismatches: 0 of 15
+    NFKC set (full-width, ligatures, superscripts, circled and Roman numerals, ㎏/℃/№,
+    ǅ/Ǳ, decomposed accents, half-width katakana with voiced marks, compatibility
+    jamo, conjoining jamo): mismatches 0 of 14

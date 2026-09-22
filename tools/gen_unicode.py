@@ -4,7 +4,8 @@ ranges from Python's unicodedata, the Han script from the `regex` package (which
 what the tiktoken pre-tokeniser's `\\p{Han}` means), and the per-code-point "fold"
 mapping (NFKD, then drop nonspacing marks, then lowercase every char) that
 DeepSeek-V4.1 uses to build the compressed token map of its engram hash layers.
-Hangul syllables fold algorithmically and are not in the table."""
+Hangul syllables fold algorithmically and are not in the table. Also the NFKC of
+every single code point that NFKC changes (the `NFKC` tokenizer normalizer)."""
 import unicodedata
 import regex
 def ranges(pred):
@@ -62,4 +63,28 @@ src += emit("fold_drop", drops) + "\n\n"
 src += "/// Code points whose fold is several code points (UTF-8).\n"
 src += "pub const FoldMulti = struct { cp: u21, out: []const u8 };\n"
 src += "pub const fold_multi = [_]FoldMulti{\n" + "\n".join(f"    .{{ .cp = 0x{cp:X}, .out = {zstr(s)} }}," for cp,s in multi) + "\n};\n"
+# NFKC of each code point on its own (composition across code points, e.g. a
+# letter followed by a combining accent, is not applied).
+nfkc=[(cp,unicodedata.normalize('NFKC',chr(cp))) for cp in range(0x110000) if not (0xD800<=cp<=0xDFFF) and unicodedata.normalize('NFKC',chr(cp))!=chr(cp)]
+src += "\n/// NFKC of single code points, for the code points it changes (sorted by `cp`).\n"
+src += "pub const nfkc_map = [_]FoldMulti{\n" + "\n".join(f"    .{{ .cp = 0x{cp:X}, .out = {zstr(s)} }}," for cp,s in nfkc) + "\n};\n"
+# Canonical composition, for the NFKC normalizer: primary composites (pairs
+# whose NFC is one code point; composition exclusions and Hangul, which
+# composes algorithmically, are left out) and the non-zero combining classes.
+pairs=[]
+for cp in range(0x110000):
+    if 0xD800<=cp<=0xDFFF or 0xAC00<=cp<=0xD7A3: continue
+    d=unicodedata.decomposition(chr(cp))
+    if not d or d.startswith('<'): continue
+    parts=[int(x,16) for x in d.split()]
+    if len(parts)==2 and unicodedata.normalize('NFC',chr(parts[0])+chr(parts[1]))==chr(cp):
+        pairs.append((parts[0],parts[1],cp))
+pairs.sort()
+ccc=[(cp,unicodedata.combining(chr(cp))) for cp in range(0x110000) if not (0xD800<=cp<=0xDFFF) and unicodedata.combining(chr(cp))]
+src += "\n/// Primary composites `first + second -> out`, sorted by (first, second).\n"
+src += "pub const Compose = struct { first: u21, second: u21, out: u21 };\n"
+src += "pub const compose_pairs = [_]Compose{\n" + "\n".join(f"    .{{ .first = 0x{a:X}, .second = 0x{b:X}, .out = 0x{c:X} }}," for a,b,c in pairs) + "\n};\n"
+src += "\n/// Non-zero canonical combining classes, sorted by `cp`.\n"
+src += "pub const Ccc = struct { cp: u21, ccc: u8 };\n"
+src += "pub const combining_class = [_]Ccc{\n" + "\n".join(f"    .{{ .cp = 0x{cp:X}, .ccc = {c} }}," for cp,c in ccc) + "\n};\n"
 open("src/unicode_tables.zig","w").write(src)

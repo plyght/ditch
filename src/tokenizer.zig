@@ -5,8 +5,9 @@
 //! regex pre-tokenisers (plus the `Digits`, `Punctuation`, `Whitespace` and
 //! `ByteLevel(add_prefix_space)` steps some families chain in a `Sequence`),
 //! and SentencePiece-derived BPE with Metaspace handling and byte fallback.
-//! Unicode normalisers (NFC/NFKC/Precompiled) are approximated by the
-//! identity with a warning.
+//! NFKC is applied (per code point, then canonical composition; only the
+//! reordering of several combining marks is left out); NFC and the rest of SentencePiece's `Precompiled` map are
+//! approximated by the identity.
 //!
 //! Models without a `tokenizer.json` that ship a tiktoken rank file instead
 //! (Moonshot Kimi's `tiktoken.model`, Meta's Llama 3 `tokenizer.model`) are
@@ -125,6 +126,8 @@ pub const Tokenizer = struct {
     prepend: ?[]const u8,
     replace_space: ?[]const u8, // replacement for " " (typically "▁")
     lowercase: bool,
+    /// `NFKC` normalizer: each code point is replaced by its own NFKC.
+    nfkc: bool,
     /// Pre-tokenisation steps applied in order to every segment.
     steps: []const Step,
     /// SentencePiece's `Precompiled` charsmap: only its whitespace rules are
@@ -176,6 +179,7 @@ pub const Tokenizer = struct {
             .prepend = null,
             .replace_space = null,
             .lowercase = false,
+            .nfkc = false,
             .steps = &.{},
             .sp_whitespace = false,
             .byte_level = false,
@@ -661,6 +665,8 @@ pub const Tokenizer = struct {
             }
         } else if (std.mem.eql(u8, t, "Lowercase")) {
             self.lowercase = true;
+        } else if (std.mem.eql(u8, t, "NFKC")) {
+            self.nfkc = true;
         } else if (std.mem.eql(u8, t, "Strip") or std.mem.eql(u8, t, "NFC")) {
             // Whitespace stripping of the whole input and NFC are identities for the prompts ditch builds.
         } else if (std.mem.eql(u8, t, "Precompiled")) {
@@ -857,7 +863,8 @@ pub const Tokenizer = struct {
         // Normalise. The prepended text goes through the replacement too: a
         // `Prepend " "` in front of a `Replace " " -> "▁"` (Helium) means the
         // prefix is a metaspace, not a literal space.
-        const text = if (self.sp_whitespace) try spWhitespace(a, raw) else raw;
+        const folded = if (self.nfkc) try nfkcCodePoints(a, raw) else raw;
+        const text = if (self.sp_whitespace) try spWhitespace(a, folded) else folded;
         var norm = std.ArrayList(u8).empty;
         for ([_][]const u8{ self.prepend orelse "", text }) |part| {
             for (part) |c| {
@@ -987,6 +994,110 @@ pub const Tokenizer = struct {
                 }
             },
         }
+    }
+
+    /// NFKC (EXAONE): every code point is replaced by its own NFKC —
+    /// no-break and thin spaces, full-width letters, ligatures, superscripts —
+    /// and the result is canonically composed, so a letter followed by a
+    /// combining accent, or half-width katakana followed by a voiced mark,
+    /// becomes the precomposed character. The one step of full NFKC left out
+    /// is canonical reordering of several combining marks. Bytes that are
+    /// not UTF-8 are copied and block composition.
+    fn nfkcCodePoints(a: Allocator, s: []const u8) ![]const u8 {
+        // Code points, or `raw_byte | b` for a byte that does not decode.
+        const raw_byte: u32 = 1 << 31;
+        var cps = std.ArrayList(u32).empty;
+        var i: usize = 0;
+        while (i < s.len) {
+            const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 0;
+            const cp = if (len > 0 and i + len <= s.len) (std.unicode.utf8Decode(s[i .. i + len]) catch null) else null;
+            if (cp) |c| {
+                if (nfkcOf(c)) |m| {
+                    var it = std.unicode.Utf8View.initUnchecked(m).iterator();
+                    while (it.nextCodepoint()) |mc| try cps.append(a, mc);
+                } else try cps.append(a, c);
+                i += len;
+            } else {
+                try cps.append(a, raw_byte | s[i]);
+                i += 1;
+            }
+        }
+        // Canonical composition: a code point composes with the last starter
+        // unless a code point in between has class 0 or a class >= its own.
+        var out = std.ArrayList(u32).empty;
+        var starter: ?usize = null;
+        var last_cc: i32 = -1; // class of the last code point after the starter; -1: none
+        for (cps.items) |c| {
+            const cc: i32 = if (c & raw_byte != 0) 0 else combiningClass(@intCast(c));
+            if (starter) |si| {
+                if (c & raw_byte == 0 and out.items[si] & raw_byte == 0 and (last_cc == -1 or (last_cc != 0 and last_cc < cc))) {
+                    if (composePair(@intCast(out.items[si]), @intCast(c))) |comp| {
+                        out.items[si] = comp;
+                        continue;
+                    }
+                }
+            }
+            if (cc == 0) {
+                starter = out.items.len;
+                last_cc = -1;
+            } else last_cc = cc;
+            try out.append(a, c);
+        }
+        var bytes = std.ArrayList(u8).empty;
+        for (out.items) |c| {
+            if (c & raw_byte != 0) {
+                try bytes.append(a, @truncate(c));
+            } else {
+                var buf: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(@intCast(c), &buf) catch unreachable;
+                try bytes.appendSlice(a, buf[0..n]);
+            }
+        }
+        return bytes.items;
+    }
+
+    fn combiningClass(cp: u21) i32 {
+        const table = &uni.combining_class;
+        var lo: usize = 0;
+        var hi: usize = table.len;
+        while (lo < hi) {
+            const mid = (lo + hi) / 2;
+            if (table[mid].cp == cp) return table[mid].ccc;
+            if (table[mid].cp < cp) lo = mid + 1 else hi = mid;
+        }
+        return 0;
+    }
+
+    /// The primary composite of `first + second`, if any (Hangul algorithmically).
+    fn composePair(first: u21, second: u21) ?u32 {
+        if (first >= 0x1100 and first <= 0x1112 and second >= 0x1161 and second <= 0x1175) {
+            return 0xAC00 + (@as(u32, first - 0x1100) * 21 + (second - 0x1161)) * 28;
+        }
+        if (first >= 0xAC00 and first <= 0xD7A3 and (first - 0xAC00) % 28 == 0 and second >= 0x11A8 and second <= 0x11C2) {
+            return @as(u32, first) + (second - 0x11A7);
+        }
+        const table = &uni.compose_pairs;
+        var lo: usize = 0;
+        var hi: usize = table.len;
+        while (lo < hi) {
+            const mid = (lo + hi) / 2;
+            const e = table[mid];
+            if (e.first == first and e.second == second) return e.out;
+            if (e.first < first or (e.first == first and e.second < second)) lo = mid + 1 else hi = mid;
+        }
+        return null;
+    }
+
+    fn nfkcOf(cp: u21) ?[]const u8 {
+        const table = &uni.nfkc_map;
+        var lo: usize = 0;
+        var hi: usize = table.len;
+        while (lo < hi) {
+            const mid = (lo + hi) / 2;
+            if (table[mid].cp == cp) return table[mid].out;
+            if (table[mid].cp < cp) lo = mid + 1 else hi = mid;
+        }
+        return null;
     }
 
     /// Length of the run of `\r?\n` line breaks at the start of `s` (0 if none).
@@ -1972,6 +2083,24 @@ test "pre-tokenizer steps" {
     out.clearRetainingCapacity();
     try splitClass(arena.allocator(), "a,,b", isPunctuation, false, true, &out);
     try std.testing.expectEqualStrings(",,", out.items[1]);
+}
+
+test "NFKC: compatibility forms, then canonical composition" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (input, Python's unicodedata.normalize("NFKC", input))
+    const cases = [_][2][]const u8{
+        .{ "a\u{a0}b\u{2009}c\u{200b}d", "a b c\u{200b}d" },
+        .{ "\u{ff26}\u{ff35}\u{3000}\u{fb01}ne x\u{b2}", "FU fine x2" },
+        .{ "cafe\u{301}", "caf\u{e9}" },
+        .{ "\u{ff76}\u{ff9e}", "\u{30ac}" },
+        .{ "\u{3131}\u{314f}", "\u{ac00}" },
+        .{ "\u{1100}\u{1161}\u{11a8}", "\u{ac01}" },
+        .{ "o\u{308}\u{304}", "\u{22b}" },
+        .{ "\xff\u{301}", "\xff\u{301}" },
+    };
+    for (cases) |c| try std.testing.expectEqualStrings(c[1], try Tokenizer.nfkcCodePoints(a, c[0]));
 }
 
 test "a line-break split merged with the next piece (Laguna)" {

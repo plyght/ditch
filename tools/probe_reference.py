@@ -32,7 +32,7 @@ import sys
 
 import numpy as np
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 
 LAYER_PARTS = (".layers.", ".h.", ".blocks.", ".block.", ".layer.")
@@ -54,6 +54,39 @@ def find_final_norm(model):
         if "norm" in type(mod).__name__.lower() or "norm" in name.rsplit(".", 1)[-1]:
             found = mod
     return found
+
+
+def install_remote_code_shims():
+    """Names that checkpoints' own modeling code (written for transformers 4)
+    still imports but transformers 5 removed. Only reached with --trust-remote-code."""
+    import transformers.utils.import_utils as iu
+    import transformers.utils as tu
+    from transformers.cache_utils import DynamicCache
+    for mod in (iu, tu):
+        if not hasattr(mod, "is_torch_fx_available"):
+            mod.is_torch_fx_available = lambda: False
+    if not hasattr(DynamicCache, "from_legacy_cache"):
+        def from_legacy_cache(cls, past_key_values=None):
+            cache = cls()
+            for layer, (k, v) in enumerate(past_key_values or ()):
+                cache.update(k, v, layer)
+            return cache
+        DynamicCache.from_legacy_cache = classmethod(from_legacy_cache)
+    # transformers 4 declared ties as a list of the tied names (tied to the
+    # input embedding); 5 wants {tied name: source name}.
+    from transformers import PreTrainedModel
+    expand = PreTrainedModel.get_expanded_tied_weights_keys
+    if not getattr(expand, "_ditch_shim", False):
+        def expanded(self, *a, **kw):
+            tied = getattr(self, "_tied_weights_keys", None)
+            if isinstance(tied, list):
+                src = next((n for n, _ in self.named_parameters() if n.endswith("embed_tokens.weight")), None)
+                self._tied_weights_keys = {k: src for k in tied} if src and self.config.tie_word_embeddings else {}
+            return expand(self, *a, **kw)
+        expanded._ditch_shim = True
+        PreTrainedModel.get_expanded_tied_weights_keys = expanded
+    if not hasattr(DynamicCache, "to_legacy_cache"):
+        DynamicCache.to_legacy_cache = lambda self: tuple((l.keys, l.values) for l in self.layers)
 
 
 def compare_residuals(entry, out, pre_norm, tolerance):
@@ -103,6 +136,8 @@ def main():
     ap.add_argument("--tolerance", type=float, default=1e-2)
     ap.add_argument("--system-prompt", default="You are a helpful assistant.")
     ap.add_argument("--max-new-tokens", type=int, default=32)
+    ap.add_argument("--trust-remote-code", action="store_true",
+                    help="let transformers run the checkpoint's own modeling code")
     ap.add_argument("--raw", action="store_true",
                     help="the probe was run with --raw: no chat template and no BOS")
     ap.add_argument("--residual-tolerance", type=float, default=1e-3,
@@ -111,8 +146,17 @@ def main():
     args = ap.parse_args()
 
     probe = json.load(open(args.probe_json))
-    tok = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=getattr(torch, args.dtype))
+    trc = args.trust_remote_code
+    if trc:
+        install_remote_code_shims()
+    tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=trc)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=getattr(torch, args.dtype), trust_remote_code=trc)
+    except ValueError:
+        # Not registered with AutoModelForCausalLM (Mistral 4): use the class the config names.
+        import transformers
+        cls = getattr(transformers, AutoConfig.from_pretrained(args.model, trust_remote_code=trc).architectures[0])
+        model = cls.from_pretrained(args.model, dtype=getattr(torch, args.dtype))
     model.eval()
     ok = True
     captured = {}
@@ -167,7 +211,17 @@ def main():
         if rel > args.tolerance or int(got.argmax()) != int(ref.argmax()):
             ok = False
         with torch.no_grad():
-            gen = model.generate(input_ids, max_new_tokens=args.max_new_tokens, do_sample=False)
+            try:
+                gen = model.generate(input_ids, max_new_tokens=args.max_new_tokens, do_sample=False)
+            except Exception:
+                if not trc:
+                    raise
+                # Old remote code whose generation hooks transformers 5 no longer
+                # drives: greedy by hand, recomputing the whole prefix each step.
+                gen = input_ids
+                for _ in range(args.max_new_tokens):
+                    nxt = model(input_ids=gen, use_cache=False).logits[:, -1].argmax(-1, keepdim=True)
+                    gen = torch.cat([gen, nxt], dim=-1)
         ref_text = tok.decode(gen[0, input_ids.shape[1]:], skip_special_tokens=False)
         print(f"  greedy transformers: {ref_text!r}")
         print(f"  greedy ditch:        {entry['response']!r}")
