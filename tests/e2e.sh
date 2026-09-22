@@ -588,9 +588,16 @@ RANGE_PID=$!
 # `kill` in the trap would abort it before the cleanup and make a successful
 # run exit non-zero.
 trap 'kill $RANGE_PID 2>/dev/null || true; rm -rf "$TMP"' EXIT
-for _ in $(seq 1 100); do grep -q "^PORT " "$TMP/range_port.txt" 2>/dev/null && break; sleep 0.1; done
+# Up to a minute: the first python3 of a fresh macOS runner is scanned by the
+# system and compiles the standard library on its way up, which took longer than
+# the ten seconds this used to allow. A server that exits fails at once.
+for _ in $(seq 1 600); do
+    grep -q "^PORT " "$TMP/range_port.txt" 2>/dev/null && break
+    kill -0 "$RANGE_PID" 2>/dev/null || fail "range server exited before reporting its port"
+    sleep 0.1
+done
 PORT=$(awk '/^PORT/ {print $2}' "$TMP/range_port.txt")
-[ -n "$PORT" ] || fail "range server did not start"
+[ -n "$PORT" ] || fail "range server did not report a port within a minute"
 REMOTE_COMMON=("${COMMON[@]}")
 REMOTE_COMMON[0]="http://127.0.0.1:$PORT/"
 "$DITCH" "${REMOTE_COMMON[@]}" --cache-dir "$TMP/remote_cache" --remote-chunk-size 4KB --threads 4 \
