@@ -217,6 +217,17 @@ kernel void attn_values(device float *out [[buffer(0)]],
 // Gated activations
 // ---------------------------------------------------------------------------
 
+// Abramowitz-Stegun 7.1.26, the same approximation `tensor.erf` uses. Metal
+// Shading Language has no `erf`, and matching the host polynomial term for
+// term is what keeps the gelu kernel equal to the CPU one rather than merely
+// close to it.
+inline float ditch_erf(float x) {
+    const float a = fabs(x);
+    const float t = 1.0f / (1.0f + 0.3275911f * a);
+    const float y = 1.0f - (((((1.061405429f * t - 1.453152027f) * t) + 1.421413741f) * t - 0.284496736f) * t + 0.254829592f) * t * exp(-x * x);
+    return x >= 0.0f ? y : -y;
+}
+
 // Must match tensor.Activation's declaration order.
 inline float activate(uint act, float x) {
     switch (act) {
@@ -225,7 +236,7 @@ inline float activate(uint act, float x) {
             const float u = 0.7978845608028654f * (x + 0.044715f * x * x * x);
             return 0.5f * x * (1.0f + tanh(u));
         }
-        case 2: return 0.5f * x * (1.0f + erf(x * 0.7071067811865476f)); // gelu
+        case 2: return 0.5f * x * (1.0f + ditch_erf(x * 0.7071067811865476f)); // gelu
         case 3: return fmax(x, 0.0f);                             // relu
         case 4: { const float r = fmax(x, 0.0f); return r * r; }  // relu2
         default: return x / (1.0f + exp(-1.702f * x));            // quick_gelu
