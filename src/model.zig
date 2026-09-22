@@ -3132,18 +3132,6 @@ fn ropeHead(c: *const Config, x: []f32, table: *const RopeTable, pos: usize) voi
     switch (c.rope_style) {
         .neox => compute.applyRope(x[0..d], cos_row, sin_row),
         .gptj => compute.applyRopeInterleaved(x[0..d], cos_row, sin_row),
-        .helium => {
-            // Interleaved pairs against the `[f | f]` table: coordinate j uses
-            // the angle of frequency `j mod d/2`.
-            const half = d / 2;
-            var i: usize = 0;
-            while (i + 1 < d) : (i += 2) {
-                const x1 = x[i];
-                const x2 = x[i + 1];
-                x[i] = x1 * cos_row[i % half] - x2 * sin_row[i % half];
-                x[i + 1] = x2 * cos_row[(i + 1) % half] + x1 * sin_row[(i + 1) % half];
-            }
-        },
     }
 }
 

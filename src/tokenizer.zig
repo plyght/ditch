@@ -837,17 +837,20 @@ pub const Tokenizer = struct {
         var scratch = std.heap.ArenaAllocator.init(gpa);
         defer scratch.deinit();
         const a = scratch.allocator();
-        // Normalise.
+        // Normalise. The prepended text goes through the replacement too: a
+        // `Prepend " "` in front of a `Replace " " -> "▁"` (Helium) means the
+        // prefix is a metaspace, not a literal space.
         const text = if (self.sp_whitespace) try spWhitespace(a, raw) else raw;
         var norm = std.ArrayList(u8).empty;
-        if (self.prepend) |p| try norm.appendSlice(a, p);
-        for (text) |c| {
-            if (c == ' ' and self.replace_space != null and !self.has_metaspace) {
-                try norm.appendSlice(a, self.replace_space.?);
-            } else if (self.lowercase) {
-                try norm.append(a, std.ascii.toLower(c));
-            } else {
-                try norm.append(a, c);
+        for ([_][]const u8{ self.prepend orelse "", text }) |part| {
+            for (part) |c| {
+                if (c == ' ' and self.replace_space != null and !self.has_metaspace) {
+                    try norm.appendSlice(a, self.replace_space.?);
+                } else if (self.lowercase) {
+                    try norm.append(a, std.ascii.toLower(c));
+                } else {
+                    try norm.append(a, c);
+                }
             }
         }
 
@@ -1033,8 +1036,10 @@ pub const Tokenizer = struct {
         const prev = try a.alloc(usize, n + 1);
         const piece_id = try a.alloc(u32, n + 1);
         const reachable = try a.alloc(bool, n + 1);
+        const is_unk = try a.alloc(bool, n + 1);
         @memset(best, 0);
         @memset(reachable, false);
+        @memset(is_unk, false);
         reachable[0] = true;
         var min_score: f32 = 0;
         for (self.unigram_scores) |sc| min_score = @min(min_score, sc);
@@ -1053,6 +1058,7 @@ pub const Tokenizer = struct {
                         best[end] = score;
                         prev[end] = i;
                         piece_id[end] = id;
+                        is_unk[end] = false;
                         reachable[end] = true;
                     }
                     covered = true;
@@ -1061,13 +1067,15 @@ pub const Tokenizer = struct {
                 end += utf8Len(word[end]);
             }
             if (!covered) {
-                // One character as the unknown token, so the path continues.
+                // One character as the unknown token (or its bytes, with
+                // `byte_fallback`), so the path continues.
                 const one = i + utf8Len(word[i]);
                 const score = best[i] + unk_score;
                 if (!reachable[one] or score > best[one]) {
                     best[one] = score;
                     prev[one] = i;
                     piece_id[one] = self.unk_id orelse 0;
+                    is_unk[one] = true;
                     reachable[one] = true;
                 }
             }
@@ -1078,8 +1086,20 @@ pub const Tokenizer = struct {
         defer rev.deinit(a);
         var pos = n;
         while (pos > 0) {
-            try rev.append(a, piece_id[pos]);
-            pos = prev[pos];
+            const from = prev[pos];
+            if (is_unk[pos] and self.byte_fallback) {
+                // sentencepiece replaces an unknown piece with its bytes,
+                // highest byte last so the reversal puts them back in order.
+                var b = pos;
+                while (b > from) : (b -= 1) {
+                    var nb: [8]u8 = undefined;
+                    const name = std.fmt.bufPrint(&nb, "<0x{X:0>2}>", .{word[b - 1]}) catch unreachable;
+                    try rev.append(a, self.vocab.get(name) orelse self.unk_id orelse 0);
+                }
+            } else {
+                try rev.append(a, piece_id[pos]);
+            }
+            pos = from;
         }
         std.mem.reverse(u32, rev.items);
         try self.cacheWord(word, rev.items);
@@ -2045,6 +2065,30 @@ test "unigram segmentation picks the highest-scoring path" {
     const unk = try tok.encode(gpa, "aZb", false);
     defer gpa.free(unk);
     try std.testing.expectEqualSlices(u32, &.{ 5, 0, 3 }, unk);
+}
+
+test "unigram byte fallback and a prepended space that the normalizer replaces" {
+    const gpa = std.testing.allocator;
+    // Helium's normalizer: `Prepend " "` in front of `Replace " " -> "\u2581"`,
+    // so the prefix is a metaspace, not a literal space. `\u00e9` is not in the
+    // vocabulary, so `byte_fallback` spells it out as its two UTF-8 bytes.
+    const json =
+        \\{"model":{"type":"Unigram","unk_id":0,"byte_fallback":true,
+        \\"vocab":[["<unk>",0.0],["\u2581",-3.0],["a",-4.0],["\u2581a",-2.0],["<0xC3>",-9.0],["<0xA9>",-9.0]]},
+        \\"normalizer":{"type":"Sequence","normalizers":[{"type":"Prepend","prepend":" "},{"type":"Replace","pattern":{"String":" "},"content":"\u2581"}]},
+        \\"pre_tokenizer":null,
+        \\"decoder":{"type":"Sequence","decoders":[{"type":"Replace","pattern":{"String":"\u2581"},"content":" "},{"type":"ByteFallback"},{"type":"Fuse"}]},
+        \\"added_tokens":[{"id":0,"content":"<unk>","special":true}]}
+    ;
+    const tok = try Tokenizer.parse(gpa, json, null);
+    defer tok.deinit();
+    // " a" -> "\u2581a", one piece; without the fix the prefix stayed a literal space.
+    const ids = try tok.encode(gpa, "a", false);
+    defer gpa.free(ids);
+    try std.testing.expectEqualSlices(u32, &.{3}, ids);
+    const bytes = try tok.encode(gpa, "a\u{e9}", false);
+    defer gpa.free(bytes);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 4, 5 }, bytes);
 }
 
 test "sentencepiece whitespace normalisation collapses runs and drops the leading one" {

@@ -37,12 +37,8 @@ pub const NormKind = enum {
 pub const RopeStyle = enum {
     /// `(x[i], x[i + d/2])` (Hugging Face `rotate_half`).
     neox,
-    /// `(x[2i], x[2i + 1])` (GPT-J, GLM, Llama 4, DeepSeek).
+    /// `(x[2i], x[2i + 1])` (GPT-J, GLM, Llama 4, DeepSeek, Helium).
     gptj,
-    /// Helium: the pairs of `gptj` but with the `neox` cos/sin table, so the
-    /// two coordinates of a pair are scaled by the angles of frequencies
-    /// `2i mod d/2` and `(2i + 1) mod d/2` (what the reference computes).
-    helium,
 };
 
 /// `sinusoidal`: the fairseq / XGLM table `[sin(p·f) | cos(p·f)]` computed
@@ -4812,8 +4808,8 @@ pub const registry = [_]Arch{
         .llama_cpp = null,
         .chat = "chatml",
         .verified = true,
-        .rope_style = .helium,
-        .notes = "fixture: llama layout with mlp/attention biases and Helium's rotary pairing ((x[2i], x[2i+1]) against the duplicated cos/sin table). Helium 1 (Kyutai).",
+        .rope_style = .gptj,
+        .notes = "fixture: llama layout with mlp/attention biases and interleaved rotary pairing. Helium's reference builds its table as `cat(f, f)` and then takes `[:d/2].repeat_interleave(2)` of it, which is the plain `(x[2i], x[2i+1])` pairing against frequency `i` — the same thing GPT-J does, written differently. Helium 1 (Kyutai).",
     },
     .{
         .model_type = "hunyuan_v1_dense",

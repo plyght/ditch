@@ -1232,7 +1232,7 @@ spec("ernie4_5", tok="spm", rope_style="gptj", attn_bias=True, o_bias=True, mlp_
      config={"model_type": "ernie4_5", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4,
              "num_key_value_heads": 2, "head_dim": 8, "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "hidden_act": "silu",
              "use_bias": True, "max_position_embeddings": 128, "tie_word_embeddings": False})
-spec("helium", tok="llama3", NKV=4, rope_style="helium", attn_bias=True, o_bias=False, mlp_bias=True,
+spec("helium", tok="llama3", NKV=4, rope_style="gptj", attn_bias=True, o_bias=False, mlp_bias=True,
      lm_head="lm_head.weight", eps=1e-8,
      config={"model_type": "helium", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4,
              "num_key_value_heads": 4, "head_dim": 8, "rms_norm_eps": 1e-8, "rope_theta": 10000.0, "hidden_act": "silu",
@@ -2005,15 +2005,7 @@ def generate_generic(family, out_dir):
         rd = 2 * cos.shape[1]
         rot = x[..., off:off + rd]
         c, sn = cos[:, None, :], sin[:, None, :]
-        if s["rope_style"] == "helium":
-            # Interleaved pairs against the duplicated `[f | f]` table: coordinate
-            # j is rotated by the angle of frequency `j mod rd/2`.
-            full = np.concatenate([cos, cos], -1)[:, None, :], np.concatenate([sin, sin], -1)[:, None, :]
-            x1, x2 = rot[..., 0::2], rot[..., 1::2]
-            out = np.empty_like(rot)
-            out[..., 0::2] = x1 * full[0][..., 0::2] - x2 * full[1][..., 0::2]
-            out[..., 1::2] = x2 * full[0][..., 1::2] + x1 * full[1][..., 1::2]
-        elif s["rope_style"] == "neox":
+        if s["rope_style"] == "neox":
             x1, x2 = rot[..., :rd // 2], rot[..., rd // 2:]
             out = np.concatenate([x1 * c - x2 * sn, x2 * c + x1 * sn], -1)
         else:

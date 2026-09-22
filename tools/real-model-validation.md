@@ -756,3 +756,297 @@ Chat check of the export, same prompts through `ditch probe`:
 
 The abliteration survives the export and the model still answers benign
 prompts correctly.
+
+---
+
+# Third pass: the 26 newly registered families, and AikidoSec/altar-1
+
+`main` grew from 69 to 93 registry entries (arcee, apertus, bitnet, helium,
+hunyuan_v1_dense, jais2, nanochat, persimmon, gptj, codegen, gpt_neo, xglm,
+biogpt, ernie4_5, ministral3, granite_swa, olmoe, flex_olmo, dots1,
+exaone_moe, solar_open, afmoe, mellum, laguna, hy_v3, deepseek_v32), again
+fixture-verified only. This pass ran the small ones and config-checked the
+rest, and added the mixed-precision `glm_moe_dsa` checkpoint
+`AikidoSec/altar-1`.
+
+## Bug 14 — `xglm` could not tokenize any of its own checkpoints (fixed)
+
+**Symptom.** `ditch probe facebook/xglm-564M` →
+`error: unsupported tokenizer model type: Unigram`. The `xglm` entry was
+registered and fixture-verified, but no released XGLM checkpoint could be
+loaded: `facebook/xglm-*` (and mBART, and the other SentencePiece-Unigram
+models) ship a `tokenizer.json` whose `model.type` is `Unigram`, and ditch
+read BPE only. `kyutai/helium-1-preview-2b` failed the same way.
+
+**Fix.** Implemented Unigram (`src/tokenizer.zig`): `vocab` is a list of
+`[token, log_prob]` whose index is the id, and the segmentation is the path
+through a pre-token with the highest total log-probability — a Viterbi over
+the UTF-8 character boundaries, with a one-character fallback to `unk_id`
+scored `min(score) - 10` (sentencepiece's `kUnkPenalty`) so any covered path
+wins.
+
+That alone left 4 of 15 tricky strings tokenizing differently from the
+`tokenizers` package, all whitespace: SentencePiece's `Precompiled`
+normalizer — which ditch treats as the identity — maps tabs, newlines, the
+Unicode separators and the zero-width joiners to a space, collapses runs and
+drops a leading one. Those rules are now applied wherever a `Precompiled`
+normalizer is declared (the compatibility foldings stay the identity).
+
+**Verification.** `tools/probe_reference.py` and a 15-string conformance
+check against `tokenizers.Tokenizer.from_file` (whitespace, CJK, Arabic,
+Hebrew, Cyrillic, ZWJ emoji, tabs/newlines, code, special-token literals):
+
+    mismatches: 0 of 15
+
+and the forward pass on the real checkpoint, in float32:
+
+| Model | family | tokens | residuals | first-token logits |
+| --- | --- | :---: | :---: | ---: |
+| facebook/xglm-564M | `xglm` | match | all 25 agree | 3.6e-07 |
+
+## Bug 15 — the `bitnet` entry claimed a checkpoint that cannot be run (fixed)
+
+**Symptom.** `microsoft/bitnet-b1.58-2B-4T-bf16` was refused with
+`'bitnet' quantised weights cannot be dequantised`, although every one of its
+332 tensors is BF16 — there is nothing quantised to read.
+
+**Cause and fix.** The refusal is right but the reason was wrong, and the
+registry note ("BitNet b1.58, released unpacked, as bf16") was wrong too.
+`quantization_config` is `{quant_method: "bitnet", quantization_mode:
+"online"}`: transformers' `AutoBitLinear` ternarises the weight and quantises
+the activations *inside every linear at run time*, so the released bf16
+tensors are master weights, not the model the reference runs — reading them
+as they are would silently run something else. ditch now says that, and the
+entry's note no longer claims a released checkpoint works. (The packed
+release, `microsoft/bitnet-b1.58-2B-4T`, is unreadable for the same reason.)
+
+## Families run end to end against transformers
+
+Same method as the second pass: `ditch probe --residuals` compared with
+transformers layer by layer. `--raw` marks a base model with no chat template
+(the prompt is the text, verbatim, on both sides). The logit column is the max
+absolute difference relative to the logit range.
+
+| Model | family | tokens | residuals | first-token logits | greedy |
+| --- | --- | :---: | :---: | ---: | :---: |
+| EleutherAI/gpt-neo-125m | `gpt_neo` | match (raw) | all 13 agree | 2.1e-06 | match |
+| Salesforce/codegen-350M-mono | `codegen` | match (raw) | all 21 agree | 4.6e-07 | match |
+| microsoft/biogpt | `biogpt` | (see below) | all 25 agree | 9.2e-07 | — |
+| facebook/xglm-564M | `xglm` | match (raw) | all 25 agree | 3.6e-07 | match |
+| baidu/ERNIE-4.5-0.3B-PT | `ernie4_5` | (template) | all 19 agree | 1.3e-06 | match |
+| tencent/Hunyuan-0.5B-Instruct | `hunyuan_v1_dense` | (template) | all 25 agree | 9.2e-07 | match |
+
+Three of those need a checkpoint fixed up first, and the fix-up is recorded
+because it is also what a user would have to do:
+
+* **codegen-350M-mono** and **biogpt** ship `pytorch_model.bin` only, so they
+  were re-saved as safetensors with
+  `AutoModelForCausalLM.from_pretrained(...).save_pretrained(..., safe_serialization=True)`.
+  ditch reads safetensors and GGUF by design; this is not a gap, but neither
+  family has a safetensors release.
+* **biogpt** also has no fast tokenizer at all (`BioGptTokenizer` is Moses +
+  BPE, slow-only, so `save_pretrained` writes no `tokenizer.json`), so a plain
+  BPE `tokenizer.json` was built from its `vocab.json` / `merges.txt`. Both
+  sides are then fed ditch's ids, which is what the forward-pass comparison
+  needs; the ids themselves are not the ones `BioGptTokenizer` would produce.
+  The `biogpt` family therefore cannot be run end to end from its released
+  files.
+* **ERNIE 4.5** and **Hunyuan V1 dense** have their own chat templates that
+  ditch's family set does not cover, so it falls back to `raw`. The forward
+  pass is exact; the prompt formatting is not the model's. Same class as the
+  Qwen 3.5 `<think>` gap from the second pass.
+
+## Families config-checked against a real checkpoint
+
+| Checkpoint | family | shards | result |
+| --- | --- | ---: | --- |
+| JetBrains/Mellum2-12B-A2.5B-Instruct | `mellum` | 5 | OK (28 layers) |
+| arcee-ai/AFM-4.5B | `arcee` | 2 | OK (36 layers) |
+| arcee-ai/Trinity-Nano-Preview | `afmoe` | — | OK (56 layers) |
+| rednote-hilab/dots.llm1.inst | `dots1` | — | OK (62 layers) |
+| deepseek-ai/DeepSeek-V3.2-Exp | `deepseek_v32` | — | OK (61 layers) |
+| upstage/Solar-Open-100B | `solar_open` | — | OK (48 layers) |
+| LGAI-EXAONE/EXAONE-4.0.1-32B | `exaone4` | — | OK (64 layers) |
+| allenai/OLMoE-1B-7B-0924-Instruct | `olmoe` | 3 | OK (16 layers) |
+| ibm-granite/granite-3.3-2b-instruct | `granite` | 2 | OK (40 layers) |
+
+## Families with no checkpoint this machine could reach
+
+Recorded so the gap is visible rather than assumed away:
+
+* **`jais2`** — `inception42/Jais-2-8B-Chat` is gated (HTTP 401 on
+  `config.json`). No public Jais 2 checkpoint; the `jais-family-*` repos are
+  Jais 1 (`model_type: jais`).
+* **`persimmon`** — `adept/persimmon-8b-chat` ships a SentencePiece
+  `tokenizer.model` with no `tokenizer.json`, which ditch already documents as
+  unsupported and names in the error.
+* **`gptj`** — `EleutherAI/gpt-j-6b` has no safetensors at all (`.bin` only).
+* **`flex_olmo`**, **`laguna`**, **`solar_open` (solar-open-1-mini)** — 401.
+* **`hy_v3`** — the entry's note says "Hunyuan V3 (released checkpoints …)",
+  but the only released V3 is `tencent/HunyuanImage-3.0`, whose `model_type` is
+  `hunyuan_image_3_moe` and which the registry does not name (it is an
+  image-generation model with a `HunyuanImage3ForCausalMM` head). No text
+  Hunyuan V3 is published, so the entry has nothing to run.
+* **`nanochat`** — `karpathy/nanochat-d32` has no `config.json` and ships
+  `.pt` files, so there is no official Hugging Face release. The one
+  HF-format conversion, `dnakov/nanochat-d20`, keeps nanoGPT's names —
+  `transformer.wte.weight`, `transformer.h.{N}.attn.c_q/c_k/c_v/c_proj`,
+  `transformer.h.{N}.mlp.c_fc/c_proj`, `lm_head.weight` — while the entry
+  expects the Hugging Face spelling (`model.embed_tokens.weight`,
+  `model.layers.{N}.self_attn.q_proj.weight`, `mlp.fc1` / `mlp.fc2`), so it
+  stops at `embedding tensor '{p}embed_tokens.weight' not found under any
+  known prefix`. Supporting both would need alternative `embed` / `layer`
+  templates per family, which `Names` does not have (its `prefixes` list only
+  varies the prefix); left alone rather than guessing a convention from one
+  third-party conversion.
+
+## AikidoSec/altar-1 (REAP-pruned GLM-5.3, mixed BF16 / INT4)
+
+    $ ditch --dry-run hf://AikidoSec/altar-1 --max-ram 8GB --remote-chunk-size 2MB --no-input --print-debug-information
+    info: dequantising 37011 tensors on load (0 fp8, 0 mxfp4, 37011 pack-quantized); exports are bf16
+    * Architecture: glm_moe_dsa (78 layers, hidden size 6144, vocabulary 154880, BF16 weights)
+    * Weights: trunk streamed layer by layer from the remote source, routed experts through an expert cache of 3.63GB (warp mode)
+      weights total            932.86GB (78 layers)
+      routed expert            72.0MB each, 168 per layer, top-8 per token, 885.94GB in total
+      warp mode:     min 12.38GB (trunk + top-8 experts + workspace)
+    EXIT=2   (loaded; the 8 GB budget is then too small, as it should be)
+
+Taking the four questions in turn.
+
+**1. The INT4 path.** `config_groups.group_0.weights` is
+`{type: int, num_bits: 4, group_size: 32, symmetric: false, actorder: null,
+zp_dtype: torch.int8}` — asymmetric, so zero points are used, and *not*
+`actorder`, so bug 5 does not apply to this checkpoint (it would have, had
+Aikido used AWQ's activation ordering). The stored layout is exactly what
+ditch expects: for `model.layers.5.mlp.experts.0.gate_proj`,
+`weight_packed` I32 `[2048, 768]` (768 words x 8 four-bit fields = 6144
+columns), `weight_scale` `[2048, 192]` (6144 / 32 groups), `weight_shape`
+I64 `[2]` and `weight_zero_point` I32 `[256, 192]` — `ceil(rows * bits / 32)`
+words by groups, packed *along the rows*, which is the layout `readPacked`
+decodes. Decoding eight real rows of that expert with those rules gives
+`min -0.170 max 0.110 std 0.0239 mean 6e-05` and zero points spread over
+-5…4: ordinary MLP weights, asymmetric as declared.
+
+**2. `ignore` / `targets` selectivity.** Exact, and it is data-driven rather
+than config-driven: `dequant.register` pairs a `weight_packed` with its
+`weight_scale`, so a BF16 tensor is never touched and a packed one is never
+missed. The count proves it — 37011 dequantised tensors = 73 quantised MoE
+layers x 168 experts x 3 projections (36792) + 73 x (`q_b_proj`, `kv_b_proj`,
+`o_proj`) (219). The index confirms the other side: the three `ignore`d MoE
+layers keep 504 = 3 x 168 plain `.weight` expert tensors, and `q_a_proj`,
+`kv_a_proj_with_mqa`, the shared experts, the router, the indexer, the norms,
+the embeddings and the LM head are BF16 throughout.
+
+**3. 168 routed experts.** Parsed as 168 with `num_experts_per_tok: 8` and
+`n_group: 1` / `topk_group: 1` — with one group, group-limited routing
+degenerates to a plain top-k, so the non-power-of-two count needs nothing
+special, and the estimate's "168 per layer, top-8 per token" confirms the
+parse. Expert-selective abliteration ranks and edits per expert, so 168 is
+no different from 256 to it.
+
+**4. Tensor names.** All present: the run reaches the memory estimate, which
+is past every name and shape check, across 39 shards and 150554 tensors
+(including the MTP layer's `eh_proj` / `enorm` / `hnorm` /
+`shared_head.norm`, which pass through).
+
+**Would warp mode run it here?** No, and the estimate says so honestly:
+minimum resident 12.38 GB against 15 GiB of RAM is borderline, but the
+decoded weights are 932.86 GB of bf16 and the `hf://` chunk cache is
+unbounded on disk, so a calibration pass would try to cache its way through
+328 GB of INT4 shards on an 18 GB allowance. Same disk-size limit as the
+Qwen1.5-MoE run in the first pass, now at ~18x the scale. On a host with disk
+larger than the checkpoint, the resident set is the part that matters and
+12.38 GB is within reach of a 16 GB machine.
+
+## Bug 16 — Helium's rotary embedding was not a rotation (fixed)
+
+**Symptom.** `kyutai/helium-1-preview-2b` produced fluent but wrong text —
+"The capital of France is" continued with "the capital of the United States of
+America", then degenerated. Against transformers in float32 the residuals
+diverged at the *first* decoder layer, 7.5e-01 of the layer's own magnitude.
+
+**Cause.** The registry gave `helium` its own `RopeStyle`, described as "the
+pairs of `gptj` but with the `neox` cos/sin table", implemented as
+
+    x[i]     = x1 * cos[i % half]       - x2 * sin[i % half]
+    x[i + 1] = x2 * cos[(i + 1) % half] + x1 * sin[(i + 1) % half]
+
+The two coordinates of a pair are scaled by the angles of two *different*
+frequencies, which is not a rotation of that pair at all. What misled the
+author is that `HeliumRotaryEmbedding` builds `emb = cat(freqs, freqs)` like
+a NeoX model — but `apply_rotary_pos_emb` then undoes that:
+
+    cos = cos[..., : cos.shape[-1] // 2].repeat_interleave(2, dim=-1)
+
+taking the first half (which is just `freqs` again) and repeating each entry
+twice, so coordinates `2i` and `2i + 1` both get frequency `i`. Together with
+Helium's interleaved `rotate_half` (`stack((-x[1::2], x[0::2]))`) that is
+exactly the plain GPT-J pairing, written the long way round.
+
+A one-layer cut of the real checkpoint isolated it: the input norm, the MLP
+and the attention-with-interleaved-rope each matched the reference to 1e-6,
+so only the rope pairing was left. Neither the fixture nor the NumPy
+reference could catch it, because `tools/make_fixture.py` implemented the
+same wrong formula — the fixture encoded the misreading rather than the
+reference.
+
+**Fix.** `helium` uses `.rope_style = .gptj`; the `.helium` variant and its
+branch in `ropeHead` are gone, as is the fixture generator's. The `helium`
+fixture is regenerated (its reference outputs change, which is the point).
+
+**Verification.** `kyutai/helium-1-preview-2b`, full 24 layers, float32:
+
+| | before | after |
+| --- | --- | --- |
+| first layer that diverges | 1 | none: all 25 agree |
+| worst residual, relative | 7.6e-01 | 4.0e-06 |
+| first-token logits, relative to range | 2.6e-01 | 3.8e-07 |
+| greedy reply | `'the capital of the United States of America…'` | matches transformers word for word |
+
+## Bug 17 — a prepended space was not passed through the space replacement (fixed)
+
+**Symptom.** every one of 15 test strings tokenized differently from the
+`tokenizers` package on `kyutai/helium-1-preview-2b`, each with a spurious
+leading `<unk>`.
+
+**Cause.** Helium's normalizer is `Prepend " "` followed by
+`Replace " " -> "▁"`. `encodeSegment` appended the prepended text to the
+buffer *before* the loop that performs the replacement, so the prefix stayed
+a literal space — which is in no vocabulary, hence the unknown token. It was
+invisible until now because every other family that prepends (Llama 2,
+Baichuan, the SentencePiece BPE fixture) prepends `"▁"` directly, where the
+replacement is a no-op.
+
+**Fix.** the prepended text goes through the same loop as the rest.
+
+## Bug 18 — Unigram had no byte fallback (fixed)
+
+**Symptom.** after bug 17, 6 of 15 strings still differed: Hebrew, ZWJ emoji
+and a literal tab came out as `<unk>` where the reference emitted byte
+tokens.
+
+**Cause.** `byte_fallback` was implemented for BPE but not for the new
+Unigram path, which fell straight to `unk_id`.
+
+**Fix.** a Viterbi node that fell back to the unknown token records that, and
+the reconstruction spells the character out as `<0xHH>` tokens when the model
+declares `byte_fallback` (sentencepiece's behaviour), with `unk_id` as the
+last resort.
+
+    $ python3 tokcheck.py models/kyutai__helium-1-preview-2b
+    mismatches: 0 of 15
+    $ python3 tokcheck.py models/conv__xglm          # no regression
+    mismatches: 0 of 15
+
+## Families run end to end, continued
+
+| Model | family | tokens | residuals | first-token logits | greedy |
+| --- | --- | :---: | :---: | ---: | :---: |
+| ibm-granite/granite-4.0-h-350m | `granitemoehybrid` | match | all 33 agree | 1.8e-06 | match |
+| kyutai/helium-1-preview-2b | `helium` | match (raw) | all 25 agree | 3.8e-07 | match |
+
+`granite-4.0-h-350m` is the Mamba2 + attention + fused-expert hybrid, so this
+covers the selective scan, its per-sequence state and the Granite multipliers
+on a real checkpoint. `granite-4.0-micro` (3B) loads and probes correctly too,
+but a float32 transformers reference for it does not fit in 15 GiB, so the
+350m sibling carries the comparison.
