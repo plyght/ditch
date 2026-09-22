@@ -579,7 +579,10 @@ if grep -q "^Expert cache:" "$TMP/plain.log"; then fail "--expert-cache 0 still 
 echo "==> Remote weight source: hf://-style loading over a local HTTP range server"
 python3 tools/range_server.py tests/fixtures/qwen3_moe_big "$TMP/range.log" > "$TMP/range_port.txt" &
 RANGE_PID=$!
-trap 'kill $RANGE_PID 2>/dev/null; rm -rf "$TMP"' EXIT
+# `|| true`: the server is killed again below, and under `set -e` a failing
+# `kill` in the trap would abort it before the cleanup and make a successful
+# run exit non-zero.
+trap 'kill $RANGE_PID 2>/dev/null || true; rm -rf "$TMP"' EXIT
 for _ in $(seq 1 100); do grep -q "^PORT " "$TMP/range_port.txt" 2>/dev/null && break; sleep 0.1; done
 PORT=$(awk '/^PORT/ {print $2}' "$TMP/range_port.txt")
 [ -n "$PORT" ] || fail "range server did not start"
