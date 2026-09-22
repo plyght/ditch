@@ -4,3 +4,5 @@ checkpoints/
 *.jsonl
 /models/
 /.claude/
+out/
+bench-*.md

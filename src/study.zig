@@ -404,9 +404,55 @@ pub const Study = struct {
         const all = try gpa.alloc([]const f64, self.trials.items.len);
         defer gpa.free(all);
         for (self.trials.items, 0..) |t, i| all[i] = t.losses;
-        sortByLosses(best.items, all);
+        self.sortFront(best.items, all);
         return best.toOwnedSlice(gpa);
     }
+
+    /// A trial's refusal score (any score whose name contains "Refus", so both
+    /// the generation "Refusals" count and the fast-search "Refusal mass"
+    /// proxy match) and its KL score (name contains "KL").
+    fn refusalAndKl(trial: *const Trial) struct { refusal: ?f64, kl: ?f64 } {
+        var refusal: ?f64 = null;
+        var kl: ?f64 = null;
+        for (trial.scores) |s| {
+            if (std.mem.indexOf(u8, s.name, "Refus") != null) refusal = s.value;
+            if (std.mem.indexOf(u8, s.name, "KL") != null) kl = s.value;
+        }
+        return .{ .refusal = refusal, .kl = kl };
+    }
+
+    /// Orders the Pareto front for display and `--trial-index`, matching
+    /// heretic: fewest refusals first, ties broken by KL divergence. The
+    /// first trial is thus the most strongly abliterated one, so a
+    /// non-interactive `--trial-index 1 --model-action save` saves an
+    /// abliterated model rather than the near-baseline low-KL end. Trials that
+    /// lack the named scores fall back to the raw loss order.
+    fn sortFront(self: *const Study, best: []usize, losses: []const []const f64) void {
+        std.mem.sort(usize, best, Ctx{ .study = self, .losses = losses }, Ctx.lt);
+    }
+
+    const Ctx = struct {
+        study: *const Study,
+        losses: []const []const f64,
+
+        fn lt(ctx: Ctx, a: usize, b: usize) bool {
+            const sa = refusalAndKl(&ctx.study.trials.items[a]);
+            const sb = refusalAndKl(&ctx.study.trials.items[b]);
+            if (sa.refusal != null and sb.refusal != null) {
+                if (sa.refusal.? != sb.refusal.?) return sa.refusal.? < sb.refusal.?;
+                if (sa.kl != null and sb.kl != null and sa.kl.? != sb.kl.?) return sa.kl.? < sb.kl.?;
+            }
+            // Break exact ties (and order trials with no named refusal score,
+            // e.g. before deferred scoring) by the raw loss vector, lexicographic.
+            const la = ctx.losses[a];
+            const lb = ctx.losses[b];
+            for (la, 0..) |x, i| {
+                if (x < lb[i]) return true;
+                if (x > lb[i]) return false;
+            }
+            return false;
+        }
+    };
 
     /// Loss vectors of the current Pareto front of completed trials (the
     /// reference set for early stopping). The outer slice is owned by the caller.
@@ -416,18 +462,6 @@ pub const Study = struct {
         const out = try gpa.alloc([]const f64, best.len);
         for (best, 0..) |bi, i| out[i] = self.trials.items[bi].losses;
         return out;
-    }
-
-    fn sortByLosses(best: []usize, losses: []const []const f64) void {
-        std.mem.sort(usize, best, losses, struct {
-            fn lt(l: []const []const f64, a: usize, b: usize) bool {
-                for (l[a], 0..) |x, i| {
-                    if (x < l[b][i]) return true;
-                    if (x > l[b][i]) return false;
-                }
-                return false;
-            }
-        }.lt);
     }
 };
 
@@ -493,7 +527,10 @@ test "study round trip" {
     try std.testing.expectEqual(@as(f64, 0.2), front[0][0]);
 
     // Rescoring adds a score to a trial, replaces one of the same name, is
-    // journaled, and leaves the losses (and the front) alone.
+    // journaled, and leaves the losses and front membership alone. The display
+    // order, however, follows the refusal score (heretic order: fewest refusals
+    // first), so once trial 1 is rescored to 1/10 refusals it sorts ahead of
+    // trial 2 (3/10), the reverse of the loss order.
     try reloaded.addScores(gpa, 2, &.{ .{ .name = "KL divergence", .value = 0.2, .display = "0.2000" }, .{ .name = "Refusals", .value = 0.3, .display = "3/10" } });
     try reloaded.addScores(gpa, 1, &.{ .{ .name = "KL divergence", .value = 0.5, .display = "0.5000" }, .{ .name = "Refusals", .value = 0.1, .display = "1/10" } });
     var again = try Study.open(gpa, io, path);
@@ -504,12 +541,42 @@ test "study round trip" {
     try std.testing.expectEqualStrings("1/10", Study.scoreOf(&again.trials.items[0], "Refusals").?.display);
     const best2 = try again.bestTrials(gpa);
     defer gpa.free(best2);
-    try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, best2);
-    // Scalarised selection: trial 2 has 0.3 + 0.2 = 0.5, trial 1 has 0.1 + 0.5 = 0.6 (λ = 1);
-    // with λ = 0.1 trial 1 wins (0.15 vs 0.32).
-    try std.testing.expectEqual(@as(?usize, 0), again.selectScalarised(best2, "Refusals", null, "KL divergence", 1.0));
-    try std.testing.expectEqual(@as(?usize, 1), again.selectScalarised(best2, "Refusals", null, "KL divergence", 0.1));
+    // items[0] (trial 1, 1/10 refusals) now sorts before items[1] (trial 2, 3/10).
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, best2);
+    // Scalarised selection returns the position within best2 = {0, 1}.
+    // λ = 1: trial 2 (items[1]) wins with 0.3 + 0.2 = 0.5 vs trial 1's 0.1 + 0.5 = 0.6,
+    // and items[1] is at position 1. λ = 0.1: trial 1 (items[0]) wins with 0.15 vs 0.32,
+    // at position 0.
+    try std.testing.expectEqual(@as(?usize, 1), again.selectScalarised(best2, "Refusals", null, "KL divergence", 1.0));
+    try std.testing.expectEqual(@as(?usize, 0), again.selectScalarised(best2, "Refusals", null, "KL divergence", 0.1));
     try std.testing.expectEqual(@as(?usize, null), again.selectScalarised(best2, "Refusals", null, "missing", 1.0));
     // The fallback name is used when the primary score is missing.
-    try std.testing.expectEqual(@as(?usize, 1), again.selectScalarised(best2, "nope", "Refusals", "KL divergence", 0.1));
+    try std.testing.expectEqual(@as(?usize, 0), again.selectScalarised(best2, "nope", "Refusals", "KL divergence", 0.1));
+}
+
+test "the front is ordered fewest refusals first (heretic order)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &path_buf);
+    const path = try std.fs.path.join(gpa, &.{ path_buf[0..dir_len], "study.jsonl" });
+    defer gpa.free(path);
+
+    var study = try Study.open(gpa, io, path);
+    defer study.deinit();
+    try study.reset("{\"type\":\"settings\"}");
+    const pmap = std.EnumMap(model_mod.Component, abliterate.Params){};
+    const params = [_]f64{0};
+    // Three Pareto-optimal trials: as KL grows, refusals fall (the abliteration
+    // trade-off). Objective order is [KL, refusals], so the raw loss order is
+    // KL-ascending, i.e. most refusals first — the opposite of what we want.
+    try study.addTrial(gpa, .{ .index = 1, .params = &params, .losses = &.{ 0.001, 0.90 }, .direction_index = null, .parameters = pmap, .scores = &.{ .{ .name = "KL divergence", .value = 0.001, .display = "0.0010" }, .{ .name = "Refusals", .value = 0.90, .display = "90/100" } } });
+    try study.addTrial(gpa, .{ .index = 2, .params = &params, .losses = &.{ 0.02, 0.15 }, .direction_index = null, .parameters = pmap, .scores = &.{ .{ .name = "KL divergence", .value = 0.02, .display = "0.0200" }, .{ .name = "Refusals", .value = 0.15, .display = "15/100" } } });
+    try study.addTrial(gpa, .{ .index = 3, .params = &params, .losses = &.{ 0.08, 0.05 }, .direction_index = null, .parameters = pmap, .scores = &.{ .{ .name = "KL divergence", .value = 0.08, .display = "0.0800" }, .{ .name = "Refusals", .value = 0.05, .display = "5/100" } } });
+    const best = try study.bestTrials(gpa);
+    defer gpa.free(best);
+    // Fewest refusals first: trial 3 (5/100), then trial 2 (15/100), then trial 1 (90/100).
+    try std.testing.expectEqualSlices(usize, &.{ 2, 1, 0 }, best);
 }

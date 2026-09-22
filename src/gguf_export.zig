@@ -325,13 +325,19 @@ fn addVocab(w: *gguf.Writer, a: Allocator, model: *const Model) !void {
     try w.addString("tokenizer.ggml.model", if (byte_level) "gpt2" else "llama");
     try w.addString("tokenizer.ggml.pre", pre);
 
-    const n = tok.id_to_token.len;
+    // The token list must have exactly as many entries as the token embedding
+    // has rows: llama.cpp derives n_vocab from this array and rejects a model
+    // whose `token_embd.weight` row count differs. Some checkpoints (Qwen2.5,
+    // Llama 3) pad the embedding above the tokenizer's token count for
+    // alignment, so the extra rows are emitted as unused `[PAD{id}]` tokens.
+    const n = model.embed_ref.rows;
     const tokens = try a.alloc([]const u8, n);
     const types = try a.alloc(i32, n);
     for (0..n) |id| {
-        var s = tok.id_to_token[id];
+        var s: []const u8 = if (id < tok.id_to_token.len) tok.id_to_token[id] else "";
         var t: gguf_model.TokenType = .normal;
-        if (tok.added_by_id.get(@intCast(id))) |ai| {
+        if (id < tok.id_to_token.len and tok.added_by_id.get(@intCast(id)) != null) {
+            const ai = tok.added_by_id.get(@intCast(id)).?;
             t = if (tok.added[ai].special) .control else .user_defined;
         } else if (s.len == 0) {
             s = try std.fmt.allocPrint(a, "[PAD{d}]", .{id});
