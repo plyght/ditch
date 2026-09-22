@@ -86,6 +86,17 @@ a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
   `qwen3_5` / `qwen3_5_moe` (Qwen3.5, Qwen3.8 dense and MoE, text configs;
   the linear recurrence runs sequentially, so long prefills are slower
   than on dense models)
+* Mamba (selective state-space) families: `mamba2` (Mamba-Codestral,
+  `state-spaces/mamba2-*-hf`), `nemotron_h` (Nemotron-H and Nemotron 3 Nano:
+  Mamba2, attention, relu² MLP and non-gated MoE blocks laid out by
+  `hybrid_override_pattern`), `falcon_h1` (Mamba2 and attention side by side
+  in every layer, with the muP multipliers), `jamba` (Mamba1 with the
+  RMS-normalised dt/B/C path, attention and MoE layers by period) and
+  `granitemoehybrid` (Granite 4.0 H: Mamba2, attention, fused experts next
+  to the shared MLP). The selective scan runs one token at a time (heads
+  and channels in parallel) and its state is kept per sequence through
+  prefill and decoding like the KV cache; a Mamba block's `out_proj` is
+  abliterated like an attention output projection.
 * Gemma 2 / Gemma 3 (text), GLM-4 (`glm4`, `glm`) and ChatGLM3 / GLM-4-9B
   (`chatglm`), GLM-4.5 dense and MoE (`glm4_moe`, also the `glm4v_moe`
   image/video text config), GLM-5 family (`glm_moe_dsa`, whose sparse
@@ -105,8 +116,8 @@ Implemented from the Hugging Face reference but without a fixture: Falcon
 LayerNorm), Gemma 2 logit softcapping, `dynamic` and `longrope` scaling
 beyond the original context (treated as static / short factors).
 
-Not supported: state-space and hybrid models (Mamba, Jamba, Falcon-H1,
-Nemotron-H, RWKV), Kimi K3 / K2.5+ (gated linear attention with MXFP4 or
+Not supported: Mamba1-only models (`mamba`, FalconMamba) and RWKV,
+Kimi K3 / K2.5+ (gated linear attention with MXFP4 or
 compressed-tensors weights, no `tokenizer.json`), Kimi K2 (FP8 weights, no
 `tokenizer.json`), Qwen3.8-Flash-Next (`qwen4_exp`), GLM-5.3-Flash
 (`glm5_next`) and DeepSeek V4 (sparse indexers with hyper-connections and
@@ -128,8 +139,9 @@ measured on text prompts.
 Weights are read from safetensors (F32/F16/BF16) or GGUF (llama, Mistral,
 Mixtral, Qwen2/3, Qwen MoE and Gemma 2/3 families; the registry carries the
 llama.cpp architecture name of every family for the GGUF writer).
-Abliteration edits each family's attention output projection and MLP down
-projection (per expert on MoE layers) and exports preserve every tensor
+Abliteration edits each family's attention output projection (the
+`out_proj` of a Mamba block) and MLP down projection (per expert on MoE
+layers) and exports preserve every tensor
 name and layout, including GPT-2's Conv1D transposes and fused expert
 tensors.
 
