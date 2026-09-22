@@ -2109,6 +2109,67 @@ Phi-3.5-mini-instruct, Mistral-7B-Instruct-v0.3, Mixtral-8x7B-Instruct-v0.1,
 EXAONE-3.5-2.4B-Instruct, Falcon3-1B-Instruct and DeepSeek-V2-Lite-Chat; and
 no tokenizer in the 20-string table regresses.
 
+
+## Bug 50 — eighteen releases were prompted in a format they do not use (fixed)
+
+The rest of the template sweep. For each of these, ditch either did not
+recognise the release's template (and fell back to the registry's guess or
+to `raw`), or recognised the family but not the release's generation prompt:
+
+| release | what ditch rendered | the release's format (now its own family) |
+| --- | --- | --- |
+| rednote-hilab/dots.llm1.inst | ChatML | `<|system|>…<|endofsystem|><|userprompt|>…<|endofuserprompt|><|response|>` (`dots`) |
+| ByteDance-Seed/Seed-OSS-36B-Instruct | raw | `<seed:bos>user\n…<seed:eos><seed:bos>assistant\n` (`seed`) |
+| tencent/Hunyuan-A13B-Instruct | raw | `<|startoftext|>{system}<|extra_4|>{user}<|extra_0|>`, no generation header (`hunyuan_moe`) |
+| MiniMaxAI/MiniMax-M2 | raw | `]~!b[]~b]system\n…[e~[\n]~b]user\n…[e~[\n]~b]ai\n<think>\n` (`minimax_m2`) |
+| nvidia/NVIDIA-Nemotron-Nano-9B-v2 | raw | `<SPECIAL_10>System\n…\n<SPECIAL_11>User\n…\n<SPECIAL_11>Assistant\n<think>\n`, stripped (`nemotron_nano`) |
+| nvidia/Nemotron-Mini-4B-Instruct | raw | `<extra_id_0>System\n…\n\n<extra_id_1>User\n…\n<extra_id_1>Assistant\n`, stripped (`nemotron_mini`) |
+| microsoft/phi-4 | ChatML | `<|im_start|>user<|im_sep|>…<|im_end|>` (`phi4`) |
+| microsoft/Phi-4-mini-instruct | Phi-3's, with newlines | `<|user|>…<|end|><|assistant|>` (`phi4_mini`) |
+| stabilityai/stablelm-zephyr-3b | OLMo's | Zephyr's (already a family; detection fixed) |
+| LGAI-EXAONE/EXAONE-4.0-1.2B | EXAONE 3.5's | `[|user|]\n…[|endofturn|]\n[|assistant|]\n<think>\n\n</think>\n\n` (`exaone4`) |
+| LGAI-EXAONE/K-EXAONE-236B-A23B | OLMo's | `<|user|>\n…<|endofturn|>\n<|assistant|>\n<think>\n` (`k_exaone`) |
+| openai/gpt-oss-20b | the system message as a `system` turn | the dated model-identity system block, then the system message as the *developer's* `# Instructions` (`harmony`, rewritten) |
+| HuggingFaceTB/SmolLM3-3B | ChatML | a dated `## Metadata` system block with `Reasoning Mode: /think`, no `<|im_end|>` after it (`smollm3`) |
+| upstage/Solar-Open-100B | raw | `<|begin|>user<|content|>…<|end|><|begin|>assistant`, after a dated provider prompt (`solar_open`) |
+| Qwen/Qwen3.5-397B-A17B | ChatML | ChatML, contents trimmed, `<think>\n` opened (`qwen3_5`) |
+| XiaomiMiMo/MiMo-V2-Flash | ChatML | ChatML without newlines between turns, `<think></think>` (`mimo`) |
+| deepseek-ai/DeepSeek-V3.1, V3.2-Exp | V3's | V3's, with `</think>` after `<｜Assistant｜>` — thinking off by default (`deepseek_v31`) |
+| zai-org/GLM-4.7-Flash | GLM-4's | GLM-4's headers without newlines, `<think>` opened (`glm47`) |
+| ai21labs/AI21-Jamba-Reasoning-3B | ChatML | ChatML after `<|startoftext|>`, a thinking instruction before the last user turn, `<think>\n` (`jamba_reasoning`) |
+
+Three templates write today's date (gpt-oss, SmolLM3, Solar Open); the engine
+now reads the real clock once and the renderer formats it as each template
+does (`2026-09-22`, `22 September 2026`). A generation prompt that opens a
+`<think>` block now reaches ditch's existing chain-of-thought handling, which
+— like heretic's — detects it in the rendered prompt and closes it with a
+response prefix, so studies on these reasoning models measure the answer, as
+heretic does. Registry entries whose releases use these formats name them, for
+checkpoints that ship no template.
+
+## Bugs 51–53 — three more pre-tokenizers (fixed)
+
+* **51 — Qwen 3.5's regex fell back to GPT-2's, silently.** It is Qwen 2's
+  with marks: `[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+` and
+  `[^\s\p{L}\p{M}\p{N}]`. None of the classifier's substrings matched and
+  the contraction alternative suppressed the warning; `:\n\n` came out as three
+  tokens instead of two. A `qwen3_5` kind.
+* **52 — K-EXAONE's phrase pattern.** `(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+`
+  keeps runs of words *joined by single spaces* in one pre-token (`You are a
+  helpful assistant` is one), digits are single and punctuation takes at most
+  one `[\r\n/]` after it. A `phrase` kind.
+* **53 — `Metaspace` with `prepend_scheme: "first"` prepended everywhere.**
+  Nemotron-Mini's tokenizer prepends `▁` only at the very start of the input;
+  ditch prepended it to every segment between special tokens, so
+  `<extra_id_1>User` became `▁User` (a different id).
+
+**Verification (50–53).** The template sweep over 56 releases — every
+family in the registry that has a public instruct release — now reports
+`ids match` for every one, and the 20-string tokenizer table stays at 0
+differences for all of its tokenizers (Qwen 3.5, K-EXAONE and Nemotron-Mini
+added). Unit tests hold transformers' own rendering of a system/user prompt for
+20 families and of a four-turn conversation for 6.
+
 ---
 
 # Frontier pass: the arithmetic of the frontier families on their real weights

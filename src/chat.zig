@@ -50,6 +50,42 @@ pub const Template = enum {
     kimi_k3,
     /// Jamba: `<|startoftext|><|bom|><|user|> ...<|eom|><|bom|><|assistant|>`.
     jamba,
+    /// AI21 Jamba Reasoning: ChatML after `<|startoftext|>`, a thinking
+    /// instruction in front of the last user turn, and `<think>\n` opened.
+    jamba_reasoning,
+    /// Qwen 3.5: ChatML with trimmed contents and `<think>\n` opened.
+    qwen3_5,
+    /// MiMo V2: ChatML without newlines between turns, `<think></think>` closed
+    /// at once, and a default system message.
+    mimo,
+    /// SmolLM3: a dated `## Metadata` system block, reasoning mode `/think`.
+    smollm3,
+    /// Phi-4: `<|im_start|>user<|im_sep|>...<|im_end|>`.
+    phi4,
+    /// Phi-4-mini: `<|user|>...<|end|><|assistant|>`, no newlines.
+    phi4_mini,
+    /// DeepSeek V3.1 / V3.2: DeepSeek V3's turns, the assistant opening with `</think>` (thinking off).
+    deepseek_v31,
+    /// GLM-4.7: GLM-4's headers without newlines, `<think>` opened.
+    glm47,
+    /// EXAONE 4: `[|user|]\n...[|endofturn|]\n[|assistant|]\n<think>\n\n</think>\n\n`.
+    exaone4,
+    /// K-EXAONE (EXAONE MoE): `<|user|>\n...<|endofturn|>\n<|assistant|>\n<think>\n`.
+    k_exaone,
+    /// dots.llm1: `<|system|>...<|endofsystem|><|userprompt|>...<|endofuserprompt|><|response|>`.
+    dots,
+    /// Seed-OSS: `<seed:bos>user\n...<seed:eos><seed:bos>assistant\n`.
+    seed,
+    /// Hunyuan A13B (V1 MoE): `<|startoftext|>{system}<|extra_4|>{user}<|extra_0|>`.
+    hunyuan_moe,
+    /// MiniMax-M2: `]~!b[]~b]system\n...[e~[\n]~b]user\n...[e~[\n]~b]ai\n<think>\n`.
+    minimax_m2,
+    /// Nemotron Nano 2 (Nemotron-H): `<SPECIAL_10>System\n...\n<SPECIAL_11>User\n...\n<SPECIAL_11>Assistant\n<think>\n`.
+    nemotron_nano,
+    /// Nemotron Mini: `<extra_id_0>System\n...\n\n<extra_id_1>User\n...\n<extra_id_1>Assistant\n`.
+    nemotron_mini,
+    /// Solar Open: `<|begin|>user<|content|>...<|end|><|begin|>assistant`, after a dated provider prompt.
+    solar_open,
     /// ERNIE 4.5: `<|begin_of_sentence|>{system}\nUser: ...\nAssistant: `.
     ernie,
     /// Hunyuan (V1 dense): `<｜hy_begin▁of▁sentence｜>{system}<｜hy_place▁holder▁no▁3｜><｜hy_User｜>...<｜hy_Assistant｜>`.
@@ -92,6 +128,21 @@ pub fn detect(chat_template: ?[]const u8, model_type: []const u8) Template {
             }
         }.f;
         if (has(t, "<|bom|>")) return .jamba;
+        if (has(t, "Begin by thinking about the reasoning process")) return .jamba_reasoning;
+        if (has(t, "<|im_sep|>")) return .phi4;
+        if (has(t, "## Metadata") and has(t, "Reasoning Mode")) return .smollm3;
+        if (has(t, "<|im_start|>") and has(t, "<think></think>")) return .mimo;
+        if (has(t, "<|im_start|>") and has(t, "{{- '<think>\\n' }}")) return .qwen3_5;
+        if (has(t, "<|endofuserprompt|>")) return .dots;
+        if (has(t, "<seed:bos>")) return .seed;
+        if (has(t, "<|extra_4|>")) return .hunyuan_moe;
+        if (has(t, "]~b]")) return .minimax_m2;
+        if (has(t, "<SPECIAL_11>")) return .nemotron_nano;
+        if (has(t, "<extra_id_1>")) return .nemotron_mini;
+        if (has(t, "<|begin|>") and has(t, "<|content|>")) return .solar_open;
+        if (has(t, "<|endofturn|>") and has(t, "<|user|>")) return .k_exaone;
+        if (has(t, "'<|' + message['role'] + '|>' + message['content'] + '<|end|>'")) return .phi4_mini;
+        if (has(t, "<|user|>\n' + message['content'] + eos_token")) return .zephyr;
         if (has(t, "<\u{ff5c}hy_User\u{ff5c}>")) return .hunyuan;
         if (has(t, "<|begin_of_sentence|>") and has(t, "Assistant: ")) return .ernie;
         if (has(t, "<|system_start|>") and has(t, "<|developer_start|>")) return .apertus;
@@ -106,9 +157,9 @@ pub fn detect(chat_template: ?[]const u8, model_type: []const u8) Template {
         if (has(t, "<|START_OF_TURN_TOKEN|>")) return if (has(t, "<|START_RESPONSE|>")) .cohere_response else .cohere;
         if (has(t, "<|start|>") and has(t, "<|message|>")) return .harmony;
         if (has(t, "<|start_of_role|>")) return .granite;
-        if (has(t, "[|user|]") or has(t, "'[|' + message['role'] + '|]'")) return .exaone;
-        if (has(t, "<\xef\xbd\x9cUser\xef\xbd\x9c>")) return .deepseek;
-        if (has(t, "[gMASK]")) return .glm4;
+        if (has(t, "[|user|]") or has(t, "'[|' + message['role'] + '|]'")) return if (has(t, "<think>")) .exaone4 else .exaone;
+        if (has(t, "<\xef\xbd\x9cUser\xef\xbd\x9c>")) return if (has(t, "{{'</think>'}}")) .deepseek_v31 else .deepseek;
+        if (has(t, "[gMASK]")) return if (has(t, "else '<think>'")) .glm47 else .glm4;
         if (has(t, "<|user|>") and has(t, "<|end|>")) return .phi3;
         if (has(t, "<|user|>") and has(t, "<|endoftext|>")) return .zephyr;
         if (has(t, "<|user|>")) return .olmo;
@@ -146,6 +197,28 @@ pub fn templateBos(chat_template: ?[]const u8, bos_token: ?[]const u8) []const u
 }
 
 const laguna_default_system = "You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations.";
+
+/// A calendar date, for templates that write today's (gpt-oss, SmolLM3, Solar Open).
+pub const Date = struct {
+    year: u16 = 2025,
+    month: u4 = 1,
+    day: u5 = 1,
+
+    /// The UTC date of `seconds` since the Unix epoch.
+    pub fn fromUnix(seconds: i64) Date {
+        const epoch = std.time.epoch;
+        const es = epoch.EpochSeconds{ .secs = @intCast(@max(seconds, 0)) };
+        const yd = es.getEpochDay().calculateYearDay();
+        const md = yd.calculateMonthDay();
+        return .{ .year = yd.year, .month = @intCast(md.month.numeric()), .day = @intCast(md.day_index + 1) };
+    }
+};
+
+/// The date `strftime_now` would give (Jinja's is process-global too); the
+/// engine sets it from the real clock.
+pub var today: Date = .{};
+
+const month_names = [_][]const u8{ "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" };
 
 fn trim(s: []const u8) []const u8 {
     return std.mem.trim(u8, s, " \t\r\n");
@@ -329,7 +402,17 @@ pub fn render(gpa: Allocator, template: Template, messages: []const Message) ![]
             try w.writeAll("<\xef\xbd\x9cAssistant\xef\xbd\x9c>");
         },
         .harmony => {
-            for (messages) |m| try w.print("<|start|>{s}<|message|>{s}<|end|>", .{ @tagName(m.role), trim(m.content) });
+            // openai/gpt-oss: the model-identity system block (dated, reasoning
+            // medium) always comes first; the conversation's system message is
+            // the developer's instructions.
+            try w.print("<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: {d:0>4}-{d:0>2}-{d:0>2}\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|>", .{ today.year, today.month, today.day });
+            for (messages, 0..) |m, i| {
+                switch (m.role) {
+                    .system => if (i == 0) try w.print("<|start|>developer<|message|># Instructions\n\n{s}\n\n<|end|>", .{m.content}),
+                    .user => try w.print("<|start|>user<|message|>{s}<|end|>", .{m.content}),
+                    .assistant => try w.print("<|start|>assistant<|channel|>final<|message|>{s}<|end|>", .{m.content}),
+                }
+            }
             try w.writeAll("<|start|>assistant");
         },
         .jamba => {
@@ -449,6 +532,197 @@ pub fn render(gpa: Allocator, template: Template, messages: []const Message) ![]
                 }
             }
             if (!last_user) try w.writeAll("<\u{ff5c}hy_Assistant\u{ff5c}>");
+        },
+        .jamba_reasoning => {
+            // ai21labs/AI21-Jamba-Reasoning-3B.
+            try w.writeAll("<|startoftext|>");
+            var last_user: usize = messages.len;
+            for (messages, 0..) |m, i| if (m.role == .user) {
+                last_user = i;
+            };
+            for (messages, 0..) |m, i| {
+                const pre: []const u8 = if (i == last_user) "Begin by thinking about the reasoning process in the mind within <think> </think> tags and then proceed to give your response.\n" else "";
+                try w.print("<|im_start|>{s}\n{s}{s}<|im_end|>\n", .{ @tagName(m.role), pre, m.content });
+            }
+            try w.writeAll("<|im_start|>assistant\n<think>\n");
+        },
+        .qwen3_5 => {
+            for (messages) |m| try w.print("<|im_start|>{s}\n{s}<|im_end|>\n", .{ @tagName(m.role), trim(m.content) });
+            try w.writeAll("<|im_start|>assistant\n<think>\n");
+        },
+        .mimo => {
+            if (messages.len == 0 or messages[0].role != .system) try w.writeAll("<|im_start|>system\nYou are MiMo, a helpful AI assistant engineered by Xiaomi.<|im_end|>");
+            for (messages) |m| {
+                switch (m.role) {
+                    .assistant => try w.print("<|im_start|>assistant\n<think></think>{s}<|im_end|>", .{m.content}),
+                    else => try w.print("<|im_start|>{s}\n{s}<|im_end|>", .{ @tagName(m.role), m.content }),
+                }
+            }
+            try w.writeAll("<|im_start|>assistant\n<think></think>");
+        },
+        .smollm3 => {
+            // HuggingFaceTB/SmolLM3-3B: the system turn has no `<|im_end|>`.
+            // Without a system message the template writes its long default
+            // instructions, which ditch, always passing one, leaves out.
+            try w.print("<|im_start|>system\n## Metadata\n\nKnowledge Cutoff Date: June 2025\nToday Date: {d:0>2} {s} {d}\nReasoning Mode: /think\n\n## Custom Instructions\n\n", .{ today.day, month_names[today.month - 1], today.year });
+            var i: usize = 0;
+            if (messages.len > 0 and messages[0].role == .system) {
+                try w.writeAll(std.mem.trimEnd(u8, messages[0].content, " \t\r\n"));
+                i = 1;
+            }
+            try w.writeAll("\n\n");
+            for (messages[i..]) |m| try w.print("<|im_start|>{s}\n{s}<|im_end|>\n", .{ @tagName(m.role), m.content });
+            try w.writeAll("<|im_start|>assistant\n");
+        },
+        .phi4 => {
+            for (messages) |m| try w.print("<|im_start|>{s}<|im_sep|>{s}<|im_end|>", .{ @tagName(m.role), m.content });
+            try w.writeAll("<|im_start|>assistant<|im_sep|>");
+        },
+        .phi4_mini => {
+            for (messages) |m| try w.print("<|{s}|>{s}<|end|>", .{ @tagName(m.role), m.content });
+            try w.writeAll("<|assistant|>");
+        },
+        .deepseek_v31 => {
+            try w.writeAll("<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>");
+            for (messages) |m| {
+                switch (m.role) {
+                    .system => try w.writeAll(m.content),
+                    .user => try w.print("<\u{ff5c}User\u{ff5c}>{s}", .{m.content}),
+                    .assistant => try w.print("<\u{ff5c}Assistant\u{ff5c}></think>{s}<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>", .{m.content}),
+                }
+            }
+            try w.writeAll("<\u{ff5c}Assistant\u{ff5c}></think>");
+        },
+        .glm47 => {
+            try w.writeAll("[gMASK]<sop>");
+            for (messages) |m| {
+                switch (m.role) {
+                    .assistant => try w.print("<|assistant|></think>{s}", .{m.content}),
+                    else => try w.print("<|{s}|>{s}", .{ @tagName(m.role), m.content }),
+                }
+            }
+            try w.writeAll("<|assistant|><think>");
+        },
+        .exaone4 => {
+            for (messages) |m| {
+                switch (m.role) {
+                    .assistant => try w.print("[|assistant|]\n<think>\n\n</think>\n\n{s}[|endofturn|]\n", .{m.content}),
+                    else => try w.print("[|{s}|]\n{s}[|endofturn|]\n", .{ @tagName(m.role), m.content }),
+                }
+            }
+            try w.writeAll("[|assistant|]\n<think>\n\n</think>\n\n");
+        },
+        .k_exaone => {
+            for (messages) |m| {
+                switch (m.role) {
+                    .assistant => try w.print("<|assistant|>\n<think>\n\n</think>\n\n{s}<|endofturn|>\n", .{m.content}),
+                    else => try w.print("<|{s}|>\n{s}<|endofturn|>\n", .{ @tagName(m.role), m.content }),
+                }
+            }
+            try w.writeAll("<|assistant|>\n<think>\n");
+        },
+        .dots => {
+            var i: usize = 0;
+            if (messages.len > 0 and messages[0].role == .system) {
+                try w.print("<|system|>{s}<|endofsystem|>", .{messages[0].content});
+                i = 1;
+            } else try w.writeAll("<|system|>You are a helpful assistant.<|endofsystem|>");
+            for (messages[i..]) |m| {
+                switch (m.role) {
+                    .system => {},
+                    .user => try w.print("<|userprompt|>{s}<|endofuserprompt|>", .{m.content}),
+                    .assistant => try w.print("<|response|>{s}<|endofresponse|>", .{m.content}),
+                }
+            }
+            if (messages.len == 0 or messages[messages.len - 1].role == .user) try w.writeAll("<|response|>");
+        },
+        .seed => {
+            for (messages) |m| try w.print("<seed:bos>{s}\n{s}<seed:eos>", .{ @tagName(m.role), m.content });
+            try w.writeAll("<seed:bos>assistant\n");
+        },
+        .hunyuan_moe => {
+            // tencent/Hunyuan-A13B-Instruct: no generation header; the model
+            // answers after `<|extra_0|>`.
+            const has_head = messages.len > 0 and messages[0].content.len > 0;
+            for (messages, 0..) |m, i| {
+                switch (m.role) {
+                    .system => if (i == 0 and has_head) try w.print("<|startoftext|>{s}<|extra_4|>", .{m.content}) else try w.writeAll(m.content),
+                    .user => if (i == 1 and has_head and messages[0].role == .system)
+                        try w.print("{s}<|extra_0|>", .{m.content})
+                    else
+                        try w.print("<|startoftext|>{s}<|extra_0|>", .{m.content}),
+                    .assistant => try w.print("{s}<|eos|>", .{m.content}),
+                }
+            }
+        },
+        .minimax_m2 => {
+            try w.writeAll("]~!b[]~b]system\n");
+            var i: usize = 0;
+            if (messages.len > 0 and messages[0].role == .system and messages[0].content.len > 0) {
+                try w.writeAll(messages[0].content);
+                i = 1;
+            } else {
+                if (messages.len > 0 and messages[0].role == .system) i = 1;
+                try w.writeAll("You are MiniMax-M2, a helpful AI assistant built by MiniMax. Knowledge cutoff: 2025-06.");
+            }
+            try w.writeAll("[e~[\n");
+            for (messages[i..]) |m| {
+                switch (m.role) {
+                    .system => {},
+                    .user => try w.print("]~b]user\n{s}[e~[\n", .{m.content}),
+                    .assistant => try w.print("]~b]ai\n{s}[e~[\n", .{m.content}),
+                }
+            }
+            try w.writeAll("]~b]ai\n<think>\n");
+        },
+        .nemotron_nano => {
+            var i: usize = 0;
+            try w.writeAll("<SPECIAL_10>System\n");
+            if (messages.len > 0 and messages[0].role == .system) {
+                try w.writeAll(trim(messages[0].content));
+                i = 1;
+            }
+            try w.writeAll("\n");
+            for (messages[i..]) |m| {
+                switch (m.role) {
+                    .system => {},
+                    .user => try w.print("<SPECIAL_11>User\n{s}\n", .{trim(m.content)}),
+                    .assistant => try w.print("<SPECIAL_11>Assistant\n{s}\n<SPECIAL_12>\n", .{trim(m.content)}),
+                }
+            }
+            try w.writeAll("<SPECIAL_11>Assistant\n<think>\n");
+        },
+        .nemotron_mini => {
+            try w.writeAll("<extra_id_0>System");
+            for (messages) |m| if (m.role == .system) try w.print("\n{s}", .{trim(m.content)});
+            try w.writeAll("\n\n");
+            for (messages) |m| {
+                switch (m.role) {
+                    .system => {},
+                    .user => try w.print("<extra_id_1>User\n{s}\n", .{trim(m.content)}),
+                    .assistant => try w.print("<extra_id_1>Assistant\n{s}\n", .{trim(m.content)}),
+                }
+            }
+            try w.writeAll("<extra_id_1>Assistant\n");
+        },
+        .solar_open => {
+            // upstage/Solar-Open-100B: a dated provider prompt always opens the
+            // system turn; the conversation's own follows under its heading.
+            try w.print("<|begin|>system<|content|>## Provider System Prompt\n\nYou are Solar Open 100B, a large language model trained by Upstage AI, a Korean startup. Your knowledge cutoff is 2025-07. The current date is {d:0>4}-{d:0>2}-{d:0>2}.", .{ today.year, today.month, today.day });
+            var i: usize = 0;
+            if (messages.len > 0 and messages[0].role == .system) {
+                try w.print("\n\n## System Prompt\n\n{s}", .{messages[0].content});
+                i = 1;
+            }
+            try w.writeAll("<|end|>");
+            for (messages[i..]) |m| {
+                switch (m.role) {
+                    .system => {},
+                    .user => try w.print("<|begin|>user<|content|>{s}<|end|>", .{m.content}),
+                    .assistant => try w.print("<|begin|>assistant<|content|>{s}<|end|>", .{m.content}),
+                }
+            }
+            try w.writeAll("<|begin|>assistant");
         },
         .llama4 => {
             try w.writeAll("<|begin_of_text|>");
@@ -604,6 +878,60 @@ test "template detection and rendering" {
     const ap = try render(gpa, .apertus, &.{ .{ .role = .system, .content = "Sys." }, .{ .role = .user, .content = " Hi " }, .{ .role = .assistant, .content = "Yo" }, .{ .role = .user, .content = "Bye" } });
     defer gpa.free(ap);
     try std.testing.expectEqualStrings("<|system_start|>Sys.<|system_end|><|developer_start|>Deliberation: disabled\nTool Capabilities: disabled<|developer_end|><|user_start|> Hi <|user_end|><|assistant_start|>Yo<|assistant_end|><|user_start|>Bye<|user_end|><|assistant_start|>", ap);
+    // The sweep's families: each expectation is transformers' own
+    // apply_chat_template output for (system SYS, user U1), on the release
+    // named, rendered on 2026-09-22.
+    today = .{ .year = 2026, .month = 9, .day = 22 };
+    defer today = .{};
+    const expected = [_]struct { t: Template, want: []const u8 }{
+        .{ .t = .seed, .want = "<seed:bos>system\nSYS<seed:eos><seed:bos>user\nU1<seed:eos><seed:bos>assistant\n" }, // ByteDance-Seed/Seed-OSS-36B-Instruct
+        .{ .t = .minimax_m2, .want = "]~!b[]~b]system\nSYS[e~[\n]~b]user\nU1[e~[\n]~b]ai\n<think>\n" }, // MiniMaxAI/MiniMax-M2
+        .{ .t = .nemotron_nano, .want = "<SPECIAL_10>System\nSYS\n<SPECIAL_11>User\nU1\n<SPECIAL_11>Assistant\n<think>\n" }, // nvidia/NVIDIA-Nemotron-Nano-9B-v2
+        .{ .t = .k_exaone, .want = "<|system|>\nSYS<|endofturn|>\n<|user|>\nU1<|endofturn|>\n<|assistant|>\n<think>\n" }, // LGAI-EXAONE/K-EXAONE-236B-A23B
+        .{ .t = .exaone4, .want = "[|system|]\nSYS[|endofturn|]\n[|user|]\nU1[|endofturn|]\n[|assistant|]\n<think>\n\n</think>\n\n" }, // LGAI-EXAONE/EXAONE-4.0-1.2B
+        .{ .t = .harmony, .want = "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-09-22\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>developer<|message|># Instructions\n\nSYS\n\n<|end|><|start|>user<|message|>U1<|end|><|start|>assistant" }, // openai/gpt-oss-20b
+        .{ .t = .smollm3, .want = "<|im_start|>system\n## Metadata\n\nKnowledge Cutoff Date: June 2025\nToday Date: 22 September 2026\nReasoning Mode: /think\n\n## Custom Instructions\n\nSYS\n\n<|im_start|>user\nU1<|im_end|>\n<|im_start|>assistant\n" }, // HuggingFaceTB/SmolLM3-3B
+        .{ .t = .solar_open, .want = "<|begin|>system<|content|>## Provider System Prompt\n\nYou are Solar Open 100B, a large language model trained by Upstage AI, a Korean startup. Your knowledge cutoff is 2025-07. The current date is 2026-09-22.\n\n## System Prompt\n\nSYS<|end|><|begin|>user<|content|>U1<|end|><|begin|>assistant" }, // upstage/Solar-Open-100B
+        .{ .t = .qwen3_5, .want = "<|im_start|>system\nSYS<|im_end|>\n<|im_start|>user\nU1<|im_end|>\n<|im_start|>assistant\n<think>\n" }, // Qwen/Qwen3.5-397B-A17B
+        .{ .t = .mimo, .want = "<|im_start|>system\nSYS<|im_end|><|im_start|>user\nU1<|im_end|><|im_start|>assistant\n<think></think>" }, // XiaomiMiMo/MiMo-V2-Flash
+        .{ .t = .deepseek_v31, .want = "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>SYS<\u{ff5c}User\u{ff5c}>U1<\u{ff5c}Assistant\u{ff5c}></think>" }, // deepseek-ai/DeepSeek-V3.1
+        .{ .t = .glm47, .want = "[gMASK]<sop><|system|>SYS<|user|>U1<|assistant|><think>" }, // zai-org/GLM-4.7-Flash
+        .{ .t = .jamba_reasoning, .want = "<|startoftext|><|im_start|>system\nSYS<|im_end|>\n<|im_start|>user\nBegin by thinking about the reasoning process in the mind within <think> </think> tags and then proceed to give your response.\nU1<|im_end|>\n<|im_start|>assistant\n<think>\n" }, // ai21labs/AI21-Jamba-Reasoning-3B
+        .{ .t = .phi4, .want = "<|im_start|>system<|im_sep|>SYS<|im_end|><|im_start|>user<|im_sep|>U1<|im_end|><|im_start|>assistant<|im_sep|>" }, // microsoft/phi-4
+        .{ .t = .phi4_mini, .want = "<|system|>SYS<|end|><|user|>U1<|end|><|assistant|>" }, // microsoft/Phi-4-mini-instruct
+        .{ .t = .dots, .want = "<|system|>SYS<|endofsystem|><|userprompt|>U1<|endofuserprompt|><|response|>" }, // rednote-hilab/dots.llm1.inst
+        .{ .t = .hunyuan_moe, .want = "<|startoftext|>SYS<|extra_4|>U1<|extra_0|>" }, // tencent/Hunyuan-A13B-Instruct
+        .{ .t = .nemotron_mini, .want = "<extra_id_0>System\nSYS\n\n<extra_id_1>User\nU1\n<extra_id_1>Assistant\n" }, // nvidia/Nemotron-Mini-4B-Instruct
+        .{ .t = .deepseek_v2, .want = "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>SYS\n\nUser: U1\n\nAssistant:" }, // deepseek-ai/DeepSeek-V2-Lite-Chat
+        .{ .t = .mistral_spaced, .want = "<s> [INST] SYS\n\nU1 [/INST]" }, // mistralai/Mixtral-8x7B-Instruct-v0.1
+    };
+    for (expected) |e| {
+        const got = try renderPrompt(gpa, e.t, "SYS", "U1");
+        defer gpa.free(got);
+        std.testing.expectEqualStrings(e.want, got) catch |err| {
+            std.debug.print("template {s}\n", .{@tagName(e.t)});
+            return err;
+        };
+    }
+    // Multi-turn shapes (transformers, SYS / U1 / A1 / U2).
+    const turns = [_]Message{ .{ .role = .system, .content = "SYS" }, .{ .role = .user, .content = "U1" }, .{ .role = .assistant, .content = "A1" }, .{ .role = .user, .content = "U2" } };
+    const multi = [_]struct { t: Template, want: []const u8 }{
+        .{ .t = .nemotron_nano, .want = "<SPECIAL_10>System\nSYS\n<SPECIAL_11>User\nU1\n<SPECIAL_11>Assistant\nA1\n<SPECIAL_12>\n<SPECIAL_11>User\nU2\n<SPECIAL_11>Assistant\n<think>\n" },
+        .{ .t = .k_exaone, .want = "<|system|>\nSYS<|endofturn|>\n<|user|>\nU1<|endofturn|>\n<|assistant|>\n<think>\n\n</think>\n\nA1<|endofturn|>\n<|user|>\nU2<|endofturn|>\n<|assistant|>\n<think>\n" },
+        .{ .t = .deepseek_v31, .want = "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>SYS<\u{ff5c}User\u{ff5c}>U1<\u{ff5c}Assistant\u{ff5c}></think>A1<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}><\u{ff5c}User\u{ff5c}>U2<\u{ff5c}Assistant\u{ff5c}></think>" },
+        .{ .t = .glm47, .want = "[gMASK]<sop><|system|>SYS<|user|>U1<|assistant|></think>A1<|user|>U2<|assistant|><think>" },
+        .{ .t = .jamba_reasoning, .want = "<|startoftext|><|im_start|>system\nSYS<|im_end|>\n<|im_start|>user\nU1<|im_end|>\n<|im_start|>assistant\nA1<|im_end|>\n<|im_start|>user\nBegin by thinking about the reasoning process in the mind within <think> </think> tags and then proceed to give your response.\nU2<|im_end|>\n<|im_start|>assistant\n<think>\n" },
+        .{ .t = .harmony, .want = "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-09-22\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>developer<|message|># Instructions\n\nSYS\n\n<|end|><|start|>user<|message|>U1<|end|><|start|>assistant<|channel|>final<|message|>A1<|end|><|start|>user<|message|>U2<|end|><|start|>assistant" },
+    };
+    for (multi) |e| {
+        const got = try render(gpa, e.t, &turns);
+        defer gpa.free(got);
+        std.testing.expectEqualStrings(e.want, got) catch |err| {
+            std.debug.print("template {s} (multi-turn)\n", .{@tagName(e.t)});
+            return err;
+        };
+    }
+    try std.testing.expectEqual(Date{ .year = 2026, .month = 9, .day = 22 }, Date.fromUnix(1790035200));
     // A template that emits the BOS in front of a family that does not.
     try std.testing.expectEqualStrings("<|begin_of_text|>", templateBos("{{bos_token}}\n{%- if tools %}<|im_start|>", "<|begin_of_text|>"));
     try std.testing.expectEqualStrings("", templateBos("{% for m in messages %}<|im_start|>{{ bos_token }}", "<|begin_of_text|>"));

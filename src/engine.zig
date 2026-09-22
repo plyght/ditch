@@ -80,6 +80,9 @@ pub const Engine = struct {
     ws_rows: usize = 0,
 
     pub fn init(gpa: Allocator, model: *Model, settings: *config.Settings, template: chat.Template) Engine {
+        // Templates that write today's date (gpt-oss, SmolLM3, Solar Open).
+        const now = std.Io.Clock.real.now(model.io);
+        chat.today = chat.Date.fromUnix(@intCast(@divFloor(now.nanoseconds, std.time.ns_per_s)));
         return .{
             .gpa = gpa,
             .model = model,

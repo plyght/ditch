@@ -3740,6 +3740,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "seed_oss",
+        .chat = "seed",
         .llama_cpp = "seed_oss",
         .verified = true,
         .attention_bias = true,
@@ -4151,7 +4152,7 @@ pub const registry = [_]Arch{
     .{
         .model_type = "exaone4",
         .llama_cpp = "exaone4",
-        .chat = "exaone",
+        .chat = "exaone4",
         .verified = true,
         .qk_norm = .head,
         .names = .{
@@ -4179,7 +4180,7 @@ pub const registry = [_]Arch{
     .{
         .model_type = "smollm3",
         .llama_cpp = "smollm3",
-        .chat = "chatml",
+        .chat = "smollm3",
         .verified = true,
         .tie_word_embeddings = true,
         .notes = "fixture: llama layout with no_rope_layers.",
@@ -4345,7 +4346,7 @@ pub const registry = [_]Arch{
         .model_type = "qwen3_5",
         .aliases = &.{"qwen3_5_text"},
         .llama_cpp = null,
-        .chat = "chatml",
+        .chat = "qwen3_5",
         .verified = true,
         .norm = .rms_gemma,
         .qk_norm = .head,
@@ -4369,7 +4370,7 @@ pub const registry = [_]Arch{
         .model_type = "qwen3_5_moe",
         .aliases = &.{"qwen3_5_moe_text"},
         .llama_cpp = null,
-        .chat = "chatml",
+        .chat = "qwen3_5",
         .verified = true,
         .norm = .rms_gemma,
         .qk_norm = .head,
@@ -4573,6 +4574,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "minimax_m2",
+        .chat = "minimax_m2",
         .llama_cpp = "minimax-m2",
         .verified = true,
         .qk_norm = .full,
@@ -4662,6 +4664,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "hunyuan_v1_moe",
+        .chat = "hunyuan_moe",
         .aliases = &.{"hunyuan"},
         .llama_cpp = "hunyuan-moe",
         .verified = true,
@@ -4792,7 +4795,7 @@ pub const registry = [_]Arch{
         .model_type = "mimo_v2_flash",
         .aliases = &.{"mimo_v2"},
         .llama_cpp = "mimo2",
-        .chat = "chatml",
+        .chat = "mimo",
         .verified = true,
         .names = .{
             .sinks = "self_attn.sinks",
@@ -5131,7 +5134,7 @@ pub const registry = [_]Arch{
     .{
         .model_type = "dots1",
         .llama_cpp = "dots1",
-        .chat = "chatml",
+        .chat = "dots",
         .verified = true,
         .names = .{
             .q_norm = "self_attn.q_norm.weight",
@@ -5145,7 +5148,7 @@ pub const registry = [_]Arch{
     .{
         .model_type = "exaone_moe",
         .llama_cpp = "exaone4",
-        .chat = "exaone",
+        .chat = "k_exaone",
         .verified = true,
         .names = .{
             .q_norm = "self_attn.q_norm.weight",
@@ -5159,7 +5162,7 @@ pub const registry = [_]Arch{
     .{
         .model_type = "solar_open",
         .llama_cpp = null,
-        .chat = "chatml",
+        .chat = "solar_open",
         .verified = true,
         .names = .{
             .router_correction_bias = "mlp.gate.e_score_correction_bias",

@@ -60,6 +60,14 @@ const RegexKind = enum {
     /// Seed-OSS: Qwen 2's pattern whose punctuation run takes no line breaks
     /// after it (` ?[^\s\p{L}\p{N}\r\n]+` for ` ?[^\s\p{L}\p{N}]+[\r\n]*`).
     qwen2_bare_punct,
+    /// Qwen 3.5: Qwen 2's pattern with marks in words and out of punctuation
+    /// (`[\p{L}\p{M}]+`, `[^\s\p{L}\p{M}\p{N}]`).
+    qwen3_5,
+    /// K-EXAONE's phrase pattern: a word runs over letters (each with its
+    /// marks) *and single spaces between them*
+    /// (`(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+`), digits are single, and
+    /// punctuation takes at most one line break or `/` after it.
+    phrase,
     llama3,
     /// nanochat's GPT-4-style split: Llama 3's with digit runs of at most two
     /// (`\p{N}{1,2}`). Its possessive quantifiers and single-`[\r\n]` line
@@ -116,7 +124,9 @@ const Step = union(enum) {
     whitespace_split,
     /// `ByteLevel(add_prefix_space)`; the regex (when `use_regex`) is a separate step.
     byte_level: bool,
-    metaspace: struct { prepend: bool, split: bool },
+    /// `prepend`: `always`, `first` (only at the start of the input — not
+    /// after a special token) or `never`.
+    metaspace: struct { prepend: MetaspacePrepend, split: bool },
 };
 
 const Decoder = enum { byte_level, metaspace, plain };
@@ -155,6 +165,9 @@ pub const Tokenizer = struct {
     /// pattern itself: a hand-picked subset of the cased letters that no
     /// Unicode property reproduces.
     ds2_letter_class: []const uni.Range = &.{},
+    /// While encoding: whether the segment being encoded starts the input (a
+    /// `Metaspace` with `prepend_scheme: first` prepends only there).
+    segment_at_start: bool = true,
     /// Pre-tokenisation steps applied in order to every segment.
     steps: []const Step,
     /// SentencePiece's `Precompiled` charsmap: only its whitespace rules are
@@ -740,7 +753,8 @@ pub const Tokenizer = struct {
         } else if (std.mem.eql(u8, t, "Metaspace")) {
             const scheme = if (obj.get("prepend_scheme")) |s| s.string else "always";
             const split = if (obj.get("split")) |s| s.bool else true;
-            try steps.append(arena, .{ .metaspace = .{ .prepend = !std.mem.eql(u8, scheme, "never"), .split = split } });
+            const prepend: MetaspacePrepend = if (std.mem.eql(u8, scheme, "never")) .never else if (std.mem.eql(u8, scheme, "first")) .first else .always;
+            try steps.append(arena, .{ .metaspace = .{ .prepend = prepend, .split = split } });
             if (obj.get("replacement")) |r| self.replace_space = try arena.dupe(u8, r.string);
         } else if (std.mem.eql(u8, t, "Digits")) {
             const individual = if (obj.get("individual_digits")) |v| v.bool else false;
@@ -837,6 +851,8 @@ pub const Tokenizer = struct {
         if (has(r, "\\p{P}\\p{S}")) return .deepseek3;
         if (has(r, "\\p{N}{1,2}") and has(r, "\\p{L}+")) return .nanochat;
         if (has(r, "{1,3}")) return .llama3;
+        if (has(r, "(?:\\p{L}\\p{M}*(?: \\p{L}\\p{M}*)*)+")) return .phrase;
+        if (has(r, "[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+") and has(r, "[^\\s\\p{L}\\p{M}\\p{N}]")) return .qwen3_5;
         if (has(r, "[^\\r\\n\\p{L}\\p{N}]?\\p{L}+") and has(r, " ?[^\\s\\p{L}\\p{N}\\r\\n]+|")) return .qwen2_bare_punct;
         if (has(r, "[^\\r\\n\\p{L}\\p{N}]?\\p{L}+")) return .qwen2;
         if (!has(r, "'s|'t|'re")) std.log.warn("pre-tokenizer regex is not recognised; using the GPT-2 pattern: {s}", .{r});
@@ -886,7 +902,7 @@ pub const Tokenizer = struct {
         if (!self.byte_level) return null;
         for (self.steps) |st| {
             if (st == .regex) return switch (st.regex) {
-                .qwen2, .qwen2_bare_punct => "qwen2",
+                .qwen2, .qwen2_bare_punct, .qwen3_5, .phrase => "qwen2",
                 .llama3 => "llama-bpe",
                 // No llama.cpp pre-tokenizer splits digits in pairs; the nearest
                 // one (nanochat has no llama.cpp architecture to export to anyway).
@@ -951,6 +967,7 @@ pub const Tokenizer = struct {
                         seg_end = k;
                     }
                 }
+                self.segment_at_start = seg_start == 0;
                 if (seg_end > seg_start) try self.encodeSegment(gpa, text[seg_start..seg_end], &out);
                 try out.append(gpa, a.id);
                 pos += a.content.len;
@@ -966,7 +983,9 @@ pub const Tokenizer = struct {
                 pos += 1;
             }
         }
+        self.segment_at_start = seg_start == 0;
         if (seg_start < text.len) try self.encodeSegment(gpa, text[seg_start..], &out);
+        self.segment_at_start = true;
         return out.toOwnedSlice(gpa);
     }
 
@@ -1085,7 +1104,12 @@ pub const Tokenizer = struct {
             .metaspace => |ms| {
                 const rep = self.replace_space orelse "\xe2\x96\x81";
                 var buf = std.ArrayList(u8).empty;
-                if (ms.prepend and (piece.len == 0 or !std.mem.startsWith(u8, piece, rep)) and (piece.len == 0 or piece[0] != ' ')) {
+                const prepend = switch (ms.prepend) {
+                    .always => true,
+                    .first => self.segment_at_start,
+                    .never => false,
+                };
+                if (prepend and (piece.len == 0 or !std.mem.startsWith(u8, piece, rep)) and (piece.len == 0 or piece[0] != ' ')) {
                     try buf.appendSlice(a, rep);
                 }
                 for (piece) |c| {
@@ -1621,6 +1645,7 @@ fn splitClass(a: Allocator, piece: []const u8, comptime pred: fn (u21) bool, ind
 }
 
 const UnicodeForm = enum { nfkc, nfc };
+const MetaspacePrepend = enum { always, first, never };
 
 const RegexSplitter = struct {
     text: []const u8,
@@ -1698,6 +1723,22 @@ const RegexSplitter = struct {
         return 0;
     }
 
+    /// `(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+` from `i` (a letter): letters with
+    /// their marks, and single spaces that are followed by a letter.
+    fn phraseRun(self: *const RegexSplitter, from: usize) usize {
+        var i = from;
+        while (self.cpAt(i)) |n| {
+            if (isLetter(n.cp) or inRanges(n.cp, &uni.marks)) {
+                i += n.len;
+            } else if (n.cp == ' ') {
+                const after = self.cpAt(i + 1) orelse break;
+                if (!isLetter(after.cp)) break;
+                i += 1;
+            } else break;
+        }
+        return i;
+    }
+
     fn isUpperAscii(cp: u21) bool {
         return cp >= 'A' and cp <= 'Z';
     }
@@ -1718,7 +1759,7 @@ const RegexSplitter = struct {
     fn matchOne(self: *const RegexSplitter, start: usize) usize {
         const first = self.cpAt(start).?;
         switch (self.kind) {
-            .gpt2, .qwen2, .qwen2_bare_punct, .llama3, .nanochat => {},
+            .gpt2, .qwen2, .qwen2_bare_punct, .qwen3_5, .phrase, .llama3, .nanochat => {},
             .o200k, .o200k_digit1 => return self.matchO200k(start, first),
             .kimi => return self.matchKimi(start, first),
             .deepseek3 => return self.matchDeepseek3(start, first),
@@ -1884,21 +1925,28 @@ const RegexSplitter = struct {
                 return self.matchWhitespace(start);
             },
             .o200k, .o200k_digit1, .kimi, .deepseek3, .digits3, .newlines, .ds2_letters, .ds2_punct, .trailing_ws, .cjk, .cjk_kana, .nd_chunks510, .nd_lead, .nd_groups3, .script_runs => unreachable,
-            .qwen2, .qwen2_bare_punct, .llama3, .nanochat => {
-                // '[^\r\n\p{L}\p{N}]?\p{L}+'
+            .qwen2, .qwen2_bare_punct, .qwen3_5, .phrase, .llama3, .nanochat => {
+                // '[^\r\n\p{L}\p{N}]?\p{L}+' (Qwen 3.5: `[\p{L}\p{M}]+`; phrase: see `phrase`)
+                const marks = self.kind == .qwen3_5;
                 var i = start;
                 var c = first;
+                const starts_word = struct {
+                    fn f(k: RegexKind, cp: u21) bool {
+                        return isLetter(cp) or (k == .qwen3_5 and inRanges(cp, &uni.marks));
+                    }
+                }.f;
                 if (!isNewline(c.cp) and !isLetter(c.cp) and !isNumber(c.cp)) {
                     if (self.cpAt(i + c.len)) |n| {
-                        if (isLetter(n.cp)) {
+                        if (starts_word(self.kind, n.cp)) {
                             i += c.len;
                             c = n;
                         }
                     }
                 }
-                if (isLetter(c.cp)) {
+                if (starts_word(self.kind, c.cp)) {
+                    if (self.kind == .phrase) return self.phraseRun(i);
                     while (self.cpAt(i)) |n| {
-                        if (!isLetter(n.cp)) break;
+                        if (!isLetter(n.cp) and !(marks and inRanges(n.cp, &uni.marks))) break;
                         i += n.len;
                     }
                     return i;
@@ -1919,23 +1967,35 @@ const RegexSplitter = struct {
                     }
                     return i;
                 }
-                // ' ?[^\s\p{L}\p{N}]+[\r\n]*'
+                // ' ?[^\s\p{L}\p{N}]+[\r\n]*' (Qwen 3.5 also excludes marks)
                 i = start;
                 c = first;
+                const punct = struct {
+                    fn f(m: bool, cp: u21) bool {
+                        return !isWhitespace(cp) and !isLetter(cp) and !isNumber(cp) and !(m and inRanges(cp, &uni.marks));
+                    }
+                }.f;
                 if (c.cp == ' ') {
                     if (self.cpAt(i + 1)) |n| {
-                        if (!isWhitespace(n.cp) and !isLetter(n.cp) and !isNumber(n.cp)) {
+                        if (punct(marks, n.cp)) {
                             i += 1;
                             c = n;
                         }
                     }
                 }
-                if (!isWhitespace(c.cp) and !isLetter(c.cp) and !isNumber(c.cp)) {
+                if (punct(marks, c.cp)) {
                     while (self.cpAt(i)) |n| {
-                        if (isWhitespace(n.cp) or isLetter(n.cp) or isNumber(n.cp)) break;
+                        if (!punct(marks, n.cp)) break;
                         i += n.len;
                     }
                     if (self.kind == .qwen2_bare_punct) return i;
+                    if (self.kind == .phrase) {
+                        // `[\r\n/]?`
+                        if (self.cpAt(i)) |n| {
+                            if (isNewline(n.cp) or n.cp == '/') i += n.len;
+                        }
+                        return i;
+                    }
                     while (self.cpAt(i)) |n| {
                         if (!isNewline(n.cp)) break;
                         i += n.len;
