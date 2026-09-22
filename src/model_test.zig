@@ -213,6 +213,15 @@ test "glm4_moe fixture" {
 test "glm_moe_dsa fixture" {
     try checkFixture("glm_moe_dsa");
 }
+test "kimi_linear fixture (checkpoint layout: split convolutions, block_sparse_moe)" {
+    try checkFixture("kimi_linear");
+}
+test "kimi_linear fixture (Hugging Face layout: forget_gate, fused conv1d, stacked experts)" {
+    try checkFixture("kimi_linear_hf");
+}
+test "kimi_k25 fixture (DeepSeek V3 text config under a multimodal wrapper)" {
+    try checkFixture("kimi_k25");
+}
 
 // ---------------------------------------------------------------------------
 // Abliteration, export and streaming on the registry layouts
@@ -356,4 +365,13 @@ test "glm4_moe edit, export and streamed reload (per-head q/k norms, sigmoid MoE
 }
 test "glm_moe_dsa edit, export and streamed reload (MLA sparse indexer as dense)" {
     try checkEditExportStream("glm_moe_dsa");
+}
+test "kimi_linear edit, export and streamed reload (KDA, block_sparse_moe experts)" {
+    try checkEditExportStream("kimi_linear");
+}
+test "kimi_linear_hf edit, export and streamed reload (fused conv1d, stacked experts)" {
+    try checkEditExportStream("kimi_linear_hf");
+}
+test "kimi_k25 edit, export and streamed reload (language_model prefix)" {
+    try checkEditExportStream("kimi_k25");
 }
