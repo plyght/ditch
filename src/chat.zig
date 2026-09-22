@@ -39,6 +39,10 @@ pub const Template = enum {
     kimi_k3,
     /// Jamba: `<|startoftext|><|bom|><|user|> ...<|eom|><|bom|><|assistant|>`.
     jamba,
+    /// Laguna (Poolside): `〈|EOS|〉<system>\n\n...\n</system>\n<user>\n...\n</user>\n<assistant>\n</think>`
+    /// (a default system message is inserted when the conversation has none;
+    /// `</think>` is the non-thinking generation prompt).
+    laguna,
     raw,
 
     pub fn parse(name: []const u8) ?Template {
@@ -67,6 +71,7 @@ pub fn detect(chat_template: ?[]const u8, model_type: []const u8) Template {
             }
         }.f;
         if (has(t, "<|bom|>")) return .jamba;
+        if (has(t, "</user>") and has(t, "<assistant>")) return .laguna;
         if (has(t, "<|im_middle|>")) return .kimi;
         if (has(t, "<|end_of_msg|>")) return .kimi_k3;
         if (has(t, "<|im_start|>")) return .chatml;
@@ -113,6 +118,8 @@ pub fn templateBos(chat_template: ?[]const u8, bos_token: ?[]const u8) []const u
     if (std.mem.indexOf(u8, head, bos) != null) return bos;
     return "";
 }
+
+const laguna_default_system = "You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations.";
 
 fn trim(s: []const u8) []const u8 {
     return std.mem.trim(u8, s, " \t\r\n");
@@ -245,6 +252,24 @@ pub fn render(gpa: Allocator, template: Template, messages: []const Message) ![]
             if (messages.len > 0) try w.writeAll("<|eom|>");
             try w.writeAll("<|bom|><|assistant|>");
         },
+        .laguna => {
+            try w.writeAll("\xe3\x80\x88|EOS|\xe3\x80\x89");
+            const has_system = messages.len > 0 and messages[0].role == .system;
+            const system = if (has_system) messages[0].content else laguna_default_system;
+            if (trim(system).len > 0) try w.print("<system>\n\n{s}\n</system>\n", .{std.mem.trimEnd(u8, system, " \t\r\n")});
+            for (messages, 0..) |m, i| {
+                switch (m.role) {
+                    .system => if (i != 0) try w.print("<system>\n{s}\n</system>\n", .{m.content}),
+                    .user => try w.print("<user>\n{s}\n</user>\n", .{m.content}),
+                    .assistant => {
+                        try w.writeAll("<assistant>\n</think>\n");
+                        if (trim(m.content).len > 0) try w.print("{s}\n", .{trim(m.content)});
+                        try w.writeAll("</assistant>\n");
+                    },
+                }
+            }
+            try w.writeAll("<assistant>\n</think>");
+        },
         .llama4 => {
             try w.writeAll("<|begin_of_text|>");
             for (messages) |m| try w.print("<|header_start|>{s}<|header_end|>\n\n{s}<|eot|>", .{ @tagName(m.role), trim(m.content) });
@@ -344,6 +369,16 @@ test "template detection and rendering" {
     const jb = try renderPrompt(gpa, .jamba, "Sys.", "Hi");
     defer gpa.free(jb);
     try std.testing.expectEqualStrings("<|startoftext|><|bom|><|system|> Sys.<|eom|><|bom|><|user|> Hi<|eom|><|bom|><|assistant|>", jb);
+    // Laguna (poolside/Laguna-XS.2, verified token-for-token against
+    // transformers' apply_chat_template).
+    try std.testing.expectEqual(Template.laguna, detect("{{- \"<user>\\n\" + content + \"\\n</user>\\n\" -}}{{- \"<assistant>\\n\" -}}", "laguna"));
+    try std.testing.expectEqual(Template.laguna, detect(null, "laguna"));
+    const lg = try renderPrompt(gpa, .laguna, "Sys. ", "Hi");
+    defer gpa.free(lg);
+    try std.testing.expectEqualStrings("\xe3\x80\x88|EOS|\xe3\x80\x89<system>\n\nSys.\n</system>\n<user>\nHi\n</user>\n<assistant>\n</think>", lg);
+    const lg_no_sys = try render(gpa, .laguna, &.{ .{ .role = .user, .content = "Hi" }, .{ .role = .assistant, .content = " Yo " }, .{ .role = .user, .content = "Bye" } });
+    defer gpa.free(lg_no_sys);
+    try std.testing.expectEqualStrings("\xe3\x80\x88|EOS|\xe3\x80\x89<system>\n\n" ++ laguna_default_system ++ "\n</system>\n<user>\nHi\n</user>\n<assistant>\n</think>\nYo\n</assistant>\n<user>\nBye\n</user>\n<assistant>\n</think>", lg_no_sys);
     // A template that emits the BOS in front of a family that does not.
     try std.testing.expectEqualStrings("<|begin_of_text|>", templateBos("{{bos_token}}\n{%- if tools %}<|im_start|>", "<|begin_of_text|>"));
     try std.testing.expectEqualStrings("", templateBos("{% for m in messages %}<|im_start|>{{ bos_token }}", "<|begin_of_text|>"));

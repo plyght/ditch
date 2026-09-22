@@ -1331,3 +1331,138 @@ helper scripts used here (`dl.py`, `cfgcheck.sh`, `runtiny.sh`, `runraw.sh`,
 `tokcheck.py`, `dequant_ref.py`) live in `/home/user/val` on the validation
 machine and are not part of the repository — they are three-line wrappers
 around the two commands above and are quicker to rewrite than to port.
+
+---
+
+# Third pass, continued (after the handoff)
+
+Picked up at item 1 of the handoff, `laguna`. The "sliding attention"
+suspicion turned out to be wrong, and following the real cause led to three
+more Laguna bugs, all of which the fixture could not have caught because the
+generator shared each misreading.
+
+## Bug 21 — Laguna's shared expert and correction bias were never loaded (fixed)
+
+**Symptom.** the handoff's `laguna` mismatch (2.40e-02 at layer 2). Swapping
+the sliding layer's rope for the global one, and then marking *both* layers
+`full_attention`, left the error exactly where it was, so it was not the
+sliding attention. Listing the stub's layer-1 tensors showed why:
+
+    model.layers.1.mlp.experts.e_score_correction_bias (8,)
+    model.layers.1.mlp.shared_expert.down_proj.weight (32, 16)
+    model.layers.1.mlp.shared_expert.gate_proj.weight (16, 32)
+
+**Cause.** the registry entry named the transformers *module* paths,
+`mlp.shared_experts.` and `mlp.gate.e_score_correction_bias`. Those are what
+`LagunaForCausalLM` calls them after loading, but on disk every Laguna
+checkpoint (the stub and all three `poolside/Laguna-*` releases) spells them
+`mlp.shared_expert.` and `mlp.experts.e_score_correction_bias`, and
+transformers renames them through `conversion_mapping.py`:
+
+    mapping["laguna"] += [
+        WeightRenaming("mlp.experts.e_score_correction_bias", "mlp.gate.e_score_correction_bias"),
+        WeightRenaming("mlp.shared_expert.", "mlp.shared_experts."),
+
+Both tensors are optional to ditch's MoE loader (plenty of families have
+neither), so the misses were silent: every sparse layer ran without its
+shared expert, and expert selection ignored the correction bias. The stub's
+bias is all zeros, which is why the error was small; on a trained release it
+is not, and the selected experts would have been wrong too. The fixture
+generator used the same module-path spelling, so the fixture agreed.
+
+**Fix.** the entry uses the on-disk names. The generator's `laguna` spec
+writes them too, and the fixture is regenerated.
+
+**Verification.** the stub, float32:
+
+| | before | after |
+| --- | --- | --- |
+| first layer that diverges | 2 | none: all 3 agree |
+| worst residual, relative | 2.40e-02 | 1.52e-07 |
+| first-token logits, relative to range | 1.22e-02 | 1.50e-07 |
+
+## Bug 22 — no released Laguna could be loaded: per-layer query heads (fixed)
+
+**Symptom.** the handoff's suspect 3 was real:
+
+    $ ditch --dry-run hf://poolside/Laguna-XS.2 --max-ram 6GB --remote-chunk-size 1MB --no-input
+    error: layer 1: q projection is [8192][2048], expected [6144][2048] (heads 48, head_dim 128)
+
+**Cause.** `num_attention_heads_per_layer` is `[48, 64, 64, 64, 48, …]` on
+Laguna XS.2 / XS-2.1 and `[48, 72, 72, 72, …]` on S-2.1: the full-attention
+layers have `num_attention_heads` query heads and the sliding ones more (the
+kv heads are shared). `Config` had a per-layer head size and kv-head count but
+one global query-head count.
+
+**Fix.** `Config.layer_heads`, defaulting to `num_heads` and set from
+`num_attention_heads_per_layer` by `extraLaguna` (which checks each count is a
+multiple of the kv heads). The standard attention path — the load-time shape
+checks, the projections, q/k norm and rope, the attention worker, the output
+gate and `maxQDim` — reads the layer's own count. The fixture generator takes
+a `layer_nh` list; the `laguna` fixture now has heads `[6, 4, 6]`, and
+`src/arch.zig` tests the parse and the rejection of a count that is not a
+multiple of the kv heads.
+
+**Verification.** a random Laguna built by transformers itself
+(`LagunaConfig` from the stub's, 4 layers, heads `[2, 4, 6, 2]`, sliding
+window 3 against an 11-token prompt so the window bites, router softcap 5,
+routed scaling 2, a *non-zero* correction bias, saved with `save_pretrained`,
+which writes the on-disk names of bug 21):
+
+    residuals: all 5 layers agree (worst 7.84e-07 relative, at layer 4)
+    first-token logits: ... relative to range 10.62: 4.38e-07
+
+and all three releases now pass the config-and-tensor-name check:
+
+| Checkpoint | layers | heads (full / sliding) | result |
+| --- | ---: | --- | --- |
+| poolside/Laguna-XS.2 | 40 | 48 / 64 | OK (exit 0) |
+| poolside/Laguna-XS-2.1 | 40 | 48 / 64 | OK (exit 0) |
+| poolside/Laguna-S-2.1 | 48 | 48 / 72 | OK (exit 0) |
+
+(Laguna-XS.2 is 64.6 GB of bf16 — larger than this machine's disk allowance,
+so no end-to-end run of a release.)
+
+## Bug 23 — Laguna's line-break pre-tokenizer fell back to GPT-2 (fixed)
+
+**Symptom.** every Laguna load warned
+`pre-tokenizer regex is not recognised; using the GPT-2 pattern: (?:\r?\n)+(?!\r?\n)`,
+and 4 of the 15 tokenizer test strings differed from the `tokenizers`
+package (tabs/newlines, code, a special-token literal, NBSP).
+
+**Cause.** Laguna's pre-tokenizer is a `Sequence` of two `Split`s: first
+`(?:\r?\n)+(?!\r?\n)` with behaviour `MergedWithNext` (each run of line breaks
+starts a new piece), then Qwen 2's regex. ditch classified the first as GPT-2's
+regex, so every string was first cut with GPT-2's rules and then with Qwen 2's
+— `im_start` became `im` `_start`, and `):\n` stayed glued together.
+
+**Fix.** a `newline_runs` step for exactly that split: the text is cut at the
+start of every maximal `\r?\n` run, and each run keeps the text after it.
+
+    $ python3 tokcheck.py models/hf-tiny-v2__tiny-random-LagunaForCausalLM
+    mismatches: 0 of 15
+    (and 0 of 7 further line-break cases: \r\n runs, a lone \r, leading and trailing runs)
+
+A unit test checks the pieces of `"f(x):\r\n\n  y\rz\n"` against what
+`tokenizers`' own `pre_tokenize_str` gives.
+
+## Bug 24 — Laguna was prompted with ChatML (fixed)
+
+**Symptom.** the registry gave `laguna` `.chat = "chatml"`, and the released
+`chat_template.jinja` has no `<|im_start|>`, so every Laguna study would have
+used a prompt format the model was never trained on.
+
+**Cause and fix.** Laguna has its own format:
+
+    〈|EOS|〉<system>\n\n{system}\n</system>\n<user>\n{user}\n</user>\n<assistant>\n</think>
+
+with a Poolside default system message when the conversation has none,
+completed assistant turns as `<assistant>\n</think>\n{content}\n</assistant>\n`,
+and `</think>` as the non-thinking generation prompt. It is now the `laguna`
+template family, detected from the template's `</user>` / `<assistant>`
+markers and named by the registry entry.
+
+**Verification.** the stub's weights with `poolside/Laguna-XS.2`'s tokenizer
+and template, four system/user combinations (including a code block and a
+trailing newline in the system prompt): ditch's prompt token ids equal
+`apply_chat_template(..., add_generation_prompt=True)` token for token.

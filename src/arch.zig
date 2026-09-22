@@ -662,6 +662,9 @@ pub const Config = struct {
     /// layers use a larger head.
     layer_head_dim: []usize,
     layer_kv_heads: []usize,
+    /// Per layer: query heads. Equal to `num_heads` except on Laguna, whose
+    /// `num_attention_heads_per_layer` gives the sliding layers more heads.
+    layer_heads: []usize,
     layer_attn_scale: []f32,
     /// Per layer: the layer whose keys/values this layer attends over (itself
     /// unless the layer is KV-shared, Gemma 3n / 4).
@@ -827,7 +830,7 @@ pub const Config = struct {
     /// Largest query width `heads * head_dim` of any layer.
     pub fn maxQDim(self: *const Config) usize {
         var d: usize = self.num_heads * self.head_dim;
-        for (self.layer_head_dim) |hd| d = @max(d, self.num_heads * hd);
+        for (self.layer_heads, self.layer_head_dim) |nh, hd| d = @max(d, nh * hd);
         return d;
     }
 
@@ -1374,6 +1377,8 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
     @memset(layer_head_dim, 0);
     const layer_kv_heads = try arena.alloc(usize, layers);
     @memset(layer_kv_heads, 0);
+    const layer_heads = try arena.alloc(usize, layers);
+    @memset(layer_heads, 0);
     const layer_attn_scale = try arena.alloc(f32, layers);
     const kv_source = try arena.alloc(usize, layers);
     for (kv_source, 0..) |*s, i| s.* = i;
@@ -1402,6 +1407,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         .rope_layers = rope_layers,
         .layer_head_dim = layer_head_dim,
         .layer_kv_heads = layer_kv_heads,
+        .layer_heads = layer_heads,
         .layer_attn_scale = layer_attn_scale,
         .kv_source = kv_source,
         .v_norm = false,
@@ -1522,9 +1528,10 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         if (d.norm_groups == 0 or d.inter % d.norm_groups != 0) return error.InvalidConfig;
     }
     @memset(c.layer_attn_scale, c.attention_scale);
-    for (c.layer_head_dim, c.layer_kv_heads) |*hd_l, *kv_l| {
+    for (c.layer_head_dim, c.layer_kv_heads, c.layer_heads) |*hd_l, *kv_l, *nh_l| {
         if (hd_l.* == 0) hd_l.* = c.head_dim;
         if (kv_l.* == 0) kv_l.* = c.num_kv_heads;
+        if (nh_l.* == 0) nh_l.* = c.num_heads;
     }
     // Only the Gemma tables derive frequencies from a wider head than they rotate.
     if (c.rope_local == null) c.rope_freq_dim = c.rotary_dim;
@@ -3158,6 +3165,16 @@ fn extraMellum(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
 /// correction bias, renormalised weights scaled after the shared expert is
 /// added, and a softplus gate on the attention output.
 fn extraLaguna(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
+    // The released checkpoints give full and sliding layers different query
+    // head counts (48 / 64 on Laguna XS.2); the kv heads are shared.
+    if (obj.get("num_attention_heads_per_layer")) |v| if (v == .array) {
+        if (v.array.items.len != c.num_layers) return error.InvalidConfig;
+        for (v.array.items, c.layer_heads) |item, *nh| {
+            if (item != .integer or item.integer <= 0) return error.InvalidConfig;
+            nh.* = @intCast(item.integer);
+            if (c.num_kv_heads == 0 or nh.* % c.num_kv_heads != 0) return error.InvalidConfig;
+        }
+    };
     c.qk_norm = .head;
     c.attn_gate = .softplus;
     c.moe.scoring = .sigmoid;
@@ -5146,16 +5163,17 @@ pub const registry = [_]Arch{
     .{
         .model_type = "laguna",
         .llama_cpp = null,
-        .chat = "chatml",
+        .chat = "laguna",
         .verified = true,
         .names = .{
             .q_norm = "self_attn.q_norm.weight",
             .k_norm = "self_attn.k_norm.weight",
             .attn_gate = "self_attn.g_proj.weight",
-            .router_correction_bias = "mlp.gate.e_score_correction_bias",
-            .shared_expert = "mlp.shared_experts.",
+            // The released spelling; transformers renames both on load.
+            .router_correction_bias = "mlp.experts.e_score_correction_bias",
+            .shared_expert = "mlp.shared_expert.",
         },
-        .notes = "fixture: a softplus gate on the attention output (per head or per coordinate), sigmoid routing with a tanh softcap on the router logits and a correction bias, renormalised weights scaled by moe_routed_scaling_factor, shared experts.",
+        .notes = "fixture: a softplus gate on the attention output (per head or per coordinate), sigmoid routing with a tanh softcap on the router logits and a correction bias, renormalised weights scaled by moe_routed_scaling_factor, shared experts, and per-layer query head counts (`num_attention_heads_per_layer`).",
         .extra = extraLaguna,
     },
     .{
@@ -5395,6 +5413,16 @@ test "parseConfig handles the swept families' keys" {
     );
     try std.testing.expectEqual(AttnGate.softplus, lag.attn_gate);
     try std.testing.expectEqual(@as(?f32, 5.0), lag.moe.router_softcap);
+    try std.testing.expectEqualSlices(usize, &.{ 4, 4 }, lag.layer_heads);
+    // Released Laguna checkpoints vary the query heads per layer.
+    const lag2 = try parseConfig(a,
+        \\{"model_type":"laguna","hidden_size":32,"num_attention_heads":4,"num_attention_heads_per_layer":[4,6],"num_key_value_heads":2,"num_hidden_layers":2,"head_dim":8,"vocab_size":100,"num_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":12}
+    );
+    try std.testing.expectEqualSlices(usize, &.{ 4, 6 }, lag2.layer_heads);
+    try std.testing.expectEqual(@as(usize, 6 * 8), lag2.maxQDim());
+    try std.testing.expectError(error.InvalidConfig, parseConfig(a,
+        \\{"model_type":"laguna","hidden_size":32,"num_attention_heads":4,"num_attention_heads_per_layer":[4,5],"num_key_value_heads":2,"num_hidden_layers":2,"head_dim":8,"vocab_size":100,"num_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":12}
+    ));
     // Gemma 2 alternates local and global layers, scales the queries by
     // `query_pre_attn_scalar` and softcaps both the attention and the output
     // logits.

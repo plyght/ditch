@@ -437,7 +437,7 @@ def base(**kw):
         # table (theta, rotary dim) and a global (rotary dim, freq dim) pair,
         # per-layer inputs, AltUp / Laurel, gate sparsity, conv layers,
         # per-layer output scalars, per-layer FFN widths, final softcapping.
-        layer_hd=None, layer_nkv=None, kv_shared=0, k_eq_v=False, v_norm=False, local_rope=None, global_rotary=None,
+        layer_hd=None, layer_nkv=None, layer_nh=None, kv_shared=0, k_eq_v=False, v_norm=False, local_rope=None, global_rotary=None,
         ple_dim=0, altup=None, sparsity=None, conv_layers=None, conv_K=3, layer_scale=False, layer_inter=None, final_softcap=None,
         # "gdn" (Gated DeltaNet) or "lightning" (MiniMax) linear-attention layers.
         linear_kind="gdn",
@@ -1392,14 +1392,19 @@ spec("mellum", tok="gpt2", L=2, qk_norm="head", lm_head="lm_head.weight",
              "layer_types": ["full_attention", "full_attention"],
              "rms_norm_eps": 1e-6, "rope_parameters": {"full_attention": {"rope_type": "default", "rope_theta": 10000.0}},
              "hidden_act": "silu", "max_position_embeddings": 128, "tie_word_embeddings": False})
+# Laguna's released spelling: `shared_expert.` and the correction bias under
+# `experts.` (transformers renames both on load), and more query heads on the
+# sliding layers than on the full one.
 spec("laguna", tok="llama3", L=3, qk_norm="head", attn_gate=("self_attn.g_proj.weight", "softplus", True),
-     sliding=4, sliding_layers=[1, 0, 1], lm_head="lm_head.weight",
+     sliding=4, sliding_layers=[1, 0, 1], lm_head="lm_head.weight", layer_nh=[6, 4, 6],
      moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "shared_inter": 16, "scoring": "sigmoid", "group_limited": False,
-          "rsf": 2.0, "norm": True, "softcap": 5.0, "layers": [1, 2], "corr_bias": True, "layout": "separate",
-          "prefix": "mlp.", "router": "gate.weight", "shared_name": "shared_experts."},
+          "rsf": 2.0, "norm": True, "softcap": 5.0, "layers": [1, 2], "corr_bias": True,
+          "corr_bias_name": "mlp.experts.e_score_correction_bias", "layout": "separate",
+          "prefix": "mlp.", "router": "gate.weight", "shared_name": "shared_expert."},
      config={"model_type": "laguna", "hidden_size": 32, "intermediate_size": 32, "moe_intermediate_size": 12,
              "shared_expert_intermediate_size": 16, "num_hidden_layers": 3, "num_attention_heads": 4,
-             "num_key_value_heads": 2, "head_dim": 8, "num_experts": 4, "num_experts_per_tok": 2, "gating": "per-head",
+             "num_key_value_heads": 2, "head_dim": 8, "num_attention_heads_per_layer": [6, 4, 6],
+             "num_experts": 4, "num_experts_per_tok": 2, "gating": "per-head",
              "moe_routed_scaling_factor": 2.0, "moe_router_logit_softcapping": 5.0, "sliding_window": 4,
              "layer_types": ["sliding_attention", "full_attention", "sliding_attention"],
              "mlp_layer_types": ["dense", "sparse", "sparse"],
@@ -1510,6 +1515,7 @@ def generate_generic(family, out_dir):
     conv_layers = [bool(v) for v in (s["conv_layers"] or [0] * L)]
     layer_hd = s["layer_hd"] or [HD] * L
     layer_nkv = s["layer_nkv"] or [NKV] * L
+    layer_nh = s["layer_nh"] or [NH] * L
     sliding_of = [bool(v) for v in (s["sliding_layers"] or [0] * L)]
     # KV sharing: the last `kv_shared` layers read the last earlier layer of their kind.
     kv_source = list(range(L))
@@ -1572,6 +1578,7 @@ def generate_generic(family, out_dir):
         lp = P + s["layer"].format(i=i)
         d = {}
         hd_l, nkv_l = layer_hd[i], layer_nkv[i]
+        NH = layer_nh[i]
         vd_l = VD if (s["mla"] or s["narrow_v"]) else hd_l
         d["in_norm"] = normw(lp + s["in_norm"], H) if s["in_norm"] else None
         d["post_attn_norm"] = normw(lp + s["post_attn_norm"], H) if s["post_attn_norm"] else None
@@ -1856,6 +1863,7 @@ def generate_generic(family, out_dir):
             d["down"] = mat(lp + s["down"], H, inter)
             d["db"] = bias_for(lp + s["down"], H, s["mlp_bias"])
         layers.append(d)
+    NH = s["NH"]
     # Tensors the reference never runs but that must carry through exports.
     for name, shape in s["extra_tensors"]:
         weights[name] = bf16_round(rng.normal(0, 0.2, size=shape))
@@ -2043,6 +2051,7 @@ def generate_generic(family, out_dir):
     def attention(d, li, h, cos, sin):
         T = h.shape[0]
         HD, NKV, VD = layer_hd[li], layer_nkv[li], (s["VD"] if (s["mla"] or s["narrow_v"]) else layer_hd[li])
+        NH = layer_nh[li]
         if s["mla"]:
             m = s["mla"]
             nope, rp, vd = m["nope"], m["rope"], m["v"]

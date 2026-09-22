@@ -76,6 +76,10 @@ const RegexKind = enum {
 const Step = union(enum) {
     regex: RegexKind,
     split_string: struct { pattern: []const u8, removed: bool },
+    /// `Split(Regex("(?:\\r?\\n)+(?!\\r?\\n)"), MergedWithNext)` (Laguna): each
+    /// maximal run of line breaks starts a new piece, followed by the text up
+    /// to the next run.
+    newline_runs,
     /// `Digits(individual_digits)`
     digits: bool,
     /// `Punctuation` (true: contiguous runs stay together)
@@ -676,6 +680,11 @@ pub const Tokenizer = struct {
             const pattern = obj.get("pattern").?.object;
             const behavior = if (obj.get("behavior")) |b| (if (b == .string) b.string else "isolated") else "isolated";
             if (pattern.get("Regex")) |r| {
+                if (std.mem.eql(u8, r.string, "(?:\\r?\\n)+(?!\\r?\\n)")) {
+                    if (!std.ascii.eqlIgnoreCase(behavior, "mergedwithnext")) std.log.warn("pre-tokenizer: line-break split with behaviour {s} is treated as MergedWithNext", .{behavior});
+                    try steps.append(arena, .newline_runs);
+                    return;
+                }
                 try steps.append(arena, .{ .regex = classifyRegex(r.string) });
             } else if (pattern.get("String")) |str| {
                 try steps.append(arena, .{ .split_string = .{ .pattern = try arena.dupe(u8, str.string), .removed = std.ascii.eqlIgnoreCase(behavior, "removed") } });
@@ -888,6 +897,21 @@ pub const Tokenizer = struct {
                 }
                 if (start < piece.len) try out.append(a, piece[start..]);
             },
+            .newline_runs => {
+                var start: usize = 0;
+                var i: usize = 0;
+                while (i < piece.len) {
+                    const run = newlineRunLen(piece[i..]);
+                    if (run == 0) {
+                        i += 1;
+                        continue;
+                    }
+                    if (i > start) try out.append(a, piece[start..i]);
+                    start = i;
+                    i += run;
+                }
+                if (start < piece.len) try out.append(a, piece[start..]);
+            },
             .digits => |individual| try splitClass(a, piece, isNumber, individual, true, out),
             .punctuation => |contiguous| try splitClass(a, piece, isPunctuation, !contiguous, true, out),
             .whitespace => {
@@ -954,6 +978,18 @@ pub const Tokenizer = struct {
                     if (start < buf.items.len) try out.append(a, buf.items[start..]);
                 }
             },
+        }
+    }
+
+    /// Length of the run of `\r?\n` line breaks at the start of `s` (0 if none).
+    fn newlineRunLen(s: []const u8) usize {
+        var i: usize = 0;
+        while (true) {
+            if (i < s.len and s[i] == '\n') {
+                i += 1;
+            } else if (i + 1 < s.len and s[i] == '\r' and s[i + 1] == '\n') {
+                i += 2;
+            } else return i;
         }
     }
 
@@ -1914,6 +1950,33 @@ test "pre-tokenizer steps" {
     out.clearRetainingCapacity();
     try splitClass(arena.allocator(), "a,,b", isPunctuation, false, true, &out);
     try std.testing.expectEqualStrings(",,", out.items[1]);
+}
+
+test "a line-break split merged with the next piece (Laguna)" {
+    const gpa = std.testing.allocator;
+    const json =
+        \\{"model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+        \\"pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":"(?:\\r?\\n)+(?!\\r?\\n)"},"behavior":"MergedWithNext","invert":false},{"type":"Split","pattern":{"Regex":"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"use_regex":false}]},
+        \\"decoder":{"type":"ByteLevel"}}
+    ;
+    const tok = try Tokenizer.parse(gpa, json, null);
+    defer tok.deinit();
+    try std.testing.expect(tok.steps[0] == .newline_runs);
+    try std.testing.expect(tok.steps[1] == .regex and tok.steps[1].regex == .qwen2);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var pieces = std.ArrayList([]const u8).empty;
+    try pieces.append(a, "f(x):\r\n\n  y\rz\n");
+    for (tok.steps) |step| {
+        var next = std.ArrayList([]const u8).empty;
+        for (pieces.items) |piece| try tok.applyStep(a, step, piece, &next);
+        pieces = next;
+    }
+    // Without the first step Qwen 2's regex would keep "):\r\n\n" together.
+    const want = [_][]const u8{ "f", "(x", "):", "\r\n\n", " ", " y", "\r", "z", "\n" };
+    try std.testing.expectEqual(want.len, pieces.items.len);
+    for (want, pieces.items) |w, got| try std.testing.expectEqualStrings(w, got);
 }
 
 test "byte-level bpe round trip" {
