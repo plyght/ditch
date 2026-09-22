@@ -30,6 +30,9 @@ pub fn checkFixture(comptime family: []const u8) !void {
     defer ws.deinit();
     var cache = try model_mod.KvCache.init(gpa, c.num_layers, ref.value.cases.len, 64, c.num_kv_heads * c.head_dim);
     defer cache.deinit();
+    if (c.has_linear) {
+        cache.linear = try model_mod.LinearCache.init(gpa, c, ref.value.cases.len);
+    }
 
     var prompts = std.ArrayList([]const u32).empty;
     defer {
@@ -195,6 +198,21 @@ test "mixtral fixture" {
 test "qwen2_moe fixture" {
     try checkFixture("qwen2_moe");
 }
+test "qwen3_next fixture" {
+    try checkFixture("qwen3_next");
+}
+test "qwen3_5 fixture" {
+    try checkFixture("qwen3_5");
+}
+test "qwen3_5_moe fixture" {
+    try checkFixture("qwen3_5_moe");
+}
+test "glm4_moe fixture" {
+    try checkFixture("glm4_moe");
+}
+test "glm_moe_dsa fixture" {
+    try checkFixture("glm_moe_dsa");
+}
 
 // ---------------------------------------------------------------------------
 // Abliteration, export and streaming on the registry layouts
@@ -326,4 +344,16 @@ test "chatglm edit, export and streamed reload (remote-code layout)" {
 }
 test "cohere edit, export and streamed reload (parallel residual, tied head)" {
     try checkEditExportStream("cohere");
+}
+test "qwen3_next edit, export and streamed reload (linear attention, gated full attention)" {
+    try checkEditExportStream("qwen3_next");
+}
+test "qwen3_5_moe edit, export and streamed reload (split linear projections, swish gate)" {
+    try checkEditExportStream("qwen3_5_moe");
+}
+test "glm4_moe edit, export and streamed reload (per-head q/k norms, sigmoid MoE)" {
+    try checkEditExportStream("glm4_moe");
+}
+test "glm_moe_dsa edit, export and streamed reload (MLA sparse indexer as dense)" {
+    try checkEditExportStream("glm_moe_dsa");
 }
