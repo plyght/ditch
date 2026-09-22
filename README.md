@@ -97,7 +97,17 @@ a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
   layouts), DeepSeek V2 / V3 (MLA, group-limited and sigmoid routing, shared
   experts), Llama 4 text (top-1 routing, NoPE layers), gpt-oss (attention
   sinks, interleaved fused experts; BF16 checkpoints only, MXFP4 must be
-  dequantised first)
+  dequantised first), ERNIE 4.5 MoE (`ernie4_5_moe`), Hunyuan-A13B
+  (`hunyuan_v1_moe`), GraniteMoE / GraniteMoeShared (`granitemoe`) and the
+  attention-only Granite 4 layout (`granitemoehybrid` without Mamba layers)
+* MiniMax: M2 (`minimax_m2`), MiniMax-Text-01 / M1 (`minimax`: lightning
+  linear attention alternating with softmax attention; the recurrence runs
+  sequentially) and M3 (`minimax_m3_vl` text config, also `minimax_m3`;
+  MiniMax Sparse Attention selects the top-k key blocks per query, which
+  covers every block for prompts up to `index_block_size ×
+  index_topk_blocks` tokens, 2048 with the released config, so ditch runs
+  those layers as dense attention and its results are exact only within
+  that length)
 
 Implemented from the Hugging Face reference but without a fixture: Falcon
 40B/180B (grouped qkv, `ln_attn`/`ln_mlp`) and Falcon ALiBi, Baichuan 13B
@@ -106,13 +116,15 @@ LayerNorm), Gemma 2 logit softcapping, `dynamic` and `longrope` scaling
 beyond the original context (treated as static / short factors).
 
 Not supported: state-space and hybrid models (Mamba, Jamba, Falcon-H1,
-Nemotron-H, RWKV), Kimi K3 / K2.5+ (gated linear attention with MXFP4 or
+Nemotron-H, RWKV, Granite 4 `granitemoehybrid` checkpoints with Mamba-2
+layers), Kimi K3 / K2.5+ (gated linear attention with MXFP4 or
 compressed-tensors weights, no `tokenizer.json`), Kimi K2 (FP8 weights, no
 `tokenizer.json`), Qwen3.8-Flash-Next (`qwen4_exp`), GLM-5.3-Flash
 (`glm5_next`) and DeepSeek V4 (sparse indexers with hyper-connections and
 hash layers, FP4/FP8 weights), encoder-decoder models, Gemma 3n (per-layer
-inputs), MiniCPM3, GraniteMoE, OPT-350m (projection layers), FP8
-checkpoints, and tokenizers without a `tokenizer.json`
+inputs), MiniCPM3, HunYuan cross-layer attention (`use_cla`), OPT-350m
+(projection layers), FP8 checkpoints, and tokenizers without a
+`tokenizer.json`
 (SentencePiece-only Baichuan; generate one with
 `AutoTokenizer.from_pretrained(...).save_pretrained(...)` and place it
 next to the model). ditch names the missing piece instead of guessing:
