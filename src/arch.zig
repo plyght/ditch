@@ -73,7 +73,12 @@ pub const QkNorm = enum {
     l2,
 };
 
-pub const RouterScoring = enum { softmax, sigmoid };
+pub const RouterScoring = enum {
+    softmax,
+    sigmoid,
+    /// `sqrt(softplus(x))` (DeepSeek V4).
+    sqrtsoftplus,
+};
 
 pub const TopkMethod = enum {
     /// Plain top-k over the scores.
@@ -122,6 +127,89 @@ pub const MoeConfig = struct {
     /// Expert projections carry biases (gpt-oss).
     expert_bias: bool = false,
     swiglu: ?Swiglu = null,
+    /// Clamp on the expert pre-activations before the gated activation: the
+    /// gate from above, the up projection on both sides (DeepSeek V4).
+    swiglu_limit: ?f32 = null,
+    /// Divisor of the router logits before scoring (DeepSeek V4.1 `gate_temp`).
+    gate_temp: f32 = 1.0,
+    /// Routing weights are renormalised with a `+1e-20` floor on their sum (DeepSeek V4).
+    norm_eps_floor: bool = false,
+};
+
+/// Compressed-KV branch of a DeepSeek V4 / V4.1 attention layer.
+pub const CompressBranch = enum {
+    /// Sliding window only.
+    none,
+    /// V4 compressed sparse attention: two overlapping series (Ca/Cb) pooled
+    /// over `2 * ratio` slots with a position bias, then a Lightning Indexer.
+    csa,
+    /// V4 heavily compressed attention: one series pooled over `ratio` slots.
+    hca,
+    /// V4.1 shared compressed attention (CSA2): the group's KV source pools
+    /// `ratio` tokens with a gate (no position bias, no overlap); a ratio of
+    /// 1 is a plain per-token latent.
+    shared,
+};
+
+/// Engram conditional memory (DeepSeek V4.1): n-gram hash tables gated into
+/// the residual streams at `layer_ids`.
+pub const Engram = struct {
+    layer_ids: []const usize,
+    /// Rows of every layer's table (`engram_num_embeddings`).
+    num_embeddings: []const usize,
+    max_ngram: usize,
+    n_heads: usize,
+    head_dim: usize,
+    pad_id: u32,
+    /// Size of the tokenizer-normalised vocabulary the hashes run on; the
+    /// value derived from the tokenizer must match it.
+    compressed_vocab_size: usize,
+    /// Bucket sizes are the primes above this (per (n-gram size, head)).
+    vocab_size: usize,
+};
+
+/// DeepSeek V4 / V4.1 family layout: manifold-constrained hyper-connections
+/// (`hc_mult` residual streams), low-rank query and grouped output
+/// projections, shared-KV sliding-window attention with sinks and a
+/// compressed-KV branch, hash-routed or n-gram-memory layers.
+pub const DsV4 = struct {
+    /// DeepSeek V4.1: single-pass hyper-connections, CSA2 KV sharing, QAT
+    /// fake quantisation, engram layers.
+    v41: bool,
+    q_lora_rank: usize,
+    o_groups: usize,
+    o_lora_rank: usize,
+    /// Per layer: tokens pooled into one compressed entry (0 = no compressed branch).
+    compress_ratio: []const usize,
+    branch: []const CompressBranch,
+    /// Per layer: the layer whose compressed cache this layer attends to (the
+    /// layer itself for V4; the group's KV source for V4.1).
+    kv_source: []const ?usize,
+    /// Lightning Indexer top-k: the dense equivalent is exact while every
+    /// reachable compressed entry fits (`(pos + 1) / ratio <= index_topk`).
+    index_topk: usize,
+    index_n_heads: usize,
+    index_head_dim: usize,
+    /// V4.1 two-level top-k: at most `candidate_topk_blocks` blocks of
+    /// `candidate_block_size` entries are reachable once the candidate
+    /// source layer runs (null: disabled).
+    candidate_source: ?usize,
+    candidate_topk_blocks: usize,
+    candidate_block_size: usize,
+    /// RoPE of the compressed branches (queries and keys of CSA/HCA layers).
+    compress_rope_theta: f32,
+    compress_rope_scaling: RopeScaling,
+    /// Per layer: expert selection comes from the `tid2eid` table of the
+    /// input token instead of the router scores (V4 `hash_moe`).
+    hash_moe_layers: []const bool,
+    hc_mult: usize,
+    hc_sinkhorn_iters: usize,
+    hc_eps: f32,
+    /// V4.1 quantisation-aware training semantics: the window KV is rounded
+    /// to block-scaled FP8 and the compressed latents to block-scaled FP4
+    /// even when the weights are not quantised.
+    fake_quant: bool,
+    engram: ?Engram,
 };
 
 /// Tensor-name templates. `{p}` is the model prefix, `{i}` the layer index and
@@ -301,6 +389,11 @@ pub const Config = struct {
     /// Per layer: true if the layer's MLP is a routed mixture of experts.
     moe_layers: []bool,
     moe: MoeConfig,
+    /// Residual streams per token (1 for conventional residuals; `hc_mult`
+    /// for hyper-connection families).
+    hc_mult: usize,
+    /// DeepSeek V4 / V4.1 layout (null for other families).
+    dsv4: ?DsV4,
 
     pub fn isGemma(self: *const Config) bool {
         return self.norm == .rms_gemma;
@@ -421,8 +514,6 @@ fn rejectKnownHybrid(model_type: []const u8) !void {
         .{ "glm5_next", "GLM-5.3-Flash hybrid (linear attention with sparse indexer and hyper-connections)" },
         .{ "glm5_next_text", "GLM-5.3-Flash hybrid (linear attention with sparse indexer and hyper-connections)" },
         .{ "glm_moe_lite", "GLM-4.7-Flash (not yet verified against a reference forward pass)" },
-        .{ "deepseek_v4", "DeepSeek V4 (sparse indexer, hash layers, hyper-connections, FP4/FP8 weights)" },
-        .{ "deepseek_v41", "DeepSeek V4.1 (sparse indexer, hash layers, hyper-connections, FP4/FP8 weights)" },
     };
     inline for (table) |e| {
         if (std.mem.eql(u8, model_type, e[0])) {
@@ -450,21 +541,6 @@ fn rejectUnsupportedMath(top: std.json.ObjectMap, obj: std.json.ObjectMap) !void
             std.log.err("unsupported model: '{s}' expert dtype cannot be dequantised yet", .{dt});
             return error.UnsupportedArchitecture;
         }
-    }
-    if (getNum(obj, "num_hash_layers") != null or getBool(obj, "mhc", false) or getNum(obj, "hc_mult") != null) {
-        std.log.err("unsupported model: hyper-connections and hash layers are not implemented", .{});
-        return error.UnsupportedArchitecture;
-    }
-    if (getStr(obj, "scoring_func")) |s| {
-        if (std.mem.eql(u8, s, "sqrtsoftplus")) {
-            std.log.err("unsupported model: 'sqrtsoftplus' MoE routing is not implemented", .{});
-            return error.UnsupportedArchitecture;
-        }
-    }
-    const act = getStr(obj, "hidden_activation") orelse getStr(obj, "hidden_act") orelse getStr(obj, "activation_function") orelse "";
-    if (std.mem.eql(u8, act, "situ")) {
-        std.log.err("unsupported model: 'situ' activation is not implemented", .{});
-        return error.UnsupportedArchitecture;
     }
 }
 
@@ -537,73 +613,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
     rotary_dim -= rotary_dim % 2;
 
     var rope_scaling: RopeScaling = .none;
-    if (getObj(obj, "rope_scaling")) |rs| {
-        const t = getStr(rs, "rope_type") orelse getStr(rs, "type") orelse "";
-        if (std.mem.eql(u8, t, "llama3")) {
-            rope_scaling = .{ .llama3 = .{
-                .factor = getF32(rs, "factor", 8),
-                .low_freq_factor = getF32(rs, "low_freq_factor", 1),
-                .high_freq_factor = getF32(rs, "high_freq_factor", 4),
-                .original_max_position = getF32(rs, "original_max_position_embeddings", 8192),
-            } };
-        } else if (std.mem.eql(u8, t, "linear")) {
-            rope_scaling = .{ .linear = getF32(rs, "factor", 1) };
-        } else if (std.mem.eql(u8, t, "yarn")) {
-            const factor = getF32(rs, "factor", 1);
-            const mscale = getF32(rs, "mscale", 1);
-            const mscale_all_dim = getF32(rs, "mscale_all_dim", 0);
-            const attention_factor: f32 = if (getNum(rs, "attention_factor")) |af| @floatCast(af) else if (mscale != 0 and mscale_all_dim != 0)
-                yarnMscale(factor, mscale) / yarnMscale(factor, mscale_all_dim)
-            else
-                yarnMscale(factor, 1);
-            rope_scaling = .{ .yarn = .{
-                .factor = factor,
-                .original_max_position = getF32(rs, "original_max_position_embeddings", getF32(obj, "original_max_position_embeddings", 4096)),
-                .beta_fast = getF32(rs, "beta_fast", 32),
-                .beta_slow = getF32(rs, "beta_slow", 1),
-                .attention_factor = attention_factor,
-                .truncate = getBool(rs, "truncate", true),
-            } };
-        } else if (std.mem.eql(u8, t, "longrope")) {
-            const half = rotary_dim / 2;
-            const factors = try arena.alloc(f32, half);
-            @memset(factors, 1);
-            if (rs.get("short_factor")) |sf| {
-                if (sf == .array) for (sf.array.items, 0..) |v, i| {
-                    if (i < half) factors[i] = switch (v) {
-                        .float => |f| @floatCast(f),
-                        .integer => |n| @floatFromInt(n),
-                        else => 1,
-                    };
-                };
-            }
-            const original: f32 = getF32(obj, "original_max_position_embeddings", getF32(rs, "original_max_position_embeddings", @floatFromInt(max_pos)));
-            const factor: f32 = if (getNum(rs, "factor")) |f| @floatCast(f) else @as(f32, @floatFromInt(max_pos)) / original;
-            const attention_factor: f32 = if (getNum(rs, "attention_factor")) |af| @floatCast(af) else if (factor <= 1) 1.0 else @sqrt(1.0 + @log(factor) / @log(original));
-            rope_scaling = .{ .longrope = .{ .factors = factors, .attention_factor = attention_factor } };
-            std.log.warn("longrope: using the short rotary factors for every position (prompts beyond {d} tokens use the wrong table)", .{@as(usize, @intFromFloat(original))});
-        } else if (std.mem.eql(u8, t, "ditch_factors")) {
-            // Per-frequency divisors (a GGUF `rope_freqs.weight` that is not a
-            // standard llama3 scaling); written by gguf_model.zig, read only by ditch.
-            if (rs.get("factors")) |fa| {
-                if (fa == .array) {
-                    const factors = try arena.alloc(f32, fa.array.items.len);
-                    for (fa.array.items, 0..) |v, i| factors[i] = switch (v) {
-                        .float => |x| @floatCast(x),
-                        .integer => |x| @floatFromInt(x),
-                        else => 1.0,
-                    };
-                    rope_scaling = .{ .factors = factors };
-                }
-            }
-        } else if (std.mem.eql(u8, t, "dynamic")) {
-            std.log.warn("dynamic NTK rope scaling is treated as unscaled RoPE (exact below the original context length)", .{});
-        } else if (std.mem.eql(u8, t, "mrope") or std.mem.eql(u8, t, "default") or t.len == 0) {
-            // mrope over text-only positions equals plain RoPE.
-        } else {
-            std.log.warn("rope scaling type '{s}' is not supported; using unscaled RoPE", .{t});
-        }
-    }
+    if (getObj(obj, "rope_scaling")) |rs| rope_scaling = try parseRopeScaling(arena, obj, rs, rotary_dim, max_pos);
 
     const sliding_window: ?usize = blk: {
         const v = obj.get("sliding_window") orelse break :blk null;
@@ -623,6 +633,10 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
                 if (i < layers and v == .string) {
                     const t = v.string;
                     if (std.mem.eql(u8, t, "sliding_attention") or std.mem.eql(u8, t, "chunked_attention")) {
+                        sliding_layers[i] = true;
+                    } else if (std.mem.eql(u8, t, "compressed_sparse_attention") or std.mem.eql(u8, t, "heavily_compressed_attention") or std.mem.eql(u8, t, "shared_compressed_attention")) {
+                        // DeepSeek V4 / V4.1: a sliding window plus a compressed
+                        // branch (read again by the family hook).
                         sliding_layers[i] = true;
                     } else if (std.mem.eql(u8, t, "linear_attention")) {
                         linear_layers[i] = true;
@@ -761,6 +775,8 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         .moe_intermediate_size = getInt(obj, "moe_intermediate_size", if (intermediate_size > 0) intermediate_size else 4 * hidden),
         .moe_layers = moe_layers,
         .moe = .{},
+        .hc_mult = 1,
+        .dsv4 = null,
     };
     if (getNum(obj, "query_pre_attn_scalar")) |q| c.attention_scale = @floatCast(1.0 / @sqrt(q));
     if (getNum(attn_cfg, "clip_qkv")) |v| c.clip_qkv = @floatCast(v);
@@ -795,6 +811,79 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         for (c.sliding_layers, 0..) |*s, i| s.* = (i % 2 == 0);
     }
     return c;
+}
+
+/// Parses a `rope_scaling` / `rope_parameters` dictionary `rs` (`obj` is the
+/// model config it belongs to, for the fallback keys some families keep at
+/// the top level).
+fn parseRopeScaling(arena: Allocator, obj: std.json.ObjectMap, rs: std.json.ObjectMap, rotary_dim: usize, max_pos: usize) !RopeScaling {
+    var result: RopeScaling = .none;
+    const t = getStr(rs, "rope_type") orelse getStr(rs, "type") orelse "";
+    if (std.mem.eql(u8, t, "llama3")) {
+        result = .{ .llama3 = .{
+            .factor = getF32(rs, "factor", 8),
+            .low_freq_factor = getF32(rs, "low_freq_factor", 1),
+            .high_freq_factor = getF32(rs, "high_freq_factor", 4),
+            .original_max_position = getF32(rs, "original_max_position_embeddings", 8192),
+        } };
+    } else if (std.mem.eql(u8, t, "linear")) {
+        result = .{ .linear = getF32(rs, "factor", 1) };
+    } else if (std.mem.eql(u8, t, "yarn")) {
+        const factor = getF32(rs, "factor", 1);
+        const mscale = getF32(rs, "mscale", 1);
+        const mscale_all_dim = getF32(rs, "mscale_all_dim", 0);
+        const attention_factor: f32 = if (getNum(rs, "attention_factor")) |af| @floatCast(af) else if (mscale != 0 and mscale_all_dim != 0)
+            yarnMscale(factor, mscale) / yarnMscale(factor, mscale_all_dim)
+        else
+            yarnMscale(factor, 1);
+        result = .{ .yarn = .{
+            .factor = factor,
+            .original_max_position = getF32(rs, "original_max_position_embeddings", getF32(obj, "original_max_position_embeddings", 4096)),
+            .beta_fast = getF32(rs, "beta_fast", 32),
+            .beta_slow = getF32(rs, "beta_slow", 1),
+            .attention_factor = attention_factor,
+            .truncate = getBool(rs, "truncate", true),
+        } };
+    } else if (std.mem.eql(u8, t, "longrope")) {
+        const half = rotary_dim / 2;
+        const factors = try arena.alloc(f32, half);
+        @memset(factors, 1);
+        if (rs.get("short_factor")) |sf| {
+            if (sf == .array) for (sf.array.items, 0..) |v, i| {
+                if (i < half) factors[i] = switch (v) {
+                    .float => |f| @floatCast(f),
+                    .integer => |n| @floatFromInt(n),
+                    else => 1,
+                };
+            };
+        }
+        const original: f32 = getF32(obj, "original_max_position_embeddings", getF32(rs, "original_max_position_embeddings", @floatFromInt(max_pos)));
+        const factor: f32 = if (getNum(rs, "factor")) |f| @floatCast(f) else @as(f32, @floatFromInt(max_pos)) / original;
+        const attention_factor: f32 = if (getNum(rs, "attention_factor")) |af| @floatCast(af) else if (factor <= 1) 1.0 else @sqrt(1.0 + @log(factor) / @log(original));
+        result = .{ .longrope = .{ .factors = factors, .attention_factor = attention_factor } };
+        std.log.warn("longrope: using the short rotary factors for every position (prompts beyond {d} tokens use the wrong table)", .{@as(usize, @intFromFloat(original))});
+    } else if (std.mem.eql(u8, t, "ditch_factors")) {
+        // Per-frequency divisors (a GGUF `rope_freqs.weight` that is not a
+        // standard llama3 scaling); written by gguf_model.zig, read only by ditch.
+        if (rs.get("factors")) |fa| {
+            if (fa == .array) {
+                const factors = try arena.alloc(f32, fa.array.items.len);
+                for (fa.array.items, 0..) |v, i| factors[i] = switch (v) {
+                    .float => |x| @floatCast(x),
+                    .integer => |x| @floatFromInt(x),
+                    else => 1.0,
+                };
+                result = .{ .factors = factors };
+            }
+        }
+    } else if (std.mem.eql(u8, t, "dynamic")) {
+        std.log.warn("dynamic NTK rope scaling is treated as unscaled RoPE (exact below the original context length)", .{});
+    } else if (std.mem.eql(u8, t, "mrope") or std.mem.eql(u8, t, "default") or t.len == 0) {
+        // mrope over text-only positions equals plain RoPE.
+    } else {
+        std.log.warn("rope scaling type '{s}' is not supported; using unscaled RoPE", .{t});
+    }
+    return result;
 }
 
 fn yarnMscale(scale: f32, mscale: f32) f32 {
@@ -898,8 +987,7 @@ fn extraGranite(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
 fn extraDeepseek(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
     // The original checkpoints pair rotary coordinates as (2i, 2i+1) (`rope_interleave`).
     c.rope_style = if (getBool(obj, "rope_interleave", true)) .gptj else .neox;
-    const scoring = getStr(obj, "scoring_func") orelse "softmax";
-    c.moe.scoring = if (std.mem.eql(u8, scoring, "sigmoid")) .sigmoid else .softmax;
+    c.moe.scoring = parseScoring(getStr(obj, "scoring_func") orelse "softmax");
     const method = getStr(obj, "topk_method") orelse "greedy";
     c.moe.topk_method = if (std.mem.eql(u8, method, "group_limited_greedy") or std.mem.eql(u8, method, "noaux_tc")) .group_limited else .greedy;
     c.moe.n_group = @max(1, getInt(obj, "n_group", 1));
@@ -1052,6 +1140,251 @@ fn extraGlmMoeDsa(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
     if (getNum(obj, "index_topk") != null) {
         std.log.warn("sparse indexer runs as dense attention (exact for short contexts)", .{});
     }
+}
+
+fn parseScoring(name: []const u8) RouterScoring {
+    if (std.mem.eql(u8, name, "sigmoid")) return .sigmoid;
+    if (std.mem.eql(u8, name, "sqrtsoftplus")) return .sqrtsoftplus;
+    return .softmax;
+}
+
+/// Integer list `key` of `obj` (null when absent or not an array).
+fn intList(arena: Allocator, obj: std.json.ObjectMap, key: []const u8) !?[]usize {
+    const v = obj.get(key) orelse return null;
+    if (v != .array) return null;
+    const out = try arena.alloc(usize, v.array.items.len);
+    for (v.array.items, 0..) |item, i| out[i] = switch (item) {
+        .integer => |n| if (n >= 0) @intCast(n) else 0,
+        .float => |f| if (f >= 0) @intFromFloat(f) else 0,
+        else => 0,
+    };
+    return out;
+}
+
+/// The parts of the DeepSeek V4 / V4.1 configs both families share: hyper-
+/// connections, the low-rank query and grouped output projections, the
+/// compressed-branch RoPE (`compress_rope_theta`, yarn only there, with the
+/// reference's `attention_factor = 1`), sinks, the clamped expert SwiGLU and
+/// the MoE routing.
+fn dsv4Common(c: *Config, arena: Allocator, obj: std.json.ObjectMap, d: *DsV4) !void {
+    c.rope_style = .gptj;
+    c.sinks = true;
+    c.norm = .rms;
+    c.num_kv_heads = getInt(obj, "num_key_value_heads", 1);
+    if (c.num_kv_heads != 1) {
+        std.log.err("deepseek_v4: shared-KV attention needs num_key_value_heads = 1 (config has {d})", .{c.num_kv_heads});
+        return error.UnsupportedArchitecture;
+    }
+    // Every layer carries the sliding window; the compressed branch is extra.
+    @memset(c.sliding_layers, true);
+    if (c.sliding_window == null) c.sliding_window = 128;
+    if (getNum(obj, "qk_rope_head_dim")) |_| c.rotary_dim = getInt(obj, "qk_rope_head_dim", c.rotary_dim);
+    c.rotary_dim -= c.rotary_dim % 2;
+    if (c.rotary_dim == 0 or c.rotary_dim > c.head_dim) return error.InvalidConfig;
+    c.v_head_dim = c.head_dim;
+    c.attention_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.head_dim)));
+    c.hc_mult = @max(1, getInt(obj, "hc_mult", 4));
+    d.hc_mult = c.hc_mult;
+    d.hc_sinkhorn_iters = getInt(obj, "hc_sinkhorn_iters", 20);
+    d.hc_eps = getF32(obj, "hc_eps", 1e-6);
+    d.q_lora_rank = getInt(obj, "q_lora_rank", 0);
+    d.o_groups = @max(1, getInt(obj, "o_groups", 8));
+    d.o_lora_rank = getInt(obj, "o_lora_rank", 1024);
+    if (d.q_lora_rank == 0 or d.o_lora_rank == 0 or (c.num_heads * c.head_dim) % d.o_groups != 0) return error.InvalidConfig;
+    d.index_topk = getInt(obj, "index_topk", 512);
+    d.index_head_dim = getInt(obj, "index_head_dim", 128);
+    // The compressed branches rotate with their own base and (yarn) scaling;
+    // the sliding-window rope is plain. The reference never multiplies the
+    // compress cos/sin by yarn's mscale unless the config says so.
+    d.compress_rope_theta = getF32(obj, "compress_rope_theta", 160000.0);
+    var compress_dict: ?std.json.ObjectMap = null;
+    if (getObj(obj, "rope_parameters")) |rp| {
+        if (getObj(rp, "main")) |m| c.rope_theta = getF32(m, "rope_theta", c.rope_theta);
+        if (getObj(rp, "compress")) |cp| {
+            compress_dict = cp;
+            d.compress_rope_theta = getF32(cp, "rope_theta", d.compress_rope_theta);
+        }
+    }
+    if (compress_dict == null) compress_dict = getObj(obj, "rope_scaling");
+    d.compress_rope_scaling = .none;
+    if (compress_dict) |cd| {
+        d.compress_rope_scaling = try parseRopeScaling(arena, obj, cd, c.rotary_dim, c.max_position_embeddings);
+        if (d.compress_rope_scaling == .yarn and getNum(cd, "attention_factor") == null) d.compress_rope_scaling.yarn.attention_factor = 1.0;
+    }
+    c.rope_scaling = .none;
+    // MoE: sqrtsoftplus scores, plain top-k on the corrected scores, renormalised.
+    c.moe.scoring = parseScoring(getStr(obj, "scoring_func") orelse "sqrtsoftplus");
+    c.moe.topk_method = .greedy;
+    c.moe.routed_scaling_factor = getF32(obj, "routed_scaling_factor", 1.5);
+    c.moe.norm_eps_floor = true;
+    const limit = getF32(obj, "swiglu_limit", 10.0);
+    c.moe.swiglu_limit = if (limit > 0) limit else null;
+    c.num_experts_per_tok = getInt(obj, "num_experts_per_tok", 6);
+    if (getNum(obj, "intermediate_size") == null) c.intermediate_size = c.moe_intermediate_size;
+    if (c.num_experts > 0) @memset(c.moe_layers, true);
+}
+
+fn extraDeepseekV4(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
+    var d: DsV4 = undefined;
+    d.v41 = false;
+    d.fake_quant = false;
+    d.engram = null;
+    d.candidate_source = null;
+    d.candidate_topk_blocks = 0;
+    d.candidate_block_size = 1;
+    try dsv4Common(c, arena, obj, &d);
+    d.index_n_heads = getInt(obj, "index_n_heads", 64);
+    c.norm_topk_prob = true;
+    const n = c.num_layers;
+    // Per-layer-type compression rates (`compress_rates`, or the legacy scalars).
+    var rate_csa: usize = 4;
+    var rate_hca: usize = 128;
+    if (getObj(obj, "compress_rates")) |cr| {
+        rate_csa = getInt(cr, "compressed_sparse_attention", rate_csa);
+        rate_hca = getInt(cr, "heavily_compressed_attention", rate_hca);
+    }
+    rate_csa = getInt(obj, "compress_rate_csa", rate_csa);
+    rate_hca = getInt(obj, "compress_rate_hca", rate_hca);
+    const branch = try arena.alloc(CompressBranch, n);
+    const ratio = try arena.alloc(usize, n);
+    const source = try arena.alloc(?usize, n);
+    if (obj.get("layer_types")) |lt| {
+        if (lt != .array or lt.array.items.len < n) return error.InvalidConfig;
+        for (lt.array.items[0..n], 0..) |v, i| {
+            if (v != .string) return error.InvalidConfig;
+            branch[i] = if (std.mem.eql(u8, v.string, "sliding_attention")) .none else if (std.mem.eql(u8, v.string, "compressed_sparse_attention")) .csa else if (std.mem.eql(u8, v.string, "heavily_compressed_attention")) .hca else return error.InvalidConfig;
+        }
+    } else if (try intList(arena, obj, "compress_ratios")) |legacy| {
+        // Legacy per-layer ints keyed by the default rates: 0 / 4 / 128.
+        if (legacy.len < n) return error.InvalidConfig;
+        for (legacy[0..n], 0..) |r, i| branch[i] = switch (r) {
+            0 => .none,
+            4 => .csa,
+            128 => .hca,
+            else => return error.InvalidConfig,
+        };
+    } else {
+        // V4-Pro default: two HCA layers, then CSA on odd and HCA on even indices.
+        for (branch, 0..) |*b, i| b.* = if (i < 2) .hca else if ((i - 2) % 2 == 1) .csa else .hca;
+    }
+    for (branch, 0..) |b, i| {
+        ratio[i] = switch (b) {
+            .none => 0,
+            .csa => rate_csa,
+            .hca => rate_hca,
+            .shared => unreachable,
+        };
+        source[i] = if (b == .none) null else i;
+        if (b != .none and ratio[i] == 0) return error.InvalidConfig;
+    }
+    d.branch = branch;
+    d.compress_ratio = ratio;
+    d.kv_source = source;
+    // Hash-routed MoE layers: `mlp_layer_types`, or the first `num_hash_layers` (default 3).
+    const hash = try arena.alloc(bool, n);
+    if (obj.get("mlp_layer_types")) |mt| {
+        if (mt != .array or mt.array.items.len < n) return error.InvalidConfig;
+        for (mt.array.items[0..n], 0..) |v, i| {
+            if (v != .string) return error.InvalidConfig;
+            hash[i] = if (std.mem.eql(u8, v.string, "hash_moe")) true else if (std.mem.eql(u8, v.string, "moe")) false else return error.InvalidConfig;
+        }
+    } else {
+        const n_hash = getInt(obj, "num_hash_layers", 3);
+        for (hash, 0..) |*h, i| h.* = i < n_hash;
+    }
+    d.hash_moe_layers = hash;
+    c.dsv4 = d;
+}
+
+fn extraDeepseekV41(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
+    var d: DsV4 = undefined;
+    d.v41 = true;
+    d.fake_quant = true;
+    if (getNum(obj, "rms_norm_eps") == null) c.rms_norm_eps = 1e-20;
+    try dsv4Common(c, arena, obj, &d);
+    d.index_n_heads = getInt(obj, "index_n_heads", 32);
+    c.norm_topk_prob = getBool(obj, "norm_topk_prob", true);
+    c.moe.gate_temp = getF32(obj, "gate_temp", 1.0);
+    if (c.moe.gate_temp == 0) return error.InvalidConfig;
+    const n = c.num_layers;
+    const n_nextn = getInt(obj, "num_nextn_predict_layers", 3);
+    // Per-layer pooling ratio: 0 sliding only, 1 full-resolution shared KV,
+    // r > 1 pooled. Trailing entries (the draft layers) are ignored.
+    const ratio = try arena.alloc(usize, n);
+    if (try intList(arena, obj, "compress_ratios")) |cr| {
+        if (cr.len < n or cr.len > n + n_nextn) return error.InvalidConfig;
+        @memcpy(ratio, cr[0..n]);
+    } else if (n == 40) {
+        for (ratio, 0..) |*r, i| r.* = if (i < 2) 0 else if (i < 20) 2 else 1;
+    } else {
+        const n_slide = @min(2, n);
+        const n_enc = (n - n_slide + 1) / 2;
+        for (ratio, 0..) |*r, i| r.* = if (i < n_slide) 0 else if (i < n_slide + n_enc) 2 else 1;
+    }
+    // KV sources: explicit, or the first layer of every run of equal ratios.
+    var sources: []usize = &.{};
+    if (try intList(arena, obj, "kv_source_layer_ids")) |ks| {
+        sources = ks;
+    } else {
+        var list = std.ArrayList(usize).empty;
+        for (ratio, 0..) |r, i| {
+            if (r > 0 and (i == 0 or ratio[i - 1] != r)) try list.append(arena, i);
+        }
+        sources = list.items;
+    }
+    const branch = try arena.alloc(CompressBranch, n);
+    const source = try arena.alloc(?usize, n);
+    for (0..n) |i| {
+        branch[i] = if (ratio[i] > 0) .shared else .none;
+        source[i] = null;
+        if (ratio[i] == 0) continue;
+        for (sources) |sidx| {
+            if (sidx <= i and (source[i] == null or sidx > source[i].?)) source[i] = sidx;
+        }
+        const src = source[i] orelse {
+            std.log.err("deepseek_v41: layer {d} has a compressed branch but no kv_source_layer_ids entry at or before it", .{i});
+            return error.InvalidConfig;
+        };
+        if (src >= n or ratio[src] == 0) return error.InvalidConfig;
+        if (ratio[src] != ratio[i]) {
+            std.log.err("deepseek_v41: layer {d} (ratio {d}) reads the compressed cache of layer {d} (ratio {d})", .{ i, ratio[i], src, ratio[src] });
+            return error.InvalidConfig;
+        }
+    }
+    d.branch = branch;
+    d.compress_ratio = ratio;
+    d.kv_source = source;
+    d.candidate_topk_blocks = getInt(obj, "candidate_topk_blocks", 2048);
+    d.candidate_block_size = @max(1, getInt(obj, "candidate_block_size", 8));
+    d.candidate_source = null;
+    if (obj.get("candidate_source_layer_id")) |v| {
+        if (v == .integer and v.integer >= 0) d.candidate_source = @intCast(v.integer);
+    } else if (sources.len > 0) d.candidate_source = sources[sources.len - 1];
+    if (d.candidate_source) |cs| if (cs >= n) return error.InvalidConfig;
+    const hash = try arena.alloc(bool, n);
+    @memset(hash, false);
+    d.hash_moe_layers = hash;
+    // Engram conditional memory.
+    d.engram = null;
+    if (try intList(arena, obj, "engram_layer_ids")) |ids| {
+        if (ids.len > 0) {
+            const counts = (try intList(arena, obj, "engram_num_embeddings")) orelse return error.InvalidConfig;
+            if (counts.len != ids.len) return error.InvalidConfig;
+            for (ids) |li| if (li >= n) return error.InvalidConfig;
+            const pad = getInt(obj, "engram_pad_id", 2);
+            d.engram = .{
+                .layer_ids = ids,
+                .num_embeddings = counts,
+                .max_ngram = @max(2, getInt(obj, "engram_max_ngram_size", 4)),
+                .n_heads = @max(1, getInt(obj, "engram_n_heads", 8)),
+                .head_dim = getInt(obj, "engram_head_dim", 256),
+                .pad_id = @intCast(pad),
+                .compressed_vocab_size = getInt(obj, "engram_compressed_vocab_size", 99092),
+                .vocab_size = getInt(obj, "engram_vocab_size", 16000000),
+            };
+        }
+    }
+    c.dsv4 = d;
 }
 
 // ---------------------------------------------------------------------------
@@ -1794,6 +2127,42 @@ pub const registry = [_]Arch{
         .notes = "fixture: MLA with a sparse indexer (run as dense attention: exact for short contexts), sigmoid MoE with correction bias and shared experts.",
         .extra = extraGlmMoeDsa,
     },
+    .{
+        .model_type = "deepseek_v4",
+        .llama_cpp = null,
+        .chat = "deepseek",
+        .verified = true,
+        .rope_style = .gptj,
+        .names = dsv4_names,
+        .notes = "fixture: hyper-connections (hc_mult streams, Sinkhorn-mixed), low-rank q with unweighted head norm, shared-KV sliding attention with sinks and inverse-roped output, grouped output projection, CSA (overlapping pooled windows; Lightning Indexer as dense: exact while every reachable entry fits index_topk) and HCA branches with their own rope, sqrtsoftplus MoE with correction bias, hash-routed (tid2eid) layers, clamped SwiGLU, shared expert, MTP tensors passed through. Checkpoints must be BF16/F16 (no FP4/FP8).",
+        .extra = extraDeepseekV4,
+    },
+    .{
+        .model_type = "deepseek_v41",
+        .aliases = &.{"deepseek_v41_text"},
+        .llama_cpp = null,
+        .chat = "deepseek",
+        .verified = true,
+        .rope_style = .gptj,
+        .names = dsv4_names,
+        .notes = "fixture: single-pass hyper-connections, CSA2 shared compressed KV (kv_source groups, ratio 1 and pooled branches, indexer as dense), FP8/FP4 fake quantisation of the window KV and latents, engram n-gram hash layers (lazy table rows, tokenizer-derived compressed ids), gate_temp routing, nested text_config with vision tensors passed through. Checkpoints must be BF16/F16 (no FP4/FP8).",
+        .extra = extraDeepseekV41,
+    },
+};
+
+/// DeepSeek V4 / V4.1 tensor names shared with the generic loader; the
+/// family-specific tensors (hyper-connections, grouped output projection,
+/// compressors, engram) are named in deepseek_v4.zig.
+const dsv4_names = Names{
+    .q_a = "self_attn.q_a_proj.weight",
+    .q_a_norm = "self_attn.q_a_norm.weight",
+    .q_b = "self_attn.q_b_proj.weight",
+    .kv_a = "self_attn.kv_proj.weight",
+    .kv_a_norm = "self_attn.kv_norm.weight",
+    .o = "self_attn.o_b_proj.weight",
+    .sinks = "self_attn.sinks",
+    .router_correction_bias = "mlp.gate.e_score_correction_bias",
+    .shared_expert = "mlp.shared_experts.",
 };
 
 test "registry lookup and aliases" {
@@ -1838,4 +2207,32 @@ test "parseConfig picks family knobs" {
     try std.testing.expect(ds.rope_scaling == .yarn);
     const ms = 0.1 * @log(@as(f32, 40)) + 1.0;
     try std.testing.expectApproxEqRel(ms * ms / @sqrt(@as(f32, 12)), ds.attention_scale, 1e-5);
+    // DeepSeek V4 with the legacy keys: per-layer compress ratios, scalar rates,
+    // num_hash_layers, top-level yarn (compress branch only, no mscale).
+    const v4 = try parseConfig(a,
+        \\{"model_type":"deepseek_v4","hidden_size":64,"num_attention_heads":4,"num_hidden_layers":4,"head_dim":16,"vocab_size":100,"q_lora_rank":16,"qk_rope_head_dim":4,"n_routed_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":16,"compress_ratios":[0,4,128,4],"compress_rate_csa":2,"num_hash_layers":1,"rope_scaling":{"rope_type":"yarn","factor":16,"original_max_position_embeddings":65536}}
+    );
+    const d4 = v4.dsv4.?;
+    try std.testing.expect(!d4.v41 and v4.hc_mult == 4 and v4.sinks and v4.rope_style == .gptj);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 2, 128, 2 }, d4.compress_ratio);
+    try std.testing.expectEqual(CompressBranch.hca, d4.branch[2]);
+    try std.testing.expect(d4.hash_moe_layers[0] and !d4.hash_moe_layers[1]);
+    try std.testing.expectEqual(@as(usize, 4), v4.rotary_dim);
+    try std.testing.expect(v4.rope_scaling == .none and d4.compress_rope_scaling == .yarn);
+    try std.testing.expectEqual(@as(f32, 1.0), d4.compress_rope_scaling.yarn.attention_factor);
+    try std.testing.expectEqual(RouterScoring.sqrtsoftplus, v4.moe.scoring);
+    try std.testing.expect(v4.moe.swiglu_limit.? == 10.0 and v4.moe_layers[0] and v4.sliding_layers[3]);
+    // DeepSeek V4.1 text config: kv-source groups, candidate source, engram, defaults.
+    const v41 = try parseConfig(a,
+        \\{"model_type":"deepseek_v41","text_config":{"model_type":"deepseek_v41_text","hidden_size":64,"num_attention_heads":4,"num_hidden_layers":6,"head_dim":16,"vocab_size":100,"q_lora_rank":16,"qk_rope_head_dim":4,"n_routed_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":16,"compress_ratios":[0,2,2,1,1,1,0,0,0],"kv_source_layer_ids":[1,3],"index_source_layer_ids":[1,3],"engram_layer_ids":[1],"engram_num_embeddings":[1000],"gate_temp":2.0}}
+    );
+    const d41 = v41.dsv4.?;
+    try std.testing.expect(d41.v41 and d41.fake_quant and v41.rms_norm_eps == 1e-20);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 2, 2, 1, 1, 1 }, d41.compress_ratio);
+    try std.testing.expectEqual(@as(?usize, 1), d41.kv_source[2]);
+    try std.testing.expectEqual(@as(?usize, 3), d41.kv_source[5]);
+    try std.testing.expectEqual(@as(?usize, null), d41.kv_source[0]);
+    try std.testing.expectEqual(@as(?usize, 3), d41.candidate_source);
+    try std.testing.expectEqual(@as(f32, 2.0), v41.moe.gate_temp);
+    try std.testing.expectEqual(@as(usize, 4), d41.engram.?.max_ngram);
 }

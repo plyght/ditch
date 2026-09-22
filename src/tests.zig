@@ -12,6 +12,7 @@ comptime {
     _ = @import("model.zig");
     _ = @import("model_test.zig");
     _ = @import("moe.zig");
+    _ = @import("deepseek_v4.zig");
     _ = @import("abliterate.zig");
     _ = @import("directions.zig");
     _ = @import("tpe.zig");
