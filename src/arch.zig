@@ -4830,7 +4830,7 @@ pub const registry = [_]Arch{
     .{
         .model_type = "apertus",
         .llama_cpp = null,
-        .chat = "chatml",
+        .chat = "apertus",
         .verified = true,
         .qk_norm = .head,
         .mlp = .dense,

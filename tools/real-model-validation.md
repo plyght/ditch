@@ -1843,6 +1843,7 @@ layers by range requests. Same comparison as everywhere else, float32.
 | Checkpoint (first N layers) | family | tokens | residuals | first-token logits |
 | --- | --- | :---: | :---: | ---: |
 | mistralai/Ministral-3-3B-Base-2512, N = 4 | `ministral3` | match (raw); template after bug 35 | all 5 agree | 2.02e-06 |
+| swiss-ai/Apertus-8B-Instruct-2509, N = 3 | `apertus` | match (raw); template after bug 36 | all 4 agree | 6.29e-07 |
 
 Ministral 3 covers yarn rope scaling and tied embeddings inside the
 `mistral3` multimodal wrapper; the tokenizer (tekken, as `tokenizer.json`)
@@ -1871,3 +1872,21 @@ V7 template inserts a long model-specific default prompt with the current
 date filled in; ditch always passes a system prompt, so the family does not
 reproduce that. Verified token for token against `apply_chat_template` on two
 system/user pairs, and a unit test covers a multi-turn conversation.
+
+## Bug 36 — Apertus was prompted with ChatML (fixed)
+
+**Symptom.** the registry named `chatml` for `apertus`, and — once bug 32
+added `nanochat`, detected by `<|user_start|>` — Apertus' template matched
+that instead; neither is its format (13 tokens against 28).
+
+**Cause and fix.** Apertus' template is its own:
+`<s><|system_start|>{system}<|system_end|><|developer_start|>Deliberation: disabled\nTool Capabilities: disabled<|developer_end|><|user_start|>{user}<|user_end|><|assistant_start|>`,
+with `<|assistant_end|>` closing a finished assistant turn and contents
+verbatim. It is now the `apertus` family, detected by `<|system_start|>`
+together with `<|developer_start|>` (checked before `nanochat`), and named by
+the registry. Without a system message the template inserts a dated default;
+ditch always passes one. The BOS is the tokenizer's (`add_bos_token`).
+Token for token against `apply_chat_template` on two system/user pairs, and a
+unit test covers a multi-turn conversation. The forward pass itself (xIELU,
+per-head q/k norm) was already exact on the real weights: all 4 residuals of
+the first 3 layers, logits to 6.3e-07; tokenizer 15 of 15.

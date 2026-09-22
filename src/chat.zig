@@ -50,6 +50,9 @@ pub const Template = enum {
     ernie,
     /// Hunyuan (V1 dense): `<｜hy_begin▁of▁sentence｜>{system}<｜hy_place▁holder▁no▁3｜><｜hy_User｜>...<｜hy_Assistant｜>`.
     hunyuan,
+    /// Apertus: `<|system_start|>...<|system_end|><|developer_start|>Deliberation: disabled\n
+    /// Tool Capabilities: disabled<|developer_end|><|user_start|>...<|user_end|><|assistant_start|>`.
+    apertus,
     /// nanochat: `<|user_start|>...<|user_end|><|assistant_start|>`; a system
     /// message is prepended to the first user turn, followed by a blank line.
     nanochat,
@@ -87,6 +90,7 @@ pub fn detect(chat_template: ?[]const u8, model_type: []const u8) Template {
         if (has(t, "<|bom|>")) return .jamba;
         if (has(t, "<\u{ff5c}hy_User\u{ff5c}>")) return .hunyuan;
         if (has(t, "<|begin_of_sentence|>") and has(t, "Assistant: ")) return .ernie;
+        if (has(t, "<|system_start|>") and has(t, "<|developer_start|>")) return .apertus;
         if (has(t, "<|user_start|>")) return .nanochat;
         if (has(t, "</user>") and has(t, "<assistant>")) return .laguna;
         if (has(t, "<|im_middle|>")) return .kimi;
@@ -314,6 +318,36 @@ pub fn render(gpa: Allocator, template: Template, messages: []const Message) ![]
             }
             try w.writeAll("<assistant>\n</think>");
         },
+        .apertus => {
+            // swiss-ai/Apertus-*-Instruct, with deliberation and tools off.
+            // Without a system message the template inserts a dated default,
+            // which ditch, always passing one, leaves out. The BOS comes from
+            // the tokenizer (`add_bos_token`).
+            var i: usize = 0;
+            if (messages.len > 0 and messages[0].role == .system) {
+                try w.print("<|system_start|>{s}<|system_end|>", .{messages[0].content});
+                i = 1;
+            }
+            try w.writeAll("<|developer_start|>Deliberation: disabled\nTool Capabilities: disabled<|developer_end|>");
+            var in_assistant = false;
+            for (messages[i..]) |m| {
+                switch (m.role) {
+                    .system => {},
+                    .user => {
+                        if (in_assistant) try w.writeAll("<|assistant_end|>");
+                        in_assistant = false;
+                        try w.print("<|user_start|>{s}<|user_end|>", .{m.content});
+                    },
+                    .assistant => {
+                        if (!in_assistant) try w.writeAll("<|assistant_start|>");
+                        in_assistant = true;
+                        try w.writeAll(m.content);
+                    },
+                }
+            }
+            if (in_assistant) try w.writeAll("<|assistant_end|>");
+            try w.writeAll("<|assistant_start|>");
+        },
         .nanochat => {
             // Contents verbatim; the template's `bos_token` comes from `templateBos`.
             var system: ?[]const u8 = null;
@@ -518,6 +552,12 @@ test "template detection and rendering" {
     const m7 = try render(gpa, .mistral_v7, &.{ .{ .role = .system, .content = "Sys.\n" }, .{ .role = .user, .content = " Hi " }, .{ .role = .assistant, .content = "Yo" }, .{ .role = .user, .content = "Bye" } });
     defer gpa.free(m7);
     try std.testing.expectEqualStrings("<s>[SYSTEM_PROMPT]Sys.\n[/SYSTEM_PROMPT][INST] Hi [/INST]Yo</s>[INST]Bye[/INST]", m7);
+    // Apertus (swiss-ai/Apertus-8B-Instruct-2509; token-for-token against
+    // apply_chat_template), which also has `<|user_start|>`.
+    try std.testing.expectEqual(Template.apertus, detect("{%- set system_token = '<|system_start|>' -%}{%- set developer_token = '<|developer_start|>' -%}{%- set user_token = '<|user_start|>' -%}", "apertus"));
+    const ap = try render(gpa, .apertus, &.{ .{ .role = .system, .content = "Sys." }, .{ .role = .user, .content = " Hi " }, .{ .role = .assistant, .content = "Yo" }, .{ .role = .user, .content = "Bye" } });
+    defer gpa.free(ap);
+    try std.testing.expectEqualStrings("<|system_start|>Sys.<|system_end|><|developer_start|>Deliberation: disabled\nTool Capabilities: disabled<|developer_end|><|user_start|> Hi <|user_end|><|assistant_start|>Yo<|assistant_end|><|user_start|>Bye<|user_end|><|assistant_start|>", ap);
     // A template that emits the BOS in front of a family that does not.
     try std.testing.expectEqualStrings("<|begin_of_text|>", templateBos("{{bos_token}}\n{%- if tools %}<|im_start|>", "<|begin_of_text|>"));
     try std.testing.expectEqualStrings("", templateBos("{% for m in messages %}<|im_start|>{{ bos_token }}", "<|begin_of_text|>"));
