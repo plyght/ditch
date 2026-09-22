@@ -131,11 +131,76 @@ pub const Mla = struct {
     v_head_dim: usize,
 };
 
-/// Llama 4 attention temperature tuning on layers without RoPE.
-pub const AttnTemperature = struct { floor_scale: f32, attn_scale: f32 };
+/// Position-dependent query scaling `1 + attn_scale * log(floor((pos + offset) / floor_scale) + 1)`:
+/// Llama 4 (offset 1, layers without RoPE only) and Mistral 4 (`llama_4_scaling_beta`,
+/// offset 0, every layer).
+pub const AttnTemperature = struct { floor_scale: f32, attn_scale: f32, offset: f32 = 1.0, all_layers: bool = false };
+
+/// Rotary table of the local (sliding) layers when it differs from the global
+/// one (Gemma 3 family): base, rotated coordinates and the frequency denominator.
+pub const LocalRope = struct { theta: f32, rotary_dim: usize, freq_dim: usize };
 
 /// gpt-oss gated activation: `(clamp(up) + 1) * clamp(gate) * sigmoid(alpha * gate)`.
 pub const Swiglu = struct { alpha: f32, limit: f32 };
+
+/// Kimi K3 SiTU gated activation: `beta · tanh(gate / beta) · sigmoid(gate) · up'`
+/// with `up' = linear_beta · tanh(up / linear_beta)` when `linear_beta` is set.
+pub const Situ = struct { beta: f32, linear_beta: ?f32 };
+/// Selective state-space block flavour of a family's Mamba layers.
+pub const SsmKind = enum {
+    none,
+    /// Mamba2 (SSD): per-head scalar decay, grouped B/C, gated RMSNorm.
+    mamba2,
+    /// Mamba1 (Jamba): per-channel `[N]` decay from `A_log`, `x_proj` /
+    /// `dt_proj` time-step path, RMS-normalised dt/B/C.
+    mamba1,
+};
+
+/// Dimensions of a family's Mamba blocks (all Mamba layers of a model share them).
+pub const SsmDims = struct {
+    kind: SsmKind = .none,
+    /// Mamba2: heads and head size; the inner size is `heads * head_dim`.
+    heads: usize = 0,
+    head_dim: usize = 0,
+    /// Inner (expanded) size of the block.
+    inter: usize = 0,
+    /// State size per head (Mamba2) or per channel (Mamba1).
+    state: usize = 0,
+    /// Mamba2: groups of the B / C projections.
+    groups: usize = 1,
+    conv_kernel: usize = 4,
+    /// Mamba1: rank of the time-step projection.
+    dt_rank: usize = 0,
+    /// Groups of the gated RMSNorm (Nemotron-H, Falcon-H1); 1 normalises the whole vector.
+    norm_groups: usize = 1,
+    /// Whether the gated RMSNorm exists (Falcon-H1 `mamba_rms_norm`); without
+    /// it the scan output is only multiplied by `silu(gate)`.
+    rms_norm: bool = true,
+    /// Normalise before multiplying by the gate (Falcon-H1 `mamba_norm_before_gate`).
+    norm_before_gate: bool = false,
+    /// Clamp of the discretised time step (`time_step_limit`).
+    dt_min: f32 = 0,
+    dt_max: f32 = std.math.inf(f32),
+    /// Activation after the causal convolution.
+    act: tensor.Activation = .silu,
+};
+
+/// Falcon-H1 muP multipliers (all 1 for the other families).
+pub const Multipliers = struct {
+    ssm_in: f32 = 1,
+    ssm_out: f32 = 1,
+    attn_in: f32 = 1,
+    attn_out: f32 = 1,
+    /// Multiplies the key projection.
+    key: f32 = 1,
+    /// Multiplies the value projection (MiMo V2 `attention_value_scale`).
+    value: f32 = 1,
+    /// Multiplies the MLP gate before the activation, and the down projection output.
+    mlp_gate: f32 = 1,
+    mlp_down: f32 = 1,
+    /// Per-section multipliers on the SSM input projection: gate, x, B, C, dt.
+    ssm_proj: [5]f32 = .{ 1, 1, 1, 1, 1 },
+};
 
 pub const MoeConfig = struct {
     scoring: RouterScoring = .softmax,
@@ -150,6 +215,11 @@ pub const MoeConfig = struct {
     /// Expert projections carry biases (gpt-oss).
     expert_bias: bool = false,
     swiglu: ?Swiglu = null,
+    /// SiTU in every gated MLP (dense layers, routed and shared experts; Kimi K3).
+    situ: ?Situ = null,
+    /// Experts (and the shared expert) are plain `down(act(up(x)))` MLPs
+    /// without a gate projection (Nemotron-H).
+    dense_experts: bool = false,
     /// Clamp on the expert pre-activations before the gated activation: the
     /// gate from above, the up projection on both sides (DeepSeek V4).
     swiglu_limit: ?f32 = null,
@@ -292,6 +362,22 @@ pub const Names = struct {
     lin_f_b: []const []const u8 = &.{},
     lin_g_a: ?[]const u8 = null,
     lin_g_b: ?[]const u8 = null,
+    /// Full-rank KDA output gate (Kimi K3 `use_full_rank_gate`), used instead
+    /// of `lin_g_a`/`lin_g_b` when `Config.linear_full_rank_gate` is set.
+    lin_g: ?[]const u8 = null,
+    /// Sigmoid gate on the full-attention output before `o` (Kimi K3 MLA
+    /// `mla_use_output_gate`), read when `Config.mla_output_gate` is set.
+    attn_gate: ?[]const u8 = null,
+    /// Attention Residual (Kimi K3): per layer the RMSNorm and `[1][hidden]`
+    /// score projection of the attention-side and MLP-side aggregations, and
+    /// at model level those of the output aggregation. Lists hold alternative
+    /// spellings (first present wins).
+    attn_res_norm: []const []const u8 = &.{},
+    attn_res_proj: []const []const u8 = &.{},
+    mlp_res_norm: []const []const u8 = &.{},
+    mlp_res_proj: []const []const u8 = &.{},
+    output_res_norm: []const []const u8 = &.{},
+    output_res_proj: []const []const u8 = &.{},
     /// Depthwise causal convolution, time-step bias, decay and gated norm of a
     /// linear-attention layer; its output projection is `lin_out`. Lists hold
     /// the alternatives of families whose checkpoints and Hugging Face
@@ -304,6 +390,12 @@ pub const Names = struct {
     lin_a_log: []const []const u8 = &.{},
     lin_norm: ?[]const u8 = null,
     lin_out: ?[]const u8 = null,
+    /// Prefix of a Mamba block inside the layer (`mixer.`, `mamba.`). The
+    /// tensor names below it are the Hugging Face ones shared by every
+    /// family: `in_proj`, `conv1d`, `dt_bias`, `A_log`, `D`, `norm`,
+    /// `out_proj` and, for Mamba1, `x_proj`, `dt_proj`, `dt_layernorm`,
+    /// `b_layernorm`, `c_layernorm`.
+    ssm: ?[]const u8 = null,
     /// MiniMax lightning attention: fused `[heads][q | k | v]` projection,
     /// sigmoid output gate, RMSNorm over `heads * head_dim` and the output
     /// projection (loaded into `Layer.o`).
@@ -344,10 +436,45 @@ pub const Names = struct {
     /// Fused `[2I][H]` gate/up tensor of the shared expert (GraniteMoeShared
     /// `input_linear`, MiniMax M3 `gate_up_proj`), relative to `shared_expert`.
     shared_gate_up: ?[]const u8 = null,
+    /// Latent MoE (Kimi K3 `routed_expert_hidden_size`): the routed experts
+    /// read `latent_down(x)` (`[latent][hidden]`) and their weighted sum,
+    /// optionally RMS-normalised by `latent_norm`, is written back through
+    /// `latent_up` (`[hidden][latent]`). Names are relative to the layer.
+    latent_down: ?[]const u8 = null,
+    latent_up: ?[]const u8 = null,
+    latent_norm: ?[]const u8 = null,
     /// Alternative MoE names (router, experts, shared expert) of checkpoints
     /// that predate the family's Hugging Face module layout; picked when the
     /// primary router tensor is absent and this one's is present.
     moe_alt: ?*const Names = null,
+    /// Gated short convolution of LFM2 conv layers; its output projection is
+    /// `conv_out` (loaded into the layer's `o` slot).
+    conv_in: ?[]const u8 = null,
+    conv_kernel: ?[]const u8 = null,
+    conv_out: ?[]const u8 = null,
+    /// Per-layer input embeddings (Gemma 3n / 4): the packed
+    /// `[vocab][layers * dim]` table, its projection from the token embedding,
+    /// the projection norm and the per-layer gate / output projection / norm.
+    ple_embed: ?[]const u8 = null,
+    ple_proj: ?[]const u8 = null,
+    ple_proj_norm: ?[]const u8 = null,
+    ple_gate: ?[]const u8 = null,
+    ple_out: ?[]const u8 = null,
+    ple_norm: ?[]const u8 = null,
+    /// Per-layer output scalar (Gemma 4 `layer_scalar`, optional in checkpoints).
+    layer_scale: ?[]const u8 = null,
+    /// AltUp (Gemma 3n): `{e}` indexes the `altup_num_inputs - 1` projections.
+    altup_proj: ?[]const u8 = null,
+    altup_unembed: ?[]const u8 = null,
+    altup_router: ?[]const u8 = null,
+    altup_router_norm: ?[]const u8 = null,
+    altup_predict: ?[]const u8 = null,
+    altup_correct: ?[]const u8 = null,
+    altup_scale: ?[]const u8 = null,
+    /// Learned augmented residual (Gemma 3n).
+    laurel_l: ?[]const u8 = null,
+    laurel_r: ?[]const u8 = null,
+    laurel_norm: ?[]const u8 = null,
 };
 
 /// One architecture family.
@@ -377,6 +504,14 @@ pub const Arch = struct {
     tie_word_embeddings: bool = false,
     embed_scale_sqrt: bool = false,
     qk_norm: QkNorm = .none,
+    /// Mamba block flavour of the family's state-space layers.
+    ssm: SsmKind = .none,
+    /// Every layer holds exactly one block (Mamba, attention, MLP or MoE)
+    /// behind one norm (Mamba2, Nemotron-H); `layer_types` names the block.
+    single_mixer: bool = false,
+    /// Every layer runs a Mamba block and attention side by side on the same
+    /// normalised input and sums them (Falcon-H1).
+    parallel_ssm: bool = false,
     /// Recurrence of the family's `linear_attention` layers, if it has any.
     linear: LinearKind = .gated_deltanet,
     /// Family-specific config keys.
@@ -398,13 +533,49 @@ pub const Config = struct {
     /// Norm epsilon (RMSNorm or LayerNorm).
     rms_norm_eps: f32,
     rope_theta: f32,
-    rope_local_theta: f32,
     rope_scaling: RopeScaling,
     /// Rotated coordinates per head (`<= head_dim`).
     rotary_dim: usize,
+    /// Denominator of the frequency exponents: `rotary_dim`, or the full head
+    /// size when only a proportion of it rotates (Gemma 4 "proportional" RoPE).
+    rope_freq_dim: usize,
+    /// Separate rotary table of the sliding layers (Gemma 3 family); null when
+    /// every layer uses the global table.
+    rope_local: ?LocalRope,
     rope_style: RopeStyle,
     /// Per layer: whether rotary embeddings are applied.
     rope_layers: []bool,
+    /// Per layer: head size, KV heads and attention scale. Equal to `head_dim`,
+    /// `num_kv_heads` and `attention_scale` except on Gemma 4, whose global
+    /// layers use a larger head.
+    layer_head_dim: []usize,
+    layer_kv_heads: []usize,
+    layer_attn_scale: []f32,
+    /// Per layer: the layer whose keys/values this layer attends over (itself
+    /// unless the layer is KV-shared, Gemma 3n / 4).
+    kv_source: []usize,
+    /// Weightless per-head RMS norm on the values (Gemma 3n / 4).
+    v_norm: bool,
+    /// A layer without `v_proj` reuses its key projection as values (Gemma 4 `attention_k_eq_v`).
+    k_eq_v: bool,
+    /// Per-layer input embeddings (Gemma 3n / 4): width per layer (0 = none) and vocabulary.
+    ple_dim: usize,
+    ple_vocab: usize,
+    /// AltUp (Gemma 3n): number of residual streams (0 = none), the active one,
+    /// and whether the corrected active stream is scaled before the per-layer gate.
+    altup_inputs: usize,
+    altup_active: usize,
+    altup_correct_scale: bool,
+    laurel_rank: usize,
+    /// Per layer: gate activation sparsity (Gemma 3n `activation_sparsity_pattern`); 0 = dense.
+    activation_sparsity: []f32,
+    /// The layers' feed-forward widths differ (Gemma 3n per-layer sizes,
+    /// Gemma 4 double-wide MLPs); `intermediate_size` is then the largest.
+    intermediate_varies: bool,
+    /// Per layer: true for gated short-convolution layers (LFM2).
+    conv_layers: []bool,
+    has_conv: bool,
+    conv_kernel: usize,
     positional: Positional,
     /// Per layer: true for Gated DeltaNet linear-attention layers (Qwen
     /// hybrids); false for full-attention layers.
@@ -419,6 +590,38 @@ pub const Config = struct {
     linear_v_heads: usize,
     linear_v_dim: usize,
     linear_conv_kernel: usize,
+    /// KDA output gate is one full-rank projection (`g_proj`) instead of the
+    /// low-rank `g_a`/`g_b` pair (Kimi K3).
+    linear_full_rank_gate: bool = false,
+    /// KDA "safe" forget gate (Kimi K3 `gate_lower_bound`): the per-channel
+    /// log-decay is `lower_bound · sigmoid(exp(A_log) · (f + dt_bias))`
+    /// instead of `-exp(A_log) · softplus(f + dt_bias)`.
+    linear_gate_lower_bound: ?f32 = null,
+    /// Full-attention (MLA) output is multiplied by `sigmoid(g_proj(h))` before
+    /// the output projection (Kimi K3 `mla_use_output_gate`).
+    mla_output_gate: bool = false,
+    /// Attention Residual block size (Kimi K3 `attn_res_block_size`; 0 = a
+    /// plain accumulated residual stream). See `model.zig` (`layerBlockAttnRes`).
+    attn_res_block: usize = 0,
+    /// Latent MoE width (Kimi K3 `routed_expert_hidden_size`; 0 = the routed
+    /// experts read and write `hidden_size` directly) and whether the summed
+    /// latent output is RMS-normalised before the up projection.
+    moe_latent: usize = 0,
+    moe_latent_norm: bool = false,
+    /// Per layer: true for Mamba (selective state-space) layers; their block
+    /// dimensions are in `ssm`.
+    ssm_layers: []bool,
+    has_ssm: bool,
+    ssm: SsmDims,
+    /// Per layer: true if the layer has a full-attention block (false for
+    /// Mamba / linear-attention layers and for the MLP-only layers of
+    /// single-block families).
+    attn_layers: []bool,
+    /// Per layer: true if the layer has an MLP or MoE block.
+    mlp_layers: []bool,
+    /// Mamba block and attention run in parallel on the same input (Falcon-H1).
+    parallel_ssm: bool,
+    mult: Multipliers,
     /// Full-attention `q_proj` carries q rows then gate rows; the gate
     /// (sigmoid, or silu when `gate_swish`) multiplies the attention output.
     gated_attention: bool,
@@ -459,13 +662,9 @@ pub const Config = struct {
     /// Sinks exist only on sliding-window layers (MiMo V2): `sinks` then
     /// requires them there and tolerates their absence on full layers.
     sinks_sliding_only: bool,
-    /// Multiplier on the value vectors before attention (MiMo V2 `attention_value_scale`).
-    value_scale: f32,
-    /// Sliding-window layers rotate with `rope_local_theta` instead of `rope_theta`.
-    sliding_rope_local: bool,
-    /// Per layer: key/value heads. `num_kv_heads` is the largest of them and
-    /// the KV cache stride; families with one value have it on every layer.
-    layer_kv_heads: []usize,
+    /// Values are narrower than the keys outside MLA (MiMo V2 `v_head_dim`):
+    /// `layerVDim` is then `v_head_dim` rather than the layer's head size.
+    narrow_values: bool,
     /// Layout of the optional fused `names.qkv` tensor of a family whose
     /// primary layout is separate q/k/v (MiMo V2 Pro checkpoints): a layer
     /// that has the fused tensor and no `q_proj` is read from it.
@@ -492,8 +691,33 @@ pub const Config = struct {
         return self.norm == .rms_gemma;
     }
 
+    /// Width of one KV cache row: the largest `kv_heads * head_dim` of any layer.
     pub fn kvDim(self: *const Config) usize {
-        return self.num_kv_heads * self.head_dim;
+        var d: usize = self.num_kv_heads * self.head_dim;
+        for (self.layer_kv_heads, self.layer_head_dim) |kvh, hd| d = @max(d, kvh * hd);
+        return d;
+    }
+
+    /// Largest query width `heads * head_dim` of any layer.
+    pub fn maxQDim(self: *const Config) usize {
+        var d: usize = self.num_heads * self.head_dim;
+        for (self.layer_head_dim) |hd| d = @max(d, self.num_heads * hd);
+        return d;
+    }
+
+    /// Value width of layer `li`.
+    pub fn layerVDim(self: *const Config, li: usize) usize {
+        return if (self.mla != null or self.narrow_values) self.v_head_dim else self.layer_head_dim[li];
+    }
+
+    /// True when layer `li` reads another layer's keys and values.
+    pub fn kvShared(self: *const Config, li: usize) bool {
+        return self.kv_source[li] != li;
+    }
+
+    /// Any layer keeps a recurrent state (linear attention, Mamba or a short convolution).
+    pub fn hasRecurrent(self: *const Config) bool {
+        return self.has_linear or self.has_ssm or self.has_conv;
     }
 };
 
@@ -598,13 +822,13 @@ pub fn lookup(model_type: []const u8) ?*const Arch {
 
 fn rejectKnownHybrid(model_type: []const u8) !void {
     const table = .{
-        .{ "kimi_k3", "Kimi K3 (AttnRes is not implemented yet)" },
         .{ "kimi_k2", "Kimi K2 (use the kimi_k25 wrapper config or a deepseek_v3 config; the standalone kimi_k2 model_type is untested)" },
         .{ "qwen4_exp", "Qwen3.8-Flash-Next hybrid (linear attention with sparse indexer and hyper-connections)" },
         .{ "qwen4_exp_text", "Qwen3.8-Flash-Next hybrid (linear attention with sparse indexer and hyper-connections)" },
         .{ "glm5_next", "GLM-5.3-Flash hybrid (linear attention with sparse indexer and hyper-connections)" },
         .{ "glm5_next_text", "GLM-5.3-Flash hybrid (linear attention with sparse indexer and hyper-connections)" },
         .{ "glm_moe_lite", "GLM-4.7-Flash (not yet verified against a reference forward pass)" },
+        .{ "lfm2_moe", "LFM2-MoE (short-convolution hybrid with sigmoid-routed experts, not yet verified against a reference forward pass)" },
     };
     inline for (table) |e| {
         if (std.mem.eql(u8, model_type, e[0])) {
@@ -628,19 +852,72 @@ fn rejectUnsupportedMath(top: std.json.ObjectMap, obj: std.json.ObjectMap) !dequ
     return quant;
 }
 
+/// Replaces the bare `Infinity`, `-Infinity` and `NaN` literals Python's
+/// json module writes (Mamba `time_step_limit`) with `null`, which JSON and
+/// std.json accept; string contents are left alone.
+pub fn sanitizeJson(arena: Allocator, text: []const u8) ![]const u8 {
+    if (std.mem.indexOf(u8, text, "Infinity") == null and std.mem.indexOf(u8, text, "NaN") == null) return text;
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var i: usize = 0;
+    var in_string = false;
+    while (i < text.len) {
+        const ch = text[i];
+        if (in_string) {
+            try out.writer.writeByte(ch);
+            if (ch == '\\' and i + 1 < text.len) {
+                try out.writer.writeByte(text[i + 1]);
+                i += 2;
+                continue;
+            }
+            if (ch == '"') in_string = false;
+            i += 1;
+            continue;
+        }
+        if (ch == '"') {
+            in_string = true;
+        } else if (std.mem.startsWith(u8, text[i..], "-Infinity")) {
+            try out.writer.writeAll("null");
+            i += "-Infinity".len;
+            continue;
+        } else if (std.mem.startsWith(u8, text[i..], "Infinity")) {
+            try out.writer.writeAll("null");
+            i += "Infinity".len;
+            continue;
+        } else if (std.mem.startsWith(u8, text[i..], "NaN")) {
+            try out.writer.writeAll("null");
+            i += "NaN".len;
+            continue;
+        }
+        try out.writer.writeByte(ch);
+        i += 1;
+    }
+    return out.toOwnedSlice();
+}
+
 pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
-    var parsed = try std.json.parseFromSlice(std.json.Value, arena, json_text, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena, try sanitizeJson(arena, json_text), .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidConfig;
     var obj = parsed.value.object;
     const top_type = getStr(obj, "model_type") orelse "llama";
     var model_type = top_type;
     // Multimodal wrappers keep the text config nested.
+    var arch_opt: ?*const Arch = null;
     if (getObj(obj, "text_config")) |tc| {
         obj = tc;
         if (getStr(obj, "model_type")) |m| model_type = m;
-    }
-    const arch = lookup(model_type) orelse lookup(top_type) orelse {
+        arch_opt = lookup(model_type);
+        // A wrapper with its own entry wins over the family of its text
+        // config: Kimi K3 nests a `kimi_linear` config but adds AttnRes,
+        // latent MoE and SiTU on top of it.
+        if (lookup(top_type)) |ta| {
+            if (arch_opt == null or ta != arch_opt.?) {
+                arch_opt = ta;
+                model_type = top_type;
+            }
+        }
+    } else arch_opt = lookup(model_type);
+    const arch = arch_opt orelse {
         try rejectKnownHybrid(model_type);
         try rejectKnownHybrid(top_type);
         _ = try rejectUnsupportedMath(parsed.value.object, obj);
@@ -657,8 +934,19 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
     const attn_cfg: std.json.ObjectMap = getObj(obj, "attn_config") orelse obj;
 
     const hidden = getIntAny(obj, &.{ "hidden_size", "n_embd", "d_model" }, 0);
-    const heads = getIntAny(obj, &.{ "num_attention_heads", "n_head", "n_heads" }, 0);
-    const layers = getIntAny(obj, &.{ "num_hidden_layers", "n_layer", "n_layers", "num_layers" }, 0);
+    var heads = getIntAny(obj, &.{ "num_attention_heads", "n_head", "n_heads" }, 0);
+    var layers = getIntAny(obj, &.{ "num_hidden_layers", "n_layer", "n_layers", "num_layers" }, 0);
+    // Block-type lists (Nemotron-H `layers_block_type`) or a hybrid pattern
+    // string define the depth when there is no explicit layer count.
+    const block_types: ?std.json.Value = obj.get("layer_types") orelse obj.get("layers_block_type");
+    if (layers == 0) {
+        if (block_types) |bt| {
+            if (bt == .array) layers = bt.array.items.len;
+        } else if (getStr(obj, "hybrid_override_pattern")) |pat| layers = pat.len;
+    }
+    // A pure state-space model has no attention heads; the attention
+    // dimensions are then placeholders (the KV cache stays empty).
+    if (heads == 0 and arch.ssm != .none) heads = 1;
     if (hidden == 0 or heads == 0 or layers == 0) return error.InvalidConfig;
     var kv_heads = getIntAny(obj, &.{ "num_key_value_heads", "num_kv_heads", "n_head_kv", "multi_query_group_num" }, heads);
     if (attn_cfg.get("kv_n_heads") != null) kv_heads = getInt(attn_cfg, "kv_n_heads", heads);
@@ -685,22 +973,39 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
 
     const act_name = getStr(obj, "hidden_activation") orelse getStr(obj, "hidden_act") orelse getStr(obj, "activation_function") orelse "";
     var act = arch.activation;
-    if (act_name.len > 0) {
+    var situ: ?Situ = null;
+    if (std.mem.eql(u8, act_name, "situ")) {
+        // Kimi K3: SiTU in the gated MLPs; the KDA convolution keeps its silu.
+        situ = .{ .beta = getF32(obj, "activation_situ_beta", 1.0), .linear_beta = if (getNum(obj, "activation_situ_linear_beta")) |b| @as(f32, @floatCast(b)) else null };
+        act = .silu;
+    } else if (act_name.len > 0) {
         if (parseActivation(act_name)) |a| act = a else std.log.warn("unknown activation '{s}'; using {s}", .{ act_name, @tagName(act) });
     }
 
     const max_pos = getIntAny(obj, &.{ "max_position_embeddings", "n_positions", "max_seq_len", "seq_length" }, 4096);
-    const rope_theta = getF32Any(obj, &.{ "rope_theta", "rotary_emb_base", "rope_base" }, 10000.0);
+    // Newer configs keep the base and the scaling together in `rope_parameters`
+    // (a per-layer-type table on the Gemma 3 family, handled by its hook).
+    const rope_params: ?std.json.ObjectMap = blk: {
+        const rp = getObj(obj, "rope_parameters") orelse break :blk null;
+        break :blk if (getObj(rp, "full_attention") != null or getObj(rp, "sliding_attention") != null) null else rp;
+    };
+    const rs_obj: ?std.json.ObjectMap = getObj(obj, "rope_scaling") orelse rope_params;
+    var rope_theta = getF32Any(obj, &.{ "rope_theta", "rotary_emb_base", "rope_base" }, 10000.0);
+    if (getNum(obj, "rope_theta") == null) if (rope_params) |rp| {
+        rope_theta = getF32(rp, "rope_theta", rope_theta);
+    };
     var rotary_dim = head_dim;
     if (getNum(obj, "partial_rotary_factor")) |f| rotary_dim = @intFromFloat(@as(f64, @floatFromInt(head_dim)) * f);
     if (getNum(obj, "rotary_pct")) |f| rotary_dim = @intFromFloat(@as(f64, @floatFromInt(head_dim)) * f);
+    if (getNum(obj, "partial_rotary_factor") == null and mla == null) if (rope_params) |rp| {
+        if (getNum(rp, "partial_rotary_factor")) |f| rotary_dim = @intFromFloat(@as(f64, @floatFromInt(head_dim)) * f);
+    };
     // MiniMax checkpoints express partial rotary as an absolute `rotary_dim`.
     if (getNum(obj, "rotary_dim") != null) rotary_dim = @min(getInt(obj, "rotary_dim", head_dim), head_dim);
     if (mla) |m| rotary_dim = m.qk_rope_head_dim;
     rotary_dim -= rotary_dim % 2;
 
-    var rope_scaling: RopeScaling = .none;
-    if (getObj(obj, "rope_scaling")) |rs| rope_scaling = try parseRopeScaling(arena, obj, rs, rotary_dim, max_pos);
+    const rope_scaling: RopeScaling = if (rs_obj) |rs| try parseRopeScaling(arena, obj, rs, rotary_dim, max_pos) else .none;
 
     const sliding_window: ?usize = blk: {
         const v = obj.get("sliding_window") orelse break :blk null;
@@ -713,9 +1018,22 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
     @memset(sliding_layers, false);
     const linear_layers = try arena.alloc(bool, layers);
     @memset(linear_layers, false);
+    const conv_layers = try arena.alloc(bool, layers);
+    @memset(conv_layers, false);
     var has_linear = false;
-    if (obj.get("layer_types")) |lt| {
+    // Mamba families: `linear_attention` (or the legacy `mamba`) marks a
+    // state-space layer; single-block families also name `mlp` / `moe` layers.
+    const ssm_layers = try arena.alloc(bool, layers);
+    @memset(ssm_layers, false);
+    const mlp_only = try arena.alloc(bool, layers);
+    @memset(mlp_only, false);
+    const moe_only = try arena.alloc(bool, layers);
+    @memset(moe_only, false);
+    var has_conv = false;
+    var has_block_types = false;
+    if (block_types) |lt| {
         if (lt == .array) {
+            has_block_types = true;
             for (lt.array.items, 0..) |v, i| {
                 if (i < layers and v == .string) {
                     const t = v.string;
@@ -725,10 +1043,26 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
                         // DeepSeek V4 / V4.1: a sliding window plus a compressed
                         // branch (read again by the family hook).
                         sliding_layers[i] = true;
-                    } else if (std.mem.eql(u8, t, "linear_attention")) {
-                        linear_layers[i] = true;
-                        has_linear = true;
-                    } else if (std.mem.eql(u8, t, "full_attention") or std.mem.eql(u8, t, "attention")) {} else if (std.mem.eql(u8, t, "deepseek_sparse_attention")) {
+                    } else if (std.mem.eql(u8, t, "linear_attention") or std.mem.eql(u8, t, "mamba")) {
+                        if (arch.ssm != .none) {
+                            ssm_layers[i] = true;
+                        } else if (std.mem.eql(u8, t, "mamba")) {
+                            std.log.err("unsupported layer type 'mamba' in a {s} model", .{model_type});
+                            return error.UnsupportedArchitecture;
+                        } else {
+                            linear_layers[i] = true;
+                            has_linear = true;
+                        }
+                    } else if (std.mem.eql(u8, t, "conv")) {
+                        conv_layers[i] = true;
+                        has_conv = true;
+                    } else if (std.mem.eql(u8, t, "full_attention") or std.mem.eql(u8, t, "attention")) {} else if (std.mem.eql(u8, t, "mlp") or std.mem.eql(u8, t, "moe")) {
+                        if (!arch.single_mixer) {
+                            std.log.err("unsupported layer type '{s}' in a {s} model", .{ t, model_type });
+                            return error.UnsupportedArchitecture;
+                        }
+                        if (t[1] == 'l') mlp_only[i] = true else moe_only[i] = true;
+                    } else if (std.mem.eql(u8, t, "deepseek_sparse_attention")) {
                         // Zhipu's sparse indexer selects a top-k over the keys; for
                         // the short calibration contexts ditch scores, the top-k
                         // covers the whole context, so dense attention is exact.
@@ -743,7 +1077,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
                             std.log.warn("minimax_m3_sparse runs as dense attention (exact while the context fits index_topk_blocks blocks)", .{});
                         }
                     } else {
-                        std.log.err("unsupported layer type '{s}' (only full/sliding/linear attention are implemented)", .{t});
+                        std.log.err("unsupported layer type '{s}' (only full/sliding/linear attention, conv, Mamba, mlp and moe blocks are implemented)", .{t});
                         return error.UnsupportedArchitecture;
                     }
                 }
@@ -792,7 +1126,34 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
             }
         }
     }
-    const intermediate_size = getIntAny(obj, &.{ "intermediate_size", "n_inner", "ffn_dim", "ffn_hidden_size" }, 0);
+    // `intermediate_size` may be a per-layer list (Gemma 3n); the weights carry
+    // the exact sizes and the largest one sizes the workspace.
+    var intermediate_size = getIntAny(obj, &.{ "intermediate_size", "n_inner", "ffn_dim", "ffn_hidden_size" }, 0);
+    var intermediate_varies = false;
+    if (obj.get("intermediate_size")) |isz| {
+        if (isz == .array) for (isz.array.items) |v| {
+            if (v == .integer and v.integer > 0) {
+                const n: usize = @intCast(v.integer);
+                if (intermediate_size != 0 and n != intermediate_size) intermediate_varies = true;
+                intermediate_size = @max(intermediate_size, n);
+            }
+        };
+    }
+
+    // Which blocks each layer holds. Single-block families take the MLP /
+    // MoE layers from the block-type list (the sparse-step rule above does
+    // not apply to them); families without a list fill these in their hook.
+    const attn_layers = try arena.alloc(bool, layers);
+    const mlp_layers = try arena.alloc(bool, layers);
+    for (0..layers) |i| {
+        attn_layers[i] = !linear_layers[i] and !ssm_layers[i] and !mlp_only[i] and !moe_only[i];
+        mlp_layers[i] = if (arch.single_mixer) (mlp_only[i] or moe_only[i]) else true;
+        if (arch.single_mixer and has_block_types) moe_layers[i] = moe_only[i];
+    }
+    if (arch.parallel_ssm) {
+        @memset(ssm_layers, true);
+        @memset(attn_layers, true);
+    }
 
     const linear_k_heads = getInt(obj, "linear_num_key_heads", 0);
     const linear_k_dim = getInt(obj, "linear_key_head_dim", 0);
@@ -809,10 +1170,17 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
 
     const rope_layers = try arena.alloc(bool, layers);
     @memset(rope_layers, arch.positional == .rope);
-    // Filled by the family hook for families with per-layer kv heads; 0 =
-    // the model-wide `num_kv_heads` (resolved after the hook).
+    // Per-layer geometry: a hook may set individual layers (Gemma 4); the rest
+    // follow the model-level values once every hook has run.
+    const layer_head_dim = try arena.alloc(usize, layers);
+    @memset(layer_head_dim, 0);
     const layer_kv_heads = try arena.alloc(usize, layers);
     @memset(layer_kv_heads, 0);
+    const layer_attn_scale = try arena.alloc(f32, layers);
+    const kv_source = try arena.alloc(usize, layers);
+    for (kv_source, 0..) |*s, i| s.* = i;
+    const activation_sparsity = try arena.alloc(f32, layers);
+    @memset(activation_sparsity, 0);
 
     var c = Config{
         .arch = arch,
@@ -828,11 +1196,29 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         .vocab_size = getIntAny(obj, &.{ "vocab_size", "padded_vocab_size" }, 0),
         .rms_norm_eps = getF32Any(obj, &.{ "rms_norm_eps", "layer_norm_eps", "layer_norm_epsilon", "layernorm_epsilon", "norm_eps", "norm_epsilon" }, if (arch.norm == .rms or arch.norm == .rms_gemma) 1e-6 else 1e-5),
         .rope_theta = rope_theta,
-        .rope_local_theta = getF32(obj, "rope_local_base_freq", 10000.0),
         .rope_scaling = rope_scaling,
         .rotary_dim = rotary_dim,
+        .rope_freq_dim = rotary_dim,
+        .rope_local = null,
         .rope_style = arch.rope_style,
         .rope_layers = rope_layers,
+        .layer_head_dim = layer_head_dim,
+        .layer_kv_heads = layer_kv_heads,
+        .layer_attn_scale = layer_attn_scale,
+        .kv_source = kv_source,
+        .v_norm = false,
+        .k_eq_v = false,
+        .ple_dim = 0,
+        .ple_vocab = 0,
+        .altup_inputs = 0,
+        .altup_active = 0,
+        .altup_correct_scale = true,
+        .laurel_rank = 0,
+        .activation_sparsity = activation_sparsity,
+        .intermediate_varies = intermediate_varies,
+        .conv_layers = conv_layers,
+        .has_conv = has_conv,
+        .conv_kernel = getInt(obj, "conv_L_cache", 0),
         .positional = arch.positional,
         .linear_layers = linear_layers,
         .has_linear = has_linear,
@@ -842,6 +1228,13 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         .linear_v_heads = linear_v_heads,
         .linear_v_dim = linear_v_dim,
         .linear_conv_kernel = linear_conv_kernel,
+        .ssm_layers = ssm_layers,
+        .has_ssm = false,
+        .ssm = .{},
+        .attn_layers = attn_layers,
+        .mlp_layers = mlp_layers,
+        .parallel_ssm = arch.parallel_ssm,
+        .mult = .{},
         .gated_attention = false,
         .gate_swish = gate_swish,
         .position_offset = 0,
@@ -870,9 +1263,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         .attn_temperature = null,
         .sinks = false,
         .sinks_sliding_only = false,
-        .value_scale = 1.0,
-        .sliding_rope_local = false,
-        .layer_kv_heads = layer_kv_heads,
+        .narrow_values = false,
         .qkv_alt = null,
         .qkv_chunks = 0,
         .mla = mla,
@@ -881,7 +1272,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         .norm_topk_prob = getBool(obj, "norm_topk_prob", false),
         .moe_intermediate_size = getInt(obj, "moe_intermediate_size", if (intermediate_size > 0) intermediate_size else 4 * hidden),
         .moe_layers = moe_layers,
-        .moe = .{},
+        .moe = .{ .situ = situ },
         .hc_mult = 1,
         .dsv4 = null,
     };
@@ -894,7 +1285,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         c.attention_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(m.qk_nope_head_dim + m.qk_rope_head_dim)));
         if (rope_scaling == .yarn) {
             // DeepSeek scales the softmax by mscale² (mscale_all_dim).
-            if (getObj(obj, "rope_scaling")) |rs| {
+            if (rs_obj) |rs| {
                 const all_dim = getF32(rs, "mscale_all_dim", 0);
                 if (all_dim != 0) {
                     const ms = yarnMscale(rope_scaling.yarn.factor, all_dim);
@@ -912,10 +1303,30 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
     }
     if (getBool(attn_cfg, "alibi", false)) c.positional = .alibi;
     if (arch.extra) |f| try f(&c, arena, obj);
-    for (c.layer_kv_heads) |*k| {
-        if (k.* == 0) k.* = c.num_kv_heads;
-        if (k.* == 0 or c.num_heads % k.* != 0) return error.InvalidConfig;
-        c.num_kv_heads = @max(c.num_kv_heads, k.*);
+    // Hooks may mark linear / Mamba layers after the fact (Kimi Linear's
+    // kda_layers, the Jamba periods): those layers hold no attention block
+    // unless the family runs both side by side.
+    for (0..layers) |i| c.attn_layers[i] = c.attn_layers[i] and !c.linear_layers[i] and !c.conv_layers[i] and (!c.ssm_layers[i] or c.parallel_ssm);
+    for (c.ssm_layers) |s| c.has_ssm = c.has_ssm or s;
+    if (c.has_ssm) {
+        if (c.ssm.kind != arch.ssm) return error.InvalidConfig;
+        const d = &c.ssm;
+        if (d.inter == 0 or d.state == 0 or d.conv_kernel == 0 or (d.kind == .mamba2 and (d.heads == 0 or d.head_dim == 0 or d.groups == 0 or d.heads % d.groups != 0 or d.heads * d.head_dim != d.inter)) or (d.kind == .mamba1 and d.dt_rank == 0)) {
+            std.log.err("inconsistent Mamba block dimensions in config.json", .{});
+            return error.InvalidConfig;
+        }
+        if (d.norm_groups == 0 or d.inter % d.norm_groups != 0) return error.InvalidConfig;
+    }
+    @memset(c.layer_attn_scale, c.attention_scale);
+    for (c.layer_head_dim, c.layer_kv_heads) |*hd_l, *kv_l| {
+        if (hd_l.* == 0) hd_l.* = c.head_dim;
+        if (kv_l.* == 0) kv_l.* = c.num_kv_heads;
+    }
+    // Only the Gemma tables derive frequencies from a wider head than they rotate.
+    if (c.rope_local == null) c.rope_freq_dim = c.rotary_dim;
+    if (c.has_conv and c.conv_kernel < 2) {
+        std.log.err("conv layers need conv_L_cache >= 2", .{});
+        return error.InvalidConfig;
     }
     if (c.has_linear and c.linear_kind != .lightning and (c.linear_k_heads == 0 or c.linear_k_dim == 0 or c.linear_v_heads == 0 or c.linear_v_dim == 0 or c.linear_conv_kernel == 0)) {
         std.log.err("linear_attention layers need linear_num_key_heads/key_head_dim/num_value_heads/value_head_dim/conv_kernel_dim", .{});
@@ -994,12 +1405,91 @@ fn parseRopeScaling(arena: Allocator, obj: std.json.ObjectMap, rs: std.json.Obje
         }
     } else if (std.mem.eql(u8, t, "dynamic")) {
         std.log.warn("dynamic NTK rope scaling is treated as unscaled RoPE (exact below the original context length)", .{});
+    } else if (std.mem.eql(u8, t, "proportional")) {
+        // Gemma 4: a proportion of the head rotates with frequencies derived
+        // from the full head (the family hook sets the dims); `factor`
+        // divides the frequencies like linear scaling.
+        const factor = getF32(rs, "factor", 1);
+        if (factor != 1) result = .{ .linear = factor };
     } else if (std.mem.eql(u8, t, "mrope") or std.mem.eql(u8, t, "default") or t.len == 0) {
         // mrope over text-only positions equals plain RoPE.
     } else {
         std.log.warn("rope scaling type '{s}' is not supported; using unscaled RoPE", .{t});
     }
     return result;
+}
+
+fn evenDim(x: f64) usize {
+    var d: usize = @intFromFloat(x);
+    d -= d % 2;
+    return d;
+}
+
+/// Rotary tables of the Gemma 3 family: the global layers' base and scaling
+/// (`rope_theta` / `rope_scaling`, or `rope_parameters.full_attention`) and the
+/// sliding layers' own base (`rope_local_base_freq` or
+/// `rope_parameters.sliding_attention`). `hd_local` / `hd_global` are the head
+/// sizes of the two layer kinds.
+fn gemmaRope(c: *Config, arena: Allocator, obj: std.json.ObjectMap, hd_local: usize, hd_global: usize) !void {
+    var local_theta = getF32(obj, "rope_local_base_freq", 10000.0);
+    var local_dim = hd_local;
+    var global_dim = hd_global;
+    var freq_dim = hd_global;
+    if (getNum(obj, "partial_rotary_factor")) |f| {
+        local_dim = evenDim(@as(f64, @floatFromInt(hd_local)) * f);
+        global_dim = evenDim(@as(f64, @floatFromInt(hd_global)) * f);
+        freq_dim = global_dim;
+    }
+    if (getObj(obj, "rope_parameters")) |rp| {
+        if (getObj(rp, "full_attention")) |full| {
+            c.rope_theta = getF32(full, "rope_theta", c.rope_theta);
+            c.rope_scaling = try parseRopeScaling(arena, obj, full, global_dim, c.max_position_embeddings);
+            const t = getStr(full, "rope_type") orelse "default";
+            if (getNum(full, "partial_rotary_factor")) |f| {
+                if (std.mem.eql(u8, t, "proportional")) {
+                    // `int(f * head_dim // 2)` angles; the frequencies follow the full head.
+                    global_dim = 2 * @as(usize, @intFromFloat(@floor(@as(f64, @floatFromInt(hd_global)) * f / 2.0)));
+                    freq_dim = hd_global;
+                } else {
+                    global_dim = evenDim(@as(f64, @floatFromInt(hd_global)) * f);
+                    freq_dim = global_dim;
+                }
+            } else if (std.mem.eql(u8, t, "proportional")) {
+                freq_dim = hd_global;
+            }
+        }
+        if (getObj(rp, "sliding_attention")) |sl| {
+            local_theta = getF32(sl, "rope_theta", local_theta);
+            if (getNum(sl, "partial_rotary_factor")) |f| local_dim = evenDim(@as(f64, @floatFromInt(hd_local)) * f);
+        }
+    }
+    c.rotary_dim = global_dim;
+    c.rope_freq_dim = freq_dim;
+    c.rope_local = .{ .theta = local_theta, .rotary_dim = local_dim, .freq_dim = local_dim };
+}
+
+/// The last `num_kv_shared_layers` layers read the keys and values of the last
+/// non-shared layer of their kind (sliding or global) instead of computing their own.
+fn kvSharing(c: *Config, obj: std.json.ObjectMap) !void {
+    const n = getInt(obj, "num_kv_shared_layers", 0);
+    if (n == 0 or n >= c.num_layers) return;
+    const first = c.num_layers - n;
+    for (first..c.num_layers) |i| {
+        var j = first;
+        var found = false;
+        while (j > 0) {
+            j -= 1;
+            if (c.sliding_layers[j] == c.sliding_layers[i]) {
+                c.kv_source[i] = j;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            std.log.err("layer {d} shares keys/values but no earlier layer of its kind exists", .{i});
+            return error.InvalidConfig;
+        }
+    }
 }
 
 fn yarnMscale(scale: f32, mscale: f32) f32 {
@@ -1011,7 +1501,7 @@ fn yarnMscale(scale: f32, mscale: f32) f32 {
 // Family-specific config hooks
 // ---------------------------------------------------------------------------
 
-fn extraGemma(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
+fn extraGemma(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
     if (getStr(obj, "hidden_activation") == null and getStr(obj, "hidden_act") == null) c.activation = .gelu_tanh;
     if (getNum(obj, "sliding_window_pattern") == null and obj.get("layer_types") == null and c.sliding_window != null) {
         // Gemma 3 defaults to a pattern of 6 (5 local, 1 global); Gemma 2 alternates.
@@ -1019,115 +1509,155 @@ fn extraGemma(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
             for (c.sliding_layers, 0..) |*s, i| s.* = ((i + 1) % 6 != 0);
         }
     }
-    // Gemma 3 local layers rotate with `rope_local_base_freq`.
-    if (std.mem.startsWith(u8, c.model_type, "gemma3")) c.sliding_rope_local = true;
+    if (std.mem.startsWith(u8, c.model_type, "gemma3")) try gemmaRope(c, arena, obj, c.head_dim, c.head_dim);
 }
 
-/// Xiaomi MiMo V2 (`MiMoV2FlashConfig` in transformers; the hub checkpoints of
-/// MiMo-V2-Flash, V2.5 and V2.6 carry the remote-code spellings of the same
-/// settings: `hybrid_layer_pattern`, `swa_*`, `moe_layer_freq`, ...). Hybrid
-/// attention: full layers with `num_key_value_heads` KV heads, sliding layers
-/// with `swa_num_key_value_heads` (twice as many) plus attention sinks; values
-/// are `v_head_dim` wide and scaled by `attention_value_scale`; partial rotary
-/// with one base per layer type; the first layer is dense, the rest
-/// DeepSeek-V3-style sigmoid MoE (correction bias, group-limited top-k) without
-/// shared experts. MTP (`model.mtp.*`), vision and audio tensors are never read.
-fn extraMiMoV2(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
-    const n = c.num_layers;
-    const hf_spelling = std.mem.eql(u8, c.model_type, "mimo_v2_flash") or obj.get("layer_types") != null or obj.get("rope_parameters") != null or obj.get("mlp_layer_types") != null;
-    if (getNum(obj, "rms_norm_eps") == null) c.rms_norm_eps = getF32(obj, "layernorm_epsilon", 1e-5);
-    if (getStr(obj, "store_dtype")) |sd| {
-        if (!dequant.expertDtypeSupported(sd) or std.mem.eql(u8, sd, "mxfp4")) {
-            std.log.err("unsupported model: MiMo experts stored as '{s}' (store_dtype) cannot be dequantised; convert the experts to bf16 first", .{sd});
+fn perLayerEmbeddings(c: *Config, obj: std.json.ObjectMap, default_dim: usize) void {
+    c.ple_dim = getInt(obj, "hidden_size_per_layer_input", default_dim);
+    c.ple_vocab = getInt(obj, "vocab_size_per_layer_input", c.vocab_size);
+    if (c.ple_vocab == 0) c.ple_vocab = c.vocab_size;
+}
+
+fn extraGemma3n(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
+    if (getStr(obj, "hidden_activation") == null and getStr(obj, "hidden_act") == null) c.activation = .gelu_tanh;
+    if (obj.get("layer_types") == null) {
+        // Every fifth layer is global.
+        for (c.sliding_layers, 0..) |*s, i| s.* = ((i + 1) % 5 != 0);
+    }
+    if (c.sliding_window == null) c.sliding_window = 512;
+    c.attention_scale = 1.0;
+    c.v_norm = true;
+    try gemmaRope(c, arena, obj, c.head_dim, c.head_dim);
+    try kvSharing(c, obj);
+    perLayerEmbeddings(c, obj, 256);
+    c.altup_inputs = getInt(obj, "altup_num_inputs", 4);
+    c.altup_active = getInt(obj, "altup_active_idx", 0);
+    c.altup_correct_scale = getBool(obj, "altup_correct_scale", true);
+    c.laurel_rank = getInt(obj, "laurel_rank", 64);
+    if (c.altup_inputs < 1 or c.altup_active >= c.altup_inputs or c.ple_dim == 0 or c.laurel_rank == 0) return error.InvalidConfig;
+    // Activation sparsity: one value per layer, one for all, or the default
+    // (the first 10 layers at 0.95 on models deeper than 10 layers).
+    if (obj.get("activation_sparsity_pattern")) |asp| {
+        switch (asp) {
+            .array => |a| for (a.items, 0..) |v, i| {
+                if (i < c.num_layers) c.activation_sparsity[i] = switch (v) {
+                    .float => |f| @floatCast(f),
+                    .integer => |n| @floatFromInt(n),
+                    else => 0,
+                };
+            },
+            .float => |f| @memset(c.activation_sparsity, @floatCast(f)),
+            .integer => |n| @memset(c.activation_sparsity, @floatFromInt(n)),
+            else => {},
+        }
+    } else if (c.num_layers > 10) {
+        for (c.activation_sparsity[0..10]) |*s| s.* = 0.95;
+    }
+    for (c.activation_sparsity) |s| if (s < 0 or s >= 1) return error.InvalidConfig;
+}
+
+fn extraGemma4(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
+    if (getStr(obj, "hidden_activation") == null and getStr(obj, "hidden_act") == null) c.activation = .gelu_tanh;
+    if (getStr(obj, "use_bidirectional_attention")) |m| {
+        if (std.mem.eql(u8, m, "all")) {
+            std.log.err("unsupported model: Gemma 4 with bidirectional attention on every token", .{});
             return error.UnsupportedArchitecture;
         }
     }
-    // Attention layout per layer: `layer_types` (parsed above), the remote-code
-    // `hybrid_layer_pattern` (1 = sliding) or the default (first and every
-    // sixth layer full, the rest sliding).
-    if (obj.get("layer_types") == null) {
-        if (obj.get("hybrid_layer_pattern")) |hp| {
-            if (hp != .array or hp.array.items.len < n) return error.InvalidConfig;
-            for (c.sliding_layers, 0..) |*s, i| s.* = hp.array.items[i] == .integer and hp.array.items[i].integer == 1;
-        } else {
-            for (c.sliding_layers, 0..) |*s, i| s.* = !(i == 0 or (i + 1) % 6 == 0);
-        }
-    }
-    if (c.sliding_window == null) c.sliding_window = getInt(obj, "sliding_window_size", 128);
-    var any_sliding = false;
-    for (c.sliding_layers) |s| any_sliding = any_sliding or s;
-    c.sinks = any_sliding and getBool(obj, "add_swa_attention_sink_bias", true);
-    c.sinks_sliding_only = true;
-    // Heads: the sliding layers double the kv heads; every other dimension is shared.
-    const kv_full = getInt(obj, "num_key_value_heads", c.num_heads);
-    const kv_swa = getInt(obj, "swa_num_key_value_heads", 2 * kv_full);
-    c.v_head_dim = getInt(obj, "v_head_dim", c.head_dim);
-    if (getInt(obj, "swa_num_attention_heads", c.num_heads) != c.num_heads or getInt(obj, "swa_head_dim", c.head_dim) != c.head_dim or getInt(obj, "swa_v_head_dim", c.v_head_dim) != c.v_head_dim) {
-        std.log.err("unsupported model: MiMo sliding layers with their own head count or head size (swa_num_attention_heads / swa_head_dim / swa_v_head_dim)", .{});
+    if (getBool(obj, "enable_moe_block", false)) {
+        std.log.err("unsupported model: Gemma 4 MoE block (a routed expert block in parallel with the dense MLP, as in gemma-4-26B-A4B) is not implemented", .{});
         return error.UnsupportedArchitecture;
     }
-    if (c.v_head_dim > c.head_dim or c.v_head_dim == 0 or kv_full == 0 or kv_swa == 0) return error.InvalidConfig;
-    for (c.layer_kv_heads, 0..) |*k, i| k.* = if (c.sliding_layers[i]) kv_swa else kv_full;
-    c.num_kv_heads = kv_full;
-    // Values are scaled before attention. transformers defaults the scale to
-    // 0.707 and reads an explicit null as 1; the remote-code modules default to 1.
-    c.value_scale = if (obj.get("attention_value_scale")) |v| (if (v == .null) 1.0 else getF32(obj, "attention_value_scale", 1.0)) else if (hf_spelling) 0.707 else 1.0;
-    // Rotary: one base per layer type, partial rotary factor 0.334 (int(head_dim * f) dims).
-    var factor: f64 = if (getNum(obj, "partial_rotary_factor")) |f| f else if (hf_spelling) 0.334 else 1.0;
-    if (hf_spelling and getNum(obj, "rope_theta") == null and getObj(obj, "rope_parameters") == null) c.rope_theta = 5_000_000.0;
-    c.rope_local_theta = getF32(obj, "swa_rope_theta", if (hf_spelling) 10_000.0 else c.rope_theta);
-    if (getObj(obj, "rope_parameters")) |rp| {
-        const full: ?std.json.ObjectMap = getObj(rp, "full_attention") orelse (if (getNum(rp, "rope_theta") != null) rp else null);
-        const swa: ?std.json.ObjectMap = getObj(rp, "sliding_attention") orelse (if (getNum(rp, "rope_theta") != null) rp else null);
-        if (full) |f| {
-            c.rope_theta = getF32(f, "rope_theta", 5_000_000.0);
-            factor = getNum(f, "partial_rotary_factor") orelse 0.334;
-            c.rope_scaling = try parseRopeScaling(arena, obj, f, c.rotary_dim, c.max_position_embeddings);
-        }
-        if (swa) |s| {
-            c.rope_local_theta = getF32(s, "rope_theta", 10_000.0);
-            const sf = getNum(s, "partial_rotary_factor") orelse 0.334;
-            const t = getStr(s, "rope_type") orelse getStr(s, "type") orelse "default";
-            if (sf != factor or !(std.mem.eql(u8, t, "default") or std.mem.eql(u8, t, "mrope"))) {
-                std.log.err("unsupported model: MiMo sliding layers with their own rotary factor or scaling ({s})", .{t});
-                return error.UnsupportedArchitecture;
-            }
+    if (obj.get("layer_types") == null) {
+        // 5 local, 1 global; the last layer is always global.
+        for (c.sliding_layers, 0..) |*s, i| s.* = ((i + 1) % 6 != 0);
+    }
+    if (c.num_layers > 0) c.sliding_layers[c.num_layers - 1] = false;
+    if (c.sliding_window == null) c.sliding_window = 512;
+    c.attention_scale = 1.0;
+    c.v_norm = true;
+    c.k_eq_v = getBool(obj, "attention_k_eq_v", false);
+    // Global layers use their own head size and KV heads: `global_head_dim`
+    // (512 unless given) and `num_global_key_value_heads`, or an explicit
+    // `per_layer_config` table indexed by layer.
+    var global_hd = getInt(obj, "global_head_dim", 512);
+    var global_kv = c.num_kv_heads;
+    if (getNum(obj, "num_global_key_value_heads") != null and c.k_eq_v) global_kv = getInt(obj, "num_global_key_value_heads", global_kv);
+    if (getObj(obj, "per_layer_config")) |plc| {
+        var it = plc.iterator();
+        var found = false;
+        while (it.next()) |kv| {
+            const idx = std.fmt.parseInt(usize, kv.key_ptr.*, 10) catch continue;
+            if (idx >= c.num_layers or c.sliding_layers[idx] or kv.value_ptr.* != .object or found) continue;
+            const lc = kv.value_ptr.object;
+            global_hd = getInt(lc, "head_dim", global_hd);
+            global_kv = getInt(lc, "num_key_value_heads", global_kv);
+            found = true;
         }
     }
-    c.rotary_dim = @intFromFloat(@as(f64, @floatFromInt(c.head_dim)) * factor);
-    c.rotary_dim -= c.rotary_dim % 2;
-    if (c.rotary_dim == 0 or c.rotary_dim > c.head_dim) return error.InvalidConfig;
-    c.sliding_rope_local = true;
-    // Mixture of experts: sigmoid scores plus a correction bias choose the
-    // experts (group-limited top-k), the raw scores weight them.
-    c.moe.scoring = parseScoring(getStr(obj, "scoring_func") orelse "sigmoid");
-    const method = getStr(obj, "topk_method") orelse "noaux_tc";
-    c.moe.topk_method = if (std.mem.eql(u8, method, "greedy")) .greedy else .group_limited;
+    for (0..c.num_layers) |i| {
+        if (!c.sliding_layers[i]) {
+            c.layer_head_dim[i] = global_hd;
+            c.layer_kv_heads[i] = global_kv;
+        }
+    }
+    try gemmaRope(c, arena, obj, c.head_dim, global_hd);
+    try kvSharing(c, obj);
+    perLayerEmbeddings(c, obj, 256);
+    // KV-shared layers may carry a double-wide MLP; the weights say which.
+    if (getBool(obj, "use_double_wide_mlp", false) and getInt(obj, "num_kv_shared_layers", 0) > 0) c.intermediate_varies = true;
+}
+
+fn extraLfm2(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
+    if (obj.get("layer_types") == null) {
+        // `full_attn_idxs` lists the attention layers; every other layer is a conv layer.
+        if (obj.get("full_attn_idxs")) |fa| {
+            @memset(c.conv_layers, true);
+            if (fa == .array) for (fa.array.items) |v| {
+                if (v == .integer and v.integer >= 0 and v.integer < c.num_layers) c.conv_layers[@intCast(v.integer)] = false;
+            };
+        }
+        c.has_conv = false;
+        for (c.conv_layers) |l| c.has_conv = c.has_conv or l;
+    }
+    c.conv_kernel = getInt(obj, "conv_L_cache", 3);
+    if (getNum(obj, "rope_theta") == null and getObj(obj, "rope_parameters") == null) c.rope_theta = 1000000.0;
+    c.tie_word_embeddings = getBool(obj, "tie_word_embeddings", getBool(obj, "tie_embedding", true));
+    // Feed-forward width as Lfm2MLP derives it from `block_ff_dim`.
+    var ff = getInt(obj, "block_ff_dim", c.intermediate_size);
+    if (getBool(obj, "block_auto_adjust_ff_dim", true)) {
+        ff = @intFromFloat(2.0 * @as(f64, @floatFromInt(ff)) / 3.0);
+        const mult = getF32(obj, "block_ffn_dim_multiplier", 1.0);
+        ff = @intFromFloat(@as(f64, mult) * @as(f64, @floatFromInt(ff)));
+        const mo = getInt(obj, "block_multiple_of", 256);
+        if (mo > 0) ff = mo * ((ff + mo - 1) / mo);
+    }
+    c.intermediate_size = ff;
+}
+
+fn extraMistral4(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
+    c.rope_style = if (getBool(obj, "rope_interleave", true)) .gptj else .neox;
+    c.moe.scoring = .softmax;
+    c.moe.topk_method = .group_limited;
+    c.moe.group_score_top2 = true;
     c.moe.n_group = @max(1, getInt(obj, "n_group", 1));
     c.moe.topk_group = @max(1, getInt(obj, "topk_group", 1));
     c.moe.routed_scaling_factor = getF32(obj, "routed_scaling_factor", 1.0);
     c.norm_topk_prob = getBool(obj, "norm_topk_prob", true);
-    c.num_experts_per_tok = getInt(obj, "num_experts_per_tok", 8);
-    if (c.num_experts > 0) {
-        if (c.moe.topk_method == .group_limited and c.num_experts % c.moe.n_group != 0) return error.InvalidConfig;
-        for (c.moe_layers, 0..) |*m, i| m.* = i > 0;
-        if (obj.get("mlp_layer_types")) |ml| {
-            if (ml != .array or ml.array.items.len < n) return error.InvalidConfig;
-            for (ml.array.items[0..n], 0..) |v, i| {
-                if (v != .string) return error.InvalidConfig;
-                c.moe_layers[i] = if (std.mem.eql(u8, v.string, "sparse")) true else if (std.mem.eql(u8, v.string, "dense")) false else return error.InvalidConfig;
-            }
-        } else if (obj.get("moe_layer_freq")) |mf| {
-            if (mf == .array) {
-                if (mf.array.items.len < n) return error.InvalidConfig;
-                for (mf.array.items[0..n], 0..) |v, i| c.moe_layers[i] = !(v == .integer and v.integer == 0);
-            }
+    c.num_experts_per_tok = getInt(obj, "num_experts_per_tok", 4);
+    if (c.num_experts % c.moe.n_group != 0) return error.InvalidConfig;
+    // Queries are scaled by `1 + beta * log(1 + floor(pos / original_max_position_embeddings))`.
+    const rp = getObj(obj, "rope_parameters") orelse getObj(obj, "rope_scaling");
+    if (rp) |r| {
+        if (getNum(r, "llama_4_scaling_beta")) |beta| {
+            c.attn_temperature = .{
+                .floor_scale = getF32(r, "original_max_position_embeddings", 8192),
+                .attn_scale = @floatCast(beta),
+                .offset = 0,
+                .all_layers = true,
+            };
         }
     }
-    // MiMo-V2.5 / V2.6 Pro checkpoints fuse q/k/v into one `qkv_proj`
-    // pre-sharded over `num_key_value_heads` chunks, each `[Q | K | V]`.
-    c.qkv_alt = .grouped;
-    c.qkv_chunks = kv_full;
 }
 
 fn extraMixtral(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
@@ -1185,13 +1715,17 @@ fn extraCohere(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
 }
 
 fn extraGlm4(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
-    if (getNum(obj, "partial_rotary_factor") == null) c.rotary_dim = c.head_dim / 2;
+    if (getNum(obj, "partial_rotary_factor") == null) {
+        c.rotary_dim = c.head_dim / 2;
+        c.rope_freq_dim = c.rotary_dim;
+    }
     c.attention_bias = getBool(obj, "attention_bias", true);
 }
 
 fn extraChatGlm(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
     // Rotary embeddings cover half of `kv_channels`, interleaved; theta is scaled by rope_ratio.
     c.rotary_dim = c.head_dim / 2;
+    c.rope_freq_dim = c.rotary_dim;
     c.rope_theta = 10000.0 * getF32(obj, "rope_ratio", 1.0);
     c.attention_bias = getBool(obj, "add_qkv_bias", true);
     if (!getBool(obj, "rmsnorm", true)) c.norm = .layer;
@@ -1365,6 +1899,210 @@ fn extraGlmMoeDsa(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
     if (getNum(obj, "index_topk") != null) {
         std.log.warn("sparse indexer runs as dense attention (exact for short contexts)", .{});
     }
+}
+
+// --- Mamba families ---------------------------------------------------------
+
+fn jsonF32(v: std.json.Value) ?f32 {
+    return switch (v) {
+        .integer => |i| @floatFromInt(i),
+        .float => |f| @floatCast(f),
+        else => null,
+    };
+}
+
+/// Fills `out` from a JSON array of numbers (entries beyond the array keep their value).
+fn floatList(obj: std.json.ObjectMap, key: []const u8, out: []f32) void {
+    const v = obj.get(key) orelse return;
+    if (v != .array) return;
+    for (v.array.items, 0..) |item, i| {
+        if (i >= out.len) break;
+        if (jsonF32(item)) |f| out[i] = f;
+    }
+}
+
+/// `time_step_limit`: a `[min, max]` clamp of the discretised time step. A
+/// missing or null entry (JSON has no infinity) leaves that bound open.
+fn dtLimit(obj: std.json.ObjectMap, d: *SsmDims) void {
+    const v = obj.get("time_step_limit") orelse return;
+    if (v != .array or v.array.items.len != 2) return;
+    if (jsonF32(v.array.items[0])) |lo| d.dt_min = lo;
+    if (jsonF32(v.array.items[1])) |hi| d.dt_max = hi;
+}
+
+/// Mamba2 dimensions from the `mamba_*` keys of the Falcon-H1 / Granite configs.
+fn mambaDims(c: *Config, obj: std.json.ObjectMap) void {
+    const d = &c.ssm;
+    d.kind = .mamba2;
+    const expand = getF32(obj, "mamba_expand", 2);
+    d.inter = if (getNum(obj, "mamba_d_ssm")) |_| getInt(obj, "mamba_d_ssm", 0) else @intFromFloat(expand * @as(f32, @floatFromInt(c.hidden_size)));
+    d.heads = getInt(obj, "mamba_n_heads", 128);
+    // `mamba_d_head` may be the string "auto".
+    d.head_dim = if (getNum(obj, "mamba_d_head")) |_| getInt(obj, "mamba_d_head", 0) else if (d.heads > 0) d.inter / d.heads else 0;
+    d.state = getInt(obj, "mamba_d_state", 256);
+    d.groups = getInt(obj, "mamba_n_groups", 1);
+    d.conv_kernel = getInt(obj, "mamba_d_conv", 4);
+    d.act = c.activation;
+    dtLimit(obj, d);
+}
+
+fn extraMamba2(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
+    const d = &c.ssm;
+    d.kind = .mamba2;
+    d.heads = getInt(obj, "num_heads", 128);
+    d.head_dim = getInt(obj, "head_dim", 64);
+    d.inter = d.heads * d.head_dim;
+    d.state = getInt(obj, "state_size", 128);
+    d.groups = getInt(obj, "n_groups", 8);
+    d.conv_kernel = getInt(obj, "conv_kernel", 4);
+    d.act = c.activation;
+    dtLimit(obj, d);
+    const want: usize = @intFromFloat(getF32(obj, "expand", 2) * @as(f32, @floatFromInt(c.hidden_size)));
+    if (want != d.inter) {
+        std.log.err("mamba2: expand * hidden_size ({d}) must equal num_heads * head_dim ({d})", .{ want, d.inter });
+        return error.InvalidConfig;
+    }
+    // No attention anywhere: placeholder attention dimensions keep the KV
+    // cache (one float per position) out of the way.
+    c.num_heads = 1;
+    c.num_kv_heads = 1;
+    c.head_dim = 1;
+    c.v_head_dim = 1;
+    c.rotary_dim = 0;
+    c.positional = .none;
+    @memset(c.ssm_layers, true);
+    @memset(c.attn_layers, false);
+    @memset(c.mlp_layers, false);
+    @memset(c.moe_layers, false);
+}
+
+fn extraNemotronH(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
+    const d = &c.ssm;
+    d.kind = .mamba2;
+    d.heads = getInt(obj, "mamba_num_heads", 128);
+    d.head_dim = getInt(obj, "mamba_head_dim", 64);
+    d.inter = d.heads * d.head_dim;
+    d.state = getInt(obj, "ssm_state_size", 128);
+    d.groups = getInt(obj, "n_groups", 8);
+    d.conv_kernel = getInt(obj, "conv_kernel", 4);
+    // The gated RMSNorm normalises each B/C group of channels separately,
+    // and the time step is floored at `time_step_min` (the chunked scan's
+    // `dt_limit`; ditch applies it on every token).
+    d.norm_groups = d.groups;
+    d.dt_min = getF32(obj, "time_step_min", 0.001);
+    d.act = .silu;
+    if (getStr(obj, "mamba_hidden_act")) |a| d.act = parseActivation(a) orelse return error.UnsupportedArchitecture;
+    // MLP and expert activation: `mlp_hidden_act` (relu²), not `hidden_act`.
+    c.activation = .relu2;
+    if (getStr(obj, "mlp_hidden_act")) |a| c.activation = parseActivation(a) orelse return error.UnsupportedArchitecture;
+    // Attention layers carry no positional encoding.
+    c.positional = .none;
+    if (obj.get("layer_types") == null and obj.get("layers_block_type") == null) {
+        const pat = getStr(obj, "hybrid_override_pattern") orelse {
+            std.log.err("nemotron_h: config.json needs layers_block_type or hybrid_override_pattern", .{});
+            return error.InvalidConfig;
+        };
+        if (pat.len != c.num_layers) {
+            std.log.err("nemotron_h: hybrid_override_pattern has {d} entries for {d} layers", .{ pat.len, c.num_layers });
+            return error.InvalidConfig;
+        }
+        for (pat, 0..) |ch, i| {
+            c.ssm_layers[i] = ch == 'M';
+            c.attn_layers[i] = ch == '*';
+            c.mlp_layers[i] = ch == '-' or ch == 'E';
+            c.moe_layers[i] = ch == 'E';
+            if (ch != 'M' and ch != '*' and ch != '-' and ch != 'E') {
+                std.log.err("nemotron_h: unknown block '{c}' in hybrid_override_pattern", .{ch});
+                return error.UnsupportedArchitecture;
+            }
+        }
+    }
+    var any_moe = false;
+    for (c.moe_layers) |m| any_moe = any_moe or m;
+    if (any_moe and c.num_experts == 0) {
+        std.log.err("nemotron_h: moe layers without n_routed_experts", .{});
+        return error.InvalidConfig;
+    }
+    if (getNum(obj, "moe_latent_size") != null) {
+        std.log.err("unsupported model: nemotron_h latent expert projections (moe_latent_size) are not implemented", .{});
+        return error.UnsupportedArchitecture;
+    }
+    c.moe.scoring = .sigmoid;
+    c.moe.topk_method = .group_limited;
+    c.moe.n_group = @max(1, getInt(obj, "n_group", 1));
+    c.moe.topk_group = @max(1, getInt(obj, "topk_group", 1));
+    c.moe.routed_scaling_factor = getF32(obj, "routed_scaling_factor", 1.0);
+    c.moe.dense_experts = true;
+    if (c.moe.topk_method == .group_limited and c.num_experts > 0 and c.num_experts % c.moe.n_group != 0) return error.InvalidConfig;
+}
+
+fn extraFalconH1(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
+    mambaDims(c, obj);
+    const d = &c.ssm;
+    d.norm_groups = d.groups;
+    d.rms_norm = getBool(obj, "mamba_rms_norm", false);
+    d.norm_before_gate = getBool(obj, "mamba_norm_before_gate", true);
+    const m = &c.mult;
+    m.ssm_in = getF32(obj, "ssm_in_multiplier", 1);
+    m.ssm_out = getF32(obj, "ssm_out_multiplier", 1);
+    m.attn_in = getF32(obj, "attention_in_multiplier", 1);
+    m.attn_out = getF32(obj, "attention_out_multiplier", 1);
+    m.key = getF32(obj, "key_multiplier", 1);
+    var mlp = [2]f32{ 1, 1 };
+    floatList(obj, "mlp_multipliers", &mlp);
+    m.mlp_gate = mlp[0];
+    m.mlp_down = mlp[1];
+    floatList(obj, "ssm_multipliers", &m.ssm_proj);
+    c.embed_scale = getF32(obj, "embedding_multiplier", 1);
+    c.logit_scale = getF32(obj, "lm_head_multiplier", 1);
+    @memset(c.mlp_layers, true);
+}
+
+fn extraJamba(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
+    const d = &c.ssm;
+    d.kind = .mamba1;
+    d.inter = @intFromFloat(getF32(obj, "mamba_expand", 2) * @as(f32, @floatFromInt(c.hidden_size)));
+    d.state = getInt(obj, "mamba_d_state", 16);
+    d.conv_kernel = getInt(obj, "mamba_d_conv", 4);
+    // `mamba_dt_rank` may be the string "auto": ceil(hidden / 16).
+    d.dt_rank = if (getNum(obj, "mamba_dt_rank")) |_| getInt(obj, "mamba_dt_rank", 0) else (c.hidden_size + 15) / 16;
+    d.act = c.activation;
+    // Attention layers carry no positional encoding.
+    c.positional = .none;
+    if (obj.get("layer_types") == null and obj.get("layers_block_type") == null) {
+        const period = @max(1, getInt(obj, "attn_layer_period", 8));
+        const offset = getInt(obj, "attn_layer_offset", 4);
+        for (0..c.num_layers) |i| {
+            c.attn_layers[i] = i % period == offset;
+            c.ssm_layers[i] = !c.attn_layers[i];
+        }
+    }
+    // Every layer has an MLP; every `expert_layer_period`-th one is a mixture.
+    if (c.num_experts <= 1) c.num_experts = 0;
+    const eperiod = @max(1, getInt(obj, "expert_layer_period", 2));
+    const eoffset = getInt(obj, "expert_layer_offset", 1);
+    for (0..c.num_layers) |i| c.moe_layers[i] = c.num_experts > 0 and i % eperiod == eoffset;
+    @memset(c.mlp_layers, true);
+}
+
+fn extraGraniteHybrid(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
+    try extraGraniteMoe(c, arena, obj);
+    mambaDims(c, obj);
+    // Attention layers use RoPE only when the config asks for it.
+    c.positional = .none;
+    if (getStr(obj, "position_embedding_type")) |t| {
+        if (std.mem.eql(u8, t, "rope")) {
+            c.positional = .rope;
+            @memset(c.rope_layers, true);
+        }
+    }
+    if (obj.get("layer_types") == null and obj.get("layers_block_type") == null) {
+        @memset(c.ssm_layers, true);
+        @memset(c.attn_layers, false);
+    }
+    // Softmax over the top-k router logits equals a renormalised softmax top-k.
+    c.norm_topk_prob = true;
+    @memset(c.mlp_layers, true);
 }
 
 /// First element of an integer array config value (or the scalar), requiring
@@ -1547,6 +2285,11 @@ fn extraHunyuanMoe(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
 /// `moe_renormalize`, `num_expert_group`, `model_max_length`); the Hugging
 /// Face module spells them out (`linear_num_heads`, `layer_types`,
 /// `mlp_layer_types`). Full-attention layers are MLA without RoPE.
+///
+/// Kimi K3 reuses this config with `attn_res_block_size` (Attention
+/// Residual), `routed_expert_hidden_size` / `latent_moe_use_norm` (latent
+/// MoE), `mla_use_output_gate`, `use_full_rank_gate` / `gate_lower_bound` in
+/// `linear_attn_config` and the `situ` activation (parsed generically).
 fn extraKimiLinear(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
     const lac: ?std.json.ObjectMap = getObj(obj, "linear_attn_config");
     var heads = getInt(obj, "linear_num_heads", 32);
@@ -1556,6 +2299,16 @@ fn extraKimiLinear(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
         heads = getInt(l, "num_heads", heads);
         head_dim = getInt(l, "head_dim", head_dim);
         kernel = getInt(l, "short_conv_kernel_size", kernel);
+        c.linear_full_rank_gate = getBool(l, "use_full_rank_gate", false);
+        if (getNum(l, "gate_lower_bound")) |lb| c.linear_gate_lower_bound = @floatCast(lb);
+    }
+    c.mla_output_gate = getBool(obj, "mla_use_output_gate", false);
+    c.attn_res_block = getInt(obj, "attn_res_block_size", 0);
+    c.moe_latent = getInt(obj, "routed_expert_hidden_size", 0);
+    c.moe_latent_norm = getBool(obj, "latent_moe_use_norm", false);
+    if (getBool(obj, "mla_use_nope", true) == false) {
+        std.log.err("kimi_linear: full-attention layers with RoPE (mla_use_nope = false) are not implemented", .{});
+        return error.UnsupportedArchitecture;
     }
     c.linear_k_heads = heads;
     c.linear_v_heads = heads;
@@ -1620,18 +2373,114 @@ fn extraGraniteMoe(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void 
     if (c.num_experts > 0) @memset(c.moe_layers, true);
 }
 
-fn extraGraniteHybrid(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
-    try extraGraniteMoe(c, arena, obj);
-    // `linear_attention` (or `mamba`) layers are Mamba-2 blocks here.
-    if (c.has_linear) {
-        std.log.err("unsupported model: GraniteMoeHybrid with Mamba-2 layers (only attention-only configurations run)", .{});
+/// Xiaomi MiMo V2 (`MiMoV2FlashConfig` in transformers; the hub checkpoints of
+/// MiMo-V2-Flash, V2.5 and V2.6 carry the remote-code spellings of the same
+/// settings: `hybrid_layer_pattern`, `swa_*`, `moe_layer_freq`, ...). Hybrid
+/// attention: full layers with `num_key_value_heads` KV heads, sliding layers
+/// with `swa_num_key_value_heads` (twice as many) plus attention sinks; values
+/// are `v_head_dim` wide and scaled by `attention_value_scale`; partial rotary
+/// with one base per layer type; the first layer is dense, the rest
+/// DeepSeek-V3-style sigmoid MoE (correction bias, group-limited top-k) without
+/// shared experts. MTP (`model.mtp.*`), vision and audio tensors are never read.
+fn extraMiMoV2(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
+    const n = c.num_layers;
+    const hf_spelling = std.mem.eql(u8, c.model_type, "mimo_v2_flash") or obj.get("layer_types") != null or obj.get("rope_parameters") != null or obj.get("mlp_layer_types") != null;
+    if (getNum(obj, "rms_norm_eps") == null) c.rms_norm_eps = getF32(obj, "layernorm_epsilon", 1e-5);
+    if (getStr(obj, "store_dtype")) |sd| {
+        if (!dequant.expertDtypeSupported(sd) or std.mem.eql(u8, sd, "mxfp4")) {
+            std.log.err("unsupported model: MiMo experts stored as '{s}' (store_dtype) cannot be dequantised; convert the experts to bf16 first", .{sd});
+            return error.UnsupportedArchitecture;
+        }
+    }
+    // Attention layout per layer: `layer_types` (parsed above), the remote-code
+    // `hybrid_layer_pattern` (1 = sliding) or the default (first and every
+    // sixth layer full, the rest sliding).
+    if (obj.get("layer_types") == null) {
+        if (obj.get("hybrid_layer_pattern")) |hp| {
+            if (hp != .array or hp.array.items.len < n) return error.InvalidConfig;
+            for (c.sliding_layers, 0..) |*s, i| s.* = hp.array.items[i] == .integer and hp.array.items[i].integer == 1;
+        } else {
+            for (c.sliding_layers, 0..) |*s, i| s.* = !(i == 0 or (i + 1) % 6 == 0);
+        }
+    }
+    if (c.sliding_window == null) c.sliding_window = getInt(obj, "sliding_window_size", 128);
+    var any_sliding = false;
+    for (c.sliding_layers) |s| any_sliding = any_sliding or s;
+    c.sinks = any_sliding and getBool(obj, "add_swa_attention_sink_bias", true);
+    c.sinks_sliding_only = true;
+    // Heads: the sliding layers double the kv heads; every other dimension is shared.
+    const kv_full = getInt(obj, "num_key_value_heads", c.num_heads);
+    const kv_swa = getInt(obj, "swa_num_key_value_heads", 2 * kv_full);
+    c.v_head_dim = getInt(obj, "v_head_dim", c.head_dim);
+    c.narrow_values = true;
+    if (getInt(obj, "swa_num_attention_heads", c.num_heads) != c.num_heads or getInt(obj, "swa_head_dim", c.head_dim) != c.head_dim or getInt(obj, "swa_v_head_dim", c.v_head_dim) != c.v_head_dim) {
+        std.log.err("unsupported model: MiMo sliding layers with their own head count or head size (swa_num_attention_heads / swa_head_dim / swa_v_head_dim)", .{});
         return error.UnsupportedArchitecture;
     }
-    if (getStr(obj, "position_embedding_type")) |t| {
-        if (!std.mem.eql(u8, t, "rope")) c.positional = .none;
-    } else if (obj.get("position_embedding_type")) |v| {
-        if (v == .null) c.positional = .none;
+    if (c.v_head_dim > c.head_dim or c.v_head_dim == 0 or kv_full == 0 or kv_swa == 0) return error.InvalidConfig;
+    if (c.num_heads % kv_full != 0 or c.num_heads % kv_swa != 0) return error.InvalidConfig;
+    for (c.layer_kv_heads, 0..) |*k, i| k.* = if (c.sliding_layers[i]) kv_swa else kv_full;
+    c.num_kv_heads = kv_full;
+    // Values are scaled before attention. transformers defaults the scale to
+    // 0.707 and reads an explicit null as 1; the remote-code modules default to 1.
+    c.mult.value = if (obj.get("attention_value_scale")) |v| (if (v == .null) 1.0 else getF32(obj, "attention_value_scale", 1.0)) else if (hf_spelling) 0.707 else 1.0;
+    // Rotary: one base per layer type, partial rotary factor 0.334 (int(head_dim * f) dims).
+    var factor: f64 = if (getNum(obj, "partial_rotary_factor")) |f| f else if (hf_spelling) 0.334 else 1.0;
+    if (hf_spelling and getNum(obj, "rope_theta") == null and getObj(obj, "rope_parameters") == null) c.rope_theta = 5_000_000.0;
+    var local_theta = getF32(obj, "swa_rope_theta", if (hf_spelling) 10_000.0 else c.rope_theta);
+    if (getObj(obj, "rope_parameters")) |rp| {
+        const full: ?std.json.ObjectMap = getObj(rp, "full_attention") orelse (if (getNum(rp, "rope_theta") != null) rp else null);
+        const swa: ?std.json.ObjectMap = getObj(rp, "sliding_attention") orelse (if (getNum(rp, "rope_theta") != null) rp else null);
+        if (full) |f| {
+            c.rope_theta = getF32(f, "rope_theta", 5_000_000.0);
+            factor = getNum(f, "partial_rotary_factor") orelse 0.334;
+            c.rope_scaling = try parseRopeScaling(arena, obj, f, c.rotary_dim, c.max_position_embeddings);
+        }
+        if (swa) |s| {
+            local_theta = getF32(s, "rope_theta", 10_000.0);
+            const sf = getNum(s, "partial_rotary_factor") orelse 0.334;
+            const t = getStr(s, "rope_type") orelse getStr(s, "type") orelse "default";
+            if (sf != factor or !(std.mem.eql(u8, t, "default") or std.mem.eql(u8, t, "mrope"))) {
+                std.log.err("unsupported model: MiMo sliding layers with their own rotary factor or scaling ({s})", .{t});
+                return error.UnsupportedArchitecture;
+            }
+        }
     }
+    c.rotary_dim = evenDim(@as(f64, @floatFromInt(c.head_dim)) * factor);
+    if (c.rotary_dim == 0 or c.rotary_dim > c.head_dim) return error.InvalidConfig;
+    c.rope_freq_dim = c.rotary_dim;
+    // The sliding layers rotate the same coordinates with their own base.
+    c.rope_local = .{ .theta = local_theta, .rotary_dim = c.rotary_dim, .freq_dim = c.rotary_dim };
+    // Mixture of experts: sigmoid scores plus a correction bias choose the
+    // experts (group-limited top-k), the raw scores weight them.
+    c.moe.scoring = parseScoring(getStr(obj, "scoring_func") orelse "sigmoid");
+    const method = getStr(obj, "topk_method") orelse "noaux_tc";
+    c.moe.topk_method = if (std.mem.eql(u8, method, "greedy")) .greedy else .group_limited;
+    c.moe.n_group = @max(1, getInt(obj, "n_group", 1));
+    c.moe.topk_group = @max(1, getInt(obj, "topk_group", 1));
+    c.moe.routed_scaling_factor = getF32(obj, "routed_scaling_factor", 1.0);
+    c.norm_topk_prob = getBool(obj, "norm_topk_prob", true);
+    c.num_experts_per_tok = getInt(obj, "num_experts_per_tok", 8);
+    if (c.num_experts > 0) {
+        if (c.moe.topk_method == .group_limited and c.num_experts % c.moe.n_group != 0) return error.InvalidConfig;
+        for (c.moe_layers, 0..) |*m, i| m.* = i > 0;
+        if (obj.get("mlp_layer_types")) |ml| {
+            if (ml != .array or ml.array.items.len < n) return error.InvalidConfig;
+            for (ml.array.items[0..n], 0..) |v, i| {
+                if (v != .string) return error.InvalidConfig;
+                c.moe_layers[i] = if (std.mem.eql(u8, v.string, "sparse")) true else if (std.mem.eql(u8, v.string, "dense")) false else return error.InvalidConfig;
+            }
+        } else if (obj.get("moe_layer_freq")) |mf| {
+            if (mf == .array) {
+                if (mf.array.items.len < n) return error.InvalidConfig;
+                for (mf.array.items[0..n], 0..) |v, i| c.moe_layers[i] = !(v == .integer and v.integer == 0);
+            }
+        }
+    }
+    // MiMo-V2.5 / V2.6 Pro checkpoints fuse q/k/v into one `qkv_proj`
+    // pre-sharded over `num_key_value_heads` chunks, each `[Q | K | V]`.
+    c.qkv_alt = .grouped;
+    c.qkv_chunks = kv_full;
 }
 
 fn parseScoring(name: []const u8) RouterScoring {
@@ -1899,6 +2748,49 @@ const kimi_linear_checkpoint_moe = Names{
     .shared_gate = "gate_proj.weight",
     .shared_up = "up_proj.weight",
     .shared_down = "down_proj.weight",
+    .latent_down = "block_sparse_moe.routed_expert_down_proj.weight",
+    .latent_up = "block_sparse_moe.routed_expert_up_proj.weight",
+    .latent_norm = "block_sparse_moe.routed_expert_norm.weight",
+};
+
+/// Kimi Linear and Kimi K3 (`KimiLinearForCausalLM`): the K3-only tensors
+/// (full-rank KDA gate, MLA output gate, Attention Residual scorers, latent
+/// MoE projections) are read only when the config enables them.
+const kimi_linear_names = Names{
+    .q_a = "self_attn.q_a_proj.weight",
+    .q_a_norm = "self_attn.q_a_layernorm.weight",
+    .q_b = "self_attn.q_b_proj.weight",
+    .kv_a = "self_attn.kv_a_proj_with_mqa.weight",
+    .kv_a_norm = "self_attn.kv_a_layernorm.weight",
+    .kv_b = "self_attn.kv_b_proj.weight",
+    .attn_gate = "self_attn.g_proj.weight",
+    .lin_q = "self_attn.q_proj.weight",
+    .lin_k = "self_attn.k_proj.weight",
+    .lin_v = "self_attn.v_proj.weight",
+    .lin_conv = "self_attn.conv1d.weight",
+    .lin_conv_split = &.{ "self_attn.q_conv1d.weight", "self_attn.k_conv1d.weight", "self_attn.v_conv1d.weight" },
+    .lin_f_a = &.{ "self_attn.forget_gate.f_a_proj.weight", "self_attn.f_a_proj.weight" },
+    .lin_f_b = &.{ "self_attn.forget_gate.f_b_proj.weight", "self_attn.f_b_proj.weight" },
+    .lin_dt_bias = &.{ "self_attn.forget_gate.dt_bias", "self_attn.dt_bias" },
+    .lin_a_log = &.{ "self_attn.forget_gate.A_log", "self_attn.A_log" },
+    .lin_b = "self_attn.b_proj.weight",
+    .lin_g_a = "self_attn.g_a_proj.weight",
+    .lin_g_b = "self_attn.g_b_proj.weight",
+    .lin_g = "self_attn.g_proj.weight",
+    .lin_norm = "self_attn.o_norm.weight",
+    .lin_out = "self_attn.o_proj.weight",
+    .attn_res_norm = &.{ "self_attention_res_norm.weight", "self_attention_res.norm_weight" },
+    .attn_res_proj = &.{ "self_attention_res_proj.weight", "self_attention_res.proj_weight" },
+    .mlp_res_norm = &.{ "mlp_res_norm.weight", "mlp_res.norm_weight" },
+    .mlp_res_proj = &.{ "mlp_res_proj.weight", "mlp_res.proj_weight" },
+    .output_res_norm = &.{ "{p}output_attn_res_norm.weight", "{p}output_attn_res.norm_weight" },
+    .output_res_proj = &.{ "{p}output_attn_res_proj.weight", "{p}output_attn_res.proj_weight" },
+    .router_correction_bias = "mlp.gate.e_score_correction_bias",
+    .shared_expert = "mlp.shared_experts.",
+    .latent_down = "mlp.routed_expert_down_proj.weight",
+    .latent_up = "mlp.routed_expert_up_proj.weight",
+    .latent_norm = "mlp.routed_expert_norm.weight",
+    .moe_alt = &kimi_linear_checkpoint_moe,
 };
 
 const deepseek_v3_names = Names{
@@ -2000,6 +2892,118 @@ pub const registry = [_]Arch{
         },
         .notes = "fixture: (1+w) norms, pre/post norms, per-head (1+w) q/k norms, sqrt(H) embedding scale, sliding layers with a local rope base, query_pre_attn_scalar, linear rope scaling.",
         .extra = extraGemma,
+    },
+    .{
+        .model_type = "gemma3n",
+        .aliases = &.{"gemma3n_text"},
+        .llama_cpp = "gemma3n",
+        .chat = "gemma",
+        .verified = true,
+        .activation = .gelu_tanh,
+        .tie_word_embeddings = true,
+        .embed_scale_sqrt = true,
+        .qk_norm = .head,
+        .names = .{
+            .post_attn_norm = "post_attention_layernorm.weight",
+            .pre_ff_norm = "pre_feedforward_layernorm.weight",
+            .post_ff_norm = "post_feedforward_layernorm.weight",
+            .q_norm = "self_attn.q_norm.weight",
+            .k_norm = "self_attn.k_norm.weight",
+            .ple_embed = "{p}embed_tokens_per_layer.weight",
+            .ple_proj = "{p}per_layer_model_projection.weight",
+            .ple_proj_norm = "{p}per_layer_projection_norm.weight",
+            .ple_gate = "per_layer_input_gate.weight",
+            .ple_out = "per_layer_projection.weight",
+            .ple_norm = "post_per_layer_input_norm.weight",
+            .altup_proj = "{p}altup_projections.{e}.weight",
+            .altup_unembed = "{p}altup_unembed_projections.{e}.weight",
+            .altup_router = "altup.modality_router.weight",
+            .altup_router_norm = "altup.router_norm.weight",
+            .altup_predict = "altup.prediction_coefs.weight",
+            .altup_correct = "altup.correction_coefs.weight",
+            .altup_scale = "altup.correct_output_scale",
+            .laurel_l = "laurel.linear_left.weight",
+            .laurel_r = "laurel.linear_right.weight",
+            .laurel_norm = "laurel.post_laurel_norm.weight",
+        },
+        .notes = "fixture (text): AltUp residual streams (predict / correct, magnitude-matched embed and unembed projections), Laurel blocks, per-layer input embeddings, KV-shared layers, weightless value norm, unit attention scale, gaussian-top-k gate sparsity, sliding layers with a local rope base, final logit softcapping. The gemma3n image/audio wrapper runs its text config; the towers pass through exports untouched.",
+        .extra = extraGemma3n,
+    },
+    .{
+        .model_type = "gemma4",
+        .aliases = &.{"gemma4_text"},
+        .llama_cpp = "gemma4",
+        .chat = "gemma",
+        .verified = true,
+        .activation = .gelu_tanh,
+        .tie_word_embeddings = true,
+        .embed_scale_sqrt = true,
+        .qk_norm = .head,
+        .names = .{
+            .post_attn_norm = "post_attention_layernorm.weight",
+            .pre_ff_norm = "pre_feedforward_layernorm.weight",
+            .post_ff_norm = "post_feedforward_layernorm.weight",
+            .q_norm = "self_attn.q_norm.weight",
+            .k_norm = "self_attn.k_norm.weight",
+            .ple_embed = "{p}embed_tokens_per_layer.weight",
+            .ple_proj = "{p}per_layer_model_projection.weight",
+            .ple_proj_norm = "{p}per_layer_projection_norm.weight",
+            .ple_gate = "per_layer_input_gate.weight",
+            .ple_out = "per_layer_projection.weight",
+            .ple_norm = "post_per_layer_input_norm.weight",
+            .layer_scale = "layer_scalar",
+        },
+        .notes = "fixture (text): global layers with their own head size and KV heads (global_head_dim / per_layer_config), proportional rope on global layers and a local base on sliding ones, keys reused as values (attention_k_eq_v), KV-shared layers, weightless value norm, unit attention scale, per-layer input embeddings, layer_scalar, double-wide MLPs on shared layers. The gemma4 image/audio wrapper runs its text config; the towers pass through exports untouched. The MoE block of gemma-4-26B-A4B (enable_moe_block) is not implemented.",
+        .extra = extraGemma4,
+    },
+    .{
+        .model_type = "seed_oss",
+        .llama_cpp = "seed_oss",
+        .verified = true,
+        .attention_bias = true,
+        .notes = "fixture: llama layout with q/k/v biases and an unbiased o_proj (attention_out_bias), explicit head_dim. Seed-OSS 36B.",
+    },
+    .{
+        .model_type = "lfm2",
+        .llama_cpp = "lfm2",
+        .chat = "chatml",
+        .verified = true,
+        .qk_norm = .head,
+        .tie_word_embeddings = true,
+        .names = .{
+            .final_norm = "{p}embedding_norm.weight",
+            .input_norm = &.{"operator_norm.weight"},
+            .pre_ff_norm = "ffn_norm.weight",
+            .q_norm = "self_attn.q_layernorm.weight",
+            .k_norm = "self_attn.k_layernorm.weight",
+            .o = "self_attn.out_proj.weight",
+            .gate = "feed_forward.w1.weight",
+            .up = "feed_forward.w3.weight",
+            .down = "feed_forward.w2.weight",
+            .conv_in = "conv.in_proj.weight",
+            .conv_kernel = "conv.conv.weight",
+            .conv_out = "conv.out_proj.weight",
+        },
+        .notes = "fixture: gated short-convolution layers (in_proj B/C/x split, depthwise causal conv with conv_L_cache taps, out_proj) mixed with attention layers carrying per-head q/k norms, block_ff_dim sizing, embedding_norm as the final norm. LFM2 / LFM2.5 dense (lfm2_moe is unsupported).",
+        .extra = extraLfm2,
+    },
+    .{
+        .model_type = "mistral4",
+        .aliases = &.{"mistral4_text"},
+        .llama_cpp = "mistral4",
+        .chat = "mistral",
+        .verified = true,
+        .names = .{
+            .q_a = "self_attn.q_a_proj.weight",
+            .q_a_norm = "self_attn.q_a_layernorm.weight",
+            .q_b = "self_attn.q_b_proj.weight",
+            .kv_a = "self_attn.kv_a_proj_with_mqa.weight",
+            .kv_a_norm = "self_attn.kv_a_layernorm.weight",
+            .kv_b = "self_attn.kv_b_proj.weight",
+            .shared_expert = "mlp.shared_experts.",
+        },
+        .notes = "fixture (text): MLA with interleaved rotary, yarn (mscale_all_dim) from rope_parameters, llama_4_scaling_beta query scaling on every layer, softmax group-limited top-k (two best experts per group) with renormalisation, fused [E][2I][H] experts, shared experts, first_k_dense_replace. Mistral Small 4 text config.",
+        .extra = extraMistral4,
     },
     .{
         .model_type = "qwen2_moe",
@@ -2141,7 +3145,7 @@ pub const registry = [_]Arch{
             .up = "mlp.dense_h_to_4h.weight",
             .down = "mlp.dense_4h_to_h.weight",
         },
-        .notes = "fixture: multi-query fused qkv (7B layout), parallel attention with one LayerNorm. The 40B/180B grouped layout with ln_attn/ln_mlp and the ALiBi variant are implemented but unverified. Falcon-H1 (Mamba hybrid) is unsupported.",
+        .notes = "fixture: multi-query fused qkv (7B layout), parallel attention with one LayerNorm. The 40B/180B grouped layout with ln_attn/ln_mlp and the ALiBi variant are implemented but unverified. Falcon-H1 is the `falcon_h1` entry.",
         .extra = extraFalcon,
     },
     .{
@@ -2268,7 +3272,7 @@ pub const registry = [_]Arch{
         .llama_cpp = "granite",
         .chat = "granite",
         .verified = true,
-        .notes = "fixture: embedding, attention and residual multipliers, logits scaling. Granite 3.x dense (GraniteMoE has its own entry).",
+        .notes = "fixture: embedding, attention and residual multipliers, logits scaling. Granite 3.x dense (GraniteMoE and Granite 4.0 H `granitemoehybrid` have their own entries).",
         .extra = extraGranite,
     },
     .{
@@ -2380,7 +3384,7 @@ pub const registry = [_]Arch{
         .mlp = .dense,
         .activation = .relu2,
         .names = .{ .gate = null, .up = "mlp.up_proj.weight", .down = "mlp.down_proj.weight" },
-        .notes = "fixture: LayerNorm1p with bias, relu² dense MLP, partial rotary. Nemotron-H (Mamba hybrid) is unsupported.",
+        .notes = "fixture: LayerNorm1p with bias, relu² dense MLP, partial rotary. Nemotron-H is the `nemotron_h` entry.",
         .extra = extraNemotron,
     },
     .{
@@ -2631,6 +3635,98 @@ pub const registry = [_]Arch{
         .extra = extraGlmMoeDsa,
     },
     .{
+        .model_type = "mamba2",
+        .llama_cpp = "mamba2",
+        .verified = true,
+        .positional = .none,
+        .ssm = .mamba2,
+        .single_mixer = true,
+        .names = .{
+            .prefixes = &.{ "backbone.", "" },
+            .embed = "{p}embeddings.weight",
+            .final_norm = "{p}norm_f.weight",
+            .input_norm = &.{"norm.weight"},
+            .pre_ff_norm = null,
+            .ssm = "mixer.",
+        },
+        .notes = "fixture: pure Mamba2 (SSD) blocks: in_proj split into gate / conv channels / dt, biased causal conv1d, grouped B/C, per-head decay, D skip, gated RMSNorm, out_proj; no attention, no MLP. Mamba-Codestral, state-spaces/mamba2-*-hf.",
+        .extra = extraMamba2,
+    },
+    .{
+        .model_type = "nemotron_h",
+        .llama_cpp = "nemotron_h",
+        .verified = true,
+        .positional = .none,
+        .mlp = .dense,
+        .activation = .relu2,
+        .ssm = .mamba2,
+        .single_mixer = true,
+        .names = .{
+            .prefixes = &.{ "backbone.", "" },
+            .embed = "{p}embeddings.weight",
+            .final_norm = "{p}norm_f.weight",
+            .input_norm = &.{"norm.weight"},
+            .pre_ff_norm = null,
+            .q = "mixer.q_proj.weight",
+            .k = "mixer.k_proj.weight",
+            .v = "mixer.v_proj.weight",
+            .o = "mixer.o_proj.weight",
+            .gate = null,
+            .up = "mixer.up_proj.weight",
+            .down = "mixer.down_proj.weight",
+            .router = "mixer.gate.weight",
+            .router_correction_bias = "mixer.gate.e_score_correction_bias",
+            .expert = "mixer.experts.{e}.",
+            .fused_gate_up = &.{},
+            .fused_down = &.{},
+            .shared_expert = "mixer.shared_experts.",
+            .ssm = "mixer.",
+        },
+        .notes = "fixture: one block per layer from hybrid_override_pattern / layers_block_type (M: Mamba2 with grouped gated norm and dt floor, *: attention without positional encoding, -: relu² MLP, E: non-gated experts with sigmoid group-limited routing, correction bias and a shared expert). Nemotron-H, Nemotron 3 Nano (llama.cpp: nemotron_h_moe).",
+        .extra = extraNemotronH,
+    },
+    .{
+        .model_type = "falcon_h1",
+        .llama_cpp = "falcon-h1",
+        .chat = "chatml",
+        .verified = true,
+        .ssm = .mamba2,
+        .parallel_ssm = true,
+        .names = .{
+            .prefixes = &.{ "model.", "" },
+            .final_norm = "{p}final_layernorm.weight",
+            .pre_ff_norm = "pre_ff_layernorm.weight",
+            .gate = "feed_forward.gate_proj.weight",
+            .up = "feed_forward.up_proj.weight",
+            .down = "feed_forward.down_proj.weight",
+            .ssm = "mamba.",
+        },
+        .notes = "fixtures: Mamba2 and attention in parallel on one input norm with the muP multipliers (ssm/attention in and out, key, mlp, per-section in_proj, embedding, lm_head), grouped gated RMSNorm with either gate order, and the norm-free variant. Both out projections are abliterated.",
+        .extra = extraFalconH1,
+    },
+    .{
+        .model_type = "jamba",
+        .llama_cpp = "jamba",
+        .verified = true,
+        .positional = .none,
+        .ssm = .mamba1,
+        .names = .{
+            .prefixes = &.{ "model.", "" },
+            .final_norm = "{p}final_layernorm.weight",
+            .pre_ff_norm = "pre_ff_layernorm.weight",
+            .gate = "feed_forward.gate_proj.weight",
+            .up = "feed_forward.up_proj.weight",
+            .down = "feed_forward.down_proj.weight",
+            .router = "feed_forward.router.weight",
+            .expert = "feed_forward.experts.{e}.",
+            .fused_gate_up = &.{"feed_forward.experts.gate_up_proj"},
+            .fused_down = &.{"feed_forward.experts.down_proj"},
+            .ssm = "mamba.",
+        },
+        .notes = "fixture: Mamba1 layers (in_proj, conv1d, x_proj with RMS-normalised dt/B/C, dt_proj, per-channel A_log, D, silu(z) gate) at attn_layer_period / offset, attention without positional encoding, softmax MoE at expert_layer_period / offset (separate expert tensors) and dense MLPs.",
+        .extra = extraJamba,
+    },
+    .{
         .model_type = "minimax_m2",
         .llama_cpp = "minimax-m2",
         .verified = true,
@@ -2753,8 +3849,11 @@ pub const registry = [_]Arch{
         .llama_cpp = "granitehybrid",
         .chat = "granite",
         .verified = true,
+        .positional = .none,
         .mlp = .gated_fused,
+        .ssm = .mamba2,
         .names = .{
+            .prefixes = &.{ "model.", "" },
             .gate = null,
             .up = null,
             .gate_up = "shared_mlp.input_linear.weight",
@@ -2767,8 +3866,9 @@ pub const registry = [_]Arch{
             .shared_expert = "shared_mlp.",
             .shared_gate_up = "input_linear.weight",
             .shared_down = "output_linear.weight",
+            .ssm = "mamba.",
         },
-        .notes = "fixture: attention-only Granite 4 layout (layer_types all attention): fused routed experts plus the fused shared_mlp, or a dense shared_mlp when num_local_experts is 0, optional RoPE (position_embedding_type). Mamba-2 layers are rejected.",
+        .notes = "fixtures: Mamba2 and attention layers from layer_types (also the legacy mamba / attention names; the attention-only layout too), embedding / attention / residual / logits multipliers, fused input_linear / output_linear routed experts plus the fused shared_mlp, or a dense shared_mlp when num_local_experts is 0, optional RoPE (position_embedding_type). Granite 4.0 H (tiny, small).",
         .extra = extraGraniteHybrid,
     },
     .{
@@ -2776,32 +3876,19 @@ pub const registry = [_]Arch{
         .llama_cpp = "kimi-linear",
         .verified = true,
         .linear = .kda,
-        .names = .{
-            .q_a = "self_attn.q_a_proj.weight",
-            .q_a_norm = "self_attn.q_a_layernorm.weight",
-            .q_b = "self_attn.q_b_proj.weight",
-            .kv_a = "self_attn.kv_a_proj_with_mqa.weight",
-            .kv_a_norm = "self_attn.kv_a_layernorm.weight",
-            .kv_b = "self_attn.kv_b_proj.weight",
-            .lin_q = "self_attn.q_proj.weight",
-            .lin_k = "self_attn.k_proj.weight",
-            .lin_v = "self_attn.v_proj.weight",
-            .lin_conv = "self_attn.conv1d.weight",
-            .lin_conv_split = &.{ "self_attn.q_conv1d.weight", "self_attn.k_conv1d.weight", "self_attn.v_conv1d.weight" },
-            .lin_f_a = &.{ "self_attn.forget_gate.f_a_proj.weight", "self_attn.f_a_proj.weight" },
-            .lin_f_b = &.{ "self_attn.forget_gate.f_b_proj.weight", "self_attn.f_b_proj.weight" },
-            .lin_dt_bias = &.{ "self_attn.forget_gate.dt_bias", "self_attn.dt_bias" },
-            .lin_a_log = &.{ "self_attn.forget_gate.A_log", "self_attn.A_log" },
-            .lin_b = "self_attn.b_proj.weight",
-            .lin_g_a = "self_attn.g_a_proj.weight",
-            .lin_g_b = "self_attn.g_b_proj.weight",
-            .lin_norm = "self_attn.o_norm.weight",
-            .lin_out = "self_attn.o_proj.weight",
-            .router_correction_bias = "mlp.gate.e_score_correction_bias",
-            .shared_expert = "mlp.shared_experts.",
-            .moe_alt = &kimi_linear_checkpoint_moe,
-        },
+        .names = kimi_linear_names,
         .notes = "fixtures: Kimi Delta Attention layers (per-channel decay from the low-rank forget gate, q/k/v short convolution, sigmoid-gated output norm) in the original checkpoint layout (linear_attn_config, split q/k/v convolutions, block_sparse_moe with w1/w3/w2 experts) and in the Hugging Face module layout (layer_types, fused conv1d, stacked experts); MLA full-attention layers without RoPE; sigmoid MoE with correction bias, top-2 group scores, routed_scaling_factor and shared experts. Kimi-Linear-48B-A3B.",
+        .extra = extraKimiLinear,
+    },
+    .{
+        .model_type = "kimi_k3",
+        .aliases = &.{"kimi_k3_text"},
+        .llama_cpp = null,
+        .chat = "kimi_k3",
+        .verified = true,
+        .linear = .kda,
+        .names = kimi_linear_names,
+        .notes = "fixtures: the Kimi K3 image-video wrapper (KimiK3ForConditionalGeneration) around a kimi_linear text config with Attention Residual (attn_res_block_size: softmax-weighted retrieval over the banked block prefixes and the running one, at the attention input, the MLP input and the output norm), KDA layers with the full-rank output gate and the safe forget gate (gate_lower_bound), MLA layers with the sigmoid output gate, latent MoE (routed_expert_down_proj / routed_expert_up_proj with routed_expert_norm), SiTU activation, two shared experts, sigmoid routing with correction bias, language_model prefix; bf16 and compressed-tensors mxfp4-pack-quantized experts. The vision tower and projector pass through exports untouched.",
         .extra = extraKimiLinear,
     },
     .{
@@ -2870,6 +3957,9 @@ test "registry lookup and aliases" {
     try std.testing.expect(lookup("llama") != null);
     try std.testing.expectEqualStrings("gemma3", lookup("gemma3_text").?.model_type);
     try std.testing.expectEqualStrings("qwen2", lookup("qwen2_5_vl").?.model_type);
+    try std.testing.expectEqualStrings("gemma4", lookup("gemma4_text").?.model_type);
+    try std.testing.expectEqualStrings("gemma3n", lookup("gemma3n_text").?.model_type);
+    try std.testing.expectEqualStrings("mistral4", lookup("mistral4_text").?.model_type);
     try std.testing.expect(lookup("mamba") == null);
     // Every entry has a unique model_type.
     for (registry, 0..) |a, i| {
@@ -2968,6 +4058,22 @@ test "parseConfig picks family knobs" {
     try std.testing.expectEqualStrings("kimi_k25", k25.arch.model_type);
     try std.testing.expect(k25.mla != null and !k25.moe_layers[0] and k25.moe_layers[1]);
     try std.testing.expectEqual(RouterScoring.sigmoid, k25.moe.scoring);
+    // Kimi K3: the wrapper entry wins over the nested kimi_linear text config
+    // and carries AttnRes, latent MoE, SiTU and the K3 attention gates.
+    const k3 = try parseConfig(a,
+        \\{"model_type":"kimi_k3","text_config":{"model_type":"kimi_linear","hidden_size":64,"num_attention_heads":4,"num_hidden_layers":5,"vocab_size":100,"q_lora_rank":32,"kv_lora_rank":16,"qk_nope_head_dim":8,"qk_rope_head_dim":4,"v_head_dim":8,"num_experts":8,"num_experts_per_token":2,"num_shared_experts":2,"moe_intermediate_size":16,"routed_expert_hidden_size":24,"latent_moe_use_norm":true,"attn_res_block_size":2,"hidden_act":"situ","activation_situ_beta":4.0,"activation_situ_linear_beta":25.0,"mla_use_nope":true,"mla_use_output_gate":true,"first_k_dense_replace":1,"linear_attn_config":{"kda_layers":[1,2,4],"full_attn_layers":[3,5],"head_dim":16,"num_heads":2,"short_conv_kernel_size":4,"use_full_rank_gate":true,"gate_lower_bound":-5.0}}}
+    );
+    try std.testing.expectEqualStrings("kimi_k3", k3.arch.model_type);
+    try std.testing.expectEqualStrings("kimi_k3", k3.model_type);
+    try std.testing.expectEqual(@as(usize, 2), k3.attn_res_block);
+    try std.testing.expectEqual(@as(usize, 24), k3.moe_latent);
+    try std.testing.expect(k3.moe_latent_norm and k3.mla_output_gate and k3.linear_full_rank_gate);
+    try std.testing.expectEqual(@as(f32, -5.0), k3.linear_gate_lower_bound.?);
+    try std.testing.expectEqual(tensor.Activation.silu, k3.activation);
+    try std.testing.expectEqual(@as(f32, 4.0), k3.moe.situ.?.beta);
+    try std.testing.expectEqual(@as(f32, 25.0), k3.moe.situ.?.linear_beta.?);
+    try std.testing.expect(k3.linear_layers[0] and !k3.linear_layers[2] and k3.linear_layers[3] and !k3.linear_layers[4]);
+    try std.testing.expect(!k3.moe_layers[0] and k3.moe_layers[4]);
 }
 
 test "parseConfig handles both MiMo V2 spellings" {
@@ -2982,13 +4088,14 @@ test "parseConfig handles both MiMo V2 spellings" {
     try std.testing.expect(!hf.sliding_layers[0] and hf.sliding_layers[1] and !hf.sliding_layers[5] and hf.sliding_layers[6] and !hf.sliding_layers[11]);
     try std.testing.expectEqual(@as(usize, 2), hf.layer_kv_heads[0]);
     try std.testing.expectEqual(@as(usize, 4), hf.layer_kv_heads[1]);
-    try std.testing.expectEqual(@as(usize, 4), hf.num_kv_heads);
-    try std.testing.expectEqual(@as(usize, 16), hf.v_head_dim);
+    try std.testing.expectEqual(@as(usize, 4 * 24), hf.kvDim());
+    try std.testing.expectEqual(@as(usize, 16), hf.layerVDim(0));
     try std.testing.expectEqual(@as(usize, 8), hf.rotary_dim); // int(24 * 0.334)
     try std.testing.expectEqual(@as(f32, 5_000_000.0), hf.rope_theta);
-    try std.testing.expectEqual(@as(f32, 10_000.0), hf.rope_local_theta);
-    try std.testing.expect(hf.sliding_rope_local and hf.sinks and hf.sinks_sliding_only);
-    try std.testing.expectEqual(@as(f32, 0.707), hf.value_scale);
+    try std.testing.expectEqual(@as(f32, 10_000.0), hf.rope_local.?.theta);
+    try std.testing.expectEqual(@as(usize, 8), hf.rope_local.?.rotary_dim);
+    try std.testing.expect(hf.sinks and hf.sinks_sliding_only and hf.narrow_values);
+    try std.testing.expectEqual(@as(f32, 0.707), hf.mult.value);
     try std.testing.expectEqual(@as(f32, 1e-5), hf.rms_norm_eps);
     try std.testing.expect(!hf.moe_layers[0] and hf.moe_layers[1] and hf.moe_layers[11]);
     try std.testing.expectEqual(RouterScoring.sigmoid, hf.moe.scoring);
@@ -3003,7 +4110,7 @@ test "parseConfig handles both MiMo V2 spellings" {
     try std.testing.expectEqualSlices(bool, &.{ false, true, true, false }, hub.sliding_layers);
     try std.testing.expectEqualSlices(usize, &.{ 2, 4, 4, 2 }, hub.layer_kv_heads);
     try std.testing.expectEqual(@as(?usize, 64), hub.sliding_window);
-    try std.testing.expectEqual(@as(f32, 1.0), hub.value_scale);
+    try std.testing.expectEqual(@as(f32, 1.0), hub.mult.value);
     try std.testing.expectEqual(@as(f32, 1.0), hub.moe.routed_scaling_factor);
     try std.testing.expectEqual(@as(usize, 8), hub.rotary_dim);
     try std.testing.expectEqualSlices(bool, &.{ false, true, true, true }, hub.moe_layers);
@@ -3058,4 +4165,129 @@ test "parseConfig handles the MiniMax, HunYuan, ERNIE and Granite MoE keys" {
     try std.testing.expectEqual(MlpKind.gated_fused, gh.mlp);
     try std.testing.expectEqual(@as(f32, 12.0), gh.embed_scale);
     try std.testing.expectEqualStrings("granitemoe", lookup("granitemoeshared").?.model_type);
+}
+
+test "parseConfig: Mamba families" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Nemotron-H: one block per layer from the pattern, relu² MLPs, non-gated
+    // experts, no positional encoding; `Infinity` (json.dump's spelling) is accepted.
+    const nh = try parseConfig(a,
+        \\{"model_type":"nemotron_h","hidden_size":64,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":16,"hybrid_override_pattern":"M*-E","mamba_num_heads":8,"mamba_head_dim":16,"ssm_state_size":16,"n_groups":2,"conv_kernel":4,"n_routed_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":32,"vocab_size":100,"time_step_limit":[0.001, Infinity],"note":"Infinity stays a string"}
+    );
+    try std.testing.expectEqual(@as(usize, 4), nh.num_layers);
+    try std.testing.expectEqualSlices(bool, &.{ true, false, false, false }, nh.ssm_layers);
+    try std.testing.expectEqualSlices(bool, &.{ false, true, false, false }, nh.attn_layers);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, true, true }, nh.mlp_layers);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, false, true }, nh.moe_layers);
+    try std.testing.expect(nh.has_ssm and nh.ssm.kind == .mamba2);
+    try std.testing.expectEqual(@as(usize, 128), nh.ssm.inter);
+    try std.testing.expectEqual(@as(usize, 2), nh.ssm.norm_groups);
+    try std.testing.expectEqual(@as(f32, 0.001), nh.ssm.dt_min);
+    try std.testing.expect(nh.ssm.dt_max == std.math.inf(f32));
+    try std.testing.expectEqual(tensor.Activation.relu2, nh.activation);
+    try std.testing.expectEqual(tensor.Activation.silu, nh.ssm.act);
+    try std.testing.expectEqual(Positional.none, nh.positional);
+    try std.testing.expect(nh.moe.dense_experts and nh.moe.scoring == .sigmoid);
+    // Jamba: attention and expert layers from period / offset, dt_rank "auto".
+    const jm = try parseConfig(a,
+        \\{"model_type":"jamba","hidden_size":64,"num_attention_heads":4,"num_hidden_layers":4,"attn_layer_period":2,"attn_layer_offset":1,"expert_layer_period":2,"expert_layer_offset":0,"num_experts":4,"num_experts_per_tok":2,"mamba_d_state":16,"mamba_d_conv":4,"mamba_expand":2,"mamba_dt_rank":"auto","vocab_size":100}
+    );
+    try std.testing.expectEqualSlices(bool, &.{ true, false, true, false }, jm.ssm_layers);
+    try std.testing.expectEqualSlices(bool, &.{ false, true, false, true }, jm.attn_layers);
+    try std.testing.expectEqualSlices(bool, &.{ true, false, true, false }, jm.moe_layers);
+    try std.testing.expect(jm.ssm.kind == .mamba1);
+    try std.testing.expectEqual(@as(usize, 128), jm.ssm.inter);
+    try std.testing.expectEqual(@as(usize, 4), jm.ssm.dt_rank);
+    // Falcon-H1: every layer runs both blocks; the multipliers are read.
+    const fh = try parseConfig(a,
+        \\{"model_type":"falcon_h1","hidden_size":64,"num_attention_heads":4,"num_hidden_layers":2,"mamba_d_ssm":128,"mamba_n_heads":8,"mamba_d_head":"auto","mamba_n_groups":2,"mamba_d_state":16,"mamba_d_conv":4,"mamba_rms_norm":true,"key_multiplier":0.5,"ssm_multipliers":[1,2,3,4,5],"mlp_multipliers":[1.5,0.5],"lm_head_multiplier":0.25,"vocab_size":100}
+    );
+    try std.testing.expect(fh.parallel_ssm and fh.ssm_layers[1] and fh.attn_layers[1] and fh.mlp_layers[1]);
+    try std.testing.expectEqual(@as(usize, 16), fh.ssm.head_dim);
+    try std.testing.expectEqual(@as(f32, 0.5), fh.mult.key);
+    try std.testing.expectEqual(@as(f32, 5), fh.mult.ssm_proj[4]);
+    try std.testing.expectEqual(@as(f32, 0.5), fh.mult.mlp_down);
+    try std.testing.expectEqual(@as(f32, 0.25), fh.logit_scale);
+    // Pure Mamba2 has no attention heads at all.
+    const m2 = try parseConfig(a,
+        \\{"model_type":"mamba2","hidden_size":64,"num_hidden_layers":2,"num_heads":8,"head_dim":16,"state_size":16,"n_groups":2,"expand":2,"conv_kernel":4,"vocab_size":100}
+    );
+    try std.testing.expect(!m2.attn_layers[0] and !m2.mlp_layers[0] and m2.ssm_layers[0]);
+    try std.testing.expectEqual(@as(usize, 1), m2.num_kv_heads);
+    try std.testing.expect(!m2.rope_layers[0]);
+    // Granite: RoPE only on request.
+    const gh = try parseConfig(a,
+        \\{"model_type":"granitemoehybrid","hidden_size":64,"num_attention_heads":4,"num_hidden_layers":2,"layer_types":["mamba","attention"],"position_embedding_type":"rope","num_local_experts":0,"mamba_n_heads":8,"mamba_d_state":16,"vocab_size":100}
+    );
+    try std.testing.expect(gh.ssm_layers[0] and gh.attn_layers[1] and gh.rope_layers[1] and !gh.moe_layers[0]);
+    try std.testing.expectEqual(@as(usize, 16), gh.ssm.head_dim);
+}
+
+test "sanitizeJson replaces the non-JSON float literals outside strings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("{\"a\": [0, null, null], \"b\": \"Infinity\\\"NaN\", \"c\": null}", try sanitizeJson(a, "{\"a\": [0, Infinity, -Infinity], \"b\": \"Infinity\\\"NaN\", \"c\": NaN}"));
+    const plain = "{\"x\": 1}";
+    try std.testing.expect((try sanitizeJson(a, plain)).ptr == plain.ptr);
+}
+
+test "parseConfig picks the Gemma 4, Gemma 3n, LFM2 and Mistral 4 knobs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const g4 = try parseConfig(a,
+        \\{"model_type":"gemma4","text_config":{"model_type":"gemma4_text","hidden_size":64,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":16,"num_hidden_layers":12,"vocab_size":100,"global_head_dim":32,"num_global_key_value_heads":1,"attention_k_eq_v":true,"num_kv_shared_layers":2,"hidden_size_per_layer_input":8,"sliding_window":512,"rope_parameters":{"full_attention":{"rope_type":"proportional","partial_rotary_factor":0.25,"rope_theta":1000000.0},"sliding_attention":{"rope_type":"default","rope_theta":10000.0}}}}
+    );
+    // Default pattern: 5 sliding, 1 global; the last layer is global.
+    try std.testing.expect(g4.sliding_layers[0] and !g4.sliding_layers[5] and g4.sliding_layers[6] and !g4.sliding_layers[11]);
+    try std.testing.expectEqual(@as(usize, 32), g4.layer_head_dim[5]);
+    try std.testing.expectEqual(@as(usize, 1), g4.layer_kv_heads[5]);
+    try std.testing.expectEqual(@as(usize, 16), g4.layer_head_dim[0]);
+    try std.testing.expectEqual(@as(usize, 2), g4.layer_kv_heads[0]);
+    try std.testing.expectEqual(@as(usize, 32), g4.kvDim());
+    try std.testing.expectEqual(@as(f32, 1.0), g4.layer_attn_scale[3]);
+    // Proportional rope: 8 rotated coordinates with frequencies over the 32-wide head.
+    try std.testing.expectEqual(@as(usize, 8), g4.rotary_dim);
+    try std.testing.expectEqual(@as(usize, 32), g4.rope_freq_dim);
+    try std.testing.expectEqual(@as(f32, 1000000.0), g4.rope_theta);
+    try std.testing.expectEqual(@as(f32, 10000.0), g4.rope_local.?.theta);
+    try std.testing.expectEqual(@as(usize, 16), g4.rope_local.?.rotary_dim);
+    // Layers 10 (sliding) and 11 (global) read layers 9 and 5.
+    try std.testing.expectEqual(@as(usize, 9), g4.kv_source[10]);
+    try std.testing.expectEqual(@as(usize, 5), g4.kv_source[11]);
+    try std.testing.expectEqual(@as(usize, 8), g4.kv_source[8]);
+    try std.testing.expect(g4.k_eq_v and g4.v_norm and g4.ple_dim == 8);
+
+    const g3n = try parseConfig(a,
+        \\{"model_type":"gemma3n_text","hidden_size":64,"intermediate_size":[128,256],"num_attention_heads":4,"num_key_value_heads":2,"head_dim":16,"num_hidden_layers":2,"vocab_size":100,"altup_num_inputs":4,"laurel_rank":8,"activation_sparsity_pattern":[0.95,0.0]}
+    );
+    try std.testing.expectEqual(@as(usize, 256), g3n.intermediate_size);
+    try std.testing.expect(g3n.intermediate_varies);
+    try std.testing.expectEqual(@as(usize, 4), g3n.altup_inputs);
+    try std.testing.expectEqual(@as(f32, 0.95), g3n.activation_sparsity[0]);
+    try std.testing.expectEqual(@as(usize, 256), g3n.ple_dim);
+
+    const lfm = try parseConfig(a,
+        \\{"model_type":"lfm2","hidden_size":64,"num_attention_heads":4,"num_key_value_heads":2,"num_hidden_layers":4,"vocab_size":100,"norm_eps":1e-5,"conv_L_cache":3,"block_ff_dim":12288,"block_multiple_of":256,"block_ffn_dim_multiplier":1.0,"block_auto_adjust_ff_dim":true,"full_attn_idxs":[2]}
+    );
+    try std.testing.expect(lfm.conv_layers[0] and lfm.conv_layers[1] and !lfm.conv_layers[2] and lfm.conv_layers[3]);
+    try std.testing.expect(lfm.has_conv);
+    try std.testing.expectEqual(@as(usize, 8192), lfm.intermediate_size);
+    try std.testing.expectEqual(@as(f32, 1000000.0), lfm.rope_theta);
+    try std.testing.expectEqual(QkNorm.head, lfm.qk_norm);
+
+    const m4 = try parseConfig(a,
+        \\{"model_type":"mistral4","hidden_size":64,"num_attention_heads":4,"num_hidden_layers":3,"vocab_size":100,"q_lora_rank":32,"kv_lora_rank":16,"qk_nope_head_dim":8,"qk_rope_head_dim":4,"v_head_dim":8,"n_routed_experts":8,"n_shared_experts":1,"num_experts_per_tok":2,"n_group":2,"topk_group":1,"first_k_dense_replace":1,"rope_parameters":{"rope_type":"yarn","rope_theta":10000.0,"factor":128.0,"original_max_position_embeddings":8192,"beta_fast":32.0,"beta_slow":1.0,"mscale":1.0,"mscale_all_dim":1.0,"llama_4_scaling_beta":0.1}}
+    );
+    try std.testing.expect(m4.rope_scaling == .yarn);
+    try std.testing.expectEqual(RopeStyle.gptj, m4.rope_style);
+    try std.testing.expect(m4.moe.group_score_top2 and m4.moe.topk_method == .group_limited);
+    try std.testing.expect(!m4.moe_layers[0] and m4.moe_layers[1]);
+    const t = m4.attn_temperature.?;
+    try std.testing.expect(t.all_layers and t.offset == 0 and t.floor_scale == 8192 and t.attn_scale == 0.1);
+    const ms4 = 0.1 * @log(@as(f32, 128)) + 1.0;
+    try std.testing.expectApproxEqRel(ms4 * ms4 / @sqrt(@as(f32, 12)), m4.attention_scale, 1e-5);
 }

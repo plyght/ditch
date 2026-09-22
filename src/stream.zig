@@ -675,7 +675,7 @@ fn firstTokenLogits(gpa: Allocator, model: *const model_mod.Model, prompts: []co
     const out = try gpa.alloc(f32, prompts.len * c.vocab_size);
     errdefer gpa.free(out);
     for (prompts, 0..) |p, i| {
-        const kv_bytes = model_mod.KvCache.bytesFor(c.num_layers, 1, p.len + 1, c.num_kv_heads * c.head_dim);
+        const kv_bytes = model_mod.KvCache.bytesFor(c.num_layers, 1, p.len + 1, c.kvDim());
         const rows = workspaceRows(model, @max(1, p.len), 1, kv_bytes);
         var ws = try model_mod.Workspace.init(model.gpa, c, rows, 1);
         defer ws.deinit();

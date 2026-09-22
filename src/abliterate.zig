@@ -143,6 +143,8 @@ pub fn kernelWeight(p: Params, layer: usize) ?f32 {
 /// On MoE layers the `mlp.down_proj` kernel weight is applied to every expert's
 /// down projection (routed and shared), as heretic does (broad edit); with
 /// `opts.visited_experts_only` (warp mode) unvisited routed experts are skipped.
+/// On a latent-MoE layer (Kimi K3) the routed experts' shared up projection
+/// takes the edit instead of their latent-space down projections.
 pub fn apply(model: *Model, dirs: []const f32, direction_index: ?f32, params: std.EnumMap(Component, Params), opts: Options) !void {
     const gpa = model.gpa;
     const hidden = model.config.hidden_size;
@@ -158,11 +160,22 @@ pub fn apply(model: *Model, dirs: []const f32, direction_index: ?f32, params: st
         for (Component.all) |comp| {
             const p = params.get(comp) orelse continue;
             const weight = kernelWeight(p, li) orelse continue;
+            // Single-block layers (Mamba2, Nemotron-H) lack one of the two.
+            if (!model.hasComponent(li, comp)) continue;
             if (model.budget) |b| try b.checkTime();
             const v = if (global_dir) |g| g else dirs[(li + 1) * stride ..][0..stride];
             if (comp == .mlp_down_proj and layer.moe != null) {
                 const m = &layer.moe.?;
-                var idx: usize = 0;
+                // Latent MoE: the routed experts write into the residual
+                // through one shared up projection; that takes their edit.
+                var idx: usize = if (m.routedInLatent()) m.experts.len else 0;
+                if (m.routedInLatent()) {
+                    const lease = try model.acquireLatentUp(li);
+                    defer lease.release(model);
+                    const delta = try computeDelta(model.pool, gpa, lease.weight, v, weight, opts, opts.seed +% seed_counter);
+                    seed_counter += 1;
+                    model.setLatentDelta(li, delta);
+                }
                 while (idx < m.numDown()) : (idx += 1) {
                     if (visited_only and idx < m.experts.len and !model.expertVisited(li, idx)) continue;
                     // One expert matrix resident at a time (streamed mode reads it from disk).
@@ -176,11 +189,22 @@ pub fn apply(model: *Model, dirs: []const f32, direction_index: ?f32, params: st
             }
             // The matrix stays resident for all passes of computeDelta (up to ~13
             // in "full" mode) and is released before the next component is read.
-            const lease = try model.acquireComponent(li, comp);
-            defer @constCast(&model.store).release(lease);
-            const delta = try computeDelta(model.pool, gpa, lease.weight, v, weight, opts, opts.seed +% seed_counter);
-            seed_counter += 1;
-            model.setDelta(li, comp, delta);
+            {
+                const lease = try model.acquireComponent(li, comp);
+                defer @constCast(&model.store).release(lease);
+                const delta = try computeDelta(model.pool, gpa, lease.weight, v, weight, opts, opts.seed +% seed_counter);
+                seed_counter += 1;
+                model.setDelta(li, comp, delta);
+            }
+            // A Mamba block next to attention (Falcon-H1) writes to the
+            // residual through its own out_proj: edited like the o_proj.
+            if (comp == .attn_o_proj and model.hasSsmOut(li)) {
+                const lease = try model.acquireSsmOut(li);
+                defer @constCast(&model.store).release(lease);
+                const delta = try computeDelta(model.pool, gpa, lease.weight, v, weight, opts, opts.seed +% seed_counter);
+                seed_counter += 1;
+                model.setSsmOutDelta(li, delta);
+            }
         }
     }
 }
