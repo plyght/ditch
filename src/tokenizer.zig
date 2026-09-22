@@ -109,12 +109,21 @@ pub const Tokenizer = struct {
     /// Set by `parseTiktoken`; selects the pattern written by `toJson`.
     tiktoken_kind: ?TiktokenKind,
     unk_id: ?u32,
+    /// Unigram (SentencePiece) model: one log-probability per id, and the
+    /// longest vocabulary entry in bytes. Empty for a BPE tokenizer.
+    unigram_scores: []const f32,
+    unigram_max_len: usize,
     // normalizer
     prepend: ?[]const u8,
     replace_space: ?[]const u8, // replacement for " " (typically "▁")
     lowercase: bool,
     /// Pre-tokenisation steps applied in order to every segment.
     steps: []const Step,
+    /// SentencePiece's `Precompiled` charsmap: only its whitespace rules are
+    /// applied (control characters and the Unicode separators become a space,
+    /// runs of spaces collapse, the ends are stripped), which is what it does
+    /// to ordinary text; the rest of the charsmap is the identity.
+    sp_whitespace: bool,
     /// Pieces are mapped through the GPT-2 byte→unicode table before BPE.
     byte_level: bool,
     has_metaspace: bool,
@@ -154,10 +163,13 @@ pub const Tokenizer = struct {
             .rank_bpe = false,
             .tiktoken_kind = null,
             .unk_id = null,
+            .unigram_scores = &.{},
+            .unigram_max_len = 0,
             .prepend = null,
             .replace_space = null,
             .lowercase = false,
             .steps = &.{},
+            .sp_whitespace = false,
             .byte_level = false,
             .has_metaspace = false,
             .decoder = .plain,
@@ -215,16 +227,43 @@ pub const Tokenizer = struct {
         // --- model ---
         const model = (root.get("model") orelse return error.InvalidTokenizer).object;
         const model_type = if (model.get("type")) |t| t.string else "BPE";
-        if (!std.mem.eql(u8, model_type, "BPE")) {
+        const unigram = std.mem.eql(u8, model_type, "Unigram");
+        if (!std.mem.eql(u8, model_type, "BPE") and !unigram) {
             std.log.err("unsupported tokenizer model type: {s}", .{model_type});
             return error.UnsupportedTokenizer;
         }
         if (model.get("byte_fallback")) |v| self.byte_fallback = v == .bool and v.bool;
         if (model.get("ignore_merges")) |v| self.ignore_merges = v == .bool and v.bool;
 
-        const vocab = (model.get("vocab") orelse return error.InvalidTokenizer).object;
+        const vocab_value = model.get("vocab") orelse return error.InvalidTokenizer;
         var max_id: usize = 0;
-        {
+        if (unigram) {
+            // `vocab` is `[[token, log_prob], ...]`; the id is the index.
+            const list = if (vocab_value == .array) vocab_value.array.items else return error.InvalidTokenizer;
+            const scores = try arena.alloc(f32, list.len);
+            for (list, 0..) |entry, i| {
+                if (entry != .array or entry.array.items.len < 2) return error.InvalidTokenizer;
+                const token = entry.array.items[0];
+                if (token != .string) return error.InvalidTokenizer;
+                const score = entry.array.items[1];
+                scores[i] = switch (score) {
+                    .float => |f| @floatCast(f),
+                    .integer => |n| @floatFromInt(n),
+                    else => return error.InvalidTokenizer,
+                };
+                const id: u32 = @intCast(i);
+                const key = try arena.dupe(u8, token.string);
+                // The first entry of a duplicated token wins, as in sentencepiece.
+                if (!self.vocab.contains(key)) try self.vocab.put(arena, key, id);
+                self.unigram_max_len = @max(self.unigram_max_len, key.len);
+                max_id = @max(max_id, i);
+            }
+            self.unigram_scores = scores;
+            if (model.get("unk_id")) |u| {
+                if (u == .integer and u.integer >= 0) self.unk_id = @intCast(u.integer);
+            }
+        } else {
+            const vocab = if (vocab_value == .object) vocab_value.object else return error.InvalidTokenizer;
             var it = vocab.iterator();
             while (it.next()) |e| {
                 const id: u32 = @intCast(e.value_ptr.integer);
@@ -616,6 +655,11 @@ pub const Tokenizer = struct {
             self.lowercase = true;
         } else if (std.mem.eql(u8, t, "Strip") or std.mem.eql(u8, t, "NFC")) {
             // Whitespace stripping of the whole input and NFC are identities for the prompts ditch builds.
+        } else if (std.mem.eql(u8, t, "Precompiled")) {
+            // The charsmap is a compiled trie; ditch applies the part of it
+            // that ordinary text actually hits (see `sp_whitespace`) and
+            // leaves the rest — the compatibility foldings — as the identity.
+            self.sp_whitespace = true;
         } else {
             std.log.warn("normalizer '{s}' is approximated by the identity (text that is not already normalised may tokenize differently)", .{t});
         }
@@ -794,9 +838,10 @@ pub const Tokenizer = struct {
         defer scratch.deinit();
         const a = scratch.allocator();
         // Normalise.
+        const text = if (self.sp_whitespace) try spWhitespace(a, raw) else raw;
         var norm = std.ArrayList(u8).empty;
         if (self.prepend) |p| try norm.appendSlice(a, p);
-        for (raw) |c| {
+        for (text) |c| {
             if (c == ' ' and self.replace_space != null and !self.has_metaspace) {
                 try norm.appendSlice(a, self.replace_space.?);
             } else if (self.lowercase) {
@@ -923,12 +968,131 @@ pub const Tokenizer = struct {
     const Symbol = struct { start: usize, end: usize };
 
     /// Runs byte-pair merging over one pre-tokenised word and appends ids.
+    /// SentencePiece's whitespace normalisation (`nmt_nfkc` plus
+    /// `remove_extra_whitespaces`): the C0 controls, the Unicode separators
+    /// and the zero-width joiners become a space, runs of spaces collapse to
+    /// one, and a leading run is dropped (Metaspace supplies the prefix). The
+    /// zero-width space and the byte order mark are removed outright.
+    fn spWhitespace(a: Allocator, raw: []const u8) ![]const u8 {
+        var out = std.ArrayList(u8).empty;
+        var i: usize = 0;
+        var pending_space = false;
+        while (i < raw.len) {
+            const len = utf8Len(raw[i]);
+            const cp: u21 = if (len == 1) raw[i] else (std.unicode.utf8Decode(raw[i..][0..@min(len, raw.len - i)]) catch raw[i]);
+            i += len;
+            const space = switch (cp) {
+                0x09...0x0D, 0x20, 0x85, 0xA0, 0x1680 => true,
+                0x2000...0x200A => true,
+                0x2028, 0x2029, 0x202F, 0x205F, 0x3000 => true,
+                0x200C, 0x200D => true, // ZWNJ / ZWJ
+                else => false,
+            };
+            const drop = switch (cp) {
+                0x00...0x08, 0x0E...0x1F, 0x7F => true,
+                0x200B, 0xFEFF => true, // zero-width space, BOM
+                else => false,
+            };
+            if (drop) continue;
+            if (space) {
+                pending_space = out.items.len > 0; // strip leading
+                continue;
+            }
+            if (pending_space) {
+                try out.append(a, ' ');
+                pending_space = false;
+            }
+            var buf: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(cp, &buf) catch {
+                try out.append(a, raw[i - len]);
+                continue;
+            };
+            try out.appendSlice(a, buf[0..n]);
+        }
+        // Leading whitespace is dropped (Metaspace supplies the prefix), a
+        // trailing run collapses to one space, which sentencepiece keeps.
+        if (pending_space) try out.append(a, ' ');
+        return out.items;
+    }
+
+    fn utf8Len(first: u8) usize {
+        return std.unicode.utf8ByteSequenceLength(first) catch 1;
+    }
+
+    /// Unigram (SentencePiece) segmentation: the path through `word` whose
+    /// vocabulary pieces have the highest total log-probability, by Viterbi
+    /// over the UTF-8 character boundaries. A position no piece covers falls
+    /// back to one character as `unk_id`, scored below every vocabulary entry
+    /// so a covered path always wins.
+    fn unigramWord(self: *Tokenizer, gpa: Allocator, word: []const u8, out: *std.ArrayList(u32)) !void {
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const n = word.len;
+        const best = try a.alloc(f32, n + 1);
+        const prev = try a.alloc(usize, n + 1);
+        const piece_id = try a.alloc(u32, n + 1);
+        const reachable = try a.alloc(bool, n + 1);
+        @memset(best, 0);
+        @memset(reachable, false);
+        reachable[0] = true;
+        var min_score: f32 = 0;
+        for (self.unigram_scores) |sc| min_score = @min(min_score, sc);
+        const unk_score = min_score - 10.0; // sentencepiece's kUnkPenalty
+
+        var i: usize = 0;
+        while (i < n) : (i += utf8Len(word[i])) {
+            if (!reachable[i]) continue;
+            var covered = false;
+            var end = i + utf8Len(word[i]);
+            const limit = @min(n, i + @max(self.unigram_max_len, 1));
+            while (end <= limit) {
+                if (self.vocab.get(word[i..end])) |id| {
+                    const score = best[i] + self.unigram_scores[id];
+                    if (!reachable[end] or score > best[end]) {
+                        best[end] = score;
+                        prev[end] = i;
+                        piece_id[end] = id;
+                        reachable[end] = true;
+                    }
+                    covered = true;
+                }
+                if (end == n) break;
+                end += utf8Len(word[end]);
+            }
+            if (!covered) {
+                // One character as the unknown token, so the path continues.
+                const one = i + utf8Len(word[i]);
+                const score = best[i] + unk_score;
+                if (!reachable[one] or score > best[one]) {
+                    best[one] = score;
+                    prev[one] = i;
+                    piece_id[one] = self.unk_id orelse 0;
+                    reachable[one] = true;
+                }
+            }
+        }
+        if (!reachable[n]) return; // no path: nothing to emit
+
+        var rev = std.ArrayList(u32).empty;
+        defer rev.deinit(a);
+        var pos = n;
+        while (pos > 0) {
+            try rev.append(a, piece_id[pos]);
+            pos = prev[pos];
+        }
+        std.mem.reverse(u32, rev.items);
+        try self.cacheWord(word, rev.items);
+        try out.appendSlice(gpa, rev.items);
+    }
+
     fn bpeWord(self: *Tokenizer, gpa: Allocator, word: []const u8, out: *std.ArrayList(u32)) !void {
         if (word.len == 0) return;
         if (self.cache.get(word)) |ids| {
             try out.appendSlice(gpa, ids);
             return;
         }
+        if (self.unigram_scores.len > 0) return self.unigramWord(gpa, word, out);
         var ids = std.ArrayList(u32).empty;
         defer ids.deinit(gpa);
 
@@ -1859,4 +2023,42 @@ test "sentencepiece style bpe with byte fallback" {
     const text = try tok.decode(gpa, ids, true);
     defer gpa.free(text);
     try std.testing.expectEqualStrings("hi €", text);
+}
+
+test "unigram segmentation picks the highest-scoring path" {
+    const gpa = std.testing.allocator;
+    // "\u2581ab" can be cut as "\u2581a"+"b" (-1.5 -3.0) or "\u2581"+"ab" (-4.0 -0.5):
+    // the second path wins on total log-probability, not on longest match.
+    const json =
+        \\{"model":{"type":"Unigram","unk_id":0,"vocab":[["<unk>",0.0],["\u2581",-4.0],["a",-3.5],["b",-3.0],["ab",-0.5],["\u2581a",-1.5],["\u2581ab",-9.0]]},
+        \\"normalizer":{"type":"Sequence","normalizers":[{"type":"Precompiled","precompiled_charsmap":""}]},
+        \\"pre_tokenizer":{"type":"Metaspace","replacement":"\u2581","prepend_scheme":"always"},
+        \\"decoder":{"type":"Metaspace","replacement":"\u2581","prepend_scheme":"always"},
+        \\"added_tokens":[{"id":0,"content":"<unk>","special":true}]}
+    ;
+    const tok = try Tokenizer.parse(gpa, json, null);
+    defer tok.deinit();
+    const ids = try tok.encode(gpa, "ab", false);
+    defer gpa.free(ids);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 4 }, ids);
+    // A character no piece covers becomes the unknown token, and the path continues.
+    const unk = try tok.encode(gpa, "aZb", false);
+    defer gpa.free(unk);
+    try std.testing.expectEqualSlices(u32, &.{ 5, 0, 3 }, unk);
+}
+
+test "sentencepiece whitespace normalisation collapses runs and drops the leading one" {
+    const gpa = std.testing.allocator;
+    const json =
+        \\{"model":{"type":"Unigram","unk_id":0,"vocab":[["<unk>",0.0],["\u2581",-4.0],["a",-3.5],["b",-3.0]]},
+        \\"normalizer":{"type":"Precompiled","precompiled_charsmap":""},
+        \\"pre_tokenizer":{"type":"Metaspace","replacement":"\u2581","prepend_scheme":"always"},
+        \\"decoder":{"type":"Metaspace","replacement":"\u2581","prepend_scheme":"always"}}
+    ;
+    const tok = try Tokenizer.parse(gpa, json, null);
+    defer tok.deinit();
+    // "  a\t\tb " -> "a b " -> pieces "\u2581a", "\u2581b", "\u2581".
+    const ids = try tok.encode(gpa, "  a\t\tb ", false);
+    defer gpa.free(ids);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 1, 3, 1 }, ids);
 }

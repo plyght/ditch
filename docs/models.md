@@ -320,7 +320,10 @@ The ggml types ditch reads and writes:
 ## Tokenizers
 
 * `tokenizer.json` (Hugging Face fast tokenizers): byte-level and
-  SentencePiece-style BPE.
+  SentencePiece-style BPE, and Unigram (SentencePiece: the highest
+  log-probability segmentation, by Viterbi over the character boundaries, with
+  a one-character fallback to the unknown token). XGLM, mBART and the other
+  Unigram models tokenize identically to the `tokenizers` package.
 * tiktoken rank files, when a model ships no `tokenizer.json`: Moonshot's
   `tiktoken.model` (Kimi K2, K2.5, K3, Kimi-Linear, with the pattern and
   special tokens of `tokenization_kimi.py`) or Meta's Llama 3
@@ -339,8 +342,11 @@ The ggml types ditch reads and writes:
   `tokenizer.json` with
   `AutoTokenizer.from_pretrained(...).save_pretrained(...)` and place it next
   to the model.
-* Unicode normalisers (NFC, NFKC, Precompiled) are approximated by the
-  identity.
+* Unicode normalisers (NFC, NFKC) are approximated by the identity. Of
+  SentencePiece's `Precompiled` charsmap only the whitespace rules are applied
+  — control characters, the Unicode separators and the zero-width joiners
+  become a space, runs of spaces collapse, a leading run is dropped — which is
+  the part ordinary text hits; the compatibility foldings are the identity.
 
 ## Not supported
 

@@ -4805,7 +4805,7 @@ pub const registry = [_]Arch{
             .attn_sub_norm = "self_attn.attn_sub_norm.weight",
             .ffn_sub_norm = "mlp.ffn_sub_norm.weight",
         },
-        .notes = "fixture: the sub-layer RMSNorms on the attention output and the gated MLP intermediate, relu² activation. BitNet b1.58 (released unpacked, as bf16).",
+        .notes = "fixture: the sub-layer RMSNorms on the attention output and the gated MLP intermediate, relu² activation. No *released* BitNet checkpoint can be run: b1.58 ternarises its weights and quantises its activations inside every linear at run time (quantization_config.quant_method = bitnet), so neither the packed release nor the bf16 master weights are the model the reference runs; both are refused with that reason. The entry covers the layout for a checkpoint that ships plain weights.",
     },
     .{
         .model_type = "helium",

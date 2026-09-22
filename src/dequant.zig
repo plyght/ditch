@@ -178,6 +178,14 @@ pub fn parseQuantConfig(qc: ?std.json.ObjectMap) !QuantConfig {
         std.log.err("unsupported model: compressed-tensors format '{s}' cannot be dequantised (pack-quantized, mxfp4-pack-quantized and float-quantized are supported)", .{format});
         return error.UnsupportedArchitecture;
     }
+    if (std.mem.eql(u8, method, "bitnet")) {
+        // Nothing is stored quantised: the released weights are bf16 master
+        // weights that the reference implementation ternarises (and quantises
+        // the activations of) inside every linear, at run time. Reading them
+        // as they are would silently run a different model.
+        std.log.err("unsupported model: BitNet quantises its weights and activations inside every linear at run time ('{s}' mode), so the released weights are master weights, not the model ditch would run", .{objStr(obj, "quantization_mode") orelse "online"});
+        return error.UnsupportedArchitecture;
+    }
     const shown = if (method.len > 0) method else if (format.len > 0) format else "unknown";
     std.log.err("unsupported model: '{s}' quantised weights cannot be dequantised (fp8, mxfp4 and compressed-tensors pack-quantized/mxfp4-pack-quantized/float-quantized are supported)", .{shown});
     return error.UnsupportedArchitecture;

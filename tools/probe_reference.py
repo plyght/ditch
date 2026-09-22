@@ -4,6 +4,10 @@
     ditch probe MODEL --prompt "..." --prompt "..." --json > probe.json
     python3 tools/probe_reference.py MODEL probe.json [--dtype bfloat16]
 
+A base model with no chat template is probed with `ditch probe --raw` and
+compared with `--raw` here: the prompt is the text, verbatim, with no
+special tokens.
+
 For every prompt the script renders the chat template with the same system
 prompt, tokenises it with `tokenizers`, runs the model once and compares:
 the rendered text, the token ids, the first-token logits (max absolute
@@ -31,23 +35,25 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
+LAYER_PARTS = (".layers.", ".h.", ".blocks.", ".block.", ".layer.")
+
+
 def find_final_norm(model):
     """The module whose input is the residual the final norm reads.
 
-    Named `norm` on most families, but also `ln_f` (GPT-2), `final_layernorm`
-    (Phi, Nemotron-H) or `embedding_norm` (LFM2), so the last norm-like child
-    of the decoder is the fallback.
+    Named `norm` on most families, but also `ln_f` (GPT-2, GPT-Neo),
+    `final_layernorm` (Phi, Nemotron-H) or `embedding_norm` (LFM2), and the
+    decoder hangs off `model`, `transformer`, `gpt_neox` or `language_model`
+    depending on the family. So: the last normalisation module that is not
+    inside the layer stack.
     """
-    inner = getattr(model, "model", model)
-    inner = getattr(inner, "language_model", inner)
-    for name in ("norm", "final_layernorm", "ln_f", "final_norm", "embedding_norm"):
-        mod = getattr(inner, name, None)
-        if mod is not None:
-            return mod
-    for _, mod in reversed(list(inner.named_children())):
-        if "norm" in type(mod).__name__.lower():
-            return mod
-    return None
+    found = None
+    for name, mod in model.named_modules():
+        if any(part in "." + name + "." for part in LAYER_PARTS):
+            continue
+        if "norm" in type(mod).__name__.lower() or "norm" in name.rsplit(".", 1)[-1]:
+            found = mod
+    return found
 
 
 def compare_residuals(entry, out, pre_norm, tolerance):
@@ -67,18 +73,21 @@ def compare_residuals(entry, out, pre_norm, tolerance):
     worst, worst_layer = 0.0, 0
     first_bad = None
     for i, (a, b) in enumerate(zip(hidden, got)):
-        d = float(np.abs(a - b).max())
-        if d > worst:
-            worst, worst_layer = d, i
-        if first_bad is None and d > tolerance:
-            first_bad = (i, d, float(np.abs(a).max()))
+        scale = max(float(np.abs(a).max()), 1e-6)
+        # Relative to the layer's own magnitude, so a bf16 reference (which a
+        # model too big for a float32 one needs) is judged on the same scale.
+        rel = float(np.abs(a - b).max()) / scale
+        if rel > worst:
+            worst, worst_layer = rel, i
+        if first_bad is None and rel > tolerance:
+            first_bad = (i, rel, float(np.abs(a - b).max()), scale)
     if first_bad is not None:
-        i, d, scale = first_bad
-        print(f"  residuals diverge first at layer {i}: max |difference| {d:.5f} (|reference| {scale:.4f})")
+        i, rel, d, scale = first_bad
+        print(f"  residuals diverge first at layer {i}: max |difference| {d:.5f} = {rel:.2e} of |reference| {scale:.4f}")
         print(f"    layer {i} is the {'embedding output' if i == 0 else f'output of layer {i - 1}'};"
               f" the layers before it agree")
         return False
-    print(f"  residuals: all {len(got)} layers agree (worst max |difference| {worst:.2e} at layer {worst_layer})")
+    print(f"  residuals: all {len(got)} layers agree (worst {worst:.2e} relative, at layer {worst_layer})")
     return True
 
 
@@ -90,8 +99,11 @@ def main():
     ap.add_argument("--tolerance", type=float, default=1e-2)
     ap.add_argument("--system-prompt", default="You are a helpful assistant.")
     ap.add_argument("--max-new-tokens", type=int, default=32)
+    ap.add_argument("--raw", action="store_true",
+                    help="the probe was run with --raw: no chat template and no BOS")
     ap.add_argument("--residual-tolerance", type=float, default=1e-3,
-                    help="max |difference| of a per-layer residual before it counts as a mismatch")
+                    help="max |difference| of a per-layer residual, relative to that layer's own"
+                         " magnitude, before it counts as a mismatch")
     args = ap.parse_args()
 
     probe = json.load(open(args.probe_json))
@@ -105,12 +117,16 @@ def main():
         final_norm.register_forward_pre_hook(lambda mod, inp: captured.__setitem__("pre_norm", inp[0]))
     for entry in probe["prompts"]:
         messages = [{"role": "system", "content": args.system_prompt}, {"role": "user", "content": entry["user"]}]
-        try:
-            text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        except Exception as exc:  # models without a system role (Gemma)
-            print(f"chat template with system role failed ({exc}); retrying without it")
-            text = tok.apply_chat_template(messages[1:], tokenize=False, add_generation_prompt=True)
-        ids = tok(text, add_special_tokens=True if tok.bos_token and not text.startswith(tok.bos_token or "\0") else False)["input_ids"]
+        if args.raw:
+            text = entry["user"]
+            ids = tok(text, add_special_tokens=False)["input_ids"]
+        else:
+            try:
+                text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            except Exception as exc:  # models without a system role (Gemma)
+                print(f"chat template with system role failed ({exc}); retrying without it")
+                text = tok.apply_chat_template(messages[1:], tokenize=False, add_generation_prompt=True)
+            ids = tok(text, add_special_tokens=True if tok.bos_token and not text.startswith(tok.bos_token or "\0") else False)["input_ids"]
         print(f"\n== {entry['user'][:60]!r}")
         bos = tok.bos_token or ""
         if bos and text.startswith(bos) and not entry["text"].startswith(bos):
