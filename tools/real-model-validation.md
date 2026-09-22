@@ -1858,6 +1858,7 @@ layers by range requests. Same comparison as everywhere else, float32.
 | swiss-ai/Apertus-8B-Instruct-2509, N = 3 | `apertus` | match (raw); template after bug 36 | all 4 agree | 6.29e-07 |
 | arcee-ai/AFM-4.5B, N = 3 | `arcee` | match (raw); template ids match | all 4 agree | 6.14e-07 |
 | allenai/OLMoE-1B-7B-0924-Instruct, N = 2 | `olmoe` | match (raw); template ids match | all 3 agree (after bugs 54, 55) | 1.36e-06 |
+| arcee-ai/Trinity-Nano-Preview, N = 4 (3 sliding + 1 NoPE full, dense then MoE) | `afmoe` | match (raw); template ids match | all 5 agree (after bug 57) | 7.02e-06 |
 
 Ministral 3 covers yarn rope scaling and tied embeddings inside the
 `mistral3` multimodal wrapper; the tokenizer (tekken, as `tokenizer.json`)
@@ -2225,6 +2226,29 @@ config for every registered type, against `CONFIG_MAPPING[type]()` — now
 reports no difference in the norm epsilon or the RoPE base for any of the 78
 families that have a transformers config class. A unit test covers OLMoE's
 epsilon and Mixtral's base.
+
+
+## Bug 57 — AFMoE's μP embedding scale was ignored (fixed)
+
+**Symptom.** the first four layers of `arcee-ai/Trinity-Nano-Preview` (the
+one released AFMoE small enough to cut) diverged at layer 0 — the embedding
+itself — by a factor of 32. (The reference first needed `pad_token_id: null`
+in the cut's config: transformers' `AfmoeConfig` has no such attribute and
+its model reads it. ditch ignores the key.)
+
+**Cause.** Trinity's config sets `mup_enabled: true`, and `AfmoeModel`
+then multiplies the embeddings by `hidden_size ** 0.5` (32 for 1024). ditch's
+`afmoe` entry never read the key, and the fixture generator's spec had no μP
+either, so the fixture agreed. `arcee-ai/Trinity-Nano-Preview` was
+config-checked in the earlier passes, which cannot see a scale.
+
+**Fix.** `extraAfmoe` sets `embed_scale = sqrt(hidden_size)` when
+`mup_enabled`; the generator's `afmoe` spec enables μP and the fixture is
+regenerated (it fails without the fix: 331/332).
+
+**Verification.** the table above: all 5 residuals of the first four layers
+agree, first-token logits to 7.0e-06 of the range, tokenizer 15 / 15 (after
+bugs 39–40) and template ids equal.
 
 ---
 

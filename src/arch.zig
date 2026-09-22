@@ -3192,6 +3192,8 @@ fn extraAfmoe(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
     // Only the local layers are roped; the full-attention ones are NoPE
     // (`AfmoeAttention` applies the rotary under `if self.is_local_attention`).
     for (c.rope_layers, 0..) |*r, i| r.* = c.sliding_layers[i];
+    // μP: the embeddings are scaled by sqrt(hidden_size) (arcee-ai/Trinity-Nano-Preview sets it).
+    if (getBool(obj, "mup_enabled", false)) c.embed_scale = @sqrt(@as(f32, @floatFromInt(c.hidden_size)));
 }
 
 /// Mellum: a plain softmax top-k router (renormalised) over fused experts.
