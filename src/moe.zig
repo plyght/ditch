@@ -105,17 +105,25 @@ pub const Expert = struct {
     gate_bias: ?[]const f32 = null,
     up_bias: ?[]const f32 = null,
     down_bias: ?[]const f32 = null,
+    /// False for a plain `down(act(up(x)))` expert (Nemotron-H): `gate` /
+    /// `gate_ref` then alias `up` and there is no second input matrix.
+    gated: bool = true,
 
     /// Fused, transposed layout: gate and up are column ranges of one block
     /// and come out of a single read.
     pub fn sharesGateUpBlock(self: *const Expert) bool {
-        return self.gate_ref.transposed != null and self.up_ref.transposed != null and self.gate_ref.ref.offset == self.up_ref.ref.offset and self.gate_ref.ref.file == self.up_ref.ref.file;
+        return self.gated and self.gate_ref.transposed != null and self.up_ref.transposed != null and self.gate_ref.ref.offset == self.up_ref.ref.offset and self.gate_ref.ref.file == self.up_ref.ref.file;
+    }
+
+    /// Matrices to make resident: two for a non-gated expert, three otherwise.
+    pub fn matrixCount(self: *const Expert) usize {
+        return if (self.gated) 3 else 2;
     }
 };
 
-/// Bytes resident for one routed expert (its three matrices).
+/// Bytes resident for one routed expert (its two or three matrices).
 pub fn expertBytes(ex: *const Expert) u64 {
-    return ex.gate_ref.residentBytes() + ex.up_ref.residentBytes() + ex.down_ref.residentBytes();
+    return ex.gate_ref.residentBytes() + (if (ex.gated) ex.up_ref.residentBytes() else 0) + ex.down_ref.residentBytes();
 }
 
 /// Transient bytes needed while an expert is read (the block buffer of a
@@ -139,6 +147,12 @@ pub const SharedExpert = struct {
     gate_ref: MatrixRef,
     up_ref: MatrixRef,
     down_ref: MatrixRef,
+    /// As `Expert.gated`.
+    gated: bool = true,
+
+    pub fn matrixCount(self: *const SharedExpert) usize {
+        return if (self.gated) 3 else 2;
+    }
 };
 
 pub const MoeLayer = struct {
@@ -204,7 +218,8 @@ pub const MoeLayer = struct {
     pub fn trunkBytes(self: *const MoeLayer) u64 {
         var total: u64 = 0;
         if (self.shared) |sh| {
-            for ([_]MatrixRef{ sh.gate_ref, sh.up_ref, sh.down_ref }) |r| total += r.residentBytes();
+            total += sh.gate_ref.residentBytes() + sh.down_ref.residentBytes();
+            if (sh.gated) total += sh.up_ref.residentBytes();
         }
         return total;
     }
@@ -368,13 +383,13 @@ pub fn acquireLayer(model: *const Model, m: *const MoeLayer) !MoeLease {
     const store: *stream.WeightStore = @constCast(&model.store);
     if (model.expert_cache != null) {
         const sh = m.shared orelse return lease;
-        const shared_leases = try gpa.alloc(Lease, 3);
+        const shared_leases = try gpa.alloc(Lease, sh.matrixCount());
         errdefer gpa.free(shared_leases);
         var n: usize = 0;
         errdefer store.releaseSet(shared_leases[0..n]);
         var s = sh;
         s.gate = try acquireInto(store, sh.gate_ref, shared_leases, &n);
-        s.up = try acquireInto(store, sh.up_ref, shared_leases, &n);
+        s.up = if (sh.gated) try acquireInto(store, sh.up_ref, shared_leases, &n) else s.gate;
         s.down = try acquireInto(store, sh.down_ref, shared_leases, &n);
         lease.layer.shared = s;
         lease.leases = shared_leases;
@@ -383,8 +398,11 @@ pub fn acquireLayer(model: *const Model, m: *const MoeLayer) !MoeLease {
     const experts = try gpa.alloc(Expert, m.experts.len);
     errdefer gpa.free(experts);
     // Three matrices per routed expert (gate and up of a transposed fused block
-    // come out of one read but are still two leases) plus the shared expert.
-    const all_leases = try gpa.alloc(Lease, 3 * m.experts.len + @as(usize, if (m.shared != null) 3 else 0));
+    // come out of one read but are still two leases; a non-gated expert has
+    // two matrices) plus the shared expert.
+    var n_leases: usize = if (m.shared) |sh| sh.matrixCount() else 0;
+    for (m.experts) |*ex| n_leases += ex.matrixCount();
+    const all_leases = try gpa.alloc(Lease, n_leases);
     errdefer gpa.free(all_leases);
     var n: usize = 0;
     errdefer store.releaseSet(all_leases[0..n]);
@@ -398,14 +416,14 @@ pub fn acquireLayer(model: *const Model, m: *const MoeLayer) !MoeLease {
             n += 2;
         } else {
             experts[e].gate = try acquireInto(store, ex.gate_ref, all_leases, &n);
-            experts[e].up = try acquireInto(store, ex.up_ref, all_leases, &n);
+            experts[e].up = if (ex.gated) try acquireInto(store, ex.up_ref, all_leases, &n) else experts[e].gate;
         }
         experts[e].down = try acquireInto(store, ex.down_ref, all_leases, &n);
     }
     if (m.shared) |sh| {
         var s = sh;
         s.gate = try acquireInto(store, sh.gate_ref, all_leases, &n);
-        s.up = try acquireInto(store, sh.up_ref, all_leases, &n);
+        s.up = if (sh.gated) try acquireInto(store, sh.up_ref, all_leases, &n) else s.gate;
         s.down = try acquireInto(store, sh.down_ref, all_leases, &n);
         lease.layer.shared = s;
     }
@@ -633,6 +651,26 @@ pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !Mo
             }
             ex.down_bias = try biasRow(model, arena, dn_bias_name, e, hidden);
         }
+    } else if (c.moe.dense_experts) {
+        // Non-gated experts (Nemotron-H): `up_proj` and `down_proj` only.
+        for (self.experts, 0..) |*ex, e| {
+            const ep = try cat(arena, &.{ lp, try model_mod.resolveName(arena, names.expert, "", 0, e) });
+            const up_name = try cat(arena, &.{ ep, names.expert_up });
+            const down_name = try cat(arena, &.{ ep, names.expert_down });
+            const up = try model.loadMat(up_name);
+            const up_ref = MatrixRef{ .ref = try model.ref(up_name) };
+            ex.* = .{
+                .gate = up,
+                .up = up,
+                .down = try model.loadMat(down_name),
+                .gate_ref = up_ref,
+                .up_ref = up_ref,
+                .down_ref = .{ .ref = try model.ref(down_name) },
+                .gate_bias = model.loadVecOpt(try model_mod.biasName(arena, up_name)),
+                .down_bias = model.loadVecOpt(try model_mod.biasName(arena, down_name)),
+                .gated = false,
+            };
+        }
     } else {
         for (self.experts, 0..) |*ex, e| {
             const ep = try cat(arena, &.{ lp, try model_mod.resolveName(arena, names.expert, "", 0, e) });
@@ -657,22 +695,64 @@ pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !Mo
     }
 
     // Shared expert(s): one fused block (DeepSeek `shared_experts`, Qwen2-MoE
-    // `shared_expert`, Llama 4 `shared_expert`); its width comes from the weights.
+    // `shared_expert`, Llama 4 `shared_expert`); its width comes from the
+    // weights. Granite stores its gate and up rows in one `input_linear`
+    // tensor; Nemotron-H's shared expert has no gate.
     if (names.shared_expert) |sp_t| {
         const sp = try cat(arena, &.{ lp, sp_t });
         const down_name = try cat(arena, &.{ sp, names.expert_down });
         if (model.find(down_name)) |_| {
-            const gate_name = try cat(arena, &.{ sp, names.expert_gate });
-            const up_name = try cat(arena, &.{ sp, names.expert_up });
-            self.shared = .{
-                .gate = try model.loadMat(gate_name),
-                .up = try model.loadMat(up_name),
-                .down = try model.loadMat(down_name),
-                .gate_ref = .{ .ref = try model.ref(gate_name) },
-                .up_ref = .{ .ref = try model.ref(up_name) },
-                .down_ref = .{ .ref = try model.ref(down_name) },
-                .gate_vec = if (names.shared_expert_gate) |g| model.loadVecOpt(try cat(arena, &.{ lp, g })) else null,
-            };
+            const down = try model.loadMat(down_name);
+            const s_inter = down.cols;
+            if (names.shared_gate_up) |gu_t| {
+                const gu_name = try cat(arena, &.{ sp, gu_t });
+                const gu_ref = try model.ref(gu_name);
+                if (gu_ref.rows != 2 * s_inter or gu_ref.cols != hidden) {
+                    std.log.err("shared expert {s} is [{d}][{d}], expected [{d}][{d}]", .{ gu_name, gu_ref.rows, gu_ref.cols, 2 * s_inter, hidden });
+                    return error.InvalidConfig;
+                }
+                const gu_w = try model.loadMat(gu_name);
+                self.shared = .{
+                    .gate = if (mapped) blockWeight(gu_w, 0, 0, s_inter, hidden, 0) else gu_ref.rowSlice(0, s_inter).shapeOnly(),
+                    .up = if (mapped) blockWeight(gu_w, 0, 0, s_inter, hidden, s_inter) else gu_ref.rowSlice(s_inter, s_inter).shapeOnly(),
+                    .down = down,
+                    .gate_ref = .{ .ref = gu_ref.rowSlice(0, s_inter) },
+                    .up_ref = .{ .ref = gu_ref.rowSlice(s_inter, s_inter) },
+                    .down_ref = .{ .ref = try model.ref(down_name) },
+                    .gate_vec = null,
+                };
+            } else if (c.moe.dense_experts) {
+                const up_name = try cat(arena, &.{ sp, names.expert_up });
+                const up = try model.loadMat(up_name);
+                const up_ref = MatrixRef{ .ref = try model.ref(up_name) };
+                self.shared = .{
+                    .gate = up,
+                    .up = up,
+                    .down = down,
+                    .gate_ref = up_ref,
+                    .up_ref = up_ref,
+                    .down_ref = .{ .ref = try model.ref(down_name) },
+                    .gate_vec = null,
+                    .gated = false,
+                };
+            } else {
+                const gate_name = try cat(arena, &.{ sp, names.expert_gate });
+                const up_name = try cat(arena, &.{ sp, names.expert_up });
+                self.shared = .{
+                    .gate = try model.loadMat(gate_name),
+                    .up = try model.loadMat(up_name),
+                    .down = down,
+                    .gate_ref = .{ .ref = try model.ref(gate_name) },
+                    .up_ref = .{ .ref = try model.ref(up_name) },
+                    .down_ref = .{ .ref = try model.ref(down_name) },
+                    .gate_vec = if (names.shared_expert_gate) |g| model.loadVecOpt(try cat(arena, &.{ lp, g })) else null,
+                };
+            }
+            const sh = &self.shared.?;
+            if (sh.gate.rows != s_inter or sh.gate.cols != hidden or sh.down.rows != hidden) {
+                std.log.err("layer {d}: shared expert shapes do not match", .{li});
+                return error.InvalidConfig;
+            }
         }
     }
     return self;
@@ -686,12 +766,22 @@ inline fn sigmoid(x: f32) f32 {
     return 1.0 / (1.0 + @exp(-x));
 }
 
-/// `out[ne][hidden] = (act(x Wgᵀ + bg) ⊙ (x Wuᵀ + bu)) Wdᵀ + bd` for `ne` rows of `x`.
-fn runExpert(model: *const Model, m: *const MoeLayer, gate_w: Weight, up_w: Weight, down_w: Weight, biases: [3]?[]const f32, delta: ?*const Delta, x: []const f32, ne: usize, gate: []f32, up: []f32, out: []f32) !void {
+/// `out[ne][hidden] = (act(x Wgᵀ + bg) ⊙ (x Wuᵀ + bu)) Wdᵀ + bd` for `ne` rows
+/// of `x`; a non-gated expert (`gated == false`) computes `act(x Wgᵀ + bg) Wdᵀ + bd`.
+fn runExpert(model: *const Model, m: *const MoeLayer, gated: bool, gate_w: Weight, up_w: Weight, down_w: Weight, biases: [3]?[]const f32, delta: ?*const Delta, x: []const f32, ne: usize, gate: []f32, up: []f32, out: []f32) !void {
     const gpa = model.gpa;
     const inter = gate_w.rows;
     const hidden = down_w.rows;
     try tensor.matmulT(model.pool, gpa, gate, x, ne, gate_w, null);
+    if (!gated) {
+        for (0..ne) |i| {
+            if (biases[0]) |b| tensor.axpy(gate[i * inter ..][0..inter], 1.0, b[0..inter]);
+        }
+        tensor.gatedActivation(model.pool, m.activation, gate, gate, null, ne, inter, inter, inter);
+        try tensor.matmulT(model.pool, gpa, out, gate, ne, down_w, delta);
+        if (biases[2]) |b| for (0..ne) |i| tensor.axpy(out[i * hidden ..][0..hidden], 1.0, b[0..hidden]);
+        return;
+    }
     try tensor.matmulT(model.pool, gpa, up, x, ne, up_w, null);
     for (0..ne) |i| {
         if (biases[0]) |b| tensor.axpy(gate[i * inter ..][0..inter], 1.0, b[0..inter]);
@@ -871,9 +961,9 @@ pub fn forward(model: *const Model, m: *const MoeLayer, li: usize, out: []f32, h
         if (cache) |c| {
             const entry = try c.acquire(li, m, e);
             defer c.release(entry);
-            try runExpert(model, m, entry.gate, entry.up, entry.down, biases, delta, xg, ne, gate, up, eo);
+            try runExpert(model, m, ex.gated, entry.gate, entry.up, entry.down, biases, delta, xg, ne, gate, up, eo);
         } else {
-            try runExpert(model, m, ex.gate, ex.up, ex.down, biases, delta, xg, ne, gate, up, eo);
+            try runExpert(model, m, ex.gated, ex.gate, ex.up, ex.down, biases, delta, xg, ne, gate, up, eo);
         }
         for (0..ne) |j| tensor.axpy(out[tok[j] * hidden ..][0..hidden], if (r.scale_input) 1.0 else wts[j], eo[j * hidden ..][0..hidden]);
     }
@@ -884,7 +974,7 @@ pub fn forward(model: *const Model, m: *const MoeLayer, li: usize, out: []f32, h
         defer gpa.free(sg);
         const su = try gpa.alloc(f32, n * s_inter);
         defer gpa.free(su);
-        try runExpert(model, m, sh.gate, sh.up, sh.down, .{ null, null, null }, if (sh.down_delta) |*d| d else null, h, n, sg, su, eo);
+        try runExpert(model, m, sh.gated, sh.gate, sh.up, sh.down, .{ null, null, null }, if (sh.down_delta) |*d| d else null, h, n, sg, su, eo);
         for (0..n) |t| {
             const s: f32 = if (sh.gate_vec) |g| sigmoid(tensor.dot(h[t * hidden ..][0..hidden], g[0..hidden])) else 1.0;
             tensor.axpy(out[t * hidden ..][0..hidden], s, eo[t * hidden ..][0..hidden]);
@@ -1044,16 +1134,26 @@ pub fn applyExpertSelective(model: *Model, dirs: []const f32, cfg: search.TrialC
         const v = if (global_dir) |g| g else dirs[(li + 1) * stride ..][0..stride];
         if (cfg.parameters.get(.attn_o_proj)) |p| {
             if (abliterate.kernelWeight(p, li)) |weight| {
-                // One matrix resident at a time (streamed mode reads it from disk).
-                const lease = try model.acquireComponent(li, .attn_o_proj);
-                defer store.release(lease);
-                const delta = try abliterate.computeDelta(model.pool, gpa, lease.weight, v, weight, opts, opts.seed +% seed_counter);
-                seed_counter += 1;
-                model.setDelta(li, .attn_o_proj, delta);
+                if (model.hasComponent(li, .attn_o_proj)) {
+                    // One matrix resident at a time (streamed mode reads it from disk).
+                    const lease = try model.acquireComponent(li, .attn_o_proj);
+                    defer store.release(lease);
+                    const delta = try abliterate.computeDelta(model.pool, gpa, lease.weight, v, weight, opts, opts.seed +% seed_counter);
+                    seed_counter += 1;
+                    model.setDelta(li, .attn_o_proj, delta);
+                }
+                if (model.hasSsmOut(li)) {
+                    const lease = try model.acquireSsmOut(li);
+                    defer store.release(lease);
+                    const delta = try abliterate.computeDelta(model.pool, gpa, lease.weight, v, weight, opts, opts.seed +% seed_counter);
+                    seed_counter += 1;
+                    model.setSsmOutDelta(li, delta);
+                }
             }
         }
         const p = cfg.parameters.get(.mlp_down_proj) orelse continue;
         const lambda = abliterate.kernelWeight(p, li) orelse continue;
+        if (!model.hasComponent(li, .mlp_down_proj)) continue;
         const m = &(layer.moe orelse {
             // Dense layer inside a hybrid model.
             const lease = try model.acquireComponent(li, .mlp_down_proj);
