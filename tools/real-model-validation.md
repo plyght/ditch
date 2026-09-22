@@ -2059,6 +2059,56 @@ sweep, 20 hard strings per tokenizer:
 | LiquidAI/LFM2-350M | 2 crashes | 0 |
 | SmolLM3, EXAONE 4, Granite 3.3, Hunyuan-A13B, Solar Open, GLM 4.5 | 0 | 0 |
 
+
+## Bug 48 — six template families trimmed contents or added a newline the real templates do not (fixed)
+
+The template half of the sweep: prompt ids against `apply_chat_template` for a
+system/user pair with surrounding whitespace and one with a trailing newline in
+the system prompt and a code block.
+
+**Symptom and cause.** ditch's families trimmed every message, but the real
+templates of GLM-4 / 4.5 (`zai-org/GLM-4-9B-0414`, `GLM-4.5-Air`,
+`THUDM/glm-4-9b-chat-hf`), OLMo 2 / OLMoE, Granite 3.3 / 4.0, Phi-3.5,
+EXAONE 3.5, DeepSeek V3 and Mistral v0.3 insert contents verbatim — `Be
+terse.\n` keeps its newline, ` Hi there ` its spaces. (Llama 3 and Gemma do
+trim, and keep doing so.) Beyond that:
+
+* `glm4` ended the prompt with `<|assistant|>\n`; every GLM-4 template ends
+  it with `<|assistant|>` and the model writes the newline — one extra token
+  at exactly the position abliteration measures.
+* `mistral` put the system prompt in the *first* user turn; v0.3 puts it in
+  the *last*. Mixtral v0.1 (and Mistral v0.1 / v0.2) is a different layout,
+  `<s> [INST] {system}\n\n{user} [/INST]` with spaces, which ditch rendered
+  as v0.3's — now `mistral_spaced`, detected by `' [INST] '`.
+* `exaone` missed the empty `[|system|][|endofturn|]` turn EXAONE 3.5 writes
+  when there is no system message, and EXAONE 3.5's template (which builds
+  its tags as `'[|' + message['role'] + '|]'`) was not detected at all.
+* DeepSeek V2 is not DeepSeek V3's format:
+  `<｜begin▁of▁sentence｜>{system}\n\nUser: {user}\n\nAssistant:`. It is now
+  the `deepseek_v2` family, detected by `'User: '` with `'Assistant:'`, and
+  named by the `deepseek_v2` entry.
+
+## Bug 49 — added tokens' `lstrip` / `rstrip` were ignored (fixed)
+
+**Symptom.** Phi-3.5's prompt rendered identically but tokenized to 24 ids
+against transformers' 14.
+
+**Cause.** Phi-3's `<|system|>`, `<|user|>`, `<|end|>`, `<|assistant|>` are
+added tokens with `rstrip: true`: `tokenizers` lets each absorb the
+whitespace that follows it, so `<|user|>\n Hi` is `<|user|>`, `Hi`. ditch
+ignored both flags.
+
+**Fix.** `AddedToken` carries `lstrip` / `rstrip`, and the added-token split
+drops the whitespace before / after a token that has them. A unit test covers
+both.
+
+**Verification (48, 49).** the sweep, now `ids match` for all of:
+GLM-4-9B-0414, GLM-4.5-Air, glm-4-9b-chat-hf, OLMo-2-1124-7B-Instruct,
+OLMoE-1B-7B-0924-Instruct, granite-3.3-2b-instruct, granite-4.0-h-350m,
+Phi-3.5-mini-instruct, Mistral-7B-Instruct-v0.3, Mixtral-8x7B-Instruct-v0.1,
+EXAONE-3.5-2.4B-Instruct, Falcon3-1B-Instruct and DeepSeek-V2-Lite-Chat; and
+no tokenizer in the 20-string table regresses.
+
 ---
 
 # Frontier pass: the arithmetic of the frontier families on their real weights

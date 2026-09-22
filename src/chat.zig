@@ -14,6 +14,10 @@ pub const Template = enum {
     /// Mistral's V7 (tekken) template — Ministral 3, Mistral Small 3.x,
     /// Magistral, Devstral: `<s>[SYSTEM_PROMPT]...[/SYSTEM_PROMPT][INST]...[/INST]`.
     mistral_v7,
+    /// Mistral v0.1 / v0.2, Mixtral v0.1: `<s> [INST] ... [/INST]`, with spaces.
+    mistral_spaced,
+    /// DeepSeek V2: `<｜begin▁of▁sentence｜>{system}\n\nUser: ...\n\nAssistant:`.
+    deepseek_v2,
     gemma,
     /// Phi-3 / Phi-4: `<|user|>\n...<|end|>\n<|assistant|>\n`.
     phi3,
@@ -102,14 +106,15 @@ pub fn detect(chat_template: ?[]const u8, model_type: []const u8) Template {
         if (has(t, "<|START_OF_TURN_TOKEN|>")) return if (has(t, "<|START_RESPONSE|>")) .cohere_response else .cohere;
         if (has(t, "<|start|>") and has(t, "<|message|>")) return .harmony;
         if (has(t, "<|start_of_role|>")) return .granite;
-        if (has(t, "[|user|]")) return .exaone;
+        if (has(t, "[|user|]") or has(t, "'[|' + message['role'] + '|]'")) return .exaone;
         if (has(t, "<\xef\xbd\x9cUser\xef\xbd\x9c>")) return .deepseek;
         if (has(t, "[gMASK]")) return .glm4;
         if (has(t, "<|user|>") and has(t, "<|end|>")) return .phi3;
         if (has(t, "<|user|>") and has(t, "<|endoftext|>")) return .zephyr;
         if (has(t, "<|user|>")) return .olmo;
         if (has(t, "<<SYS>>")) return .llama2;
-        if (has(t, "[INST]")) return if (has(t, "[SYSTEM_PROMPT]")) .mistral_v7 else .mistral;
+        if (has(t, "[INST]")) return if (has(t, "[SYSTEM_PROMPT]")) .mistral_v7 else if (has(t, "' [INST] '")) .mistral_spaced else .mistral;
+        if (has(t, "'User: '") and has(t, "'Assistant:'")) return .deepseek_v2;
     }
     if (arch.lookup(model_type)) |a| {
         if (Template.parse(a.chat)) |tpl| return tpl;
@@ -215,6 +220,31 @@ pub fn render(gpa: Allocator, template: Template, messages: []const Message) ![]
             }
         },
         .mistral => {
+            // mistralai/Mistral-7B-Instruct-v0.3: the system message goes in
+            // front of the *last* user turn; contents verbatim.
+            try w.writeAll("<s>");
+            var system: ?[]const u8 = null;
+            var last_user: usize = messages.len;
+            for (messages, 0..) |m, i| switch (m.role) {
+                .system => system = m.content,
+                .user => last_user = i,
+                .assistant => {},
+            };
+            for (messages, 0..) |m, i| {
+                switch (m.role) {
+                    .system => {},
+                    .user => {
+                        try w.writeAll("[INST] ");
+                        if (i == last_user) if (system) |s| try w.print("{s}\n\n", .{s});
+                        try w.print("{s}[/INST]", .{m.content});
+                    },
+                    .assistant => try w.print(" {s}</s>", .{trim(m.content)}),
+                }
+            }
+        },
+        .mistral_spaced => {
+            // mistralai/Mixtral-8x7B-Instruct-v0.1: the system message joins
+            // the first user turn.
             try w.writeAll("<s>");
             var system: ?[]const u8 = null;
             var first_user = true;
@@ -222,16 +252,26 @@ pub fn render(gpa: Allocator, template: Template, messages: []const Message) ![]
                 switch (m.role) {
                     .system => system = m.content,
                     .user => {
-                        try w.writeAll("[INST] ");
-                        if (first_user) {
-                            if (system) |s| try w.print("{s}\n\n", .{trim(s)});
-                            first_user = false;
-                        }
-                        try w.print("{s}[/INST]", .{trim(m.content)});
+                        try w.writeAll(" [INST] ");
+                        if (first_user) if (system) |s| try w.print("{s}\n\n", .{s});
+                        first_user = false;
+                        try w.print("{s} [/INST]", .{m.content});
                     },
-                    .assistant => try w.print(" {s}</s>", .{trim(m.content)}),
+                    .assistant => try w.print(" {s}</s>", .{m.content}),
                 }
             }
+        },
+        .deepseek_v2 => {
+            // deepseek-ai/DeepSeek-V2-Lite-Chat: contents verbatim.
+            try w.writeAll("<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>");
+            for (messages) |m| {
+                switch (m.role) {
+                    .system => try w.print("{s}\n\n", .{m.content}),
+                    .user => try w.print("User: {s}\n\n", .{m.content}),
+                    .assistant => try w.print("Assistant: {s}<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>", .{m.content}),
+                }
+            }
+            try w.writeAll("Assistant:");
         },
         .phi3, .zephyr, .olmo => {
             // `<|role|>` headers; the turn terminator differs per family.
@@ -240,13 +280,16 @@ pub fn render(gpa: Allocator, template: Template, messages: []const Message) ![]
                 .zephyr => "<|endoftext|>\n",
                 else => "\n",
             };
-            for (messages) |m| try w.print("<|{s}|>\n{s}{s}", .{ @tagName(m.role), trim(m.content), end });
+            // Contents verbatim (Phi-3.5, StableLM Zephyr, OLMo 2, Falcon 3).
+            for (messages) |m| try w.print("<|{s}|>\n{s}{s}", .{ @tagName(m.role), m.content, end });
             try w.writeAll("<|assistant|>\n");
         },
         .glm4 => {
+            // GLM-4-0414 / GLM-4.5 / glm-4-9b-chat-hf: contents verbatim, and
+            // the generation header ends the prompt (the model writes the newline).
             try w.writeAll("[gMASK]<sop>");
-            for (messages) |m| try w.print("<|{s}|>\n{s}", .{ @tagName(m.role), trim(m.content) });
-            try w.writeAll("<|assistant|>\n");
+            for (messages) |m| try w.print("<|{s}|>\n{s}", .{ @tagName(m.role), m.content });
+            try w.writeAll("<|assistant|>");
         },
         .cohere => {
             try w.writeAll("<BOS_TOKEN>");
@@ -278,8 +321,8 @@ pub fn render(gpa: Allocator, template: Template, messages: []const Message) ![]
             try w.writeAll("<\xef\xbd\x9cbegin\xe2\x96\x81of\xe2\x96\x81sentence\xef\xbd\x9c>");
             for (messages) |m| {
                 switch (m.role) {
-                    .system => try w.print("{s}", .{trim(m.content)}),
-                    .user => try w.print("<\xef\xbd\x9cUser\xef\xbd\x9c>{s}", .{trim(m.content)}),
+                    .system => try w.print("{s}", .{m.content}),
+                    .user => try w.print("<\xef\xbd\x9cUser\xef\xbd\x9c>{s}", .{m.content}),
                     .assistant => try w.print("<\xef\xbd\x9cAssistant\xef\xbd\x9c>{s}<\xef\xbd\x9cend\xe2\x96\x81of\xe2\x96\x81sentence\xef\xbd\x9c>", .{trim(m.content)}),
                 }
             }
@@ -413,17 +456,20 @@ pub fn render(gpa: Allocator, template: Template, messages: []const Message) ![]
             try w.writeAll("<|header_start|>assistant<|header_end|>\n\n");
         },
         .exaone => {
+            // LGAI-EXAONE/EXAONE-3.5-*: contents verbatim; an empty system turn
+            // when the conversation does not open with one.
+            if (messages.len == 0 or messages[0].role != .system) try w.writeAll("[|system|][|endofturn|]\n");
             for (messages) |m| {
                 switch (m.role) {
-                    .system => try w.print("[|system|]{s}[|endofturn|]\n", .{trim(m.content)}),
-                    .user => try w.print("[|user|]{s}\n", .{trim(m.content)}),
-                    .assistant => try w.print("[|assistant|]{s}[|endofturn|]\n", .{trim(m.content)}),
+                    .system => try w.print("[|system|]{s}[|endofturn|]\n", .{m.content}),
+                    .user => try w.print("[|user|]{s}\n", .{m.content}),
+                    .assistant => try w.print("[|assistant|]{s}[|endofturn|]\n", .{m.content}),
                 }
             }
             try w.writeAll("[|assistant|]");
         },
         .granite => {
-            for (messages) |m| try w.print("<|start_of_role|>{s}<|end_of_role|>{s}<|end_of_text|>\n", .{ @tagName(m.role), trim(m.content) });
+            for (messages) |m| try w.print("<|start_of_role|>{s}<|end_of_role|>{s}<|end_of_text|>\n", .{ @tagName(m.role), m.content });
             try w.writeAll("<|start_of_role|>assistant<|end_of_role|>");
         },
         .kimi => {

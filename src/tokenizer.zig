@@ -46,6 +46,11 @@ pub const AddedToken = struct {
     id: u32,
     content: []const u8,
     special: bool,
+    /// The token absorbs the whitespace before (`lstrip`) or after
+    /// (`rstrip`) it, as `tokenizers`' `AddedToken` does (Phi-3's
+    /// `<|user|>`, `<|end|>`: `rstrip`).
+    lstrip: bool = false,
+    rstrip: bool = false,
 };
 
 /// The `Split` regular expressions the splitter implements natively.
@@ -340,7 +345,9 @@ pub const Tokenizer = struct {
                 const id: u32 = @intCast(obj.get("id").?.integer);
                 const content = try arena.dupe(u8, obj.get("content").?.string);
                 const special = if (obj.get("special")) |s| s.bool else false;
-                try list.append(arena, .{ .id = id, .content = content, .special = special });
+                const lstrip = if (obj.get("lstrip")) |v| (v == .bool and v.bool) else false;
+                const rstrip = if (obj.get("rstrip")) |v| (v == .bool and v.bool) else false;
+                try list.append(arena, .{ .id = id, .content = content, .special = special, .lstrip = lstrip, .rstrip = rstrip });
                 self.id_to_token[id] = content;
                 if (!self.vocab.contains(content)) try self.vocab.put(arena, content, id);
                 if (special) try self.special_ids.put(arena, id, {});
@@ -935,9 +942,25 @@ pub const Tokenizer = struct {
                 }
             }
             if (matched) |a| {
-                if (pos > seg_start) try self.encodeSegment(gpa, text[seg_start..pos], &out);
+                var seg_end = pos;
+                if (a.lstrip) {
+                    while (seg_end > seg_start) {
+                        var k = seg_end - 1;
+                        while (k > seg_start and (text[k] & 0xC0) == 0x80) k -= 1;
+                        if (!isWhitespace(cpAtSlice(text, k).cp)) break;
+                        seg_end = k;
+                    }
+                }
+                if (seg_end > seg_start) try self.encodeSegment(gpa, text[seg_start..seg_end], &out);
                 try out.append(gpa, a.id);
                 pos += a.content.len;
+                if (a.rstrip) {
+                    while (pos < text.len) {
+                        const c = cpAtSlice(text, pos);
+                        if (!isWhitespace(c.cp)) break;
+                        pos += c.len;
+                    }
+                }
                 seg_start = pos;
             } else {
                 pos += 1;
@@ -2330,6 +2353,19 @@ test "pre-tokenizer variants found by the tokenizer sweep" {
     const class = try Tokenizer.parseCharClass(arena.allocator(), "\\s?[A-Za-z\u{b5}\u{c0}-\u{d6}\\-]+");
     try std.testing.expect(inRanges('q', class) and inRanges(0xB5, class) and inRanges(0xC3, class) and inRanges('-', class));
     try std.testing.expect(!inRanges(0xD7, class) and !inRanges(0x939, class) and !inRanges('[', class));
+}
+
+test "added tokens absorb the whitespace their lstrip / rstrip flags name (Phi-3)" {
+    const gpa = std.testing.allocator;
+    const json =
+        \\{"model":{"type":"BPE","vocab":{"a":0,"b":1," ":2,"\n":3},"merges":[]},
+        \\"added_tokens":[{"id":4,"content":"<|user|>","rstrip":true,"special":true},{"id":5,"content":"<|end|>","lstrip":true,"special":true}]}
+    ;
+    const tok = try Tokenizer.parse(gpa, json, null);
+    defer tok.deinit();
+    const ids = try tok.encode(gpa, "a<|user|>\n  b \n<|end|>\nb", false);
+    defer gpa.free(ids);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 4, 1, 5, 3, 1 }, ids);
 }
 
 test "byte-level bpe round trip" {
