@@ -203,7 +203,7 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings,
     };
     for (model.files) |f| {
         var it = f.tensors.iterator();
-        while (it.next()) |kv| result.weight_bytes += kv.value_ptr.data.len;
+        while (it.next()) |kv| result.weight_bytes += kv.value_ptr.byte_len;
     }
 
     // Prompts.

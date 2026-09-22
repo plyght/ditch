@@ -379,6 +379,7 @@ pub const regex_gpt2 = "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L
 /// The regular expression behind a `tokenizer.ggml.pre` name.
 pub fn regexForPre(pre: []const u8) []const u8 {
     if (isLlamaBpe(pre)) return regex_llama3;
+    if (isKimi(pre)) return @import("tokenizer.zig").pattern_kimi;
     if (std.mem.eql(u8, pre, "qwen2") or std.mem.eql(u8, pre, "deepseek-r1-qwen")) return regex_qwen2;
     if (!std.mem.eql(u8, pre, "gpt-2") and !std.mem.eql(u8, pre, "default")) {
         std.log.warn("pre-tokenizer '{s}' is not known; using the GPT-2 pattern", .{pre});
@@ -388,6 +389,11 @@ pub fn regexForPre(pre: []const u8) []const u8 {
 
 fn isLlamaBpe(pre: []const u8) bool {
     return std.mem.eql(u8, pre, "llama-bpe") or std.mem.eql(u8, pre, "llama3") or std.mem.eql(u8, pre, "llama-v3");
+}
+
+/// llama.cpp's name for Moonshot's tiktoken vocabulary (Kimi K2 and later).
+fn isKimi(pre: []const u8) bool {
+    return std.mem.eql(u8, pre, "kimi-k2");
 }
 
 const Vocab = struct {
@@ -517,7 +523,8 @@ fn buildTokenizerJson(a: Allocator, f: *const gguf.File) ![]const u8 {
     // Model.
     try w.writeAll(",\"model\":{\"type\":\"BPE\",\"dropout\":null,\"continuing_subword_prefix\":null,\"end_of_word_suffix\":null,\"fuse_unk\":");
     try w.writeAll(if (is_spm) "true" else "false");
-    try w.print(",\"byte_fallback\":{s},\"ignore_merges\":{s},\"unk_token\":", .{ if (is_spm) "true" else "false", if (isLlamaBpe(v.pre)) "true" else "false" });
+    // tiktoken-derived vocabularies (Llama 3, Kimi) take a whole pre-token from the vocabulary before merging.
+    try w.print(",\"byte_fallback\":{s},\"ignore_merges\":{s},\"unk_token\":", .{ if (is_spm) "true" else "false", if (isLlamaBpe(v.pre) or isKimi(v.pre)) "true" else "false" });
     if (v.unk) |u| try jsonStr(w, v.tokens[u]) else try w.writeAll("null");
     try w.writeAll(",\"vocab\":{");
     var seen = std.StringHashMapUnmanaged(u32){};

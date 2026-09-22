@@ -268,7 +268,7 @@ pub const MoeLayer = struct {
         const names = self.names;
         if (self.shared != null) {
             if (names.shared_expert) |sp| {
-                if (std.mem.startsWith(u8, suffix, sp) and std.mem.eql(u8, suffix[sp.len..], names.expert_down)) return .{ .expert = self.experts.len };
+                if (std.mem.startsWith(u8, suffix, sp) and std.mem.eql(u8, suffix[sp.len..], names.shared_down orelse names.expert_down)) return .{ .expert = self.experts.len };
             }
         }
         // `mlp.experts.{e}.` → prefix before `{e}` and the text after it.
@@ -490,12 +490,17 @@ fn deinterleave(arena: Allocator, v: []const f32) ![2][]f32 {
 /// Loads the MoE block of layer `li` with tensor prefix `lp` (e.g. "model.layers.3.").
 pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !MoeLayer {
     const c = &model.config;
-    const names = &c.arch.names;
+    var names: *const arch.Names = &c.arch.names;
     const hidden = c.hidden_size;
     const inter = c.moe_intermediate_size;
     const n_experts = c.num_experts;
     const mapped = !model.streamed();
 
+    // Checkpoints that predate the family's Hugging Face module layout keep
+    // the MoE under other names (Kimi Linear's `block_sparse_moe`).
+    if (names.moe_alt) |alt| {
+        if (model.store.lookup(try cat(arena, &.{ lp, names.router })) == null and model.store.lookup(try cat(arena, &.{ lp, alt.router })) != null) names = alt;
+    }
     const router_name = try cat(arena, &.{ lp, names.router });
     const router_ref = model.store.lookup(router_name) orelse {
         std.log.err("missing router tensor {s}", .{router_name});
@@ -657,22 +662,53 @@ pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !Mo
     }
 
     // Shared expert(s): one fused block (DeepSeek `shared_experts`, Qwen2-MoE
-    // `shared_expert`, Llama 4 `shared_expert`); its width comes from the weights.
+    // `shared_expert`, Llama 4 `shared_expert`); its width comes from the
+    // weights. GraniteMoeShared and MiniMax M3 store its gate and up rows in
+    // one `[2I][hidden]` tensor: the two halves become row slices of it.
     if (names.shared_expert) |sp_t| {
         const sp = try cat(arena, &.{ lp, sp_t });
-        const down_name = try cat(arena, &.{ sp, names.expert_down });
+        const down_name = try cat(arena, &.{ sp, names.shared_down orelse names.expert_down });
         if (model.find(down_name)) |_| {
-            const gate_name = try cat(arena, &.{ sp, names.expert_gate });
-            const up_name = try cat(arena, &.{ sp, names.expert_up });
-            self.shared = .{
-                .gate = try model.loadMat(gate_name),
-                .up = try model.loadMat(up_name),
+            var sh = SharedExpert{
+                .gate = undefined,
+                .up = undefined,
                 .down = try model.loadMat(down_name),
-                .gate_ref = .{ .ref = try model.ref(gate_name) },
-                .up_ref = .{ .ref = try model.ref(up_name) },
+                .gate_ref = undefined,
+                .up_ref = undefined,
                 .down_ref = .{ .ref = try model.ref(down_name) },
                 .gate_vec = if (names.shared_expert_gate) |g| model.loadVecOpt(try cat(arena, &.{ lp, g })) else null,
             };
+            const fused_name: ?[]const u8 = if (names.shared_gate_up) |t| try cat(arena, &.{ sp, t }) else null;
+            if (fused_name != null and model.find(fused_name.?) != null) {
+                const gu_ref = try model.ref(fused_name.?);
+                if (gu_ref.rows % 2 != 0 or gu_ref.rows / 2 != sh.down.cols) {
+                    std.log.err("shared expert {s} is [{d}][{d}], expected [{d}][{d}]", .{ fused_name.?, gu_ref.rows, gu_ref.cols, 2 * sh.down.cols, hidden });
+                    return error.InvalidConfig;
+                }
+                const si = gu_ref.rows / 2;
+                sh.gate_ref = .{ .ref = gu_ref.rowSlice(0, si) };
+                sh.up_ref = .{ .ref = gu_ref.rowSlice(si, si) };
+                if (mapped) {
+                    const gu_w = model.find(fused_name.?).?.asWeight();
+                    sh.gate = blockWeight(gu_w, 0, 0, si, hidden, 0);
+                    sh.up = blockWeight(gu_w, 0, 0, si, hidden, si);
+                } else {
+                    sh.gate = sh.gate_ref.shapeOnly();
+                    sh.up = sh.up_ref.shapeOnly();
+                }
+            } else {
+                const gate_name = try cat(arena, &.{ sp, names.shared_gate orelse names.expert_gate });
+                const up_name = try cat(arena, &.{ sp, names.shared_up orelse names.expert_up });
+                sh.gate = try model.loadMat(gate_name);
+                sh.up = try model.loadMat(up_name);
+                sh.gate_ref = .{ .ref = try model.ref(gate_name) };
+                sh.up_ref = .{ .ref = try model.ref(up_name) };
+            }
+            if (sh.gate.cols != hidden or sh.down.rows != hidden or sh.gate.rows != sh.down.cols or sh.up.rows != sh.down.cols) {
+                std.log.err("shared expert of layer {d} has inconsistent shapes", .{li});
+                return error.InvalidConfig;
+            }
+            self.shared = sh;
         }
     }
     return self;
@@ -771,8 +807,8 @@ pub fn forward(model: *const Model, m: *const MoeLayer, li: usize, out: []f32, h
             const per_group = n_experts / n_group;
             for (0..n_group) |g| {
                 const gs = choice[g * per_group ..][0..per_group];
-                if (m.correction_bias != null or r.group_top2) {
-                    // Sum of the two best selection scores of the group (DeepSeek V3, Mistral 4).
+                if (m.correction_bias != null or r.group_score_top2) {
+                    // Sum of the two best selection scores of the group (DeepSeek V3, Kimi Linear).
                     var b1: f32 = -std.math.inf(f32);
                     var b2: f32 = -std.math.inf(f32);
                     for (gs) |s| {
@@ -1359,4 +1395,13 @@ test "streamed MoE forward and edits match mapped (fused experts)" {
 }
 test "streamed MoE forward and edits match mapped (transposed fused experts)" {
     try checkStreamedMatchesMapped("qwen3_moe_fused_t");
+}
+test "streamed MoE forward and edits match mapped (fused [E, 2I, H] experts, fused shared expert)" {
+    try checkStreamedMatchesMapped("granitemoehybrid");
+}
+test "streamed MoE forward and edits match mapped (Mixtral names, fused shared expert, swiglu)" {
+    try checkStreamedMatchesMapped("minimax_m3");
+}
+test "selective export round trip (fused [E, 2I, H] experts)" {
+    try checkExportRoundTrip("granitemoe");
 }

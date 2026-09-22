@@ -32,6 +32,11 @@ pub const Template = enum {
     exaone,
     /// Granite 3: `<|start_of_role|>user<|end_of_role|>...<|end_of_text|>`.
     granite,
+    /// Kimi K2 / K2.5: `<|im_user|>user<|im_middle|>...<|im_end|>` (a default
+    /// system message is inserted when the conversation has none).
+    kimi,
+    /// Kimi K3 (XTML): `<|open|>message role="user"<|sep|>...<|close|>message<|sep|><|end_of_msg|>`.
+    kimi_k3,
     raw,
 
     pub fn parse(name: []const u8) ?Template {
@@ -59,6 +64,8 @@ pub fn detect(chat_template: ?[]const u8, model_type: []const u8) Template {
                 return std.mem.indexOf(u8, hay, needle) != null;
             }
         }.f;
+        if (has(t, "<|im_middle|>")) return .kimi;
+        if (has(t, "<|end_of_msg|>")) return .kimi_k3;
         if (has(t, "<|im_start|>")) return .chatml;
         if (has(t, "<|start_header_id|>")) return .llama3;
         if (has(t, "<|header_start|>")) return .llama4;
@@ -79,6 +86,8 @@ pub fn detect(chat_template: ?[]const u8, model_type: []const u8) Template {
         if (Template.parse(a.chat)) |tpl| return tpl;
     }
     if (std.mem.startsWith(u8, model_type, "qwen")) return .chatml;
+    if (std.mem.eql(u8, model_type, "kimi_k3")) return .kimi_k3;
+    if (std.mem.startsWith(u8, model_type, "kimi")) return .kimi;
     if (std.mem.startsWith(u8, model_type, "llama")) return .llama3;
     if (std.mem.startsWith(u8, model_type, "gemma")) return .gemma;
     if (std.mem.startsWith(u8, model_type, "mistral")) return .mistral;
@@ -224,6 +233,27 @@ pub fn render(gpa: Allocator, template: Template, messages: []const Message) ![]
             for (messages) |m| try w.print("<|start_of_role|>{s}<|end_of_role|>{s}<|end_of_text|>\n", .{ @tagName(m.role), trim(m.content) });
             try w.writeAll("<|start_of_role|>assistant<|end_of_role|>");
         },
+        .kimi => {
+            // moonshotai/Kimi-K2-Instruct: content is not trimmed; a missing system message becomes the default one.
+            if (messages.len == 0 or messages[0].role != .system) try w.writeAll("<|im_system|>system<|im_middle|>You are a helpful assistant<|im_end|>");
+            for (messages) |m| {
+                const header: []const u8 = switch (m.role) {
+                    .system => "<|im_system|>system<|im_middle|>",
+                    .user => "<|im_user|>user<|im_middle|>",
+                    .assistant => "<|im_assistant|>assistant<|im_middle|>",
+                };
+                try w.print("{s}{s}<|im_end|>", .{ header, m.content });
+            }
+            try w.writeAll("<|im_assistant|>assistant<|im_middle|>");
+        },
+        .kimi_k3 => {
+            // Kimi K3's XTML: the structural markers are special tokens, the tag names plain text.
+            // The assistant's channels (`<|open|>think<|sep|>...`) are produced by the model itself.
+            for (messages) |m| {
+                try w.print("<|open|>message role=\"{s}\"<|sep|>{s}<|close|>message<|sep|><|end_of_msg|>", .{ @tagName(m.role), m.content });
+            }
+            try w.writeAll("<|open|>message role=\"assistant\"<|sep|>");
+        },
         .raw => {
             for (messages) |m| {
                 switch (m.role) {
@@ -262,4 +292,16 @@ test "template detection and rendering" {
     const g = try renderPrompt(gpa, .gemma, "Sys.", "Hi");
     defer gpa.free(g);
     try std.testing.expectEqualStrings("<bos><start_of_turn>user\nSys.\n\nHi<end_of_turn>\n<start_of_turn>model\n", g);
+    try std.testing.expectEqual(Template.kimi, detect("{{ '<|im_user|>user<|im_middle|>' }}", "deepseek_v3"));
+    try std.testing.expectEqual(Template.kimi, detect(null, "kimi_k25"));
+    try std.testing.expectEqual(Template.kimi_k3, detect("<|open|>message<|sep|><|close|>message<|sep|><|end_of_msg|>", "kimi_k3"));
+    const k = try renderPrompt(gpa, .kimi, "Sys.", "Hi");
+    defer gpa.free(k);
+    try std.testing.expectEqualStrings("<|im_system|>system<|im_middle|>Sys.<|im_end|><|im_user|>user<|im_middle|>Hi<|im_end|><|im_assistant|>assistant<|im_middle|>", k);
+    const k_no_sys = try render(gpa, .kimi, &.{.{ .role = .user, .content = "Hi" }});
+    defer gpa.free(k_no_sys);
+    try std.testing.expectEqualStrings("<|im_system|>system<|im_middle|>You are a helpful assistant<|im_end|><|im_user|>user<|im_middle|>Hi<|im_end|><|im_assistant|>assistant<|im_middle|>", k_no_sys);
+    const k3 = try renderPrompt(gpa, .kimi_k3, "Sys.", "Hi");
+    defer gpa.free(k3);
+    try std.testing.expectEqualStrings("<|open|>message role=\"system\"<|sep|>Sys.<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>Hi<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|>", k3);
 }

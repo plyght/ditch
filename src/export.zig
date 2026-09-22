@@ -5,6 +5,11 @@
 //! bounded conversion chunk, regardless of model size. A `.incomplete` marker
 //! is created before the first shard and removed only after everything was
 //! written, so a directory never looks complete when it is not.
+//!
+//! A checkpoint that was dequantised on load (FP8, MXFP4, pack-quantized INT4;
+//! see dequant.zig) is exported as a plain bf16 checkpoint: the store hands
+//! out the decoded tensors, so every one of them is written in bf16 (or the
+//! requested `export_dtype`) and `config.json` loses its `quantization_config`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -245,7 +250,7 @@ fn saveModelInner(gpa: Allocator, io: Io, model: *const Model, dir: Io.Dir, opts
     }
 
     // Config and tokenizer files.
-    try dir.writeFile(io, .{ .sub_path = "config.json", .data = model.config_json });
+    try dir.writeFile(io, .{ .sub_path = "config.json", .data = model.export_config_json });
     try dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = model.tokenizer_json });
     if (model.generation_config_json) |g| try dir.writeFile(io, .{ .sub_path = "generation_config.json", .data = g });
     if (model.tokenizer_config_json) |t| try dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = t });
@@ -256,6 +261,18 @@ fn saveModelInner(gpa: Allocator, io: Io, model: *const Model, dir: Io.Dir, opts
         copyIfExists(io, s.*, dir, "chat_template.jinja");
         copyIfExists(io, s.*, dir, "added_tokens.json");
         copyIfExists(io, s.*, dir, "preprocessor_config.json");
+        // A tiktoken vocabulary (and the tokenizer code that reads it) travels with the
+        // tokenizer.json synthesised from it, so the export loads either way.
+        if (model.tokenizer.tiktoken_kind != null) {
+            copyIfExists(io, s.*, dir, "tiktoken.model");
+            copyIfExists(io, s.*, dir, "tokenizer.model");
+            var it = s.iterate();
+            while (it.next(io) catch null) |entry| {
+                if (entry.kind == .file and std.mem.startsWith(u8, entry.name, "tokenization_") and std.mem.endsWith(u8, entry.name, ".py")) {
+                    copyIfExists(io, s.*, dir, entry.name);
+                }
+            }
+        }
     }
     if (opts.readme_body) |body| try dir.writeFile(io, .{ .sub_path = "README.md", .data = body });
 }
