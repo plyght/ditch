@@ -29,11 +29,17 @@ What ditch adds:
 
 Download the archive for your platform from the
 [releases page](https://github.com/plyght/ditch/releases) and put `ditch` on
-your `PATH`; to build from source you need Zig 0.16.0:
+your `PATH`. On x86-64 prefer the **`-v3`** archive: it is built for AVX2 and
+FMA (Intel Haswell, AMD Zen and newer) and is about twice as fast on the matmul
+kernels. The plain x86-64 archive reaches only SSE2 and is there for older
+machines. `ditch --version` prints the kernel shape it was built with.
+
+To build from source you need Zig 0.16.0:
 
 ```sh
 git clone https://github.com/plyght/ditch && cd ditch
-zig build -Doptimize=ReleaseFast   # binary: zig-out/bin/ditch
+zig build -Doptimize=ReleaseFast              # portable
+zig build -Doptimize=ReleaseFast -Dcpu=native # tuned for this machine
 ```
 
 To uninstall, delete the binary and its cache, `~/.cache/ditch` (or

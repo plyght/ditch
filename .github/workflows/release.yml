@@ -42,19 +42,32 @@ jobs:
           set -euo pipefail
           version="${{ steps.version.outputs.version }}"
           mkdir -p dist
-          for t in x86_64-linux-musl aarch64-linux-musl x86_64-macos aarch64-macos x86_64-windows-gnu; do
-            zig build -Doptimize=ReleaseFast -Dtarget="$t" --prefix "zig-out/$t"
-            name="ditch-${version}-${t}"
+          # Each entry is "<target>[:<cpu>]". The plain x86-64 builds run
+          # anywhere but reach only SSE2, so every x86-64 platform also gets a
+          # -v3 build (AVX2 + FMA, Haswell/Zen and newer), which is about twice
+          # as fast on the matmul kernels. The aarch64 builds already have NEON
+          # in the baseline, so they need no second variant.
+          for spec in x86_64-linux-musl aarch64-linux-musl x86_64-macos aarch64-macos x86_64-windows-gnu \
+                      x86_64-linux-musl:x86_64_v3 x86_64-macos:x86_64_v3 x86_64-windows-gnu:x86_64_v3; do
+            t="${spec%%:*}"
+            cpu="${spec#*:}"
+            if [ "$cpu" = "$spec" ]; then
+              zig build -Doptimize=ReleaseFast -Dtarget="$t" --prefix "zig-out/$spec"
+              name="ditch-${version}-${t}"
+            else
+              zig build -Doptimize=ReleaseFast -Dtarget="$t" -Dcpu="$cpu" --prefix "zig-out/$spec"
+              name="ditch-${version}-${t}-v3"
+            fi
             staging="dist/$name"
             mkdir -p "$staging"
             cp README.md LICENSE config.default.lua "$staging/"
             case "$t" in
               *windows*)
-                cp "zig-out/$t/bin/ditch.exe" "$staging/"
+                cp "zig-out/$spec/bin/ditch.exe" "$staging/"
                 (cd dist && zip -qr "$name.zip" "$name")
                 ;;
               *)
-                cp "zig-out/$t/bin/ditch" "$staging/"
+                cp "zig-out/$spec/bin/ditch" "$staging/"
                 tar -C dist -czf "dist/$name.tar.gz" "$name"
                 ;;
             esac
