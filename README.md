@@ -295,7 +295,7 @@ has 32. `ditch --version` and `ditch bench --kernels` print what a build chose.
 | AVX-512 (`-Dcpu=x86_64_v4`) | 16 | 4x4 | 69.9 | 23.0 |
 | AVX2 (`-Dcpu=x86_64_v3`) | 8 | 4x3 | 66.4 (was 37.0) | 23.0 (was 19.9) |
 | x86-64 baseline (the release binaries) | 4 | 4x3 | 30.5 (was 1.1) | 17.3 (was 1.2) |
-| NEON (Apple Silicon, `aarch64-macos`) | 4 | 4x4 | not measured | not measured |
+| NEON (Apple Silicon, `aarch64-macos`) | 4 | 4x4 | see below | see below |
 
 One thread, 64 x 2048 x 2048 bf16 product, on one 4-vCPU x86-64 machine; "was"
 is the previous fixed 16-lane 4x4 kernel on the same machine. The baseline
@@ -319,9 +319,27 @@ framework (`cblas_sgemm`, which reaches the AMX/SME matrix units) once a call
 has at least eight input rows; decode-shaped calls stay on the built-in kernel,
 which reads each bf16 weight once and never materialises an f32 tile. Turn
 Accelerate off at run time with `--no-accelerate`, or out of the build with
-`-Daccelerate=false`. The NEON and Accelerate paths are verified on Apple
-Silicon by the `macos-26` CI job; the numbers in its log are the ones to trust
-for a Mac.
+`-Daccelerate=false`.
+
+Accelerate runs single-threaded (`VECLIB_MAXIMUM_THREADS=1`, unless you set it
+yourself), because ditch already spreads a matmul over its own workers and each
+hands `cblas_sgemm` one tile. Left multithreaded it started a second thread
+pool inside every one of those calls, and its threads kept spinning afterwards,
+which made it slower than the built-in kernel and halved kernels that never
+call it. Three threads on the `macos-26` CI runner, GFLOP/s:
+
+| Kernel | Built-in | Accelerate, multithreaded | Accelerate, single-threaded |
+| :--- | ---: | ---: | ---: |
+| matmul prefill, bf16 weights | 185 | 167 | 262 |
+| matmul prefill, f32 weights | 174 | 169 | 272 |
+| gated activation (never calls Accelerate) | 31 | 14 | 32 |
+
+Its results agree with the built-in kernel to a relative 1.3e-6. Decode does not
+go through Accelerate, and its numbers are not in the table because they swung
+from 41 to 88 GFLOP/s between two identical built-in runs. That runner is a
+3-vCPU virtual machine, so treat these as its numbers rather than a Mac's; the
+NEON and Accelerate paths are checked on it by the `macos-26` CI job, whose log
+has the full table for every run.
 
 ## Development
 
