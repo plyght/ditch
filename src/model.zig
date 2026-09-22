@@ -27,6 +27,7 @@ const search = @import("search.zig");
 pub const arch = @import("arch.zig");
 const expert_cache = @import("expert_cache.zig");
 const remote = @import("remote.zig");
+pub const dsv4 = @import("deepseek_v4.zig");
 const dequant = @import("dequant.zig");
 
 const Allocator = std.mem.Allocator;
@@ -49,7 +50,61 @@ pub const Norm = struct {
 };
 
 /// Which matrix of a layer a `LayerRefs` entry describes.
-pub const Slot = enum { q, k, v, qkv, o, gate, up, gate_up, down, router, q_a, q_b, kv_a, kv_b, lin_qkvz, lin_qkv, lin_z, lin_b, lin_a, lin_ba, lin_conv, lin_q, lin_k, lin_v, lin_conv_q, lin_conv_k, lin_conv_v, lin_f_a, lin_f_b, lin_g_a, lin_g_b, light_qkv, light_gate, conv_in, conv_kernel, ple_gate, ple_out, laurel_l, laurel_r, altup_router, altup_predict, altup_correct };
+pub const Slot = enum {
+    q,
+    k,
+    v,
+    qkv,
+    o,
+    gate,
+    up,
+    gate_up,
+    down,
+    router,
+    q_a,
+    q_b,
+    kv_a,
+    kv_b,
+    lin_qkvz,
+    lin_qkv,
+    lin_z,
+    lin_b,
+    lin_a,
+    lin_ba,
+    lin_conv,
+    lin_q,
+    lin_k,
+    lin_v,
+    lin_conv_q,
+    lin_conv_k,
+    lin_conv_v,
+    lin_f_a,
+    lin_f_b,
+    lin_g_a,
+    lin_g_b,
+    light_qkv,
+    light_gate,
+    // DeepSeek V4 / V4.1 (deepseek_v4.zig)
+    d_q_a,
+    d_q_b,
+    d_kv,
+    d_o_a,
+    d_hc_attn,
+    d_hc_ffn,
+    d_comp_kv,
+    d_comp_gate,
+    d_engram_wkv,
+    // LFM2 short convolution, Gemma 3n / 4 per-layer inputs, AltUp and Laurel
+    conv_in,
+    conv_kernel,
+    ple_gate,
+    ple_out,
+    laurel_l,
+    laurel_r,
+    altup_router,
+    altup_predict,
+    altup_correct,
+};
 
 /// Where a layer's matrices live on disk. `Model.acquireLayer` turns these
 /// into resident `Weight` views for the duration of one layer's compute.
@@ -228,6 +283,9 @@ pub const Layer = struct {
     altup: ?AltUpWeights = null,
     /// Scalar on the layer output (Gemma 4 `layer_scalar`).
     layer_scale: ?f32 = null,
+    /// DeepSeek V4 / V4.1 weights (hyper-connections, low-rank and grouped
+    /// projections, compressor, engram); null for other families.
+    dsv4: ?dsv4.LayerWeights = null,
     /// Dense MLP (null for mixture-of-experts layers).
     ///
     /// In mapped mode the `Weight` fields of a layer view the mapping (or an
@@ -309,6 +367,15 @@ pub const Layer = struct {
             .lin_g_b => self.linear.?.g_b = w,
             .light_qkv => self.linear.?.light_qkv = w,
             .light_gate => self.linear.?.light_gate = w,
+            .d_q_a => self.dsv4.?.q_a = w,
+            .d_q_b => self.dsv4.?.q_b = w,
+            .d_kv => self.dsv4.?.kv = w,
+            .d_o_a => self.dsv4.?.o_a = w,
+            .d_hc_attn => self.dsv4.?.attn_hc.fn_w = w,
+            .d_hc_ffn => self.dsv4.?.ffn_hc.fn_w = w,
+            .d_comp_kv => self.dsv4.?.compressor.?.kv = w,
+            .d_comp_gate => self.dsv4.?.compressor.?.gate = w,
+            .d_engram_wkv => self.dsv4.?.engram.?.wkv = w,
         }
     }
 };
@@ -505,6 +572,12 @@ pub const Model = struct {
     rope_local: RopeTable,
     /// ALiBi slope per head (empty unless `config.positional == .alibi`).
     alibi_slopes: []f32,
+    /// RoPE tables of the compressed branches (DeepSeek V4 / V4.1; empty otherwise).
+    rope_cos_compress: []f32,
+    rope_sin_compress: []f32,
+    /// DeepSeek V4 final stream collapse and V4.1 engram hash state.
+    dsv4_head: ?dsv4.HyperHead,
+    engram: ?dsv4.EngramState,
 
     pub fn deinit(self: *Model) void {
         self.resetDeltas();
@@ -1157,7 +1230,9 @@ pub const Model = struct {
             const hd = c.layer_head_dim[i];
             const nkv = c.layer_kv_heads[i];
             const kv_shared = c.kvShared(i);
-            if (c.linear_layers[i]) {
+            if (c.dsv4 != null) {
+                try dsv4.loadLayer(self, layer, arena, i, lp);
+            } else if (c.linear_layers[i]) {
                 switch (c.linear_kind) {
                     .gated_deltanet => try self.loadLinear(layer, arena, i, lp),
                     .kda => try self.loadKda(layer, arena, i, lp),
@@ -1248,7 +1323,7 @@ pub const Model = struct {
                 }
                 layer.k_norm = null;
             }
-            if (!c.linear_layers[i] and !c.conv_layers[i]) {
+            if (!c.linear_layers[i] and !c.conv_layers[i] and c.dsv4 == null) {
                 const o_name = try cat(arena, lp, names.o);
                 layer.o = try self.loadMatT(o_name, c.arch.conv1d);
                 layer.o_bias = self.loadVecOpt(try biasName(arena, o_name));
@@ -1314,6 +1389,9 @@ pub const Model = struct {
         }
         self.alibi_slopes = &.{};
         if (c.positional == .alibi) self.alibi_slopes = try alibiSlopes(arena, c.num_heads);
+        self.dsv4_head = null;
+        self.engram = null;
+        if (c.dsv4 != null) try dsv4.loadModel(self, arena);
     }
 
     /// Resolves a model-level name template with the detected prefix.
@@ -1644,6 +1722,13 @@ pub const Model = struct {
         const len = @min(c.max_position_embeddings, 8192);
         self.rope = try self.fillRope(len, c.rope_theta, c.rotary_dim, c.rope_freq_dim, c.rope_scaling);
         self.rope_local = if (c.rope_local) |l| try self.fillRope(len, l.theta, l.rotary_dim, l.freq_dim, .none) else self.rope;
+        self.rope_cos_compress = &.{};
+        self.rope_sin_compress = &.{};
+        if (c.dsv4) |d| {
+            const t = try self.fillRope(len, d.compress_rope_theta, c.rotary_dim, c.rotary_dim, d.compress_rope_scaling);
+            self.rope_cos_compress = t.cos;
+            self.rope_sin_compress = t.sin;
+        }
     }
 
     /// Builds a `[len][dim / 2]` table: `dim` coordinates rotate with
@@ -1979,6 +2064,8 @@ pub const KvCache = struct {
     layer_written: []usize = &.{},
     /// Recurrent state of linear-attention layers (null for dense models).
     linear: ?LinearCache = null,
+    /// Compressed-KV entries and engram look-back (DeepSeek V4 / V4.1).
+    compress: ?dsv4.CompressCache = null,
 
     pub fn init(gpa: Allocator, layers: usize, batch: usize, max_len: usize, kv_dim: usize) !KvCache {
         const n = layers * batch * max_len * kv_dim;
@@ -2027,6 +2114,7 @@ pub const KvCache = struct {
             };
         }
         if (c.has_linear or c.has_conv) cache.linear = try LinearCache.init(gpa, c, batch);
+        if (c.dsv4 != null) cache.compress = try dsv4.CompressCache.init(gpa, c, batch, max_len);
         return cache;
     }
 
@@ -2036,6 +2124,7 @@ pub const KvCache = struct {
         if (self.scratch) |*s| s.deinit();
         if (self.layer_written.len > 0) self.gpa.free(self.layer_written);
         if (self.linear) |*l| l.deinit();
+        if (self.compress) |*cc| cc.deinit();
     }
 
     pub fn spilled(self: *const KvCache) bool {
@@ -2374,7 +2463,12 @@ pub const Workspace = struct {
         const qd: u64 = c.maxQDim();
         const kvd: u64 = c.kvDim();
         const inter: u64 = c.intermediate_size;
-        return (5 * hidden + 2 * qd + 2 * kvd + fusedQkvRows(c) + 2 * inter + fusedGateUpCols(c) + linearCols(c) + altCols(c) + pleCols(c)) * 4;
+        return (4 * hidden + streamWidth(c) + 2 * qd + 2 * kvd + fusedQkvRows(c) + 2 * inter + fusedGateUpCols(c) + linearCols(c) + altCols(c) + pleCols(c)) * 4;
+    }
+
+    /// Width of one residual row: `hidden` times the number of residual streams.
+    pub fn streamWidth(c: *const Config) usize {
+        return c.hc_mult * c.hidden_size;
     }
 
     fn altCols(c: *const Config) usize {
@@ -2429,7 +2523,7 @@ pub const Workspace = struct {
             .max_logit_rows = max_logit_rows,
         };
         errdefer self.deinit();
-        self.x = try gpa.alloc(f32, max_rows * hidden);
+        self.x = try gpa.alloc(f32, max_rows * streamWidth(c));
         self.h = try gpa.alloc(f32, max_rows * hidden);
         self.h2 = try gpa.alloc(f32, max_rows * hidden);
         self.q = try gpa.alloc(f32, max_rows * qd);
@@ -3324,11 +3418,11 @@ fn gaussianTopk(gate: []f32, n: usize, width: usize, sparsity: f32) void {
 }
 
 /// MLP sublayer (dense or mixture of experts): reads `h_in`, writes `ws.m`.
-fn mlpBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace, h_in: []const f32, n: usize) !void {
+pub fn mlpBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace, h_in: []const f32, n: usize, tokens: ?[]const u32) !void {
     const c = &model.config;
     const gpa = model.gpa;
     const hidden = c.hidden_size;
-    if (layer.moe) |*m| return moe.forward(model, m, li, ws.m, h_in, n);
+    if (layer.moe) |*m| return moe.forward(model, m, li, ws.m, h_in, n, tokens);
     const down = layer.down.?;
     const inter = down.cols;
     var din: []f32 = ws.gate;
@@ -3495,6 +3589,9 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
     const n = tokens.len;
     std.debug.assert(n == rows.len);
     const hidden = c.hidden_size;
+    const hc = c.hc_mult;
+    // Hyper-connection families keep `hc` residual streams per row.
+    const sw = hc * hidden;
     const chunk_rows = ws.max_rows;
     const single = n <= chunk_rows;
     const alt_w = if (c.altup_inputs > 1) (c.altup_inputs - 1) * hidden else 0;
@@ -3513,7 +3610,7 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
     var act_ple: ?stream.Activations = null;
     defer if (act_ple) |*a| a.deinit();
     if (!single) {
-        act = try stream.Activations.init(gpa, model.io, n, hidden, act_opts);
+        act = try stream.Activations.init(gpa, model.io, n, sw, act_opts);
         if (alt_w > 0) act_alt = try stream.Activations.init(gpa, model.io, n, alt_w, act_opts);
         if (ple_w > 0) act_ple = try stream.Activations.init(gpa, model.io, n, ple_w, act_opts);
     }
@@ -3535,9 +3632,9 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
     var start: usize = 0;
     while (start < n) : (start += chunk_rows) {
         const cn = @min(chunk_rows, n - start);
-        const xs = if (single) ws.x[0 .. n * hidden] else act.?.chunkUninit(start, cn, ws.x);
+        const xs = if (single) ws.x[0 .. n * sw] else act.?.chunkUninit(start, cn, ws.x);
         for (tokens[start..][0..cn], 0..) |t, i| {
-            const x = xs[i * hidden ..][0..hidden];
+            const x = xs[i * sw ..][0..hidden];
             try model.embedRow(t, x);
             if (c.embed_scale != 1.0) tensor.scale(x, c.embed_scale);
             if (model.pos_embed_ref != null) {
@@ -3549,6 +3646,8 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
                 applyNorm(c, ws.h[0..hidden], x, nm);
                 @memcpy(x, ws.h[0..hidden]);
             }
+            // Every stream starts as a copy of the embedding.
+            for (1..hc) |j| @memcpy(xs[i * sw + j * hidden ..][0..hidden], x);
         }
         if (ple_w > 0) {
             const ps = if (single) ws.ple[0 .. n * ple_w] else act_ple.?.chunkUninit(start, cn, ws.ple);
@@ -3561,8 +3660,23 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
             if (!single) try act_alt.?.commit(start, cn, as);
         }
         if (!single) try act.?.commit(start, cn, xs);
-        captureResiduals(opts, 0, hidden, start, cn, xs);
+        if (hc == 1) captureResiduals(opts, 0, hidden, start, cn, xs);
     }
+
+    // V4.1 single-pass hyper-connections: the collapse weights travel from
+    // one site to the next; the first site reads stream 0 only.
+    var pre_mix: ?[]f32 = null;
+    defer if (pre_mix) |p| gpa.free(p);
+    if (c.dsv4) |d| if (d.v41) {
+        const p = try gpa.alloc(f32, n * hc);
+        @memset(p, 0);
+        for (0..n) |t| p[t * hc] = 1.0;
+        pre_mix = p;
+    };
+    // The residual of a hyper-connection layer is its collapsed block input.
+    var capture_buf: ?[]f32 = null;
+    defer if (capture_buf) |b| gpa.free(b);
+    if (hc > 1 and opts.residuals != null) capture_buf = try gpa.alloc(f32, chunk_rows * hidden);
 
     for (0..c.num_layers) |li| {
         if (model.budget) |b| try b.checkTime();
@@ -3575,17 +3689,34 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
         start = 0;
         while (start < n) : (start += chunk_rows) {
             const cn = @min(chunk_rows, n - start);
-            const xs = if (single) ws.x[0 .. n * hidden] else try act.?.chunk(start, cn, ws.x);
-            const alts: []f32 = if (alt_w == 0) &.{} else if (single) ws.alt[0 .. n * alt_w] else try act_alt.?.chunk(start, cn, ws.alt);
-            const ples: []const f32 = if (ple_w == 0) &.{} else if (single) ws.ple[0 .. n * ple_w] else try act_ple.?.chunk(start, cn, ws.ple);
-            try layerBlock(model, layer, li, ws, cache, xs, alts, ples, rows[start..][0..cn]);
-            if (!single) {
-                try act.?.commit(start, cn, xs);
-                if (alt_w > 0) try act_alt.?.commit(start, cn, alts);
+            const xs = if (single) ws.x[0 .. n * sw] else try act.?.chunk(start, cn, ws.x);
+            if (hc > 1) {
+                const pm: ?[]f32 = if (pre_mix) |p| p[start * hc ..][0 .. cn * hc] else null;
+                try dsv4.layerBlock(model, layer, li, ws, cache, xs, rows[start..][0..cn], tokens[start..][0..cn], pm, capture_buf);
+                if (capture_buf) |cb| captureResiduals(opts, li, hidden, start, cn, cb);
+            } else {
+                const alts: []f32 = if (alt_w == 0) &.{} else if (single) ws.alt[0 .. n * alt_w] else try act_alt.?.chunk(start, cn, ws.alt);
+                const ples: []const f32 = if (ple_w == 0) &.{} else if (single) ws.ple[0 .. n * ple_w] else try act_ple.?.chunk(start, cn, ws.ple);
+                try layerBlock(model, layer, li, ws, cache, xs, alts, ples, rows[start..][0..cn]);
+                if (!single and alt_w > 0) try act_alt.?.commit(start, cn, alts);
             }
-            captureResiduals(opts, li + 1, hidden, start, cn, xs);
+            if (!single) try act.?.commit(start, cn, xs);
+            if (hc == 1) captureResiduals(opts, li + 1, hidden, start, cn, xs);
         }
         if (kv_layer == li) try cache.endLayer(li);
+    }
+
+    // Hyper-connections: the final collapse is the last residual entry.
+    if (hc > 1) {
+        if (opts.residuals) |res| {
+            const row = try gpa.alloc(f32, sw);
+            defer gpa.free(row);
+            for (opts.capture_rows, 0..) |r, ci| {
+                if (single) @memcpy(row, ws.x[r * sw ..][0..sw]) else try act.?.readRow(r, row);
+                const pm: ?[]const f32 = if (pre_mix) |p| p[r * hc ..][0..hc] else null;
+                dsv4.finalCollapse(model, row, pm, res[(c.num_layers * opts.capture_rows.len + ci) * hidden ..][0..hidden]);
+            }
+        }
     }
 
     // Final norm + logits for requested rows.
@@ -3604,14 +3735,16 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
         }
         const alt_row = try gpa.alloc(f32, alt_w);
         defer gpa.free(alt_row);
+        const tmp = try gpa.alloc(f32, sw);
+        defer gpa.free(tmp);
         for (opts.logit_rows, 0..) |r, i| {
             const dst = h[i * hidden ..][0..hidden];
             var src: []const f32 = undefined;
             if (single) {
-                src = ws.x[r * hidden ..][0..hidden];
+                src = ws.x[r * sw ..][0..sw];
             } else {
-                try act.?.readRow(r, ws.o[0..hidden]);
-                src = ws.o[0..hidden];
+                try act.?.readRow(r, tmp);
+                src = tmp;
             }
             if (alt_w > 0) {
                 // Gemma 3n: mean of the active stream and the unembedded extra streams.
@@ -3619,11 +3752,15 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
                     try act_alt.?.readRow(r, alt_row);
                     break :blk alt_row;
                 };
-                try altupFold(model, unembed[0..n_unembed], src, alts, ws.h2[0..hidden], ws.h[0..hidden]);
-                applyNorm(c, dst, ws.h2[0..hidden], model.final_norm);
-            } else {
-                applyNorm(c, dst, src, model.final_norm);
+                try altupFold(model, unembed[0..n_unembed], src[0..hidden], alts, ws.h2[0..hidden], ws.h[0..hidden]);
+                src = ws.h2[0..hidden];
             }
+            if (hc > 1) {
+                const pm: ?[]const f32 = if (pre_mix) |p| p[r * hc ..][0..hc] else null;
+                dsv4.finalCollapse(model, src, pm, ws.h2[0..hidden]);
+                src = ws.h2[0..hidden];
+            }
+            applyNorm(c, dst, src, model.final_norm);
         }
         const lm = try model.acquireLmHead();
         defer store.release(lm);
@@ -3673,7 +3810,7 @@ fn layerBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Workspac
         const sa = c.minimax_scales[if (c.linear_layers[li]) 1 else 0];
         for (x[0 .. n * hidden], h, attn_out) |*xv, hv, av| xv.* = sa[0] * hv + sa[1] * av;
         normRows(c, h, x, n, hidden, layer.pre_ff_norm);
-        try mlpBlock(model, layer, li, ws, h, n);
+        try mlpBlock(model, layer, li, ws, h, n, null);
         const sm = c.minimax_scales[2];
         for (x[0 .. n * hidden], h, ws.m[0 .. n * hidden]) |*xv, hv, mv| xv.* = sm[0] * hv + sm[1] * mv;
         return;
@@ -3684,7 +3821,7 @@ fn layerBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Workspac
             normRows(c, ws.h2, x, n, hidden, nm);
             mlp_in = ws.h2[0 .. n * hidden];
         }
-        try mlpBlock(model, layer, li, ws, mlp_in, n);
+        try mlpBlock(model, layer, li, ws, mlp_in, n, null);
         const m = ws.m[0 .. n * hidden];
         if (layer.post_ff_norm) |nm| normRowsInPlace(c, m, n, hidden, nm, ws.h2);
         tensor.axpy(x[0 .. n * hidden], rm, attn_out);
@@ -3692,7 +3829,7 @@ fn layerBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Workspac
     } else {
         tensor.axpy(x[0 .. n * hidden], rm, attn_out);
         normRows(c, h, x, n, hidden, layer.pre_ff_norm);
-        try mlpBlock(model, layer, li, ws, h, n);
+        try mlpBlock(model, layer, li, ws, h, n, null);
         const m = ws.m[0 .. n * hidden];
         if (layer.post_ff_norm) |nm| normRowsInPlace(c, m, n, hidden, nm, ws.h2);
         tensor.axpy(x[0 .. n * hidden], rm, m);
@@ -3797,7 +3934,7 @@ fn altupLayer(model: *const Model, layer: *const Layer, li: usize, ws: *Workspac
 
     // MLP; `act_in` becomes the activated output.
     normRows(c, h, act_in, n, hidden, layer.pre_ff_norm);
-    try mlpBlock(model, layer, li, ws, h, n);
+    try mlpBlock(model, layer, li, ws, h, n, null);
     const m = ws.m[0 .. n * hidden];
     if (layer.post_ff_norm) |nm| normRowsInPlace(c, m, n, hidden, nm, ws.h2);
     tensor.axpy(act_in, 1.0, m);

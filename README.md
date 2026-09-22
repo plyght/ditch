@@ -123,6 +123,19 @@ a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
   index_topk_blocks` tokens, 2048 with the released config, so ditch runs
   those layers as dense attention and its results are exact only within
   that length)
+* DeepSeek V4 (`deepseek_v4`) and V4.1-Flash (`deepseek_v41`, text config):
+  manifold-constrained hyper-connections, shared-KV sliding attention with
+  sinks and grouped output projection, compressed-KV branches (V4 CSA/HCA,
+  V4.1 CSA2 shared groups) whose Lightning Indexer runs as its dense
+  equivalent (exact while every reachable compressed entry fits
+  `index_topk`; longer prompts are refused, not approximated), V4.1's FP8/FP4
+  quantisation-aware rounding of the KV caches, sqrtsoftplus routing with
+  clamped SwiGLU experts, V4 hash-routed (`tid2eid`) layers and V4.1 engram
+  n-gram hash layers (table rows are read lazily; the compressed vocabulary
+  is rebuilt from the tokenizer and checked against the config). MTP, vision
+  and aligner tensors pass through exports untouched. FP8 tensors are
+  dequantised on load like the other families; the FP4 (e2m1) expert weights
+  of the released checkpoints are refused until dequantised.
 
 Implemented from the Hugging Face reference but without a fixture: Falcon
 40B/180B (grouped qkv, `ln_attn`/`ln_mlp`) and Falcon ALiBi, Baichuan 13B
@@ -133,8 +146,7 @@ beyond the original context (treated as static / short factors).
 Not supported: state-space and hybrid models (Mamba, Jamba, Falcon-H1,
 Nemotron-H, RWKV, Granite 4 `granitemoehybrid` checkpoints with Mamba-2
 layers), Kimi K3 (AttnRes), Kimi K2 (`kimi_k2` standalone config),
-Qwen3.8-Flash-Next (`qwen4_exp`), GLM-5.3-Flash (`glm5_next`) and
-DeepSeek V4 (sparse indexers with hyper-connections and hash layers),
+Qwen3.8-Flash-Next (`qwen4_exp`), GLM-5.3-Flash (`glm5_next`),
 encoder-decoder models, Gemma 4 MoE (`enable_moe_block`), LFM2-MoE,
 MiniCPM3, HunYuan cross-layer attention (`use_cla`), OPT-350m (projection
 layers), quantisation formats other than the ones listed below (GPTQ, AWQ,
@@ -340,7 +352,12 @@ RAM. The Pareto fronts are close.
    minus harmless prompts, normalised (optionally projected orthogonal to
    the harmless direction). With `--n-directions K`, further principal
    components of the harmful residuals are added from a streaming covariance
-   sketch.
+   sketch. For the hyper-connection families (DeepSeek V4 / V4.1), whose
+   residual is several parallel streams, "the residual at layer L" is the
+   single mixed vector that enters layer L's attention block (the collapsed
+   block input, before its norm) and the last entry is the final collapse
+   that enters the output norm; the edited weights are the same output and
+   down projections as everywhere else.
 2. **Edit.** For every attention output and MLP down projection, the
    direction is projected out with a per-layer weight from a small kernel
    (maximum weight at a position, decaying to a minimum over a distance),

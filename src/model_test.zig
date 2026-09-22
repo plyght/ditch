@@ -33,6 +33,9 @@ pub fn checkFixture(comptime family: []const u8) !void {
     if (c.has_linear or c.has_conv) {
         cache.linear = try model_mod.LinearCache.init(gpa, c, ref.value.cases.len);
     }
+    if (c.dsv4 != null) {
+        cache.compress = try model_mod.dsv4.CompressCache.init(gpa, c, ref.value.cases.len, 64);
+    }
 
     var prompts = std.ArrayList([]const u32).empty;
     defer {
@@ -227,6 +230,12 @@ test "gemma4 fixture" {
 }
 test "gemma3n fixture" {
     try checkFixture("gemma3n");
+}
+test "deepseek_v4 fixture" {
+    try checkFixture("deepseek_v4");
+}
+test "deepseek_v41 fixture" {
+    try checkFixture("deepseek_v41");
 }
 test "minimax_m2 fixture" {
     try checkFixture("minimax_m2");
@@ -429,6 +438,12 @@ test "gemma4 edit, export and streamed reload (per-layer head sizes, KV sharing,
 }
 test "gemma3n edit, export and streamed reload (AltUp streams, Laurel, per-layer inputs)" {
     try checkEditExportStream("gemma3n");
+}
+test "deepseek_v4 edit, export and streamed reload (hyper-connections, hash routing, MTP pass-through)" {
+    try checkEditExportStream("deepseek_v4");
+}
+test "deepseek_v41 edit, export and streamed reload (shared compressed KV, engram tables)" {
+    try checkEditExportStream("deepseek_v41");
 }
 test "minimax_m2 edit, export and streamed reload (full-projection q/k norm, Mixtral expert names)" {
     try checkEditExportStream("minimax_m2");

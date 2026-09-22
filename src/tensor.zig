@@ -10,6 +10,9 @@ pub const DType = enum {
     f32,
     f16,
     bf16,
+    /// 64-bit integers (index tables such as DeepSeek V4's `tid2eid`); carried
+    /// through exports untouched and read as integers, never as weights.
+    i64,
     // ggml block-quantised formats (see quant.zig); only meaningful for row-major matrices
     // whose row length is a multiple of the block size.
     q8_0,
@@ -26,14 +29,23 @@ pub const DType = enum {
         return switch (self) {
             .f32 => 4,
             .f16, .bf16 => 2,
+            .i64 => 8,
             else => unreachable,
         };
     }
 
     pub fn isQuantized(self: DType) bool {
         return switch (self) {
-            .f32, .f16, .bf16 => false,
+            .f32, .f16, .bf16, .i64 => false,
             else => true,
+        };
+    }
+
+    /// A floating-point storage type that kernels can read as weights.
+    pub fn isFloat(self: DType) bool {
+        return switch (self) {
+            .f32, .f16, .bf16 => true,
+            else => false,
         };
     }
 
@@ -64,6 +76,7 @@ pub const DType = enum {
         if (std.mem.eql(u8, name, "F32")) return .f32;
         if (std.mem.eql(u8, name, "F16")) return .f16;
         if (std.mem.eql(u8, name, "BF16")) return .bf16;
+        if (std.mem.eql(u8, name, "I64")) return .i64;
         return null;
     }
 
@@ -73,6 +86,7 @@ pub const DType = enum {
             .f32 => "F32",
             .f16 => "F16",
             .bf16 => "BF16",
+            .i64 => "I64",
             .q8_0 => "Q8_0",
             .q4_0 => "Q4_0",
             .q4_1 => "Q4_1",
@@ -374,6 +388,10 @@ pub fn convertToF32(dtype: DType, bytes: []const u8, out: []f32) void {
             }
             while (i < out.len) : (i += 1) out[i] = f16ToF32(src[i]);
         },
+        .i64 => {
+            const src = std.mem.bytesAsSlice(i64, bytes[0 .. out.len * 8]);
+            for (out, 0..) |*o, i| o.* = @floatFromInt(src[i]);
+        },
         else => quant.dequantize(dtype, bytes, out),
     }
 }
@@ -388,6 +406,10 @@ pub fn convertFromF32(dtype: DType, src: []const f32, out: []u8) void {
         .f16 => {
             const dst = std.mem.bytesAsSlice(u16, out[0 .. src.len * 2]);
             for (src, 0..) |v, i| dst[i] = f32ToF16(v);
+        },
+        .i64 => {
+            const dst = std.mem.bytesAsSlice(i64, out[0 .. src.len * 8]);
+            for (src, 0..) |v, i| dst[i] = @intFromFloat(@round(v));
         },
         else => quant.quantize(dtype, src, out),
     }

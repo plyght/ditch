@@ -163,6 +163,9 @@ pub const MoeLayer = struct {
     fused_down_suffix: ?[]const u8,
     /// Name templates of the family (for export lookups).
     names: *const arch.Names,
+    /// Hash routing (DeepSeek V4 `hash_moe`): expert `[token][k]` is fixed by
+    /// the input token id; the router scores only weight the selection.
+    hash_table: ?[]const u32 = null,
 
     /// Number of editable down projections: routed experts plus the shared expert.
     pub fn numDown(self: *const MoeLayer) usize {
@@ -527,6 +530,24 @@ pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !Mo
         std.log.err("router {s} is [{d}][{d}], expected [{d}][{d}]", .{ router_name, self.router.rows, self.router.cols, n_experts, hidden });
         return error.InvalidConfig;
     }
+    if (c.dsv4) |d| if (d.hash_moe_layers[li]) {
+        const table_name = try cat(arena, &.{ lp, "mlp.gate.tid2eid" });
+        const ref = model.store.lookup(table_name) orelse {
+            std.log.err("missing hash routing table {s}", .{table_name});
+            return error.MissingWeights;
+        };
+        if (ref.dtype != .i64 or ref.cols != self.top_k or ref.rows < c.vocab_size) {
+            std.log.err("hash routing table {s} is {s} [{d}][{d}], expected I64 [{d}][{d}]", .{ table_name, ref.dtype.safetensorsName(), ref.rows, ref.cols, c.vocab_size, self.top_k });
+            return error.InvalidConfig;
+        }
+        const raw = try model.store.readVecF32(arena, ref);
+        const table = try arena.alloc(u32, raw.len);
+        for (raw, 0..) |v, i| {
+            if (v < 0 or v >= @as(f32, @floatFromInt(n_experts)) or v != @floor(v)) return error.InvalidConfig;
+            table[i] = @intFromFloat(v);
+        }
+        self.hash_table = table;
+    };
 
     // Fused layout?
     var fused_gu: ?WeightRef = null;
@@ -740,6 +761,13 @@ fn runExpert(model: *const Model, m: *const MoeLayer, gate_w: Weight, up_w: Weig
             const uc = std.math.clamp(up[j], -sw.limit, sw.limit);
             g.* = (uc + 1.0) * gc * sigmoid(sw.alpha * gc);
         }
+    } else if (m.routing.swiglu_limit) |limit| {
+        // DeepSeek V4: the gate is clamped from above, the up projection on both sides.
+        for (gate[0 .. ne * inter], 0..) |*g, j| {
+            g.* = @min(g.*, limit);
+            up[j] = std.math.clamp(up[j], -limit, limit);
+        }
+        tensor.gatedActivation(model.pool, m.activation, gate, gate, up, ne, inter, inter, inter);
     } else {
         tensor.gatedActivation(model.pool, m.activation, gate, gate, up, ne, inter, inter, inter);
     }
@@ -766,11 +794,18 @@ fn topk(scores: []const f32, sel: []f32, k: usize, idx: []usize, wts: []f32) voi
     }
 }
 
+/// `sqrt(softplus(x))` (DeepSeek V4 router scores; softplus is linear above 20 like PyTorch's).
+fn sqrtSoftplus(x: f32) f32 {
+    const sp = if (x > 20.0) x else std.math.log1p(@exp(x));
+    return @sqrt(sp);
+}
+
 /// Routed MoE MLP of layer `li`: `out[n][hidden]` from normalised inputs
 /// `h[n][hidden]`. In warp mode the union of the experts selected for the
 /// `n` tokens is fetched through the model's expert cache (misses of the
 /// layer as one prefetch group), one expert pinned at a time while it runs.
-pub fn forward(model: *const Model, m: *const MoeLayer, li: usize, out: []f32, h: []const f32, n: usize) !void {
+/// `tokens` (the input token ids of the rows) drives hash-routed layers.
+pub fn forward(model: *const Model, m: *const MoeLayer, li: usize, out: []f32, h: []const f32, n: usize, tokens: ?[]const u32) !void {
     const gpa = model.gpa;
     const hidden = model.config.hidden_size;
     const n_experts = m.experts.len;
@@ -796,11 +831,29 @@ pub fn forward(model: *const Model, m: *const MoeLayer, li: usize, out: []f32, h
     for (0..n) |t| {
         const row = logits[t * n_experts ..][0..n_experts];
         if (m.router_bias) |b| tensor.axpy(row, 1.0, b[0..n_experts]);
+        if (r.gate_temp != 1.0) tensor.scale(row, 1.0 / r.gate_temp);
         switch (r.scoring) {
             .softmax => tensor.softmaxInPlace(row),
             .sigmoid => for (row) |*v| {
                 v.* = sigmoid(v.*);
             },
+            .sqrtsoftplus => for (row) |*v| {
+                v.* = sqrtSoftplus(v.*);
+            },
+        }
+        if (m.hash_table) |table| {
+            // The token id fixes the experts; the scores only weight them.
+            const toks = tokens orelse return error.MissingTokens;
+            const tid = @min(toks[t], @as(u32, @intCast(table.len / k - 1)));
+            for (0..k) |j| {
+                const e = table[tid * k + j];
+                sel[t * k + j] = e;
+                selw[t * k + j] = row[e];
+            }
+            var hsum: f32 = 0;
+            for (selw[t * k ..][0..k]) |w| hsum += w;
+            for (0..k) |j| selw[t * k + j] = selw[t * k + j] / (hsum + 1e-20) * r.routed_scaling_factor;
+            continue;
         }
         for (choice, 0..) |*cv, e| cv.* = row[e] + (if (m.correction_bias) |b| b[e] else 0);
         if (r.topk_method == .group_limited and n_group > 1) {
@@ -845,7 +898,9 @@ pub fn forward(model: *const Model, m: *const MoeLayer, li: usize, out: []f32, h
         topk(row, choice, k, sel[t * k ..][0..k], selw[t * k ..][0..k]);
         var sum: f32 = 0;
         for (selw[t * k ..][0..k]) |w| sum += w;
-        if (m.norm_topk_prob and sum > 0) {
+        if (m.norm_topk_prob and r.norm_eps_floor) {
+            for (0..k) |j| selw[t * k + j] /= sum + 1e-20;
+        } else if (m.norm_topk_prob and sum > 0) {
             for (0..k) |j| selw[t * k + j] /= sum;
         }
         if (r.routed_scaling_factor != 1.0) for (0..k) |j| {
