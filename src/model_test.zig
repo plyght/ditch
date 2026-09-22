@@ -276,6 +276,12 @@ test "kimi_linear fixture (checkpoint layout: split convolutions, block_sparse_m
 test "kimi_linear fixture (Hugging Face layout: forget_gate, fused conv1d, stacked experts)" {
     try checkFixture("kimi_linear_hf");
 }
+test "mimo_v2_flash fixture (transformers spelling: layer_types, rope_parameters, stacked experts)" {
+    try checkFixture("mimo_v2_flash");
+}
+test "mimo_v2 fixture (hub spelling: hybrid_layer_pattern, chunked qkv_proj, omni and MTP pass-through)" {
+    try checkFixture("mimo_v2");
+}
 test "kimi_k25 fixture (DeepSeek V3 text config under a multimodal wrapper)" {
     try checkFixture("kimi_k25");
 }
@@ -296,6 +302,9 @@ test "gpt_oss_mxfp4 fixture (MXFP4 expert blocks and scales)" {
 }
 test "kimi_k3_mxfp4 fixture (compressed-tensors mxfp4-pack-quantized experts)" {
     try checkFixture("kimi_k3_mxfp4");
+}
+test "mimo_v2_mxfp4 fixture (MiMo V2.6 store_dtype mxfp4 experts, bf16 MoE router)" {
+    try checkFixture("mimo_v2_mxfp4");
 }
 
 // Mamba families (selective state-space blocks with a per-sequence recurrent state).
@@ -604,6 +613,15 @@ test "gemma4 edit, export and streamed reload (per-layer head sizes, KV sharing,
 }
 test "gemma3n edit, export and streamed reload (AltUp streams, Laurel, per-layer inputs)" {
     try checkEditExportStream("gemma3n");
+}
+test "mimo_v2_flash edit, export and streamed reload (sinks on sliding layers, doubled kv heads, stacked experts, MTP pass-through)" {
+    try checkEditExportStream("mimo_v2_flash");
+}
+test "mimo_v2 edit, export and streamed reload (chunked qkv_proj, per-expert tensors, omni tensors pass-through)" {
+    try checkEditExportStream("mimo_v2");
+}
+test "mimo_v2_mxfp4 edit, export and streamed reload (store_dtype mxfp4 experts export as bf16)" {
+    try checkEditExportStream("mimo_v2_mxfp4");
 }
 test "deepseek_v4 edit, export and streamed reload (hyper-connections, hash routing, MTP pass-through)" {
     try checkEditExportStream("deepseek_v4");

@@ -38,6 +38,7 @@ const Delta = tensor.Delta;
 const WeightRef = stream.WeightRef;
 
 pub const Config = arch.Config;
+const QkvLayout = arch.QkvLayout;
 pub const RopeScaling = arch.RopeScaling;
 pub const parseConfig = arch.parseConfig;
 
@@ -1424,7 +1425,7 @@ pub const Model = struct {
                 .v_bias = null,
                 .qkv_bias = null,
                 .o_bias = null,
-                .sinks = if (names.sinks) |t| self.loadVecOpt(try cat(arena, lp, t)) else null,
+                .sinks = if (names.sinks) |t| (self.loadVecOpt(try cat(arena, lp, t)) orelse if (names.sinks_alt) |alt| self.loadVecOpt(try cat(arena, lp, alt)) else null) else null,
                 .mla = null,
                 .gate = null,
                 .up = null,
@@ -1456,10 +1457,14 @@ pub const Model = struct {
                 layer.q_norm = null;
                 layer.k_norm = null;
             }
-            if (c.sinks and layer.sinks == null) {
+            if (c.sinks and layer.sinks == null and (!c.sinks_sliding_only or c.sliding_layers[i])) {
                 std.log.err("missing attention sinks in layer {d}", .{i});
                 return error.MissingWeights;
             }
+            if (layer.sinks) |sk| if (sk.len != c.num_heads) {
+                std.log.err("layer {d}: attention sinks have {d} entries, expected one per head ({d})", .{ i, sk.len, c.num_heads });
+                return error.InvalidConfig;
+            };
 
             // Attention projections.
             layer.o = .{ .data = &.{}, .dtype = self.dtype, .rows = 0, .cols = 0 };
@@ -1520,14 +1525,18 @@ pub const Model = struct {
                         return error.InvalidConfig;
                     }
                 }
-            } else if (c.qkv_layout != .separate) {
+            } else if (c.qkv_layout != .separate or (c.qkv_alt != null and names.qkv != null and names.q != null and self.find(try cat(arena, lp, names.q.?)) == null and self.find(try cat(arena, lp, names.qkv.?)) != null)) {
                 const qkv_name = try cat(arena, lp, names.qkv orelse return error.InvalidConfig);
                 layer.qkv = try self.loadMatT(qkv_name, c.arch.conv1d);
                 layer.qkv_bias = self.loadVecOpt(try biasName(arena, qkv_name));
                 layer.refs.add(.qkv, try self.ref(qkv_name), c.arch.conv1d);
-                const want = c.num_heads * hd + 2 * nkv * hd;
+                const want = c.num_heads * hd + nkv * (hd + c.layerVDim(i));
                 if (layer.qkv.?.rows != want or layer.qkv.?.cols != c.hidden_size) {
                     std.log.err("layer {d}: fused qkv tensor is [{d}][{d}], expected [{d}][{d}]", .{ i, layer.qkv.?.rows, layer.qkv.?.cols, want, c.hidden_size });
+                    return error.InvalidConfig;
+                }
+                if (c.qkv_chunks != 0 and (c.num_heads % c.qkv_chunks != 0 or nkv % c.qkv_chunks != 0)) {
+                    std.log.err("layer {d}: fused qkv tensor is chunked {d} ways, which does not divide {d} heads / {d} kv heads", .{ i, c.qkv_chunks, c.num_heads, nkv });
                     return error.InvalidConfig;
                 }
             } else {
@@ -1554,8 +1563,8 @@ pub const Model = struct {
                         layer.v = try self.loadMat(v_name);
                         layer.v_bias = self.loadVecOpt(try biasName(arena, v_name));
                         layer.refs.add(.v, try self.ref(v_name), false);
-                        if (layer.v.?.rows != nkv * hd or layer.v.?.cols != c.hidden_size) {
-                            std.log.err("layer {d}: v projection is [{d}][{d}], expected [{d}][{d}]", .{ i, layer.v.?.rows, layer.v.?.cols, nkv * hd, c.hidden_size });
+                        if (layer.v.?.rows != nkv * c.layerVDim(i) or layer.v.?.cols != c.hidden_size) {
+                            std.log.err("layer {d}: v projection is [{d}][{d}], expected [{d}][{d}]", .{ i, layer.v.?.rows, layer.v.?.cols, nkv * c.layerVDim(i), c.hidden_size });
                             return error.InvalidConfig;
                         }
                     }
@@ -2881,7 +2890,8 @@ pub const Workspace = struct {
     }
 
     fn fusedQkvRows(c: *const Config) usize {
-        return if (c.qkv_layout != .separate and c.mla == null) (c.num_heads + 2 * c.num_kv_heads) * c.head_dim else 0;
+        if ((c.qkv_layout == .separate and c.qkv_alt == null) or c.mla != null) return 0;
+        return c.maxQDim() + 2 * c.kvDim();
     }
 
     fn fusedGateUpCols(c: *const Config) usize {
@@ -3054,36 +3064,51 @@ fn clampAll(buf: []f32, limit: f32) void {
 }
 
 /// Splits one fused qkv row into q, k and v according to the family layout.
-fn scatterQkv(c: *const Config, fused: []const f32, q: []f32, k: []f32, v: []f32) void {
-    const hd = c.head_dim;
+fn scatterQkv(c: *const Config, layout: QkvLayout, hd: usize, vd: usize, nkv: usize, fused: []const f32, q: []f32, k: []f32, v: []f32) void {
     const nh = c.num_heads;
-    const nkv = c.num_kv_heads;
     const qd = nh * hd;
-    const kvd = nkv * hd;
-    switch (c.qkv_layout) {
+    const kd = nkv * hd;
+    switch (layout) {
         .separate => unreachable,
         .concat => {
             @memcpy(q, fused[0..qd]);
-            @memcpy(k, fused[qd..][0..kvd]);
-            @memcpy(v, fused[qd + kvd ..][0..kvd]);
+            @memcpy(k, fused[qd..][0..kd]);
+            for (0..nkv) |g| @memcpy(v[g * hd ..][0..vd], fused[qd + kd + g * vd ..][0..vd]);
         },
         .heads_interleaved => {
             std.debug.assert(nkv == nh);
             for (0..nh) |h| {
-                @memcpy(q[h * hd ..][0..hd], fused[h * 3 * hd ..][0..hd]);
-                @memcpy(k[h * hd ..][0..hd], fused[h * 3 * hd + hd ..][0..hd]);
-                @memcpy(v[h * hd ..][0..hd], fused[h * 3 * hd + 2 * hd ..][0..hd]);
+                @memcpy(q[h * hd ..][0..hd], fused[h * (2 * hd + vd) ..][0..hd]);
+                @memcpy(k[h * hd ..][0..hd], fused[h * (2 * hd + vd) + hd ..][0..hd]);
+                @memcpy(v[h * hd ..][0..vd], fused[h * (2 * hd + vd) + 2 * hd ..][0..vd]);
             }
         },
         .grouped => {
-            const groups = nh / nkv;
-            for (0..nkv) |g| {
-                const base = g * (groups + 2) * hd;
-                for (0..groups) |j| @memcpy(q[(g * groups + j) * hd ..][0..hd], fused[base + j * hd ..][0..hd]);
-                @memcpy(k[g * hd ..][0..hd], fused[base + groups * hd ..][0..hd]);
-                @memcpy(v[g * hd ..][0..hd], fused[base + (groups + 1) * hd ..][0..hd]);
+            // `chunks` blocks of `[q heads of the chunk | its k heads | its v heads]`;
+            // one chunk per kv head unless the family says otherwise (MiMo V2 Pro).
+            const chunks = if (c.qkv_chunks != 0) c.qkv_chunks else nkv;
+            const qpc = nh / chunks;
+            const kpc = nkv / chunks;
+            const chunk_len = qpc * hd + kpc * (hd + vd);
+            for (0..chunks) |g| {
+                const base = g * chunk_len;
+                for (0..qpc) |j| @memcpy(q[(g * qpc + j) * hd ..][0..hd], fused[base + j * hd ..][0..hd]);
+                for (0..kpc) |j| @memcpy(k[(g * kpc + j) * hd ..][0..hd], fused[base + (qpc + j) * hd ..][0..hd]);
+                for (0..kpc) |j| @memcpy(v[(g * kpc + j) * hd ..][0..vd], fused[base + (qpc + kpc) * hd + j * vd ..][0..vd]);
             }
         },
+    }
+}
+
+/// Re-lays a `[n][kv heads * v_head_dim]` value projection out as
+/// `[n][kv heads][head_dim]` (the KV cache stride), in place, when the
+/// value heads are narrower than the key heads (MiMo V2).
+fn spreadValues(v: []f32, n: usize, nkv: usize, hd: usize, vd: usize) void {
+    if (vd == hd) return;
+    var i: usize = n * nkv;
+    while (i > 0) {
+        i -= 1;
+        std.mem.copyBackwards(f32, v[i * hd ..][0..vd], v[i * vd ..][0..vd]);
     }
 }
 
@@ -3950,11 +3975,12 @@ fn attention(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace
             return;
         }
     } else if (layer.qkv) |w| {
-        const qkv_rows = qd + 2 * kvd;
+        const qkv_rows = w.rows;
+        const layout = if (c.qkv_layout != .separate) c.qkv_layout else c.qkv_alt.?;
         try tensor.matmulT(model.pool, gpa, ws.qkv, h, n, w, null);
         if (layer.qkv_bias) |b| addBias(ws.qkv, n, qkv_rows, b);
         var i: usize = 0;
-        while (i < n) : (i += 1) scatterQkv(c, ws.qkv[i * qkv_rows ..][0..qkv_rows], ws.q[i * qd ..][0..qd], ws.k[i * kvd ..][0..kvd], ws.v[i * kvd ..][0..kvd]);
+        while (i < n) : (i += 1) scatterQkv(c, layout, hd, c.layerVDim(li), c.layer_kv_heads[li], ws.qkv[i * qkv_rows ..][0..qkv_rows], ws.q[i * qd ..][0..qd], ws.k[i * kvd ..][0..kvd], ws.v[i * kvd ..][0..kvd]);
     } else if (c.gated_attention) {
         const tmp = try gpa.alloc(f32, n * 2 * qd);
         defer gpa.free(tmp);
@@ -3988,6 +4014,7 @@ fn attention(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace
         // A KV-shared layer reads its source layer's cache and projects nothing else.
         if (!c.kvShared(li)) {
             try tensor.matmulT(model.pool, gpa, ws.k, h, n, layer.k.?, null);
+            const vd = c.layerVDim(li);
             if (layer.v) |vw| {
                 try tensor.matmulT(model.pool, gpa, ws.v, h, n, vw, null);
             } else {
@@ -3995,7 +4022,9 @@ fn attention(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace
                 @memcpy(ws.v[0 .. n * kvd], ws.k[0 .. n * kvd]);
             }
             if (layer.k_bias) |b| addBias(ws.k, n, kvd, b);
-            if (layer.v_bias) |b| addBias(ws.v, n, kvd, b);
+            if (layer.v_bias) |b| addBias(ws.v, n, c.layer_kv_heads[li] * vd, b);
+            // Narrow values (MiMo V2) are spread to the cache's head stride.
+            if (layer.v != null) spreadValues(ws.v, n, c.layer_kv_heads[li], hd, vd);
         }
     }
     try attentionTail(model, layer, li, ws, cache, rows, null, false);
@@ -4025,6 +4054,7 @@ fn attentionTail(model: *const Model, layer: *const Layer, li: usize, ws: *Works
         }
     }
     if (c.mult.key != 1.0) tensor.scale(ws.k[0 .. n * kvd], c.mult.key);
+    if (c.mult.value != 1.0 and !shared) tensor.scale(ws.v[0 .. n * kvd], c.mult.value);
 
     const use_rope = c.rope_layers[li];
     const sliding = c.sliding_layers[li];

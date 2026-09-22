@@ -150,6 +150,27 @@ a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
   index_topk_blocks` tokens, 2048 with the released config, so ditch runs
   those layers as dense attention and its results are exact only within
   that length)
+* Xiaomi MiMo V2 (`mimo_v2_flash`, the transformers module; `mimo_v2`, the
+  hub checkpoints of MiMo-V2-Flash, MiMo-V2.5 and MiMo-V2.6 Flash / Pro):
+  hybrid attention (window-128 sliding layers with attention sinks and twice
+  the kv heads, one full layer in six), values narrower than the keys and
+  scaled by `attention_value_scale`, partial rotary with one base per layer
+  type, a dense first layer then DeepSeek-V3-style sigmoid MoE; both the
+  transformers spelling of the config (`layer_types`, `rope_parameters`,
+  stacked experts) and the checkpoint spelling (`hybrid_layer_pattern`,
+  `swa_*`, `moe_layer_freq`, per-expert tensors, `attention_sink_bias`, the
+  Pro layout's fused `qkv_proj` chunked per kv head). The V2.5 / V2.6 omni
+  checkpoints run through their text layers: the vision and audio encoders,
+  `speech_embeddings` and the MTP layers (`model.mtp.*`) pass through
+  exports untouched. The released V2.6 checkpoints (`quant_method = "fp8"`
+  with `store_dtype = "mxfp4"` and a bf16 router) are dequantised on load
+  like the FP8 V2.5 ones: the dense weights from their block scales, the
+  routed experts from the packed MXFP4 `weight` / `weight_scale` pairs (see
+  Quantised checkpoints below). What is verified is the transcription: the
+  fixtures follow the transformers module and the vLLM / SGLang / llama.cpp
+  loaders, not a released checkpoint; MiMo-V2.6's `config.json` and the
+  dtypes and shapes of its expert tensors were read from a published census
+  of `MiMo-V2.6-Flash-RL`, but no released checkpoint was decoded
 * DeepSeek V4 (`deepseek_v4`) and V4.1-Flash (`deepseek_v41`, text config):
   manifold-constrained hyper-connections, shared-KV sliding attention with
   sinks and grouped output projection, compressed-KV branches (V4 CSA/HCA,
@@ -184,7 +205,8 @@ silent fallbacks. Unicode normalisers (NFKC, Precompiled) are
 approximated by the identity.
 
 Image, video and audio models (Qwen2/3-VL, Qwen3.5, GLM-4.5V, Llama 4,
-Kimi K2.5, Kimi K3, Gemma 3n, Gemma 4, Mistral Small 4) run through their text
+Kimi K2.5, Kimi K3, Gemma 3n, Gemma 4, Mistral Small 4, MiMo V2.5 / V2.6)
+run through their text
 config: the vision and audio towers are never executed, their weights pass
 through exports byte for byte, and refusal directions are measured on text
 prompts.
@@ -252,6 +274,15 @@ model:
   natural `[out, in]` layout and `weight_scale` U8 E8M0 exponents per 32
   elements; a different packing from gpt-oss's `*_blocks` / `*_scales`,
   decoded row by row.
+* **MXFP4 `store_dtype`** (MiMo-V2.6 Pro / Flash as released): a mixed
+  checkpoint, `quant_method = "fp8"` (block scales for the dense weights,
+  `ignored_layers` left in bf16) with `store_dtype = "mxfp4"` for the routed
+  experts, which are stored per projection as `weight` U8 `[out, in / 2]`
+  and `weight_scale` U8 `[out, in / 32]` — the same bytes as
+  mxfp4-pack-quantized (E2M1 nibble pairs, low nibble first; `w = code *
+  2^(scale - 127)`) under the plain tensor names, `mxfp4_block_size` giving
+  the 32-element group. Decoded row by row like the other packed layout, and
+  the bf16 MoE router (`moe_router_dtype`) is read as it is.
 
 Values are decoded to bf16, which is what the Hugging Face integrations
 produce. With `--max-ram` (streamed weights) a tensor is decoded row-chunk

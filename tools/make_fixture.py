@@ -81,6 +81,8 @@ def bf16_bits(a):
 #          fields packed densely, little end first), `weight_scale` BF16 per
 #          group, `weight_zero_point` (asymmetric, packed along the rows) and
 #          `weight_shape` I64.
+#   mxfp4_store: MiMo V2.6's `store_dtype = mxfp4` experts: the mxfp4_packed
+#          bytes under the plain `weight` / `weight_scale` names.
 #   mxfp4: gpt-oss `*_blocks` U8 (E2M1 nibble pairs, low nibble first) and
 #          `*_scales` U8 (E8M0, bias 127) per 32 elements of the natural
 #          [E, out, in] layout; the bf16 tensor is its [E, in, out] transpose.
@@ -194,6 +196,18 @@ def quant_mxfp4_packed(name, w):
     deq = (E2M1_VALUES[codes] * (2.0 ** e)[..., None].astype(np.float32)).reshape(w.shape)
     module = name[:-len(".weight")]
     return bf16_round(deq), [(module + ".weight_packed", "U8", packed), (module + ".weight_scale", "U8", (e + 127).astype(np.uint8))]
+
+
+def quant_mxfp4_store(name, w):
+    """MiMo V2.6's `store_dtype = mxfp4` experts: the same bytes as
+    `mxfp4-pack-quantized` (E2M1 nibble pairs of the natural `[out, in]`
+    layout, low nibble first, one E8M0 group scale per 32 columns) under the
+    plain `weight` / `weight_scale` names, next to the fp8 dense weights."""
+    deq, tensors = quant_mxfp4_packed(name, w)
+    module = name[:-len(".weight")]
+    renamed = [(module + ".weight", dtype, arr) if n.endswith(".weight_packed") else (n, dtype, arr)
+               for n, dtype, arr in tensors]
+    return deq, renamed
 
 
 B2U_MAP = None
@@ -422,11 +436,18 @@ def base(**kw):
         # {layer index: [(name relative to the layer, shape), ...]} of tensors the
         # reference never reads (they must survive exports untouched).
         extra_layer_tensors={},
+        # [(absolute name, shape), ...] of further unread tensors (MTP layers,
+        # the vision and audio towers of multimodal wrappers).
+        extra_tensors=[],
+        # MiMo V2: values narrower than the keys outside MLA, sinks only on the
+        # sliding layers, and a fused qkv ("chunked" layout) of `qkv_chunks`
+        # chunks of [q heads | k heads | v heads].
+        narrow_v=False, sinks_sliding_only=False, qkv_chunks=0,
         quant=None,
         config={}, extra_config={},
     )
     d.update(kw)
-    m = dict(ssm_in=1.0, ssm_out=1.0, attn_in=1.0, attn_out=1.0, key=1.0, mlp_gate=1.0, mlp_down=1.0, ssm_proj=[1.0] * 5)
+    m = dict(ssm_in=1.0, ssm_out=1.0, attn_in=1.0, attn_out=1.0, key=1.0, value=1.0, mlp_gate=1.0, mlp_down=1.0, ssm_proj=[1.0] * 5)
     m.update(d["mult"] or {})
     d["mult"] = m
     if d["VD"] is None:
@@ -1025,6 +1046,66 @@ spec("gemma3n", tok="spm", L=4, NH=4, NKV=2, HD=8, prefix="model.language_model.
              "vision_config": {"model_type": "gemma3n_vision"}, "audio_config": {"model_type": "gemma3n_audio"}})
 
 
+# Xiaomi MiMo V2: hybrid attention (full layers with NKV kv heads, sliding
+# layers with twice as many plus attention sinks), values narrower than the
+# keys and scaled by attention_value_scale, partial rotary with one base per
+# layer type, a dense first layer then DeepSeek-V3-style sigmoid MoE without
+# shared experts, and MTP tensors the reference never reads. `mimo_v2_flash`
+# is the transformers spelling (layer_types, rope_parameters, stacked experts,
+# `sinks`); `mimo_v2` the hub checkpoint spelling of MiMo-V2-Flash / V2.5 /
+# V2.6 (hybrid_layer_pattern, swa_*, moe_layer_freq, `attention_sink_bias`,
+# per-expert tensors) in the Pro layout (one qkv_proj per layer, chunked per
+# kv head of the full layers) with the omni wrapper's vision and audio tensors.
+MIMO_MTP = [("model.mtp.layers.0.enorm.weight", (32,)), ("model.mtp.layers.0.hnorm.weight", (32,)), ("model.mtp.layers.0.eh_proj.weight", (32, 64)),
+            ("model.mtp.layers.0.input_layernorm.weight", (32,)), ("model.mtp.layers.0.pre_mlp_layernorm.weight", (32,)),
+            ("model.mtp.layers.0.self_attn.o_proj.weight", (32, 32)), ("model.mtp.layers.0.mlp.gate_proj.weight", (32, 32)),
+            ("model.mtp.layers.0.mlp.up_proj.weight", (32, 32)), ("model.mtp.layers.0.mlp.down_proj.weight", (32, 32)),
+            ("model.mtp.layers.0.final_layernorm.weight", (32,))]
+spec("mimo_v2_flash", tok="gpt2", L=4, NH=4, NKV=1, HD=12, VD=8, narrow_v=True, rotary_dim=4, eps=1e-5, theta=50000.0, local_rope=(10000.0, 4),
+     lm_head="lm_head.weight", sinks="self_attn.sinks", sinks_sliding_only=True, sliding=4, sliding_layers=[0, 1, 1, 0], layer_nkv=[1, 2, 2, 1],
+     mult={"value": 0.707},
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 0, "scoring": "sigmoid", "group_limited": True, "n_group": 2, "topk_group": 1, "rsf": 1.5, "norm": True,
+          "layers": [1, 2, 3], "corr_bias": True, "layout": "fused_eih", "prefix": "mlp.", "router": "gate.weight"},
+     extra_tensors=MIMO_MTP + [("model.mtp.layers.0.self_attn.q_proj.weight", (48, 32)), ("model.mtp.layers.0.self_attn.k_proj.weight", (24, 32)),
+                               ("model.mtp.layers.0.self_attn.v_proj.weight", (16, 32)), ("model.mtp.layers.0.self_attn.sinks", (4,))],
+     config={"model_type": "mimo_v2_flash", "architectures": ["MiMoV2FlashForCausalLM"], "hidden_size": 32, "intermediate_size": 32, "moe_intermediate_size": 12,
+             "num_hidden_layers": 4, "num_attention_heads": 4, "num_key_value_heads": 1, "head_dim": 12, "v_head_dim": 8, "n_routed_experts": 4,
+             "num_experts_per_tok": 2, "n_group": 2, "topk_group": 1, "norm_topk_prob": True, "routed_scaling_factor": 1.5, "sliding_window": 4,
+             "layer_types": ["full_attention", "sliding_attention", "sliding_attention", "full_attention"],
+             "mlp_layer_types": ["dense", "sparse", "sparse", "sparse"],
+             "rope_parameters": {"full_attention": {"rope_type": "default", "rope_theta": 50000.0, "partial_rotary_factor": 0.334},
+                                 "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.334}},
+             "attention_value_scale": 0.707, "rms_norm_eps": 1e-5, "hidden_act": "silu", "max_position_embeddings": 128, "tie_word_embeddings": False})
+_MIMO_V2 = dict(tok="gpt2", L=4, NH=4, NKV=2, HD=12, VD=8, narrow_v=True, rotary_dim=4, eps=1e-5, theta=50000.0, local_rope=(10000.0, 4),
+     lm_head="lm_head.weight", sinks="self_attn.attention_sink_bias", sinks_sliding_only=True, sliding=4, sliding_layers=[0, 1, 1, 0], layer_nkv=[2, 4, 4, 2],
+     mult={"value": 0.707}, qkv="self_attn.qkv_proj.weight", qkv_layout="chunked", qkv_chunks=2,
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 0, "scoring": "sigmoid", "group_limited": True, "n_group": 2, "topk_group": 1, "rsf": 1.0, "norm": True,
+          "layers": [1, 2, 3], "corr_bias": True, "layout": "separate", "prefix": "mlp.", "router": "gate.weight"},
+     extra_tensors=MIMO_MTP + [("model.mtp.layers.0.self_attn.qkv_proj.weight", (48 + 4 * 12 + 4 * 8, 32)), ("model.mtp.layers.0.self_attn.attention_sink_bias", (4,)),
+                               ("visual.patch_embed.proj.weight", (16, 3, 2, 4, 4)), ("visual.blocks.0.attn.qkv.weight", (48, 16)), ("visual.merger.mlp.0.weight", (32, 64)),
+                               ("audio_encoder.conv1.weight", (16, 8, 3)), ("audio_encoder.projection.mlp.0.weight", (32, 16)), ("speech_embeddings.0.weight", (10, 32))])
+_MIMO_V2_CONFIG = {"model_type": "mimo_v2", "architectures": ["MiMoV2ForCausalLM"], "hidden_size": 32, "intermediate_size": 32, "moe_intermediate_size": 12,
+             "num_hidden_layers": 4, "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 12, "v_head_dim": 8,
+             "swa_num_attention_heads": 4, "swa_num_key_value_heads": 4, "swa_head_dim": 12, "swa_v_head_dim": 8,
+             "hybrid_layer_pattern": [0, 1, 1, 0], "sliding_window_size": 4, "sliding_window": 4, "add_swa_attention_sink_bias": True,
+             "rope_theta": 50000.0, "swa_rope_theta": 10000.0, "partial_rotary_factor": 0.334, "attention_value_scale": 0.707,
+             "n_routed_experts": 4, "num_experts_per_tok": 2, "n_group": 2, "topk_group": 1, "norm_topk_prob": True, "routed_scaling_factor": None,
+             "scoring_func": "sigmoid", "topk_method": "noaux_tc", "moe_layer_freq": [0, 1, 1, 1], "first_k_dense_replace": 1, "moe_router_dtype": "float32",
+             "layernorm_epsilon": 1e-5, "hidden_act": "silu", "max_position_embeddings": 128, "tie_word_embeddings": False,
+             "vision_config": {"model_type": "mimovl", "depth": 1, "hidden_size": 16, "num_heads": 2},
+             "audio_config": {"audio_channels": 1, "input_local_layers": 1, "group_size": 4}}
+spec("mimo_v2", config=_MIMO_V2_CONFIG, **_MIMO_V2)
+# MiMo-V2.6 as released: the routed experts are MXFP4 (`store_dtype`, U8
+# `weight` / `weight_scale` per expert projection) while the rest of the
+# checkpoint stays bf16 (`ignored_layers`), and the MoE router is bf16
+# (`moe_router_dtype`). The expert input dimension must be a multiple of the
+# 32-element group, so the routed experts are wider here than in `mimo_v2`.
+_MIMO_V2_MXFP4_QUANT = {"activation_scheme": "dynamic", "fmt": "e4m3", "ignored_layers": ["model.layers.*.self_attn", "model.layers.*.mlp.gate", "model.embed_tokens", "lm_head"],
+                        "mxfp4_block_size": 32, "quant_method": "fp8", "store_dtype": "mxfp4", "weight_block_size": [128, 128]}
+spec("mimo_v2_mxfp4", quant={"kind": "mxfp4_store"},
+     config=dict(_MIMO_V2_CONFIG, moe_intermediate_size=32, moe_router_dtype="bfloat16", quantization_config=_MIMO_V2_MXFP4_QUANT),
+     **dict(_MIMO_V2, moe=dict(_MIMO_V2["moe"], MI=32)))
+
 # --- generation ------------------------------------------------------------
 
 def generate_generic(family, out_dir):
@@ -1050,6 +1131,8 @@ def generate_generic(family, out_dir):
             deq, tensors = quant_mxfp4(name, w)
         elif q["kind"] == "mxfp4_packed":
             deq, tensors = quant_mxfp4_packed(name, w)
+        elif q["kind"] == "mxfp4_store":
+            deq, tensors = quant_mxfp4_store(name, w)
         else:
             raise ValueError(q["kind"])
         w[...] = deq
@@ -1167,7 +1250,7 @@ def generate_generic(family, out_dir):
         lp = P + s["layer"].format(i=i)
         d = {}
         hd_l, nkv_l = layer_hd[i], layer_nkv[i]
-        vd_l = VD if s["mla"] else hd_l
+        vd_l = VD if (s["mla"] or s["narrow_v"]) else hd_l
         d["in_norm"] = normw(lp + s["in_norm"], H) if s["in_norm"] else None
         d["post_attn_norm"] = normw(lp + s["post_attn_norm"], H) if s["post_attn_norm"] else None
         d["pre_ff_norm"] = normw(lp + s["pre_ff_norm"], H) if s["pre_ff_norm"] else None
@@ -1252,6 +1335,18 @@ def generate_generic(family, out_dir):
             d["kv_b"] = mat(lp + "self_attn.kv_b_proj.weight", NH * (m["nope"] + m["v"]), m["kv_lora_rank"])
             if s["mla_gate"]:
                 d["attn_gate"] = mat(lp + "self_attn.g_proj.weight", NH * m["v"], H)
+        elif s["qkv"] and s["qkv_layout"] == "chunked":
+            # MiMo V2 Pro: `qkv_chunks` chunks of [q heads | k heads | v heads] (the
+            # checkpoint's tensor-parallel shards); the reference reads the parts.
+            d["q"] = mat("q", qd, H, register=False)
+            d["k"] = mat("k", kvd, H, register=False)
+            d["v"] = mat("v", nkv_l * vd_l, H, register=False)
+            d["qb"] = d["kb"] = d["vb"] = None
+            nc = s["qkv_chunks"]
+            qpc, kpc = NH // nc, nkv_l // nc
+            weights[lp + s["qkv"]] = np.concatenate(
+                [np.concatenate([d["q"][c * qpc * hd_l:(c + 1) * qpc * hd_l], d["k"][c * kpc * hd_l:(c + 1) * kpc * hd_l],
+                                 d["v"][c * kpc * vd_l:(c + 1) * kpc * vd_l]], 0) for c in range(nc)], 0)
         elif s["qkv"]:
             w = mat(lp + s["qkv"], qd + 2 * kvd, H)
             b = bias_for(lp + s["qkv"], qd + 2 * kvd, s["attn_bias"])
@@ -1263,10 +1358,10 @@ def generate_generic(family, out_dir):
             if own_kv:
                 d["k"] = mat(lp + s["k"], kvd, H)
             if has_v:
-                d["v"] = mat(lp + s["v"], kvd, H)
+                d["v"] = mat(lp + s["v"], nkv_l * vd_l, H)
             d["qb"] = bias_for(lp + s["q"], qd, s["attn_bias"])
             d["kb"] = bias_for(lp + s["k"], kvd, s["attn_bias"]) if own_kv else None
-            d["vb"] = bias_for(lp + s["v"], kvd, s["attn_bias"]) if has_v else None
+            d["vb"] = bias_for(lp + s["v"], nkv_l * vd_l, s["attn_bias"]) if has_v else None
         if attn_layers[i]:
             d["o"] = mat(lp + s["o"], H, NH * vd_l)
             d["ob"] = bias_for(lp + s["o"], H, s["attn_bias"] if s["o_bias"] is None else s["o_bias"])
@@ -1283,7 +1378,7 @@ def generate_generic(family, out_dir):
                 weights[lp + s["k_norm"]] = weights[lp + s["k_norm"]].reshape(nkv_l, hd_l)
         elif conv_layers[i] and s["qk_norm"] == "head":
             pass
-        if attn_layers[i] and s["sinks"]:
+        if attn_layers[i] and s["sinks"] and (sliding_of[i] or not s["sinks_sliding_only"]):
             d["sinks"] = vec(lp + s["sinks"], NH, 1.0)
         if s["attn_res"]:
             d["attn_res"] = res_scorer(lp + "self_attention_res_")
@@ -1339,7 +1434,7 @@ def generate_generic(family, out_dir):
                         if ex[key] is None:
                             continue
                         weights[f"{mp}experts.{e}.{nm}"] = ex[key]
-                        if s["quant"] and s["quant"]["kind"] == "mxfp4_packed":
+                        if s["quant"] and s["quant"]["kind"] in ("mxfp4_packed", "mxfp4_store"):
                             # Only the routed experts are packed (the compressor ignores everything else).
                             quantize(f"{mp}experts.{e}.{nm}", ex[key])
             elif moe["layout"] == "fused_rows":
@@ -1423,6 +1518,9 @@ def generate_generic(family, out_dir):
             d["down"] = mat(lp + s["down"], H, inter)
             d["db"] = bias_for(lp + s["down"], H, s["mlp_bias"])
         layers.append(d)
+    # Tensors the reference never runs but that must carry through exports.
+    for name, shape in s["extra_tensors"]:
+        weights[name] = bf16_round(rng.normal(0, 0.2, size=shape))
 
     # config.json (with the vocabulary size filled in), generation config, weights.
     config = json.loads(json.dumps(s["config"]))
@@ -1604,7 +1702,7 @@ def generate_generic(family, out_dir):
 
     def attention(d, li, h, cos, sin):
         T = h.shape[0]
-        HD, NKV, VD = layer_hd[li], layer_nkv[li], (s["VD"] if s["mla"] else layer_hd[li])
+        HD, NKV, VD = layer_hd[li], layer_nkv[li], (s["VD"] if (s["mla"] or s["narrow_v"]) else layer_hd[li])
         if s["mla"]:
             m = s["mla"]
             nope, rp, vd = m["nope"], m["rope"], m["v"]
@@ -1656,6 +1754,7 @@ def generate_generic(family, out_dir):
                     if d["vb"] is not None:
                         v = v + d["vb"]
                     k = k * np.float32(s["mult"]["key"])
+                    v = v * np.float32(s["mult"]["value"])
                 else:
                     k = v = None
                 gate = None
@@ -1674,7 +1773,7 @@ def generate_generic(family, out_dir):
                     k = head_norm(k, *d["kn"])
             q = q.reshape(T, NH, HD)
             if own_kv:
-                k, v = k.reshape(T, NKV, HD), v.reshape(T, NKV, HD)
+                k, v = k.reshape(T, NKV, HD), v.reshape(T, NKV, VD)
             if qn == "head" and not s["qk_norm_after_rope"]:
                 q = head_norm(q, *d["qn"])
                 if own_kv:

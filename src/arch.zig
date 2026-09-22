@@ -193,6 +193,8 @@ pub const Multipliers = struct {
     attn_out: f32 = 1,
     /// Multiplies the key projection.
     key: f32 = 1,
+    /// Multiplies the value projection (MiMo V2 `attention_value_scale`).
+    value: f32 = 1,
     /// Multiplies the MLP gate before the activation, and the down projection output.
     mlp_gate: f32 = 1,
     mlp_down: f32 = 1,
@@ -407,6 +409,9 @@ pub const Names = struct {
     qkv: ?[]const u8 = null,
     o: []const u8 = "self_attn.o_proj.weight",
     sinks: ?[]const u8 = null,
+    /// Alternative name of the sink tensor (MiMo V2 checkpoints:
+    /// `attention_sink_bias`, renamed to `sinks` by transformers).
+    sinks_alt: ?[]const u8 = null,
     /// Gated DeltaNet linear-attention projections (Qwen hybrids). Qwen3-Next
     /// fuses q/k/v/z into `lin_qkvz` and b/a into `lin_ba`; Qwen3.5 splits
     /// them into `lin_qkv`, `lin_z`, `lin_b`, `lin_a`.
@@ -730,6 +735,19 @@ pub const Config = struct {
     logit_scale: f32,
     attn_temperature: ?AttnTemperature,
     sinks: bool,
+    /// Sinks exist only on sliding-window layers (MiMo V2): `sinks` then
+    /// requires them there and tolerates their absence on full layers.
+    sinks_sliding_only: bool,
+    /// Values are narrower than the keys outside MLA (MiMo V2 `v_head_dim`):
+    /// `layerVDim` is then `v_head_dim` rather than the layer's head size.
+    narrow_values: bool,
+    /// Layout of the optional fused `names.qkv` tensor of a family whose
+    /// primary layout is separate q/k/v (MiMo V2 Pro checkpoints): a layer
+    /// that has the fused tensor and no `q_proj` is read from it.
+    qkv_alt: ?QkvLayout,
+    /// Chunks of a `.grouped` fused qkv tensor, each `[q heads | k heads | v
+    /// heads]` of its share of the heads; 0 = one chunk per kv head.
+    qkv_chunks: usize,
     mla: ?Mla,
     /// Mixture-of-experts settings (num_experts == 0 for dense models).
     num_experts: usize,
@@ -772,7 +790,7 @@ pub const Config = struct {
 
     /// Value width of layer `li`.
     pub fn layerVDim(self: *const Config, li: usize) usize {
-        return if (self.mla != null) self.v_head_dim else self.layer_head_dim[li];
+        return if (self.mla != null or self.narrow_values) self.v_head_dim else self.layer_head_dim[li];
     }
 
     /// True when layer `li` reads another layer's keys and values.
@@ -1327,6 +1345,10 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         .logit_scale = 1.0,
         .attn_temperature = null,
         .sinks = false,
+        .sinks_sliding_only = false,
+        .narrow_values = false,
+        .qkv_alt = null,
+        .qkv_chunks = 0,
         .mla = mla,
         .num_experts = num_experts,
         .num_experts_per_tok = getInt(obj, "num_experts_per_tok", 2),
@@ -2698,6 +2720,128 @@ fn extraGraniteMoe(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void 
     // to a renormalised softmax over every expert).
     c.norm_topk_prob = true;
     if (c.num_experts > 0) @memset(c.moe_layers, true);
+}
+
+/// Xiaomi MiMo V2 (`MiMoV2FlashConfig` in transformers; the hub checkpoints of
+/// MiMo-V2-Flash, V2.5 and V2.6 carry the remote-code spellings of the same
+/// settings: `hybrid_layer_pattern`, `swa_*`, `moe_layer_freq`, ...). Hybrid
+/// attention: full layers with `num_key_value_heads` KV heads, sliding layers
+/// with `swa_num_key_value_heads` (twice as many) plus attention sinks; values
+/// are `v_head_dim` wide and scaled by `attention_value_scale`; partial rotary
+/// with one base per layer type; the first layer is dense, the rest
+/// DeepSeek-V3-style sigmoid MoE (correction bias, group-limited top-k) without
+/// shared experts. MTP (`model.mtp.*`), vision and audio tensors are never read.
+fn extraMiMoV2(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
+    const n = c.num_layers;
+    const hf_spelling = std.mem.eql(u8, c.model_type, "mimo_v2_flash") or obj.get("layer_types") != null or obj.get("rope_parameters") != null or obj.get("mlp_layer_types") != null;
+    if (getNum(obj, "rms_norm_eps") == null) c.rms_norm_eps = getF32(obj, "layernorm_epsilon", 1e-5);
+    // `store_dtype` names the expert storage format. MiMo V2.6 carries it in
+    // `quantization_config` (parsed by dequant.zig, which decodes the MXFP4
+    // experts on read); a copy at the config level says the same thing.
+    if (getStr(obj, "store_dtype")) |sd| {
+        if (!dequant.expertDtypeSupported(sd)) {
+            std.log.err("unsupported model: MiMo experts stored as '{s}' (store_dtype) cannot be dequantised; convert the experts to bf16 first", .{sd});
+            return error.UnsupportedArchitecture;
+        }
+    }
+    // The router runs in f32 on the bf16 gate weights whatever
+    // `moe_router_dtype` says (MiMo V2.6: bfloat16, the earlier ones float32);
+    // a quantised router would need a reader of its own.
+    if (getStr(obj, "moe_router_dtype")) |rd| {
+        if (!dequant.storeFloatDtype(rd)) {
+            std.log.err("unsupported model: MiMo MoE router in '{s}' (moe_router_dtype)", .{rd});
+            return error.UnsupportedArchitecture;
+        }
+    }
+    // Attention layout per layer: `layer_types` (parsed above), the remote-code
+    // `hybrid_layer_pattern` (1 = sliding) or the default (first and every
+    // sixth layer full, the rest sliding).
+    if (obj.get("layer_types") == null) {
+        if (obj.get("hybrid_layer_pattern")) |hp| {
+            if (hp != .array or hp.array.items.len < n) return error.InvalidConfig;
+            for (c.sliding_layers, 0..) |*s, i| s.* = hp.array.items[i] == .integer and hp.array.items[i].integer == 1;
+        } else {
+            for (c.sliding_layers, 0..) |*s, i| s.* = !(i == 0 or (i + 1) % 6 == 0);
+        }
+    }
+    if (c.sliding_window == null) c.sliding_window = getInt(obj, "sliding_window_size", 128);
+    var any_sliding = false;
+    for (c.sliding_layers) |s| any_sliding = any_sliding or s;
+    c.sinks = any_sliding and getBool(obj, "add_swa_attention_sink_bias", true);
+    c.sinks_sliding_only = true;
+    // Heads: the sliding layers double the kv heads; every other dimension is shared.
+    const kv_full = getInt(obj, "num_key_value_heads", c.num_heads);
+    const kv_swa = getInt(obj, "swa_num_key_value_heads", 2 * kv_full);
+    c.v_head_dim = getInt(obj, "v_head_dim", c.head_dim);
+    c.narrow_values = true;
+    if (getInt(obj, "swa_num_attention_heads", c.num_heads) != c.num_heads or getInt(obj, "swa_head_dim", c.head_dim) != c.head_dim or getInt(obj, "swa_v_head_dim", c.v_head_dim) != c.v_head_dim) {
+        std.log.err("unsupported model: MiMo sliding layers with their own head count or head size (swa_num_attention_heads / swa_head_dim / swa_v_head_dim)", .{});
+        return error.UnsupportedArchitecture;
+    }
+    if (c.v_head_dim > c.head_dim or c.v_head_dim == 0 or kv_full == 0 or kv_swa == 0) return error.InvalidConfig;
+    if (c.num_heads % kv_full != 0 or c.num_heads % kv_swa != 0) return error.InvalidConfig;
+    for (c.layer_kv_heads, 0..) |*k, i| k.* = if (c.sliding_layers[i]) kv_swa else kv_full;
+    c.num_kv_heads = kv_full;
+    // Values are scaled before attention. transformers defaults the scale to
+    // 0.707 and reads an explicit null as 1; the remote-code modules default to 1.
+    c.mult.value = if (obj.get("attention_value_scale")) |v| (if (v == .null) 1.0 else getF32(obj, "attention_value_scale", 1.0)) else if (hf_spelling) 0.707 else 1.0;
+    // Rotary: one base per layer type, partial rotary factor 0.334 (int(head_dim * f) dims).
+    var factor: f64 = if (getNum(obj, "partial_rotary_factor")) |f| f else if (hf_spelling) 0.334 else 1.0;
+    if (hf_spelling and getNum(obj, "rope_theta") == null and getObj(obj, "rope_parameters") == null) c.rope_theta = 5_000_000.0;
+    var local_theta = getF32(obj, "swa_rope_theta", if (hf_spelling) 10_000.0 else c.rope_theta);
+    if (getObj(obj, "rope_parameters")) |rp| {
+        const full: ?std.json.ObjectMap = getObj(rp, "full_attention") orelse (if (getNum(rp, "rope_theta") != null) rp else null);
+        const swa: ?std.json.ObjectMap = getObj(rp, "sliding_attention") orelse (if (getNum(rp, "rope_theta") != null) rp else null);
+        if (full) |f| {
+            c.rope_theta = getF32(f, "rope_theta", 5_000_000.0);
+            factor = getNum(f, "partial_rotary_factor") orelse 0.334;
+            c.rope_scaling = try parseRopeScaling(arena, obj, f, c.rotary_dim, c.max_position_embeddings);
+        }
+        if (swa) |s| {
+            local_theta = getF32(s, "rope_theta", 10_000.0);
+            const sf = getNum(s, "partial_rotary_factor") orelse 0.334;
+            const t = getStr(s, "rope_type") orelse getStr(s, "type") orelse "default";
+            if (sf != factor or !(std.mem.eql(u8, t, "default") or std.mem.eql(u8, t, "mrope"))) {
+                std.log.err("unsupported model: MiMo sliding layers with their own rotary factor or scaling ({s})", .{t});
+                return error.UnsupportedArchitecture;
+            }
+        }
+    }
+    c.rotary_dim = evenDim(@as(f64, @floatFromInt(c.head_dim)) * factor);
+    if (c.rotary_dim == 0 or c.rotary_dim > c.head_dim) return error.InvalidConfig;
+    c.rope_freq_dim = c.rotary_dim;
+    // The sliding layers rotate the same coordinates with their own base.
+    c.rope_local = .{ .theta = local_theta, .rotary_dim = c.rotary_dim, .freq_dim = c.rotary_dim };
+    // Mixture of experts: sigmoid scores plus a correction bias choose the
+    // experts (group-limited top-k), the raw scores weight them.
+    c.moe.scoring = parseScoring(getStr(obj, "scoring_func") orelse "sigmoid");
+    const method = getStr(obj, "topk_method") orelse "noaux_tc";
+    c.moe.topk_method = if (std.mem.eql(u8, method, "greedy")) .greedy else .group_limited;
+    c.moe.n_group = @max(1, getInt(obj, "n_group", 1));
+    c.moe.topk_group = @max(1, getInt(obj, "topk_group", 1));
+    c.moe.routed_scaling_factor = getF32(obj, "routed_scaling_factor", 1.0);
+    c.norm_topk_prob = getBool(obj, "norm_topk_prob", true);
+    c.num_experts_per_tok = getInt(obj, "num_experts_per_tok", 8);
+    if (c.num_experts > 0) {
+        if (c.moe.topk_method == .group_limited and c.num_experts % c.moe.n_group != 0) return error.InvalidConfig;
+        for (c.moe_layers, 0..) |*m, i| m.* = i > 0;
+        if (obj.get("mlp_layer_types")) |ml| {
+            if (ml != .array or ml.array.items.len < n) return error.InvalidConfig;
+            for (ml.array.items[0..n], 0..) |v, i| {
+                if (v != .string) return error.InvalidConfig;
+                c.moe_layers[i] = if (std.mem.eql(u8, v.string, "sparse")) true else if (std.mem.eql(u8, v.string, "dense")) false else return error.InvalidConfig;
+            }
+        } else if (obj.get("moe_layer_freq")) |mf| {
+            if (mf == .array) {
+                if (mf.array.items.len < n) return error.InvalidConfig;
+                for (mf.array.items[0..n], 0..) |v, i| c.moe_layers[i] = !(v == .integer and v.integer == 0);
+            }
+        }
+    }
+    // MiMo-V2.5 / V2.6 Pro checkpoints fuse q/k/v into one `qkv_proj`
+    // pre-sharded over `num_key_value_heads` chunks, each `[Q | K | V]`.
+    c.qkv_alt = .grouped;
+    c.qkv_chunks = kv_full;
 }
 
 fn parseScoring(name: []const u8) RouterScoring {
@@ -4207,6 +4351,21 @@ pub const registry = [_]Arch{
         .extra = extraDeepseek,
     },
     .{
+        .model_type = "mimo_v2_flash",
+        .aliases = &.{"mimo_v2"},
+        .llama_cpp = "mimo2",
+        .chat = "chatml",
+        .verified = true,
+        .names = .{
+            .sinks = "self_attn.sinks",
+            .sinks_alt = "self_attn.attention_sink_bias",
+            .qkv = "self_attn.qkv_proj.weight",
+            .router_correction_bias = "mlp.gate.e_score_correction_bias",
+        },
+        .notes = "fixtures: hybrid full / sliding-window attention (window 128 in the released configs) with attention sinks and doubled kv heads on the sliding layers, v_head_dim < head_dim with attention_value_scale, partial rotary with one base per layer type (rope_parameters, or rope_theta / swa_rope_theta), a dense first layer (mlp_layer_types / moe_layer_freq) then sigmoid MoE with correction bias and group-limited top-k, no shared experts; both the transformers spelling (layer_types, stacked experts, sinks) and the hub checkpoint spelling of MiMo-V2-Flash / V2.5 / V2.6 (model_type mimo_v2: hybrid_layer_pattern, swa_*, attention_sink_bias, per-expert tensors, the Pro layout's fused qkv_proj chunked per kv head). MTP (model.mtp.*), vision and audio encoder tensors of the V2.5 / V2.6 omni checkpoints pass through exports untouched. The V2.6 checkpoints' MXFP4 experts (quant_method fp8 with store_dtype mxfp4: U8 weight/weight_scale next to the fp8 dense weights) and their bf16 MoE router (moe_router_dtype) are read as they are.",
+        .extra = extraMiMoV2,
+    },
+    .{
         .model_type = "deepseek_v4",
         .llama_cpp = null,
         .chat = "deepseek",
@@ -4365,6 +4524,46 @@ test "parseConfig picks family knobs" {
     try std.testing.expectEqual(@as(f32, 25.0), k3.moe.situ.?.linear_beta.?);
     try std.testing.expect(k3.linear_layers[0] and !k3.linear_layers[2] and k3.linear_layers[3] and !k3.linear_layers[4]);
     try std.testing.expect(!k3.moe_layers[0] and k3.moe_layers[4]);
+}
+
+test "parseConfig handles both MiMo V2 spellings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // transformers spelling with the defaults of MiMoV2FlashConfig.
+    const hf = try parseConfig(a,
+        \\{"model_type":"mimo_v2_flash","hidden_size":64,"num_attention_heads":8,"num_key_value_heads":2,"num_hidden_layers":12,"vocab_size":100,"head_dim":24,"v_head_dim":16,"n_routed_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":16,"sliding_window":128}
+    );
+    try std.testing.expectEqualStrings("mimo_v2_flash", hf.arch.model_type);
+    try std.testing.expect(!hf.sliding_layers[0] and hf.sliding_layers[1] and !hf.sliding_layers[5] and hf.sliding_layers[6] and !hf.sliding_layers[11]);
+    try std.testing.expectEqual(@as(usize, 2), hf.layer_kv_heads[0]);
+    try std.testing.expectEqual(@as(usize, 4), hf.layer_kv_heads[1]);
+    try std.testing.expectEqual(@as(usize, 4 * 24), hf.kvDim());
+    try std.testing.expectEqual(@as(usize, 16), hf.layerVDim(0));
+    try std.testing.expectEqual(@as(usize, 8), hf.rotary_dim); // int(24 * 0.334)
+    try std.testing.expectEqual(@as(f32, 5_000_000.0), hf.rope_theta);
+    try std.testing.expectEqual(@as(f32, 10_000.0), hf.rope_local.?.theta);
+    try std.testing.expectEqual(@as(usize, 8), hf.rope_local.?.rotary_dim);
+    try std.testing.expect(hf.sinks and hf.sinks_sliding_only and hf.narrow_values);
+    try std.testing.expectEqual(@as(f32, 0.707), hf.mult.value);
+    try std.testing.expectEqual(@as(f32, 1e-5), hf.rms_norm_eps);
+    try std.testing.expect(!hf.moe_layers[0] and hf.moe_layers[1] and hf.moe_layers[11]);
+    try std.testing.expectEqual(RouterScoring.sigmoid, hf.moe.scoring);
+    try std.testing.expect(hf.norm_topk_prob and hf.moe.topk_method == .group_limited);
+    try std.testing.expectEqual(QkvLayout.grouped, hf.qkv_alt.?);
+    try std.testing.expectEqual(@as(usize, 2), hf.qkv_chunks);
+    // Hub checkpoint spelling (MiMo-V2-Flash / V2.5 / V2.6): explicit lists and swa_* keys.
+    const hub = try parseConfig(a,
+        \\{"model_type":"mimo_v2","hidden_size":64,"num_attention_heads":8,"num_key_value_heads":2,"swa_num_key_value_heads":4,"swa_num_attention_heads":8,"swa_head_dim":24,"swa_v_head_dim":16,"num_hidden_layers":4,"vocab_size":100,"head_dim":24,"v_head_dim":16,"hybrid_layer_pattern":[0,1,1,0],"sliding_window_size":64,"add_swa_attention_sink_bias":true,"rope_theta":5000000.0,"swa_rope_theta":10000.0,"partial_rotary_factor":0.334,"attention_value_scale":null,"n_routed_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":16,"moe_layer_freq":[0,1,1,1],"layernorm_epsilon":1e-5,"topk_method":"noaux_tc","routed_scaling_factor":null}
+    );
+    try std.testing.expectEqualStrings("mimo_v2_flash", hub.arch.model_type);
+    try std.testing.expectEqualSlices(bool, &.{ false, true, true, false }, hub.sliding_layers);
+    try std.testing.expectEqualSlices(usize, &.{ 2, 4, 4, 2 }, hub.layer_kv_heads);
+    try std.testing.expectEqual(@as(?usize, 64), hub.sliding_window);
+    try std.testing.expectEqual(@as(f32, 1.0), hub.mult.value);
+    try std.testing.expectEqual(@as(f32, 1.0), hub.moe.routed_scaling_factor);
+    try std.testing.expectEqual(@as(usize, 8), hub.rotary_dim);
+    try std.testing.expectEqualSlices(bool, &.{ false, true, true, true }, hub.moe_layers);
 }
 
 test "parseConfig handles the MiniMax, HunYuan, ERNIE and Granite MoE keys" {
