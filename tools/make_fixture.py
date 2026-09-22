@@ -2817,10 +2817,12 @@ RUST_WHITESPACE = set([chr(c) for c in range(0x09, 0x0E)] + [" ", "\x85", "\xa0"
 
 
 def engram_normalize(text):
-    """The engram token normaliser: NFKC, NFD, strip nonspacing marks, lowercase,
-    collapse ASCII whitespace runs, keep a lone space, else strip Unicode whitespace."""
+    """The engram token normaliser: NFKC, NFD, strip combining marks (every
+    category M, as tokenizers' StripAccents does: Indic vowel signs are Mc),
+    lowercase, collapse ASCII whitespace runs, keep a lone space, else strip
+    Unicode whitespace."""
     s = unicodedata.normalize("NFD", unicodedata.normalize("NFKC", text))
-    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    s = "".join(c for c in s if not unicodedata.category(c).startswith("M"))
     s = "".join(c.lower() for c in s)
     s = re.sub(r"[ \t\r\n]+", " ", s)
     if s == " ":

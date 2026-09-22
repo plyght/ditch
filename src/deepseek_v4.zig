@@ -1096,8 +1096,9 @@ pub fn compressedTokenMap(arena: Allocator, tokenizer: *const Tokenizer) !TokenM
     return .{ .ids = ids, .count = count };
 }
 
-/// The engram normaliser: fold every code point (NFKD, drop nonspacing
-/// marks, lowercase), collapse runs of ` \t\r\n` to one space, keep a lone
+/// The engram normaliser: fold every code point (NFKD, drop every combining
+/// mark — Mn, Mc and Me, as tokenizers' StripAccents does — lowercase),
+/// collapse runs of ` \t\r\n` to one space, keep a lone
 /// space, otherwise strip Unicode whitespace from both ends.
 pub fn normalizeText(gpa: Allocator, text: []const u8, out: *std.ArrayList(u8)) !void {
     var folded = std.ArrayList(u8).empty;
@@ -1338,6 +1339,13 @@ test "engram text normalisation" {
         .{ "한", "\u{1112}\u{1161}\u{11AB}" },
         .{ "Σ", "σ" },
         .{ "\u{3000}x\u{3000}", "x" },
+        // Spacing (Mc) and enclosing (Me) marks go too, not only the
+        // nonspacing ones: DeepSeek-V4.1-Flash's Bengali, Devanagari and
+        // Tamil tokens ("ার" is র + the Mc vowel sign U+09BE).
+        .{ "\u{09BE}\u{09B0}", "\u{09B0}" },
+        .{ " \u{0915}\u{0930}\u{0947}", "\u{0915}\u{0930}" },
+        .{ "\u{09CB}", "" },
+        .{ "a\u{20DD}", "a" },
     };
     for (cases) |cs| {
         out.clearRetainingCapacity();

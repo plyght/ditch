@@ -2320,3 +2320,77 @@ slides; at 317 the CSA layer attends 79 pooled entries (inside `index_topk`
 512, where ditch's dense indexer is exact), HCA two, and the window is full.
 The whole checkpoint also loads over `hf://` (69187 tensors renamed; 33792
 FP4 and 375 FP8 matrices registered, nothing skipped).
+
+## Bug 38 — V4.1's engram hashed Indic tokens into the wrong buckets (fixed)
+
+**Symptom.** The first V4.1 checkpoint to reach the engram code,
+`deepseek-ai/DeepSeek-V4.1-Flash`, stopped at load:
+
+    error: the tokenizer-derived compressed vocabulary has 99510 entries but
+    engram_compressed_vocab_size is 99092; the engram hashes would not match the tables
+
+The release's `inference/engram.py` derives the same map with `tokenizers`
+and asserts the 99092.
+
+**Cause.** The compressed vocabulary keys every token by its normalised text
+(`NFKC`, `NFD`, `StripAccents`, `Lowercase`, whitespace rules), and every
+engram hash multiplier derives from its size, so an off-by-one there rehashes
+the whole table. ditch folds per code point from a generated table, whose
+generator (`tools/gen_unicode.py`) dropped only nonspacing marks (`Mn`).
+`tokenizers`' `StripAccents` drops every combining mark: `Mn`, `Mc` and `Me`.
+Bengali, Devanagari and Tamil vowel signs are `Mc` (`ার` is `র` + U+09BE), so
+654 tokens got keys of their own instead of sharing their base letter's.
+Dumping ditch's key for all 129280 tokens and diffing it with the release's:
+every one of the 654 differences is an `Mc` or `Me` mark, nothing else.
+`tools/make_fixture.py`'s `engram_normalize` had the same `!= "Mn"`, so the
+fixture agreed with the code; its synthetic vocabulary has no such marks, so
+it could not have shown it either way.
+
+**Fix.** Both generators drop every category `M`; `src/unicode_tables.zig` is
+regenerated (same Unicode 14.0.0 data, only the fold tables change), and the
+engram normalisation test covers `Mc` and `Me` marks. The `deepseek_v41`
+fixture regenerates byte-identically.
+
+## DeepSeek V4.1: verified on real weights
+
+**Cut.** V4.1's layer kinds are far apart: 0-1 sliding window only (1 is an
+engram layer), 2 the ratio-2 compressed-KV source with the indexer, 3 a
+ratio-2 layer that reads layer 2's cache, 20 the ratio-1 source, candidate
+source and indexer, 21 a ratio-1 layer reading it. `tools/truncate_checkpoint.py
+--layers 0,1,2,3,20,21` keeps those six, renumbered 0-5 with
+`kv_source_layer_ids`, `index_source_layer_ids`, `candidate_source_layer_id`
+and `engram_layer_ids` renumbered with them. A V4.1 layer holds 7.2 GB of FP4
+experts and the engram table is 98 GB of FP8 a layer, so both are `--lazy`:
+holes of a 148 GB sparse file, filled by the reference with exactly the 3744
+expert tensors and table rows the two prompts (and 4 greedy tokens) use —
+12 GB on disk in the end.
+
+**Reference.** transformers has no V4.1, so `tools/ref_deepseek_v41.py` runs
+the release's own `inference/model.py` and `engram.py`, unmodified, with the
+tilelang kernels replaced by torch functions of the same arithmetic, linears
+in float on the dequantised weights (the release quantises every linear's
+activations to FP8, which ditch does not simulate, as for every FP8
+checkpoint), and lazy experts / table rows. Its config mapping reproduces the
+release's own `inference/config.json` on every field but the unused draft
+head's.
+
+**Result.**
+
+| run | residuals (7 entries) | first-token logits | argmax, top-5, greedy |
+| --- | :---: | ---: | :---: |
+| as released | first differs at 2.29e-03 (5 tokens) / 1.02e-03 (14 tokens) | 1.55e-02 / 3.77e-04 | match |
+| fake quantisation off on both sides | all agree, worst 4.12e-06 / 5.93e-06 | 2.36e-06 / 2.62e-06 | match |
+
+With V4.1's quantisation-aware rounding off (the FP8 rounding of the window
+KV, the FP4 rounding of the compressed latents and of the indexer's q/k),
+every layer agrees to 6e-06: embedding, engram, hyper-connections, both
+compressed-KV kinds, the shared caches, candidate blocks, sinks, routing,
+FP4 experts. With it on, the difference is one flipped rounding: dumping the
+pre-rounding window KVs and latents from both sides, layers 0 and 1 agree to
+1e-7, and exactly one FP8 code of layer 1's token-0 KV rounds the other way
+(an input 1.8e-06 apart on a rounding boundary); every later difference
+grows from that code. ditch's rounding is not the cause: fed the reference's
+own pre-rounding tensors (364 vectors), ditch's FP8 and FP4 rules give
+bit-identical results to the kernels'. A rounding boundary is a
+discontinuity no float32 implementation can match across a 1e-6 accumulation
+difference; the model is exact everywhere else.

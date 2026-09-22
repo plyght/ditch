@@ -2,7 +2,7 @@
 """Regenerates src/unicode_tables.zig: the Unicode letter/number/whitespace/case/mark
 ranges from Python's unicodedata, the Han script from the `regex` package (which is
 what the tiktoken pre-tokeniser's `\\p{Han}` means), and the per-code-point "fold"
-mapping (NFKD, then drop nonspacing marks, then lowercase every char) that
+mapping (NFKD, then drop every combining mark, then lowercase every char) that
 DeepSeek-V4.1 uses to build the compressed token map of its engram hash layers.
 Hangul syllables fold algorithmically and are not in the table. Also the NFKC of
 every single code point that NFKC (and NFC) changes, for the tokenizer normalizers."""
@@ -34,7 +34,9 @@ def emit(name, rs):
     return "\n".join(lines)
 def fold(cp):
     s=unicodedata.normalize('NFKD',chr(cp))
-    s=''.join(x for x in s if unicodedata.category(x)!='Mn')
+    # tokenizers' StripAccents drops every combining mark (Mn, Mc and Me), not
+    # only the nonspacing ones: Indic vowel signs are Mc.
+    s=''.join(x for x in s if not unicodedata.category(x).startswith('M'))
     return ''.join(x.lower() for x in s)
 entries=[(cp,fold(cp)) for cp in range(0x110000) if not (0xAC00<=cp<=0xD7A3) and fold(cp)!=chr(cp)]
 runs=[]; drops=[]; multi=[]
@@ -61,7 +63,7 @@ src += "/// `P` (punctuation).\n" + emit("punctuation", PU) + "\n\n" + "/// `P` 
 src += "/// Code points `lo..hi` whose fold is the single code point `cp + delta`.\n"
 src += "pub const FoldRun = struct { lo: u21, hi: u21, delta: i32 };\n"
 src += "pub const fold_runs = [_]FoldRun{\n" + "\n".join(f"    .{{ .lo = 0x{a:X}, .hi = 0x{b:X}, .delta = {d} }}," for a,b,d in runs) + "\n};\n\n"
-src += "/// Code points whose fold is empty (nonspacing marks).\n"
+src += "/// Code points whose fold is empty (combining marks).\n"
 src += emit("fold_drop", drops) + "\n\n"
 src += "/// Code points whose fold is several code points (UTF-8).\n"
 src += "pub const FoldMulti = struct { cp: u21, out: []const u8 };\n"
