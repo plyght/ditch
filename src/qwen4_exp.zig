@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const tensor = @import("tensor.zig");
+const compute = @import("compute.zig");
 const model_mod = @import("model.zig");
 const stream = @import("stream.zig");
 const arch = @import("arch.zig");
@@ -325,7 +326,7 @@ inline fn sigmoid(x: f32) f32 {
 /// Grouped (1 + w) RMSNorm: `hc` groups of `hidden` channels, each normalised
 /// on its own.
 fn groupNorm(out: []f32, x: []const f32, w: []const f32, hc: usize, hidden: usize, eps: f32) void {
-    for (0..hc) |j| tensor.rmsnorm(out[j * hidden ..][0..hidden], x[j * hidden ..][0..hidden], w[j * hidden ..][0..hidden], eps, true);
+    for (0..hc) |j| compute.rmsnorm(out[j * hidden ..][0..hidden], x[j * hidden ..][0..hidden], w[j * hidden ..][0..hidden], eps, true);
 }
 
 /// Adds the per-layer n-gram embedding of `ng` to the residual streams
@@ -398,8 +399,8 @@ pub fn pleApply(model: *const Model, w: *const NgramWeights, cache: *KvCache, x:
     defer gpa.free(key);
     const value = try gpa.alloc(f32, n * hidden);
     defer gpa.free(value);
-    try tensor.matmulT(model.pool, gpa, key, embed, n, w.key, null);
-    try tensor.matmulT(model.pool, gpa, value, embed, n, w.value, null);
+    try compute.matmulT(model.pool, gpa, key, embed, n, w.key, null);
+    try compute.matmulT(model.pool, gpa, value, embed, n, w.value, null);
 
     // `gated = sigmoid(sign(d) sqrt(|d|)) * value` per stream, with
     // `d = <norm_key(key), norm_query(streams)> / sqrt(hidden)`.

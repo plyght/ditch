@@ -87,7 +87,13 @@ pub fn locate(io: Io, arena: Allocator, path: []const u8) !?[]const u8 {
     var count: usize = 0;
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
-        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".gguf")) continue;
+        // Symbolic links count: a Hugging Face snapshot directory is links into `blobs/`.
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".gguf")) continue;
+        if (entry.kind == .sym_link) {
+            const st = dir.statFile(io, entry.name, .{}) catch continue;
+            if (st.kind != .file) continue;
+        }
         count += 1;
         if (found == null or std.mem.lessThan(u8, entry.name, found.?)) found = try arena.dupe(u8, entry.name);
     }

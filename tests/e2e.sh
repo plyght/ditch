@@ -579,7 +579,10 @@ if grep -q "^Expert cache:" "$TMP/plain.log"; then fail "--expert-cache 0 still 
 echo "==> Remote weight source: hf://-style loading over a local HTTP range server"
 python3 tools/range_server.py tests/fixtures/qwen3_moe_big "$TMP/range.log" > "$TMP/range_port.txt" &
 RANGE_PID=$!
-trap 'kill $RANGE_PID 2>/dev/null; rm -rf "$TMP"' EXIT
+# `|| true`: the server is killed again below, and under `set -e` a failing
+# `kill` in the trap would abort it before the cleanup and make a successful
+# run exit non-zero.
+trap 'kill $RANGE_PID 2>/dev/null || true; rm -rf "$TMP"' EXIT
 for _ in $(seq 1 100); do grep -q "^PORT " "$TMP/range_port.txt" 2>/dev/null && break; sleep 0.1; done
 PORT=$(awk '/^PORT/ {print $2}' "$TMP/range_port.txt")
 [ -n "$PORT" ] || fail "range server did not start"
@@ -608,6 +611,14 @@ grep -q "^Remote source: fetched 0 ranges" "$TMP/remote2.log" || fail "second re
 kl=$(grep "  \* KL divergence:" "$TMP/remote_eval.log" | tail -1 | awk '{print $4}')
 awk -v kl="$kl" 'BEGIN { exit !(kl < 1.0) }' || fail "KL divergence of the remote-source export is implausible: $kl"
 kill $RANGE_PID 2>/dev/null || true
+
+echo "==> Compute backend selftest (the CPU backend against the reference kernels)"
+"$DITCH" selftest --device cpu --json > "$TMP/selftest.json" 2> "$TMP/selftest.log" \
+    || fail "ditch selftest --device cpu failed"
+grep -q '"passed":true' "$TMP/selftest.json" || fail "selftest JSON does not report a pass"
+if grep -q '"ok":false' "$TMP/selftest.json"; then fail "the CPU backend deviates from the reference kernels"; fi
+if "$DITCH" selftest --device nonsuch > "$TMP/selftest_bad.log" 2>&1; then fail "an unknown device was accepted"; fi
+grep -q "device" "$TMP/selftest_bad.log" || fail "the unknown device was not named in the error"
 
 echo
 echo "e2e: all checks passed"

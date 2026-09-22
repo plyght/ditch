@@ -78,7 +78,7 @@ Pre-norm attention with a gated (or relu²) MLP and llama-style tensor names.
 | `gemma2` | — | yes | (1+w) norms, pre/post feedforward norms, alternating local (sliding) and global layers, `query_pre_attn_scalar`, sqrt(H) embedding scale, `tanh` softcapping on the attention logits and on the output logits. |
 | `gemma3` | `gemma3_text` | yes | (1+w) norms, pre/post norms, per-head (1+w) q/k norms, sqrt(H) embedding scale, sliding layers with a local rope base, `query_pre_attn_scalar`, linear rope scaling. |
 | `gemma3n` | `gemma3n_text` | yes | AltUp residual streams, Laurel blocks, per-layer input embeddings, KV-shared layers, weightless value norm, gaussian-top-k gate sparsity, final logit softcapping. |
-| `gemma4` | `gemma4_text` | yes | global layers with their own head size and KV heads, proportional rope on global layers, keys reused as values (`attention_k_eq_v`), KV-shared layers, per-layer inputs, `layer_scalar`, double-wide MLPs on shared layers. The MoE block of gemma-4-26B-A4B (`enable_moe_block`) is not implemented. |
+| `gemma4` | `gemma4_text`, `gemma4_unified`, `gemma4_unified_text` | yes | global layers with their own head size and KV heads, proportional rope on global layers, keys reused as values (`attention_k_eq_v`), KV-shared layers, per-layer inputs, `layer_scalar`, double-wide MLPs on shared layers. The MoE block of gemma-4-26B-A4B (`enable_moe_block`) is not implemented. |
 | `glm4` | `glm`, `glm4v`, `glm4v_text` | yes | `post_self_attn`/`post_mlp` norms, fused `gate_up_proj`, interleaved half rotary, q/k/v biases. GLM-4 (0414) and the GLM-4-9B HF port. |
 | `chatglm` | — | yes | ChatGLM3 / GLM-4 remote-code layout: concatenated `query_key_value` with bias, fused `dense_h_to_4h`, interleaved half rotary with `rope_ratio`, `output_layer`. |
 
@@ -259,7 +259,9 @@ model:
 * **compressed-tensors pack-quantized** (Kimi K2.5 and other llm-compressor
   INT4/INT8 models): `weight_packed` with `num_bits`-wide fields, per-group
   `weight_scale`, optional `weight_zero_point` and `weight_shape` from
-  `quantization_config`.
+  `quantization_config`. Under `actorder` the columns of a group are
+  scattered and `weight_g_idx` names each column's group; without it every
+  column would be decoded with the wrong scale.
 * **compressed-tensors mxfp4-pack-quantized** (Kimi K3 as released: the routed
   experts only): `weight_packed` U8 holding E2M1 nibble pairs in the natural
   `[out, in]` layout and `weight_scale` U8 E8M0 exponents per 32 elements; a
@@ -383,6 +385,16 @@ FalconMamba) and RWKV, encoder-decoder models, Gemma 4 MoE
 (`enable_moe_block`), HunYuan cross-layer attention (`use_cla`), OPT-350m's
 projection layers, and quantisation formats other than the ones above (GPTQ,
 AWQ, bitsandbytes, …).
+
+Two entries below have no released checkpoint they can run, which is worth
+knowing before reaching for them. `minimax` is verified for the `postnorm:
+false` layout, but every released MiniMax-Text-01 / M1 checkpoint sets
+`postnorm: true` and is refused by name (`minimax_m2` and `minimax_m3` are
+unaffected). `deepseek_v4` / `deepseek_v41` follow transformers' module
+names, while the released DeepSeek V4 and V4.1 checkpoints use DeepSeek's own
+(`embed.weight`, `layers.N.attn.wq_a.weight`, `layers.N.ffn.experts.E.w1`)
+and store their routed experts in e2m1 FP4, which ditch does not decode;
+both are refused with the reason.
 
 Approximations ditch does make, and says so: `dynamic` and `longrope` rope
 scaling beyond the original context are treated as static / short factors

@@ -19,11 +19,50 @@ jobs:
         run: zig build test --summary all
       - name: End-to-end
         run: bash tests/e2e.sh
+      - name: Metal backend type check (aarch64-macos, no Apple SDK needed)
+        run: zig build metal-check
+      - name: Compute backend selftest (CPU against the reference kernels)
+        run: |
+          zig build -Doptimize=ReleaseFast
+          ./zig-out/bin/ditch selftest --device cpu
       - name: Cross-compile all release targets
         run: |
           for t in x86_64-linux-musl aarch64-linux-musl x86_64-macos aarch64-macos x86_64-windows-gnu; do
             zig build -Doptimize=ReleaseFast -Dtarget=$t --prefix "zig-out/$t"
           done
+
+  # Apple silicon: the only place the Metal backend can actually be compiled
+  # against Apple's SDK and run on a GPU. The job fails when a GPU kernel is
+  # outside its tolerance, and says so loudly when the runner exposes no Metal
+  # device at all (exit 78) instead of passing quietly.
+  metal:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Metal backend, kernels and pipeline against the CPU reference
+        run: |
+          set -o pipefail
+          status=0
+          bash tests/metal_e2e.sh 2>&1 | tee metal.log || status=$?
+          if [ "$status" = "78" ]; then
+            echo "::warning title=Metal unverified::no usable Metal device on this runner; the GPU kernels were not executed"
+            echo "### Metal: NOT VERIFIED (no usable Metal device on this runner)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$status" != "0" ]; then
+            echo "### Metal: FAILED" >> "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          fi
+          echo "### Metal: verified against the CPU reference" >> "$GITHUB_STEP_SUMMARY"
+          sed -n '/^Device: /,/kernels ran on the device/p' metal.log >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: metal-selftest-log
+          path: metal.log
 
   # Apple Silicon: the NEON kernel shape, the performance-core thread pool and
   # the Accelerate path only exist on this runner, so they are tested here.

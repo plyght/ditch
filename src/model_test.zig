@@ -289,6 +289,13 @@ test "deepseek_v4 fixture" {
 test "deepseek_v41 fixture" {
     try checkFixture("deepseek_v41");
 }
+// The released DeepSeek V4 / V4.1 and GLM-5.3-Flash checkpoints flatten the
+// hyper-connection tensors (`layers.N.hc_attn_fn`, `hc_head_fn`) where
+// transformers spells them as submodules (`attn_hc.fn`, `hc_head.hc_fn`).
+// Same weights, same reference outputs, the other spelling.
+test "deepseek_v4 fixture with the released checkpoints' hyper-connection names" {
+    try checkFixture("deepseek_v4_hubnames");
+}
 test "minimax_m2 fixture" {
     try checkFixture("minimax_m2");
 }
@@ -297,6 +304,11 @@ test "minimax fixture (lightning attention, renormalised residual)" {
 }
 test "minimax_m3 fixture" {
     try checkFixture("minimax_m3");
+}
+// The released MiniMax-M3 checkpoints keep the dense and shared MLPs split
+// (`gate_proj` / `up_proj`) where the reference implementation fuses them.
+test "minimax_m3 fixture with split gate/up projections" {
+    try checkFixture("minimax_m3_split");
 }
 test "ernie4_5_moe fixture" {
     try checkFixture("ernie4_5_moe");
@@ -414,6 +426,12 @@ test "qwen2_fp8 fixture (FP8 E4M3 with block scales)" {
 test "qwen2_int4 fixture (compressed-tensors pack-quantized, zero points)" {
     try checkFixture("qwen2_int4");
 }
+// `actorder`: `weight_g_idx` names each column's scale group instead of
+// `column / group_size`. Ignoring it decodes every column with the wrong
+// scale and the model still loads, so the reference pins the mapping.
+test "qwen2_int4 fixture with actorder (weight_g_idx groups)" {
+    try checkFixture("qwen2_int4_actorder");
+}
 test "gpt_oss_mxfp4 fixture (MXFP4 expert blocks and scales)" {
     try checkFixture("gpt_oss_mxfp4");
 }
@@ -517,6 +535,43 @@ test "nemotron_h warp mode matches mapped mode" {
     defer gpa.free(b);
     try std.testing.expectEqualSlices(f32, a, b);
     try std.testing.expect(warp.expert_cache.?.anyVisited());
+}
+
+// A Hugging Face hub snapshot directory (`~/.cache/huggingface/hub/
+// models--o--n/snapshots/<sha>/`) is symbolic links into `blobs/`, so a
+// directory scan that only accepts regular files finds no weights there.
+test "a model directory of symbolic links loads (hub snapshot layout)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const pool = tensor.Pool.init(io, 2);
+    const src = "tests/fixtures/llama";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_len = try tmp.dir.realPath(io, &path_buf);
+    const tmp_path = path_buf[0..tmp_len];
+    var src_dir = try std.Io.Dir.cwd().openDir(io, src, .{ .iterate = true });
+    defer src_dir.close(io);
+    var src_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const src_len = try src_dir.realPath(io, &src_buf);
+    const src_abs = src_buf[0..src_len];
+    var it = src_dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        const abs = try std.fs.path.join(gpa, &.{ src_abs, entry.name });
+        defer gpa.free(abs);
+        try tmp.dir.symLink(io, abs, entry.name, .{});
+    }
+    const linked = try model_mod.Model.load(gpa, io, &pool, tmp_path);
+    defer linked.deinit();
+    const direct = try model_mod.Model.load(gpa, io, &pool, src);
+    defer direct.deinit();
+    const ids = [_]u32{ 40, 100, 200, 7, 3 };
+    const a = try runLogits(direct, gpa, &ids);
+    defer gpa.free(a);
+    const b = try runLogits(linked, gpa, &ids);
+    defer gpa.free(b);
+    try std.testing.expectEqualSlices(f32, a, b);
 }
 
 test "mamba2 decode from the recurrent state matches prefill" {
@@ -770,6 +825,9 @@ test "minimax edit, export and streamed reload (lightning attention out_proj)" {
 test "minimax_m3 edit, export and streamed reload (fused shared expert, pass-through indexer tensors)" {
     try checkEditExportStream("minimax_m3");
 }
+test "minimax_m3 split edit, export and streamed reload" {
+    try checkEditExportStream("minimax_m3_split");
+}
 test "ernie4_5_moe edit, export and streamed reload (moe_statics bias, shared experts)" {
     try checkEditExportStream("ernie4_5_moe");
 }
@@ -835,6 +893,9 @@ test "qwen2_fp8 edit, export and streamed reload (dequantised on load)" {
 }
 test "qwen2_int4 edit, export and streamed reload (dequantised on load)" {
     try checkEditExportStream("qwen2_int4");
+}
+test "qwen2_int4 actorder edit, export and streamed reload" {
+    try checkEditExportStream("qwen2_int4_actorder");
 }
 test "gpt_oss_mxfp4 edit, export and streamed reload (dequantised experts)" {
     try checkEditExportStream("gpt_oss_mxfp4");

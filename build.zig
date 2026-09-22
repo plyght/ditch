@@ -7,7 +7,10 @@ pub fn build(b: *std.Build) void {
 
     // Apple's Accelerate framework (cblas_sgemm) as the matmul backend for
     // prefill-shaped calls; compiled in when building for macOS, ignored
-    // everywhere else. `--accelerate=false` turns it off at run time.
+    // everywhere else. `--accelerate=false` turns it off at run time. The
+    // framework is not linked: the macOS release binaries are cross-compiled
+    // from Linux, where it does not exist, so src/tensor.zig resolves
+    // cblas_sgemm with dlopen and keeps the Zig kernels when that fails.
     const accelerate = b.option(bool, "accelerate", "Use Apple's Accelerate framework for large matrix products (macOS only, default: true on macOS)") orelse is_macos;
     // Kernel shape overrides; 0 means "pick from the target's register file"
     // (see `src/tensor.zig`). Only for benchmarking a machine by hand.
@@ -15,7 +18,18 @@ pub fn build(b: *std.Build) void {
     const tile_rows = b.option(u32, "tile-rows", "Weight rows per register tile (0 = choose from the target, the default)") orelse 0;
     const tile_inputs = b.option(u32, "tile-inputs", "Input rows per register tile (0 = choose from the target, the default)") orelse 0;
 
+    // GPU acceleration. The Metal backend needs Apple's SDK headers for its
+    // Objective-C shim, which Zig does not ship, so it is off unless asked for
+    // explicitly: `zig build -Dmetal` on a Mac with Xcode's command line tools.
+    // Everything else, cross-compiling to aarch64-macos included, builds the
+    // CPU path exactly as before.
+    const metal = b.option(bool, "metal", "Build the Metal backend (macOS target with Apple's SDK; default false)") orelse false;
+    if (metal and target.result.os.tag != .macos) {
+        std.debug.print("-Dmetal needs a macOS target ({s} was requested)\n", .{@tagName(target.result.os.tag)});
+        std.process.exit(1);
+    }
     const options = b.addOptions();
+    options.addOption(bool, "metal", metal);
     options.addOption(bool, "accelerate", accelerate and is_macos);
     options.addOption(u32, "vector_width", vector_width);
     options.addOption(u32, "tile_rows", tile_rows);
@@ -27,7 +41,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     addLua(b, root);
-    addPerf(root, options);
+    root.addOptions("build_options", options);
+    if (metal) addMetal(b, root);
 
     const exe = b.addExecutable(.{
         .name = "ditch",
@@ -47,7 +62,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     addLua(b, test_mod);
-    addPerf(test_mod, options);
+    test_mod.addOptions("build_options", options);
+    if (metal) addMetal(b, test_mod);
     // `-Dtest-filter=name`: run only the tests whose name contains it. Needed
     // to run the suite under qemu, whose mmap emulation cannot serve the
     // file-mapping tests.
@@ -67,14 +83,33 @@ pub fn build(b: *std.Build) void {
     e2e.setCwd(b.path("."));
     const e2e_step = b.step("e2e", "Run the end-to-end pipeline test (bash tests/e2e.sh)");
     e2e_step.dependOn(&e2e.step);
+
+    // Type-checks the Zig half of the Metal backend for an Apple silicon
+    // target without Apple's SDK: the shim is only declared here, never
+    // linked, so this runs anywhere. The shaders themselves need `xcrun
+    // metal`, which the macOS CI job runs.
+    const metal_mod = b.createModule(.{
+        .root_source_file = b.path("src/metal_check.zig"),
+        .target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .macos }),
+        .optimize = .ReleaseFast,
+    });
+    metal_mod.addOptions("build_options", options);
+    const metal_obj = b.addObject(.{ .name = "ditch-metal-check", .root_module = metal_mod });
+    const metal_check = b.step("metal-check", "Compile the Metal backend for aarch64-macos without linking");
+    metal_check.dependOn(&metal_obj.step);
 }
 
-/// Build options the kernels read. Accelerate itself is not linked: the macOS
-/// release binaries are cross-compiled from Linux, where the framework does
-/// not exist to link against, so `src/tensor.zig` resolves `cblas_sgemm` with
-/// `dlopen` at startup and keeps the Zig kernels when that fails.
-fn addPerf(mod: *std.Build.Module, options: *std.Build.Step.Options) void {
-    mod.addOptions("build_options", options);
+/// Compiles the Objective-C shim of the Metal backend and links the frameworks
+/// it needs. Only ever called for macOS targets (see `-Dmetal` above).
+fn addMetal(b: *std.Build, mod: *std.Build.Module) void {
+    mod.link_libc = true;
+    mod.addIncludePath(b.path("src/metal"));
+    mod.addCSourceFile(.{
+        .file = b.path("src/metal/shim.m"),
+        .flags = &.{ "-x", "objective-c", "-fno-objc-arc", "-fobjc-exceptions", "-O2" },
+    });
+    mod.linkFramework("Metal", .{});
+    mod.linkFramework("Foundation", .{});
 }
 
 /// Lua 5.4 sources are compiled into the executable so configuration files

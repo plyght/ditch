@@ -585,6 +585,12 @@ pub const Names = struct {
     /// to `layer` (hyper.zig names the tensors under them per `HyperKind`).
     hc_attn: []const u8 = "attn_hc",
     hc_ffn: []const u8 = "ffn_hc",
+    /// The released mHC checkpoints (DeepSeek V4 / V4.1, GLM-5.3-Flash) flatten
+    /// a site's three tensors into `hc_attn_fn` / `hc_attn_base` / `hc_attn_scale`
+    /// instead of the module spelling `attn_hc.fn`; whichever the store has is
+    /// used. Null on families whose sites are not mHC.
+    hc_attn_flat: ?[]const u8 = "hc_attn_",
+    hc_ffn_flat: ?[]const u8 = "hc_ffn_",
 };
 
 /// One architecture family.
@@ -3649,7 +3655,9 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "gemma4",
-        .aliases = &.{"gemma4_text"},
+        // `gemma4_unified` is the non-E-series wrapper (gemma-4-12B / -31B /
+        // -26B-A4B); the same text config under another name.
+        .aliases = &.{ "gemma4_text", "gemma4_unified", "gemma4_unified_text" },
         .llama_cpp = "gemma4",
         .chat = "gemma",
         .verified = true,
@@ -4256,6 +4264,7 @@ pub const registry = [_]Arch{
         .llama_cpp = null,
         .chat = "chatml",
         .verified = true,
+        .norm = .rms_gemma,
         .qk_norm = .head,
         .names = .{
             .q_norm = "self_attn.q_norm.weight",
@@ -4279,6 +4288,7 @@ pub const registry = [_]Arch{
         .llama_cpp = null,
         .chat = "chatml",
         .verified = true,
+        .norm = .rms_gemma,
         .qk_norm = .head,
         .names = .{
             .q_norm = "self_attn.q_norm.weight",
@@ -4302,6 +4312,7 @@ pub const registry = [_]Arch{
         .llama_cpp = null,
         .chat = "chatml",
         .verified = true,
+        .norm = .rms_gemma,
         .qk_norm = .head,
         .names = .{
             .q_norm = "self_attn.q_norm.weight",
@@ -4348,6 +4359,8 @@ pub const registry = [_]Arch{
             .shared_expert_gate = "mlp.shared_expert_gate.weight",
             .hc_attn = "attn_hyper_connection",
             .hc_ffn = "mlp_hyper_connection",
+            .hc_attn_flat = null,
+            .hc_ffn_flat = null,
         },
         .notes = "fixture: Qwen3.8-Flash-Next text config under the multimodal wrapper: gated hyper-connections (hc_count streams, (1 + w) group norms, low-rank sigmoid input mixer, sigmoid injection weights, no final norm), Gated DeltaNet layers with a sigmoid or silu output gate, sigmoid-gated full attention with (1 + w) head norms and partial rotary behind a QSA indexer (run as dense: exact while every complete block fits indexer_budget, longer prompts refused), per-layer n-gram embeddings (PLE: splitmix64 hash multipliers, prime bucket ranges, sharded tables read row by row, gated values, dilated depthwise convolution), fused softmax MoE with a gated shared expert on every layer. Vision and indexer tensors pass through exports untouched.",
         .extra = extraQwen4Exp,
@@ -4478,6 +4491,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "jamba",
+        .chat = "jamba",
         .llama_cpp = "jamba",
         .verified = true,
         .positional = .none,
@@ -4551,8 +4565,11 @@ pub const registry = [_]Arch{
         .names = .{
             .q_norm = "self_attn.q_norm.weight",
             .k_norm = "self_attn.k_norm.weight",
-            .gate = null,
-            .up = null,
+            // The released MiniMax-M3 checkpoints keep the dense and shared
+            // MLPs split (`gate_proj` / `up_proj`); the fused `gate_up_proj`
+            // spelling is used when the checkpoint has it.
+            .gate = "mlp.gate_proj.weight",
+            .up = "mlp.up_proj.weight",
             .gate_up = "mlp.gate_up_proj.weight",
             .down = "mlp.down_proj.weight",
             .router = "block_sparse_moe.gate.weight",
@@ -4564,6 +4581,8 @@ pub const registry = [_]Arch{
             .fused_gate_up = &.{},
             .fused_down = &.{},
             .shared_expert = "block_sparse_moe.shared_experts.",
+            .shared_gate = "gate_proj.weight",
+            .shared_up = "up_proj.weight",
             .shared_gate_up = "gate_up_proj.weight",
             .shared_down = "down_proj.weight",
         },
@@ -4670,10 +4689,15 @@ pub const registry = [_]Arch{
             .lin_k = "self_attn.k_proj.weight",
             .lin_v = "self_attn.v_proj.weight",
             .lin_conv = "self_attn.conv1d.weight",
-            .lin_f_a = &.{"self_attn.forget_gate.f_a_proj.weight"},
-            .lin_f_b = &.{"self_attn.forget_gate.f_b_proj.weight"},
-            .lin_dt_bias = &.{"self_attn.forget_gate.dt_bias"},
-            .lin_a_log = &.{"self_attn.forget_gate.A_log"},
+            // The released GLM-5.3-Flash checkpoints put the forget gate's
+            // tensors directly under `self_attn` and keep one convolution per
+            // projection, where transformers has a `forget_gate` submodule and
+            // one fused `conv1d`; both spellings are accepted.
+            .lin_conv_split = &.{ "self_attn.q_conv1d.weight", "self_attn.k_conv1d.weight", "self_attn.v_conv1d.weight" },
+            .lin_f_a = &.{ "self_attn.forget_gate.f_a_proj.weight", "self_attn.f_a_proj.weight" },
+            .lin_f_b = &.{ "self_attn.forget_gate.f_b_proj.weight", "self_attn.f_b_proj.weight" },
+            .lin_dt_bias = &.{ "self_attn.forget_gate.dt_bias", "self_attn.dt_bias" },
+            .lin_a_log = &.{ "self_attn.forget_gate.A_log", "self_attn.A_log" },
             .lin_b = "self_attn.b_proj.weight",
             .lin_g_a = "self_attn.g_a_proj.weight",
             .lin_g_b = "self_attn.g_b_proj.weight",

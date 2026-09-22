@@ -266,8 +266,14 @@ const Workers = struct {
             self.io.futexWake(u32, &self.generation.raw, std.math.maxInt(u32));
             for (threads[0..spawned]) |t| t.join();
         }
+        // The baseline generation is read here, not in the new thread: a
+        // worker that is still starting up when the first job is published
+        // would otherwise read the already-bumped generation, wait for the
+        // next one and never decrement `remaining` for that job, leaving the
+        // caller waiting for a worker that skipped it.
+        const first_generation = self.generation.load(.acquire);
         for (threads) |*t| {
-            t.* = try std.Thread.spawn(.{}, workerMain, .{self});
+            t.* = try std.Thread.spawn(.{}, workerMain, .{ self, first_generation });
             spawned += 1;
         }
         self.threads = threads;
@@ -316,9 +322,9 @@ const Workers = struct {
         }
     }
 
-    fn workerMain(self: *Workers) void {
+    fn workerMain(self: *Workers, first_generation: u32) void {
         setWorkerQos();
-        var seen = self.generation.load(.acquire);
+        var seen = first_generation;
         while (true) {
             // Wait for a new generation.
             var spins: usize = 0;

@@ -30,6 +30,24 @@ return {
   -- or to keep results bit-for-bit equal to another machine's.
   -- accelerate = true,
 
+  -- Compute backend for the forward pass (also --device, DITCH_DEVICE):
+  --   "cpu"   the multi-threaded CPU kernels: the default, and the reference
+  --           implementation every other backend is checked against.
+  --   "metal" Metal compute shaders on Apple silicon; needs a binary built
+  --           with -Dmetal. Matrix products run on the GPU, everything else on
+  --           the CPU, and results match the CPU path to f32 rounding (see
+  --           "GPU acceleration" in the README, and `ditch selftest --device
+  --           metal` to measure it on your own machine).
+  --   "auto"  use a GPU when one is usable, otherwise the CPU with a note.
+  -- device = "cpu",
+
+  -- Device memory a GPU backend may keep hot weight tiles in (also
+  -- --gpu-memory, DITCH_GPU_MEMORY). The default, 0, uploads each tile,
+  -- computes and drops it, so a model far larger than the GPU still runs.
+  -- Only memory-mapped weights are cached; streamed and warp modes always
+  -- upload per tile.
+  -- gpu_memory = "4GB",
+
   -- Directory for downloaded models and dataset rows
   -- (default: $DITCH_CACHE, else $XDG_CACHE_HOME/ditch, else ~/.cache/ditch).
   -- cache_dir = home .. "/.cache/ditch",
@@ -302,7 +320,8 @@ return {
   -- (tokenizer, config, the runtime); default max(10% of max_ram, 256MB),
   -- at most half of max_ram. "0" hands the whole budget to the model.
   -- budget_headroom = "1GB",
-  -- Accepted for compatibility with heretic; unused (there is no GPU backend).
+  -- Accepted for compatibility with heretic; unused. A GPU backend's memory is
+  -- bounded by gpu_memory instead, and never has to hold the whole model.
   -- max_vram = "24GB",
   -- Directory for spilled activations and KV caches
   -- (default: <cache_dir>/scratch, else ./scratch).

@@ -68,11 +68,36 @@ pub const Engine = struct {
     settings: *config.Settings,
     template: chat.Template,
     batch_size: usize,
+    /// BOS text the model's own template puts before the first turn but the
+    /// rendered family and the tokenizer do not add (see `chat.templateBos`).
+    bos_prefix: []const u8 = "",
     ws: ?model_mod.Workspace = null,
     ws_rows: usize = 0,
 
     pub fn init(gpa: Allocator, model: *Model, settings: *config.Settings, template: chat.Template) Engine {
-        return .{ .gpa = gpa, .model = model, .settings = settings, .template = template, .batch_size = @max(settings.batch_size, 1) };
+        return .{
+            .gpa = gpa,
+            .model = model,
+            .settings = settings,
+            .template = template,
+            .batch_size = @max(settings.batch_size, 1),
+            .bos_prefix = bosPrefix(model, template),
+        };
+    }
+
+    /// The BOS the rendered prompt must carry itself: the model's template
+    /// emits one, the family's rendering does not start with it, and the
+    /// tokenizer will not prepend it either.
+    fn bosPrefix(model: *Model, template: chat.Template) []const u8 {
+        const tok = model.tokenizer;
+        if (tok.add_bos) return "";
+        const bos_id = tok.bos_id orelse return "";
+        const bos = tok.id_to_token[bos_id];
+        const want = chat.templateBos(model.chat_template, bos);
+        if (want.len == 0) return "";
+        const empty = chat.renderPrompt(model.gpa, template, "", "") catch return "";
+        defer model.gpa.free(empty);
+        return if (std.mem.startsWith(u8, empty, bos)) "" else want;
     }
 
     pub fn deinit(self: *Engine) void {
@@ -110,9 +135,10 @@ pub const Engine = struct {
     /// Renders the chat template and appends the response prefix.
     pub fn formatPrompt(self: *Engine, gpa: Allocator, prompt: Prompt) ![]u8 {
         const base = try chat.renderPrompt(gpa, self.template, prompt.system, prompt.user);
-        const prefix = self.settings.response_prefix orelse return base;
+        const prefix = self.settings.response_prefix orelse "";
+        if (prefix.len == 0 and self.bos_prefix.len == 0) return base;
         defer gpa.free(base);
-        return std.fmt.allocPrint(gpa, "{s}{s}", .{ base, prefix });
+        return std.fmt.allocPrint(gpa, "{s}{s}{s}", .{ self.bos_prefix, base, prefix });
     }
 
     pub fn encodePrompt(self: *Engine, gpa: Allocator, prompt: Prompt) ![]u32 {
