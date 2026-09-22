@@ -1465,11 +1465,18 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         try selftest.run(gpa, settings, pool, out, con.result);
         return;
     }
-    const device_note = compute.selectInto(gpa, device_kind, .{ .memory_budget = settings.gpu_memory, .io = pool.io }) catch {
+    const device_note = compute.selectInto(gpa, device_kind, .{ .memory_budget = settings.gpu_memory, .io = pool.io, .min_macs = settings.device_min_macs }) catch {
         std.log.err("device {s} is not available on this build or machine (build with -Dmetal on Apple silicon, or use --device auto)", .{settings.device});
         std.process.exit(2);
     };
     defer compute.shutdown();
+    // Runs before the shutdown above: say how much the device actually did, so
+    // a small model that never crossed the dispatch threshold is visible as
+    // "0 matrix products" instead of passing for a GPU run.
+    defer if (!compute.active.isCpu()) {
+        out.print("{d} matrix products ran on {s}\n", .{ compute.served.load(.monotonic), compute.active.name }) catch {};
+        out.flush() catch {};
+    };
     if (device_note) |n| try out.print("{s}\n", .{n});
     if (!compute.active.isCpu()) {
         try out.print("Compute device: {s}", .{compute.active.name});

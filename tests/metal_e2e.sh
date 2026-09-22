@@ -120,6 +120,12 @@ COMMON=(
     --trial-index 1 --model-action save
 )
 
+# The fixture's matrices are far below the size at which ditch hands a product
+# to the GPU, so without this the "metal" run would do all its arithmetic on
+# the CPU and the comparison below would pass trivially. Zero sends every
+# weight-tile product to the device.
+export DITCH_DEVICE_MIN_MACS=0
+
 for device in cpu metal; do
     echo "==> Full abliteration on --device $device"
     "$DITCH" "${COMMON[@]}" \
@@ -129,6 +135,10 @@ for device in cpu metal; do
     grep -q "Model saved to" "$TMP/run-$device.log" || fail "$device: model was not saved"
 done
 grep -q "Compute device:" "$TMP/run-metal.log" || fail "the metal run did not report a compute device"
+served=$(sed -n 's/^\([0-9][0-9]*\) matrix products ran on .*/\1/p' "$TMP/run-metal.log" | tail -1)
+[ -n "$served" ] || fail "the metal run did not report how many products the device served"
+[ "$served" -gt 0 ] || fail "the metal run served 0 matrix products on the device: the GPU did no work"
+echo "    $served matrix products ran on the device"
 grep -q 'device = "cpu"' "$TMP/out-cpu/ditch-reproduce.lua" || fail "the manifest does not record the cpu device"
 grep -q 'device = "' "$TMP/out-metal/ditch-reproduce.lua" || fail "the manifest does not record the metal device"
 
