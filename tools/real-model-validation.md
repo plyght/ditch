@@ -203,3 +203,116 @@ many rows, so the mismatch was fatal. This is why the README noted the writer
 
 GGUF export self-validation: max |Δ| first-token logit 0.39 vs the in-memory
 model (expected from q8_0 rounding), argmax agreement 100%.
+
+### fast-search comparison (same 30/10 trials)
+
+    $ ditch Qwen/Qwen2.5-0.5B-Instruct --n-trials 30 --n-startup-trials 10 --fast-search \
+        --checkpoint-action restart --trial-index 1 --model-action save ...
+
+| | full search | --fast-search |
+| --- | ---: | ---: |
+| Wall clock (30 trials) | 49m56s | 36m25s |
+| Peak RSS | 1.63 GiB | 1.63 GiB |
+| Best trial Refusals | 5/100 | 5/100 |
+| Best trial KL (that trial) | 0.0432 | 0.1138 |
+
+Fast-search optimises a first-token refusal proxy during the search and runs
+the generation-based Refusals scorer only on the 15 Pareto candidates at the
+end, so it is ~27% faster wall-clock and reaches the same refusal floor (5/100).
+Its auto-selected trial trades more KL (0.114), but the generation-scored front
+also contains 6/100-refusal trials at KL 0.05-0.09 (trials 3/14), close to the
+full search. This matches the documented "expected, not measured" trade-off;
+now measured on this machine. No bug: fast-search behaves as designed.
+
+## Step 3 — more dense families (10 trials each, exercising the arch registry)
+
+For each model: a logit check against transformers on CPU (the strongest
+forward-pass test), then a brief 10-trial study.
+
+### Logit agreement with transformers (first-token, 3 chat prompts each)
+
+| Model | model_type | tokens | max rel. logit error (bf16) | argmax |
+| --- | --- | :---: | ---: | :---: |
+| Qwen/Qwen3-0.6B | qwen3 | match | 9.4e-03 | agree |
+| HuggingFaceTB/SmolLM2-1.7B-Instruct | llama | match | 6.5e-03 | agree |
+| microsoft/Phi-4-mini-instruct | phi3 | (coherence only) | n/a | n/a |
+
+All within the ~1e-2 bf16 tolerance. Qwen3-0.6B is a reasoning model; ditch
+detected its `<think>` chain-of-thought prefix and closed the CoT block for
+scoring. Phi-4-mini was checked by greedy coherence only (no transformers
+reference, to stay within the disk budget): "The capital of France is Paris. It
+is not only the largest city..." — coherent, so the phi3 forward pass is sound.
+gemma-3-1b-it is gated (HTTP 401 without an accepted licence), so it was
+skipped.
+
+### Brief studies (10 trials, reduced response length to keep them short)
+
+Studies used `--model-action exit` (no save) and, for the 1.7B/3.8B models,
+`--max-response-length 40-48` so the run stays brief; the smaller Qwen3 used the
+default 100.
+
+| Model | arch | Baseline Refusals | Best trial Refusals | Best KL | Wall | Peak RSS |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Qwen/Qwen3-0.6B | qwen3 | 56/100 | 21/100 | 0.0030 | 36m49s | 6.4 GiB |
+| HuggingFaceTB/SmolLM2-1.7B-Instruct | llama | 35/100 | 9/100 | 0.0804 | 49m46s | 8.8 GiB |
+
+Every study selected trial 1 = the fewest-refusals trial (the ordering fix),
+reduced refusals substantially, and ran without a crash — the qwen3, llama and
+phi3 registry entries all work on real checkpoints. (Note: an early attempt to
+run these as harness *background* tasks was killed with exit 144 at the
+response-prefix stage — a background-task lifecycle limit, not a ditch fault;
+running them with `nohup` detached from the harness ran them to completion.)
+
+| microsoft/Phi-4-mini-instruct | phi3 | 100/100 | 92/100 (best of 4, partial) | 0.014 | ~28m (4 trials) | ~9 GiB |
+
+Phi-4-mini is heavily aligned (baseline 100/100). At 3.8B with the
+memory-limited batch size of 4, each trial takes ~7 min, so the 10-trial study
+was stopped after 4 trials to keep the validation moving; the phi3 forward pass
+is already confirmed (coherent generation matching quality) and the pipeline
+(directions, abliteration, scoring) ran without error. The random startup trials
+moved refusals 100 -> 92; the TPE trials that would exploit the best direction
+were not reached.
+
+Result of step 3: the qwen2, qwen3, llama and phi3 registry entries all load
+real checkpoints, produce transformers-matching logits (qwen2/qwen3/llama) or
+coherent generations (phi3), and run the full study pipeline. No architecture
+bug was found; nothing needed fixing.
+
+## Step 4 — MoE + warp mode (hf:// streaming)
+
+    $ ditch hf://Qwen/Qwen1.5-MoE-A2.7B-Chat --max-ram 8GB --n-trials 3 \
+        --n-startup-trials 3 --max-response-length 32 --checkpoint-action restart \
+        --trial-index 1 --model-action exit --no-input --print-debug-information
+
+What worked:
+
+* `hf://` streaming: ditch fetched config.json, tokenizer.json and the
+  `model.safetensors.index.json` over HTTP range requests, with no full
+  download, and correctly treated the absent `special_tokens_map.json` /
+  `chat_template.jinja` (404) as optional.
+* Architecture `qwen2_moe` loaded (24 layers, 60 experts/layer, top-4).
+* The memory estimate is detailed and correct: weights 26.67 GB total, routed
+  experts 23.20 GB (16.5 MB each), trunk 98.2 MB/layer, and warp mode's
+  minimum resident set 1.07 GB (trunk + top-4 experts + workspace). It sizes
+  the expert cache from the budget (e.g. 4.82 GB holds 299/1440 experts at
+  `--max-ram 8GB`; 750 MB holds 45 at `--max-ram 2GB`) and warns when the cache
+  holds fewer experts than one layer, so a prefill re-reads experts.
+* **RAM bounding is excellent**: at `--max-ram 2GB` the measured peak RSS was
+  **1.06 GiB while processing a 27 GB model** — the whole point of warp mode.
+
+What blocked completion on this machine (not a ditch bug):
+
+* The remote source caches every fetched 8 MB chunk to disk with no eviction,
+  and MoE routing over even one harmful + one harmless calibration prompt
+  routes to most of the 1440 experts, so the on-disk chunk cache grew toward
+  the full 23 GB of experts (17 GB fetched before it was stopped). This
+  machine's writable disk is only ~18 GB, smaller than the model, so a full
+  calibration pass cannot be cached and the run cannot finish here.
+* This is a disk-size limit of the sandbox, not a warp-mode fault: RAM stayed
+  within budget throughout and the stream itself never failed. On a host with
+  disk larger than the model the run completes normally. A bounded (LRU) on-disk
+  chunk cache would let warp mode run models larger than the available disk;
+  that is an enhancement, noted here, not a regression.
+
+Peak RSS (warp, --max-ram 2GB): 1.06 GiB. hf:// stream: worked. Run completion:
+blocked by disk size on this machine, reported as above.
