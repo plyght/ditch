@@ -234,9 +234,9 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings,
         }
         var ws = try model_mod.Workspace.init(gpa, c, @max(total, 1), n);
         defer ws.deinit();
-        var cache = try model_mod.KvCache.init(gpa, c.num_layers, n, longest + m + 1, c.num_kv_heads * c.head_dim);
+        var cache = try model_mod.KvCache.init(gpa, c.num_layers, n, longest + m + 1, c.kvDim());
         defer cache.deinit();
-        if (c.has_linear) {
+        if (c.has_linear or c.has_conv) {
             cache.linear = try model_mod.LinearCache.init(gpa, c, n);
         }
         const logits = try gpa.alloc(f32, n * c.vocab_size);

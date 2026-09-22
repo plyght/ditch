@@ -771,8 +771,8 @@ pub fn forward(model: *const Model, m: *const MoeLayer, li: usize, out: []f32, h
             const per_group = n_experts / n_group;
             for (0..n_group) |g| {
                 const gs = choice[g * per_group ..][0..per_group];
-                if (m.correction_bias != null) {
-                    // Sum of the two best selection scores of the group (DeepSeek V3).
+                if (m.correction_bias != null or r.group_top2) {
+                    // Sum of the two best selection scores of the group (DeepSeek V3, Mistral 4).
                     var b1: f32 = -std.math.inf(f32);
                     var b2: f32 = -std.math.inf(f32);
                     for (gs) |s| {
@@ -1212,7 +1212,7 @@ fn runLogits(model: *const Model, gpa: Allocator, ids: []const u32) ![]f32 {
     const c = &model.config;
     var ws = try model_mod.Workspace.init(gpa, c, 16, 1);
     defer ws.deinit();
-    var cache = try model_mod.KvCache.init(gpa, c.num_layers, 1, 16, c.num_kv_heads * c.head_dim);
+    var cache = try model_mod.KvCache.init(gpa, c.num_layers, 1, 16, c.kvDim());
     defer cache.deinit();
     const logits = try gpa.alloc(f32, c.vocab_size);
     errdefer gpa.free(logits);

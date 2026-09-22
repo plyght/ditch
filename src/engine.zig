@@ -104,7 +104,7 @@ pub const Engine = struct {
 
     fn kvBytes(self: *Engine, batch: usize, max_len: usize) u64 {
         const c = &self.model.config;
-        return model_mod.KvCache.bytesFor(c.num_layers, batch, max_len, c.num_kv_heads * c.head_dim);
+        return model_mod.KvCache.bytesFor(c.num_layers, batch, max_len, c.kvDim());
     }
 
     /// Renders the chat template and appends the response prefix.

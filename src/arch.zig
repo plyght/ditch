@@ -103,8 +103,14 @@ pub const Mla = struct {
     v_head_dim: usize,
 };
 
-/// Llama 4 attention temperature tuning on layers without RoPE.
-pub const AttnTemperature = struct { floor_scale: f32, attn_scale: f32 };
+/// Position-dependent query scaling `1 + attn_scale * log(floor((pos + offset) / floor_scale) + 1)`:
+/// Llama 4 (offset 1, layers without RoPE only) and Mistral 4 (`llama_4_scaling_beta`,
+/// offset 0, every layer).
+pub const AttnTemperature = struct { floor_scale: f32, attn_scale: f32, offset: f32 = 1.0, all_layers: bool = false };
+
+/// Rotary table of the local (sliding) layers when it differs from the global
+/// one (Gemma 3 family): base, rotated coordinates and the frequency denominator.
+pub const LocalRope = struct { theta: f32, rotary_dim: usize, freq_dim: usize };
 
 /// gpt-oss gated activation: `(clamp(up) + 1) * clamp(gate) * sigmoid(alpha * gate)`.
 pub const Swiglu = struct { alpha: f32, limit: f32 };
@@ -122,6 +128,9 @@ pub const MoeConfig = struct {
     /// Expert projections carry biases (gpt-oss).
     expert_bias: bool = false,
     swiglu: ?Swiglu = null,
+    /// Group-limited routing scores a group by its two best experts even
+    /// without a correction bias (Mistral 4).
+    group_top2: bool = false,
 };
 
 /// Tensor-name templates. `{p}` is the model prefix, `{i}` the layer index and
@@ -195,6 +204,34 @@ pub const Names = struct {
     /// Shared expert prefix (its projections use the expert_* names).
     shared_expert: ?[]const u8 = null,
     shared_expert_gate: ?[]const u8 = null,
+    /// Gated short convolution of LFM2 conv layers; its output projection is
+    /// `conv_out` (loaded into the layer's `o` slot).
+    conv_in: ?[]const u8 = null,
+    conv_kernel: ?[]const u8 = null,
+    conv_out: ?[]const u8 = null,
+    /// Per-layer input embeddings (Gemma 3n / 4): the packed
+    /// `[vocab][layers * dim]` table, its projection from the token embedding,
+    /// the projection norm and the per-layer gate / output projection / norm.
+    ple_embed: ?[]const u8 = null,
+    ple_proj: ?[]const u8 = null,
+    ple_proj_norm: ?[]const u8 = null,
+    ple_gate: ?[]const u8 = null,
+    ple_out: ?[]const u8 = null,
+    ple_norm: ?[]const u8 = null,
+    /// Per-layer output scalar (Gemma 4 `layer_scalar`, optional in checkpoints).
+    layer_scale: ?[]const u8 = null,
+    /// AltUp (Gemma 3n): `{e}` indexes the `altup_num_inputs - 1` projections.
+    altup_proj: ?[]const u8 = null,
+    altup_unembed: ?[]const u8 = null,
+    altup_router: ?[]const u8 = null,
+    altup_router_norm: ?[]const u8 = null,
+    altup_predict: ?[]const u8 = null,
+    altup_correct: ?[]const u8 = null,
+    altup_scale: ?[]const u8 = null,
+    /// Learned augmented residual (Gemma 3n).
+    laurel_l: ?[]const u8 = null,
+    laurel_r: ?[]const u8 = null,
+    laurel_norm: ?[]const u8 = null,
 };
 
 /// One architecture family.
@@ -243,13 +280,49 @@ pub const Config = struct {
     /// Norm epsilon (RMSNorm or LayerNorm).
     rms_norm_eps: f32,
     rope_theta: f32,
-    rope_local_theta: f32,
     rope_scaling: RopeScaling,
     /// Rotated coordinates per head (`<= head_dim`).
     rotary_dim: usize,
+    /// Denominator of the frequency exponents: `rotary_dim`, or the full head
+    /// size when only a proportion of it rotates (Gemma 4 "proportional" RoPE).
+    rope_freq_dim: usize,
+    /// Separate rotary table of the sliding layers (Gemma 3 family); null when
+    /// every layer uses the global table.
+    rope_local: ?LocalRope,
     rope_style: RopeStyle,
     /// Per layer: whether rotary embeddings are applied.
     rope_layers: []bool,
+    /// Per layer: head size, KV heads and attention scale. Equal to `head_dim`,
+    /// `num_kv_heads` and `attention_scale` except on Gemma 4, whose global
+    /// layers use a larger head.
+    layer_head_dim: []usize,
+    layer_kv_heads: []usize,
+    layer_attn_scale: []f32,
+    /// Per layer: the layer whose keys/values this layer attends over (itself
+    /// unless the layer is KV-shared, Gemma 3n / 4).
+    kv_source: []usize,
+    /// Weightless per-head RMS norm on the values (Gemma 3n / 4).
+    v_norm: bool,
+    /// A layer without `v_proj` reuses its key projection as values (Gemma 4 `attention_k_eq_v`).
+    k_eq_v: bool,
+    /// Per-layer input embeddings (Gemma 3n / 4): width per layer (0 = none) and vocabulary.
+    ple_dim: usize,
+    ple_vocab: usize,
+    /// AltUp (Gemma 3n): number of residual streams (0 = none), the active one,
+    /// and whether the corrected active stream is scaled before the per-layer gate.
+    altup_inputs: usize,
+    altup_active: usize,
+    altup_correct_scale: bool,
+    laurel_rank: usize,
+    /// Per layer: gate activation sparsity (Gemma 3n `activation_sparsity_pattern`); 0 = dense.
+    activation_sparsity: []f32,
+    /// The layers' feed-forward widths differ (Gemma 3n per-layer sizes,
+    /// Gemma 4 double-wide MLPs); `intermediate_size` is then the largest.
+    intermediate_varies: bool,
+    /// Per layer: true for gated short-convolution layers (LFM2).
+    conv_layers: []bool,
+    has_conv: bool,
+    conv_kernel: usize,
     positional: Positional,
     /// Per layer: true for Gated DeltaNet linear-attention layers (Qwen
     /// hybrids); false for full-attention layers.
@@ -306,8 +379,28 @@ pub const Config = struct {
         return self.norm == .rms_gemma;
     }
 
+    /// Width of one KV cache row: the largest `kv_heads * head_dim` of any layer.
     pub fn kvDim(self: *const Config) usize {
-        return self.num_kv_heads * self.head_dim;
+        var d: usize = self.num_kv_heads * self.head_dim;
+        for (self.layer_kv_heads, self.layer_head_dim) |kvh, hd| d = @max(d, kvh * hd);
+        return d;
+    }
+
+    /// Largest query width `heads * head_dim` of any layer.
+    pub fn maxQDim(self: *const Config) usize {
+        var d: usize = self.num_heads * self.head_dim;
+        for (self.layer_head_dim) |hd| d = @max(d, self.num_heads * hd);
+        return d;
+    }
+
+    /// Value width of layer `li`.
+    pub fn layerVDim(self: *const Config, li: usize) usize {
+        return if (self.mla != null) self.v_head_dim else self.layer_head_dim[li];
+    }
+
+    /// True when layer `li` reads another layer's keys and values.
+    pub fn kvShared(self: *const Config, li: usize) bool {
+        return self.kv_source[li] != li;
     }
 };
 
@@ -423,6 +516,7 @@ fn rejectKnownHybrid(model_type: []const u8) !void {
         .{ "glm_moe_lite", "GLM-4.7-Flash (not yet verified against a reference forward pass)" },
         .{ "deepseek_v4", "DeepSeek V4 (sparse indexer, hash layers, hyper-connections, FP4/FP8 weights)" },
         .{ "deepseek_v41", "DeepSeek V4.1 (sparse indexer, hash layers, hyper-connections, FP4/FP8 weights)" },
+        .{ "lfm2_moe", "LFM2-MoE (short-convolution hybrid with sigmoid-routed experts, not yet verified against a reference forward pass)" },
     };
     inline for (table) |e| {
         if (std.mem.eql(u8, model_type, e[0])) {
@@ -529,15 +623,275 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
     }
 
     const max_pos = getIntAny(obj, &.{ "max_position_embeddings", "n_positions", "max_seq_len", "seq_length" }, 4096);
-    const rope_theta = getF32Any(obj, &.{ "rope_theta", "rotary_emb_base", "rope_base" }, 10000.0);
+    // Newer configs keep the base and the scaling together in `rope_parameters`
+    // (a per-layer-type table on the Gemma 3 family, handled by its hook).
+    const rope_params: ?std.json.ObjectMap = blk: {
+        const rp = getObj(obj, "rope_parameters") orelse break :blk null;
+        break :blk if (getObj(rp, "full_attention") != null or getObj(rp, "sliding_attention") != null) null else rp;
+    };
+    const rs_obj: ?std.json.ObjectMap = getObj(obj, "rope_scaling") orelse rope_params;
+    var rope_theta = getF32Any(obj, &.{ "rope_theta", "rotary_emb_base", "rope_base" }, 10000.0);
+    if (getNum(obj, "rope_theta") == null) if (rope_params) |rp| {
+        rope_theta = getF32(rp, "rope_theta", rope_theta);
+    };
     var rotary_dim = head_dim;
     if (getNum(obj, "partial_rotary_factor")) |f| rotary_dim = @intFromFloat(@as(f64, @floatFromInt(head_dim)) * f);
     if (getNum(obj, "rotary_pct")) |f| rotary_dim = @intFromFloat(@as(f64, @floatFromInt(head_dim)) * f);
+    if (getNum(obj, "partial_rotary_factor") == null and mla == null) if (rope_params) |rp| {
+        if (getNum(rp, "partial_rotary_factor")) |f| rotary_dim = @intFromFloat(@as(f64, @floatFromInt(head_dim)) * f);
+    };
     if (mla) |m| rotary_dim = m.qk_rope_head_dim;
     rotary_dim -= rotary_dim % 2;
 
+    const rope_scaling: RopeScaling = if (rs_obj) |rs| try parseRopeScaling(arena, rs, obj, rotary_dim, max_pos) else .none;
+
+    const sliding_window: ?usize = blk: {
+        const v = obj.get("sliding_window") orelse break :blk null;
+        break :blk switch (v) {
+            .integer => |i| if (i > 0) @as(?usize, @intCast(i)) else null,
+            else => null,
+        };
+    };
+    const sliding_layers = try arena.alloc(bool, layers);
+    @memset(sliding_layers, false);
+    const linear_layers = try arena.alloc(bool, layers);
+    @memset(linear_layers, false);
+    const conv_layers = try arena.alloc(bool, layers);
+    @memset(conv_layers, false);
+    var has_linear = false;
+    var has_conv = false;
+    if (obj.get("layer_types")) |lt| {
+        if (lt == .array) {
+            for (lt.array.items, 0..) |v, i| {
+                if (i < layers and v == .string) {
+                    const t = v.string;
+                    if (std.mem.eql(u8, t, "sliding_attention") or std.mem.eql(u8, t, "chunked_attention")) {
+                        sliding_layers[i] = true;
+                    } else if (std.mem.eql(u8, t, "linear_attention")) {
+                        linear_layers[i] = true;
+                        has_linear = true;
+                    } else if (std.mem.eql(u8, t, "conv")) {
+                        conv_layers[i] = true;
+                        has_conv = true;
+                    } else if (std.mem.eql(u8, t, "full_attention")) {} else if (std.mem.eql(u8, t, "deepseek_sparse_attention")) {
+                        // Zhipu's sparse indexer selects a top-k over the keys; for
+                        // the short calibration contexts ditch scores, the top-k
+                        // covers the whole context, so dense attention is exact.
+                        std.log.warn("deepseek_sparse_attention runs as dense attention (exact for short contexts)", .{});
+                    } else {
+                        std.log.err("unsupported layer type '{s}' (only full/sliding/linear attention and conv layers are implemented)", .{t});
+                        return error.UnsupportedArchitecture;
+                    }
+                }
+            }
+        }
+    } else if (getNum(obj, "full_attention_interval")) |_| {
+        // Qwen3-Next style hybrid: every Nth layer is full attention, the rest linear.
+        const interval = getInt(obj, "full_attention_interval", 4);
+        if (interval > 0) for (linear_layers, 0..) |*l, i| {
+            l.* = ((i + 1) % interval != 0);
+            has_linear = has_linear or l.*;
+        };
+    } else if (sliding_window != null and getNum(obj, "sliding_window_pattern") == null) {
+        @memset(sliding_layers, true);
+    }
+    if (getNum(obj, "sliding_window_pattern")) |_| {
+        const pattern = getInt(obj, "sliding_window_pattern", 6);
+        if (pattern > 0) for (sliding_layers, 0..) |*s, i| {
+            s.* = ((i + 1) % pattern != 0);
+        };
+    }
+
+    // Mixture of experts: `num_experts` (Qwen), `num_local_experts` (Mixtral,
+    // Llama 4, gpt-oss) or `n_routed_experts` (DeepSeek).
+    const num_experts = getIntAny(obj, &.{ "num_experts", "num_local_experts", "n_routed_experts" }, 0);
+    const moe_layers = try arena.alloc(bool, layers);
+    @memset(moe_layers, false);
+    if (num_experts > 0) {
+        const sparse_step = @max(getIntAny(obj, &.{ "decoder_sparse_step", "interleave_moe_layer_step", "moe_layer_freq" }, 1), 1);
+        const first_dense = getInt(obj, "first_k_dense_replace", 0);
+        for (moe_layers, 0..) |*m, i| m.* = (i >= first_dense) and ((i + 1) % sparse_step == 0);
+        if (getNum(obj, "moe_layer_freq") != null) {
+            for (moe_layers, 0..) |*m, i| m.* = (i >= first_dense) and (i % sparse_step == 0);
+        }
+        if (obj.get("mlp_only_layers")) |ml| {
+            if (ml == .array) for (ml.array.items) |v| {
+                if (v == .integer and v.integer >= 0 and v.integer < layers) moe_layers[@intCast(v.integer)] = false;
+            };
+        }
+        if (obj.get("moe_layers")) |ml| {
+            if (ml == .array) {
+                @memset(moe_layers, false);
+                for (ml.array.items) |v| {
+                    if (v == .integer and v.integer >= 0 and v.integer < layers) moe_layers[@intCast(v.integer)] = true;
+                }
+            }
+        }
+    }
+    // `intermediate_size` may be a per-layer list (Gemma 3n); the weights carry
+    // the exact sizes and the largest one sizes the workspace.
+    var intermediate_size = getIntAny(obj, &.{ "intermediate_size", "n_inner", "ffn_dim", "ffn_hidden_size" }, 0);
+    var intermediate_varies = false;
+    if (obj.get("intermediate_size")) |isz| {
+        if (isz == .array) for (isz.array.items) |v| {
+            if (v == .integer and v.integer > 0) {
+                const n: usize = @intCast(v.integer);
+                if (intermediate_size != 0 and n != intermediate_size) intermediate_varies = true;
+                intermediate_size = @max(intermediate_size, n);
+            }
+        };
+    }
+
+    const linear_k_heads = getInt(obj, "linear_num_key_heads", 0);
+    const linear_k_dim = getInt(obj, "linear_key_head_dim", 0);
+    const linear_v_heads = getInt(obj, "linear_num_value_heads", 0);
+    const linear_v_dim = getInt(obj, "linear_value_head_dim", 0);
+    const linear_conv_kernel = getInt(obj, "linear_conv_kernel_dim", 0);
+    if (has_linear and (linear_k_heads == 0 or linear_k_dim == 0 or linear_v_heads == 0 or linear_v_dim == 0 or linear_conv_kernel == 0)) {
+        std.log.err("linear_attention layers need linear_num_key_heads/key_head_dim/num_value_heads/value_head_dim/conv_kernel_dim", .{});
+        return error.InvalidConfig;
+    }
+    const gate_swish = blk: {
+        const t = getStr(obj, "output_gate_type") orelse break :blk false;
+        if (std.mem.eql(u8, t, "swish") or std.mem.eql(u8, t, "silu")) break :blk true;
+        if (std.mem.eql(u8, t, "sigmoid")) break :blk false;
+        std.log.err("unsupported output_gate_type '{s}'", .{t});
+        return error.UnsupportedArchitecture;
+    };
+
+    const rope_layers = try arena.alloc(bool, layers);
+    @memset(rope_layers, arch.positional == .rope);
+    const layer_head_dim = try arena.alloc(usize, layers);
+    @memset(layer_head_dim, head_dim);
+    const layer_kv_heads = try arena.alloc(usize, layers);
+    @memset(layer_kv_heads, kv_heads);
+    const layer_attn_scale = try arena.alloc(f32, layers);
+    const kv_source = try arena.alloc(usize, layers);
+    for (kv_source, 0..) |*s, i| s.* = i;
+    const activation_sparsity = try arena.alloc(f32, layers);
+    @memset(activation_sparsity, 0);
+
+    var c = Config{
+        .arch = arch,
+        .model_type = try arena.dupe(u8, model_type),
+        .hidden_size = hidden,
+        .intermediate_size = if (intermediate_size > 0) intermediate_size else 4 * hidden,
+        .num_layers = layers,
+        .num_heads = heads,
+        .num_kv_heads = kv_heads,
+        .head_dim = head_dim,
+        .v_head_dim = v_head_dim,
+        .vocab_size = getIntAny(obj, &.{ "vocab_size", "padded_vocab_size" }, 0),
+        .rms_norm_eps = getF32Any(obj, &.{ "rms_norm_eps", "layer_norm_eps", "layer_norm_epsilon", "layernorm_epsilon", "norm_eps", "norm_epsilon" }, if (arch.norm == .rms or arch.norm == .rms_gemma) 1e-6 else 1e-5),
+        .rope_theta = rope_theta,
+        .rope_scaling = rope_scaling,
+        .rotary_dim = rotary_dim,
+        .rope_freq_dim = rotary_dim,
+        .rope_local = null,
+        .rope_style = arch.rope_style,
+        .rope_layers = rope_layers,
+        .layer_head_dim = layer_head_dim,
+        .layer_kv_heads = layer_kv_heads,
+        .layer_attn_scale = layer_attn_scale,
+        .kv_source = kv_source,
+        .v_norm = false,
+        .k_eq_v = false,
+        .ple_dim = 0,
+        .ple_vocab = 0,
+        .altup_inputs = 0,
+        .altup_active = 0,
+        .altup_correct_scale = true,
+        .laurel_rank = 0,
+        .activation_sparsity = activation_sparsity,
+        .intermediate_varies = intermediate_varies,
+        .conv_layers = conv_layers,
+        .has_conv = has_conv,
+        .conv_kernel = getInt(obj, "conv_L_cache", 0),
+        .positional = arch.positional,
+        .linear_layers = linear_layers,
+        .has_linear = has_linear,
+        .linear_k_heads = linear_k_heads,
+        .linear_k_dim = linear_k_dim,
+        .linear_v_heads = linear_v_heads,
+        .linear_v_dim = linear_v_dim,
+        .linear_conv_kernel = linear_conv_kernel,
+        .gated_attention = false,
+        .gate_swish = gate_swish,
+        .position_offset = 0,
+        .tie_word_embeddings = getBool(obj, "tie_word_embeddings", arch.tie_word_embeddings),
+        .activation = act,
+        .max_position_embeddings = max_pos,
+        .sliding_window = sliding_window,
+        .sliding_layers = sliding_layers,
+        .attention_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))),
+        .attn_logit_softcapping = if (getNum(obj, "attn_logit_softcapping")) |v| @as(f32, @floatCast(v)) else null,
+        .final_logit_softcapping = if (getNum(obj, "final_logit_softcapping")) |v| @as(f32, @floatCast(v)) else null,
+        .attention_bias = getBool(obj, "attention_bias", arch.attention_bias),
+        .embed_scale = if (arch.embed_scale_sqrt) @sqrt(@as(f32, @floatFromInt(hidden))) else 1.0,
+        .norm = arch.norm,
+        .parallel_residual = arch.parallel_residual,
+        .qkv_layout = arch.qkv,
+        .mlp = arch.mlp,
+        .qk_norm = arch.qk_norm,
+        .qk_norm_rope_only = false,
+        .clip_qkv = null,
+        .residual_multiplier = 1.0,
+        .logit_scale = 1.0,
+        .attn_temperature = null,
+        .sinks = false,
+        .mla = mla,
+        .num_experts = num_experts,
+        .num_experts_per_tok = getInt(obj, "num_experts_per_tok", 2),
+        .norm_topk_prob = getBool(obj, "norm_topk_prob", false),
+        .moe_intermediate_size = getInt(obj, "moe_intermediate_size", if (intermediate_size > 0) intermediate_size else 4 * hidden),
+        .moe_layers = moe_layers,
+        .moe = .{},
+    };
+    if (getNum(obj, "query_pre_attn_scalar")) |q| c.attention_scale = @floatCast(1.0 / @sqrt(q));
+    if (getNum(attn_cfg, "clip_qkv")) |v| c.clip_qkv = @floatCast(v);
+    if (obj.get("clip_qkv")) |v| {
+        if (v == .float or v == .integer) c.clip_qkv = @floatCast(getNum(obj, "clip_qkv").?);
+    }
+    if (mla) |m| {
+        c.attention_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(m.qk_nope_head_dim + m.qk_rope_head_dim)));
+        if (rope_scaling == .yarn) {
+            // DeepSeek scales the softmax by mscale² (mscale_all_dim).
+            if (rs_obj) |rs| {
+                const all_dim = getF32(rs, "mscale_all_dim", 0);
+                if (all_dim != 0) {
+                    const ms = yarnMscale(rope_scaling.yarn.factor, all_dim);
+                    c.attention_scale *= ms * ms;
+                }
+            }
+        }
+    }
+    if (getBool(obj, "use_parallel_residual", false) or getBool(obj, "parallel_attn", false)) c.parallel_residual = true;
+    if (obj.get("use_parallel_residual")) |v| {
+        if (v == .bool) c.parallel_residual = v.bool;
+    }
+    if (obj.get("parallel_attn")) |v| {
+        if (v == .bool) c.parallel_residual = v.bool;
+    }
+    if (getBool(attn_cfg, "alibi", false)) c.positional = .alibi;
+    if (arch.extra) |f| try f(&c, arena, obj);
+    @memset(c.layer_attn_scale, c.attention_scale);
+    if (c.positional != .rope) @memset(c.rope_layers, false);
+    if (getNum(obj, "sliding_window_pattern") == null and c.arch.norm == .rms_gemma and obj.get("layer_types") == null and c.sliding_window != null) {
+        // Gemma 2: even layers are local.
+        for (c.sliding_layers, 0..) |*s, i| s.* = (i % 2 == 0);
+    }
+    if (c.has_conv and c.conv_kernel < 2) {
+        std.log.err("conv layers need conv_L_cache >= 2", .{});
+        return error.InvalidConfig;
+    }
+    return c;
+}
+
+/// Parses a `rope_scaling` / `rope_parameters` object. `rotary_dim` and
+/// `max_pos` are the model's (LongRoPE derives its factor from them).
+fn parseRopeScaling(arena: Allocator, rs: std.json.ObjectMap, obj: std.json.ObjectMap, rotary_dim: usize, max_pos: usize) !RopeScaling {
     var rope_scaling: RopeScaling = .none;
-    if (getObj(obj, "rope_scaling")) |rs| {
+    {
         const t = getStr(rs, "rope_type") orelse getStr(rs, "type") orelse "";
         if (std.mem.eql(u8, t, "llama3")) {
             rope_scaling = .{ .llama3 = .{
@@ -598,203 +952,92 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
             }
         } else if (std.mem.eql(u8, t, "dynamic")) {
             std.log.warn("dynamic NTK rope scaling is treated as unscaled RoPE (exact below the original context length)", .{});
+        } else if (std.mem.eql(u8, t, "proportional")) {
+            // Gemma 4: a proportion of the head rotates with frequencies derived
+            // from the full head (the family hook sets the dims); `factor`
+            // divides the frequencies like linear scaling.
+            const factor = getF32(rs, "factor", 1);
+            if (factor != 1) rope_scaling = .{ .linear = factor };
         } else if (std.mem.eql(u8, t, "mrope") or std.mem.eql(u8, t, "default") or t.len == 0) {
             // mrope over text-only positions equals plain RoPE.
         } else {
             std.log.warn("rope scaling type '{s}' is not supported; using unscaled RoPE", .{t});
         }
     }
+    return rope_scaling;
+}
 
-    const sliding_window: ?usize = blk: {
-        const v = obj.get("sliding_window") orelse break :blk null;
-        break :blk switch (v) {
-            .integer => |i| if (i > 0) @as(?usize, @intCast(i)) else null,
-            else => null,
-        };
-    };
-    const sliding_layers = try arena.alloc(bool, layers);
-    @memset(sliding_layers, false);
-    const linear_layers = try arena.alloc(bool, layers);
-    @memset(linear_layers, false);
-    var has_linear = false;
-    if (obj.get("layer_types")) |lt| {
-        if (lt == .array) {
-            for (lt.array.items, 0..) |v, i| {
-                if (i < layers and v == .string) {
-                    const t = v.string;
-                    if (std.mem.eql(u8, t, "sliding_attention") or std.mem.eql(u8, t, "chunked_attention")) {
-                        sliding_layers[i] = true;
-                    } else if (std.mem.eql(u8, t, "linear_attention")) {
-                        linear_layers[i] = true;
-                        has_linear = true;
-                    } else if (std.mem.eql(u8, t, "full_attention")) {} else if (std.mem.eql(u8, t, "deepseek_sparse_attention")) {
-                        // Zhipu's sparse indexer selects a top-k over the keys; for
-                        // the short calibration contexts ditch scores, the top-k
-                        // covers the whole context, so dense attention is exact.
-                        std.log.warn("deepseek_sparse_attention runs as dense attention (exact for short contexts)", .{});
-                    } else {
-                        std.log.err("unsupported layer type '{s}' (only full/sliding/linear attention are implemented)", .{t});
-                        return error.UnsupportedArchitecture;
-                    }
+fn evenDim(x: f64) usize {
+    var d: usize = @intFromFloat(x);
+    d -= d % 2;
+    return d;
+}
+
+/// Rotary tables of the Gemma 3 family: the global layers' base and scaling
+/// (`rope_theta` / `rope_scaling`, or `rope_parameters.full_attention`) and the
+/// sliding layers' own base (`rope_local_base_freq` or
+/// `rope_parameters.sliding_attention`). `hd_local` / `hd_global` are the head
+/// sizes of the two layer kinds.
+fn gemmaRope(c: *Config, arena: Allocator, obj: std.json.ObjectMap, hd_local: usize, hd_global: usize) !void {
+    var local_theta = getF32(obj, "rope_local_base_freq", 10000.0);
+    var local_dim = hd_local;
+    var global_dim = hd_global;
+    var freq_dim = hd_global;
+    if (getNum(obj, "partial_rotary_factor")) |f| {
+        local_dim = evenDim(@as(f64, @floatFromInt(hd_local)) * f);
+        global_dim = evenDim(@as(f64, @floatFromInt(hd_global)) * f);
+        freq_dim = global_dim;
+    }
+    if (getObj(obj, "rope_parameters")) |rp| {
+        if (getObj(rp, "full_attention")) |full| {
+            c.rope_theta = getF32(full, "rope_theta", c.rope_theta);
+            c.rope_scaling = try parseRopeScaling(arena, full, obj, global_dim, c.max_position_embeddings);
+            const t = getStr(full, "rope_type") orelse "default";
+            if (getNum(full, "partial_rotary_factor")) |f| {
+                if (std.mem.eql(u8, t, "proportional")) {
+                    // `int(f * head_dim // 2)` angles; the frequencies follow the full head.
+                    global_dim = 2 * @as(usize, @intFromFloat(@floor(@as(f64, @floatFromInt(hd_global)) * f / 2.0)));
+                    freq_dim = hd_global;
+                } else {
+                    global_dim = evenDim(@as(f64, @floatFromInt(hd_global)) * f);
+                    freq_dim = global_dim;
                 }
+            } else if (std.mem.eql(u8, t, "proportional")) {
+                freq_dim = hd_global;
             }
         }
-    } else if (getNum(obj, "full_attention_interval")) |_| {
-        // Qwen3-Next style hybrid: every Nth layer is full attention, the rest linear.
-        const interval = getInt(obj, "full_attention_interval", 4);
-        if (interval > 0) for (linear_layers, 0..) |*l, i| {
-            l.* = ((i + 1) % interval != 0);
-            has_linear = has_linear or l.*;
-        };
-    } else if (sliding_window != null and getNum(obj, "sliding_window_pattern") == null) {
-        @memset(sliding_layers, true);
+        if (getObj(rp, "sliding_attention")) |sl| {
+            local_theta = getF32(sl, "rope_theta", local_theta);
+            if (getNum(sl, "partial_rotary_factor")) |f| local_dim = evenDim(@as(f64, @floatFromInt(hd_local)) * f);
+        }
     }
-    if (getNum(obj, "sliding_window_pattern")) |_| {
-        const pattern = getInt(obj, "sliding_window_pattern", 6);
-        if (pattern > 0) for (sliding_layers, 0..) |*s, i| {
-            s.* = ((i + 1) % pattern != 0);
-        };
-    }
+    c.rotary_dim = global_dim;
+    c.rope_freq_dim = freq_dim;
+    c.rope_local = .{ .theta = local_theta, .rotary_dim = local_dim, .freq_dim = local_dim };
+}
 
-    // Mixture of experts: `num_experts` (Qwen), `num_local_experts` (Mixtral,
-    // Llama 4, gpt-oss) or `n_routed_experts` (DeepSeek).
-    const num_experts = getIntAny(obj, &.{ "num_experts", "num_local_experts", "n_routed_experts" }, 0);
-    const moe_layers = try arena.alloc(bool, layers);
-    @memset(moe_layers, false);
-    if (num_experts > 0) {
-        const sparse_step = @max(getIntAny(obj, &.{ "decoder_sparse_step", "interleave_moe_layer_step", "moe_layer_freq" }, 1), 1);
-        const first_dense = getInt(obj, "first_k_dense_replace", 0);
-        for (moe_layers, 0..) |*m, i| m.* = (i >= first_dense) and ((i + 1) % sparse_step == 0);
-        if (getNum(obj, "moe_layer_freq") != null) {
-            for (moe_layers, 0..) |*m, i| m.* = (i >= first_dense) and (i % sparse_step == 0);
-        }
-        if (obj.get("mlp_only_layers")) |ml| {
-            if (ml == .array) for (ml.array.items) |v| {
-                if (v == .integer and v.integer >= 0 and v.integer < layers) moe_layers[@intCast(v.integer)] = false;
-            };
-        }
-        if (obj.get("moe_layers")) |ml| {
-            if (ml == .array) {
-                @memset(moe_layers, false);
-                for (ml.array.items) |v| {
-                    if (v == .integer and v.integer >= 0 and v.integer < layers) moe_layers[@intCast(v.integer)] = true;
-                }
+/// The last `num_kv_shared_layers` layers read the keys and values of the last
+/// non-shared layer of their kind (sliding or global) instead of computing their own.
+fn kvSharing(c: *Config, obj: std.json.ObjectMap) !void {
+    const n = getInt(obj, "num_kv_shared_layers", 0);
+    if (n == 0 or n >= c.num_layers) return;
+    const first = c.num_layers - n;
+    for (first..c.num_layers) |i| {
+        var j = first;
+        var found = false;
+        while (j > 0) {
+            j -= 1;
+            if (c.sliding_layers[j] == c.sliding_layers[i]) {
+                c.kv_source[i] = j;
+                found = true;
+                break;
             }
         }
-    }
-    const intermediate_size = getIntAny(obj, &.{ "intermediate_size", "n_inner", "ffn_dim", "ffn_hidden_size" }, 0);
-
-    const linear_k_heads = getInt(obj, "linear_num_key_heads", 0);
-    const linear_k_dim = getInt(obj, "linear_key_head_dim", 0);
-    const linear_v_heads = getInt(obj, "linear_num_value_heads", 0);
-    const linear_v_dim = getInt(obj, "linear_value_head_dim", 0);
-    const linear_conv_kernel = getInt(obj, "linear_conv_kernel_dim", 0);
-    if (has_linear and (linear_k_heads == 0 or linear_k_dim == 0 or linear_v_heads == 0 or linear_v_dim == 0 or linear_conv_kernel == 0)) {
-        std.log.err("linear_attention layers need linear_num_key_heads/key_head_dim/num_value_heads/value_head_dim/conv_kernel_dim", .{});
-        return error.InvalidConfig;
-    }
-    const gate_swish = blk: {
-        const t = getStr(obj, "output_gate_type") orelse break :blk false;
-        if (std.mem.eql(u8, t, "swish") or std.mem.eql(u8, t, "silu")) break :blk true;
-        if (std.mem.eql(u8, t, "sigmoid")) break :blk false;
-        std.log.err("unsupported output_gate_type '{s}'", .{t});
-        return error.UnsupportedArchitecture;
-    };
-
-    const rope_layers = try arena.alloc(bool, layers);
-    @memset(rope_layers, arch.positional == .rope);
-
-    var c = Config{
-        .arch = arch,
-        .model_type = try arena.dupe(u8, model_type),
-        .hidden_size = hidden,
-        .intermediate_size = if (intermediate_size > 0) intermediate_size else 4 * hidden,
-        .num_layers = layers,
-        .num_heads = heads,
-        .num_kv_heads = kv_heads,
-        .head_dim = head_dim,
-        .v_head_dim = v_head_dim,
-        .vocab_size = getIntAny(obj, &.{ "vocab_size", "padded_vocab_size" }, 0),
-        .rms_norm_eps = getF32Any(obj, &.{ "rms_norm_eps", "layer_norm_eps", "layer_norm_epsilon", "layernorm_epsilon", "norm_eps", "norm_epsilon" }, if (arch.norm == .rms or arch.norm == .rms_gemma) 1e-6 else 1e-5),
-        .rope_theta = rope_theta,
-        .rope_local_theta = getF32(obj, "rope_local_base_freq", 10000.0),
-        .rope_scaling = rope_scaling,
-        .rotary_dim = rotary_dim,
-        .rope_style = arch.rope_style,
-        .rope_layers = rope_layers,
-        .positional = arch.positional,
-        .linear_layers = linear_layers,
-        .has_linear = has_linear,
-        .linear_k_heads = linear_k_heads,
-        .linear_k_dim = linear_k_dim,
-        .linear_v_heads = linear_v_heads,
-        .linear_v_dim = linear_v_dim,
-        .linear_conv_kernel = linear_conv_kernel,
-        .gated_attention = false,
-        .gate_swish = gate_swish,
-        .position_offset = 0,
-        .tie_word_embeddings = getBool(obj, "tie_word_embeddings", arch.tie_word_embeddings),
-        .activation = act,
-        .max_position_embeddings = max_pos,
-        .sliding_window = sliding_window,
-        .sliding_layers = sliding_layers,
-        .attention_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))),
-        .attn_logit_softcapping = if (getNum(obj, "attn_logit_softcapping")) |v| @as(f32, @floatCast(v)) else null,
-        .final_logit_softcapping = if (getNum(obj, "final_logit_softcapping")) |v| @as(f32, @floatCast(v)) else null,
-        .attention_bias = getBool(obj, "attention_bias", arch.attention_bias),
-        .embed_scale = if (arch.embed_scale_sqrt) @sqrt(@as(f32, @floatFromInt(hidden))) else 1.0,
-        .norm = arch.norm,
-        .parallel_residual = arch.parallel_residual,
-        .qkv_layout = arch.qkv,
-        .mlp = arch.mlp,
-        .qk_norm = arch.qk_norm,
-        .qk_norm_rope_only = false,
-        .clip_qkv = null,
-        .residual_multiplier = 1.0,
-        .logit_scale = 1.0,
-        .attn_temperature = null,
-        .sinks = false,
-        .mla = mla,
-        .num_experts = num_experts,
-        .num_experts_per_tok = getInt(obj, "num_experts_per_tok", 2),
-        .norm_topk_prob = getBool(obj, "norm_topk_prob", false),
-        .moe_intermediate_size = getInt(obj, "moe_intermediate_size", if (intermediate_size > 0) intermediate_size else 4 * hidden),
-        .moe_layers = moe_layers,
-        .moe = .{},
-    };
-    if (getNum(obj, "query_pre_attn_scalar")) |q| c.attention_scale = @floatCast(1.0 / @sqrt(q));
-    if (getNum(attn_cfg, "clip_qkv")) |v| c.clip_qkv = @floatCast(v);
-    if (obj.get("clip_qkv")) |v| {
-        if (v == .float or v == .integer) c.clip_qkv = @floatCast(getNum(obj, "clip_qkv").?);
-    }
-    if (mla) |m| {
-        c.attention_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(m.qk_nope_head_dim + m.qk_rope_head_dim)));
-        if (rope_scaling == .yarn) {
-            // DeepSeek scales the softmax by mscale² (mscale_all_dim).
-            if (getObj(obj, "rope_scaling")) |rs| {
-                const all_dim = getF32(rs, "mscale_all_dim", 0);
-                if (all_dim != 0) {
-                    const ms = yarnMscale(rope_scaling.yarn.factor, all_dim);
-                    c.attention_scale *= ms * ms;
-                }
-            }
+        if (!found) {
+            std.log.err("layer {d} shares keys/values but no earlier layer of its kind exists", .{i});
+            return error.InvalidConfig;
         }
     }
-    if (getBool(obj, "use_parallel_residual", false) or getBool(obj, "parallel_attn", false)) c.parallel_residual = true;
-    if (obj.get("use_parallel_residual")) |v| {
-        if (v == .bool) c.parallel_residual = v.bool;
-    }
-    if (obj.get("parallel_attn")) |v| {
-        if (v == .bool) c.parallel_residual = v.bool;
-    }
-    if (getBool(attn_cfg, "alibi", false)) c.positional = .alibi;
-    if (arch.extra) |f| try f(&c, arena, obj);
-    if (c.positional != .rope) @memset(c.rope_layers, false);
-    if (getNum(obj, "sliding_window_pattern") == null and c.arch.norm == .rms_gemma and obj.get("layer_types") == null and c.sliding_window != null) {
-        // Gemma 2: even layers are local.
-        for (c.sliding_layers, 0..) |*s, i| s.* = (i % 2 == 0);
-    }
-    return c;
 }
 
 fn yarnMscale(scale: f32, mscale: f32) f32 {
@@ -806,12 +1049,161 @@ fn yarnMscale(scale: f32, mscale: f32) f32 {
 // Family-specific config hooks
 // ---------------------------------------------------------------------------
 
-fn extraGemma(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
+fn extraGemma(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
     if (getStr(obj, "hidden_activation") == null and getStr(obj, "hidden_act") == null) c.activation = .gelu_tanh;
     if (getNum(obj, "sliding_window_pattern") == null and obj.get("layer_types") == null and c.sliding_window != null) {
         // Gemma 3 defaults to a pattern of 6 (5 local, 1 global); Gemma 2 alternates.
         if (std.mem.startsWith(u8, c.model_type, "gemma3")) {
             for (c.sliding_layers, 0..) |*s, i| s.* = ((i + 1) % 6 != 0);
+        }
+    }
+    if (std.mem.startsWith(u8, c.model_type, "gemma3")) try gemmaRope(c, arena, obj, c.head_dim, c.head_dim);
+}
+
+fn perLayerEmbeddings(c: *Config, obj: std.json.ObjectMap, default_dim: usize) void {
+    c.ple_dim = getInt(obj, "hidden_size_per_layer_input", default_dim);
+    c.ple_vocab = getInt(obj, "vocab_size_per_layer_input", c.vocab_size);
+    if (c.ple_vocab == 0) c.ple_vocab = c.vocab_size;
+}
+
+fn extraGemma3n(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
+    if (getStr(obj, "hidden_activation") == null and getStr(obj, "hidden_act") == null) c.activation = .gelu_tanh;
+    if (obj.get("layer_types") == null) {
+        // Every fifth layer is global.
+        for (c.sliding_layers, 0..) |*s, i| s.* = ((i + 1) % 5 != 0);
+    }
+    if (c.sliding_window == null) c.sliding_window = 512;
+    c.attention_scale = 1.0;
+    c.v_norm = true;
+    try gemmaRope(c, arena, obj, c.head_dim, c.head_dim);
+    try kvSharing(c, obj);
+    perLayerEmbeddings(c, obj, 256);
+    c.altup_inputs = getInt(obj, "altup_num_inputs", 4);
+    c.altup_active = getInt(obj, "altup_active_idx", 0);
+    c.altup_correct_scale = getBool(obj, "altup_correct_scale", true);
+    c.laurel_rank = getInt(obj, "laurel_rank", 64);
+    if (c.altup_inputs < 1 or c.altup_active >= c.altup_inputs or c.ple_dim == 0 or c.laurel_rank == 0) return error.InvalidConfig;
+    // Activation sparsity: one value per layer, one for all, or the default
+    // (the first 10 layers at 0.95 on models deeper than 10 layers).
+    if (obj.get("activation_sparsity_pattern")) |asp| {
+        switch (asp) {
+            .array => |a| for (a.items, 0..) |v, i| {
+                if (i < c.num_layers) c.activation_sparsity[i] = switch (v) {
+                    .float => |f| @floatCast(f),
+                    .integer => |n| @floatFromInt(n),
+                    else => 0,
+                };
+            },
+            .float => |f| @memset(c.activation_sparsity, @floatCast(f)),
+            .integer => |n| @memset(c.activation_sparsity, @floatFromInt(n)),
+            else => {},
+        }
+    } else if (c.num_layers > 10) {
+        for (c.activation_sparsity[0..10]) |*s| s.* = 0.95;
+    }
+    for (c.activation_sparsity) |s| if (s < 0 or s >= 1) return error.InvalidConfig;
+}
+
+fn extraGemma4(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
+    if (getStr(obj, "hidden_activation") == null and getStr(obj, "hidden_act") == null) c.activation = .gelu_tanh;
+    if (getStr(obj, "use_bidirectional_attention")) |m| {
+        if (std.mem.eql(u8, m, "all")) {
+            std.log.err("unsupported model: Gemma 4 with bidirectional attention on every token", .{});
+            return error.UnsupportedArchitecture;
+        }
+    }
+    if (getBool(obj, "enable_moe_block", false)) {
+        std.log.err("unsupported model: Gemma 4 MoE block (a routed expert block in parallel with the dense MLP, as in gemma-4-26B-A4B) is not implemented", .{});
+        return error.UnsupportedArchitecture;
+    }
+    if (obj.get("layer_types") == null) {
+        // 5 local, 1 global; the last layer is always global.
+        for (c.sliding_layers, 0..) |*s, i| s.* = ((i + 1) % 6 != 0);
+    }
+    if (c.num_layers > 0) c.sliding_layers[c.num_layers - 1] = false;
+    if (c.sliding_window == null) c.sliding_window = 512;
+    c.attention_scale = 1.0;
+    c.v_norm = true;
+    c.k_eq_v = getBool(obj, "attention_k_eq_v", false);
+    // Global layers use their own head size and KV heads: `global_head_dim`
+    // (512 unless given) and `num_global_key_value_heads`, or an explicit
+    // `per_layer_config` table indexed by layer.
+    var global_hd = getInt(obj, "global_head_dim", 512);
+    var global_kv = c.num_kv_heads;
+    if (getNum(obj, "num_global_key_value_heads") != null and c.k_eq_v) global_kv = getInt(obj, "num_global_key_value_heads", global_kv);
+    if (getObj(obj, "per_layer_config")) |plc| {
+        var it = plc.iterator();
+        var found = false;
+        while (it.next()) |kv| {
+            const idx = std.fmt.parseInt(usize, kv.key_ptr.*, 10) catch continue;
+            if (idx >= c.num_layers or c.sliding_layers[idx] or kv.value_ptr.* != .object or found) continue;
+            const lc = kv.value_ptr.object;
+            global_hd = getInt(lc, "head_dim", global_hd);
+            global_kv = getInt(lc, "num_key_value_heads", global_kv);
+            found = true;
+        }
+    }
+    for (0..c.num_layers) |i| {
+        if (!c.sliding_layers[i]) {
+            c.layer_head_dim[i] = global_hd;
+            c.layer_kv_heads[i] = global_kv;
+        }
+    }
+    try gemmaRope(c, arena, obj, c.head_dim, global_hd);
+    try kvSharing(c, obj);
+    perLayerEmbeddings(c, obj, 256);
+    // KV-shared layers may carry a double-wide MLP; the weights say which.
+    if (getBool(obj, "use_double_wide_mlp", false) and getInt(obj, "num_kv_shared_layers", 0) > 0) c.intermediate_varies = true;
+}
+
+fn extraLfm2(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
+    if (obj.get("layer_types") == null) {
+        // `full_attn_idxs` lists the attention layers; every other layer is a conv layer.
+        if (obj.get("full_attn_idxs")) |fa| {
+            @memset(c.conv_layers, true);
+            if (fa == .array) for (fa.array.items) |v| {
+                if (v == .integer and v.integer >= 0 and v.integer < c.num_layers) c.conv_layers[@intCast(v.integer)] = false;
+            };
+        }
+        c.has_conv = false;
+        for (c.conv_layers) |l| c.has_conv = c.has_conv or l;
+    }
+    c.conv_kernel = getInt(obj, "conv_L_cache", 3);
+    if (getNum(obj, "rope_theta") == null and getObj(obj, "rope_parameters") == null) c.rope_theta = 1000000.0;
+    c.tie_word_embeddings = getBool(obj, "tie_word_embeddings", getBool(obj, "tie_embedding", true));
+    // Feed-forward width as Lfm2MLP derives it from `block_ff_dim`.
+    var ff = getInt(obj, "block_ff_dim", c.intermediate_size);
+    if (getBool(obj, "block_auto_adjust_ff_dim", true)) {
+        ff = @intFromFloat(2.0 * @as(f64, @floatFromInt(ff)) / 3.0);
+        const mult = getF32(obj, "block_ffn_dim_multiplier", 1.0);
+        ff = @intFromFloat(@as(f64, mult) * @as(f64, @floatFromInt(ff)));
+        const mo = getInt(obj, "block_multiple_of", 256);
+        if (mo > 0) ff = mo * ((ff + mo - 1) / mo);
+    }
+    c.intermediate_size = ff;
+}
+
+fn extraMistral4(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
+    c.rope_style = if (getBool(obj, "rope_interleave", true)) .gptj else .neox;
+    c.moe.scoring = .softmax;
+    c.moe.topk_method = .group_limited;
+    c.moe.group_top2 = true;
+    c.moe.n_group = @max(1, getInt(obj, "n_group", 1));
+    c.moe.topk_group = @max(1, getInt(obj, "topk_group", 1));
+    c.moe.routed_scaling_factor = getF32(obj, "routed_scaling_factor", 1.0);
+    c.norm_topk_prob = getBool(obj, "norm_topk_prob", true);
+    c.num_experts_per_tok = getInt(obj, "num_experts_per_tok", 4);
+    if (c.num_experts % c.moe.n_group != 0) return error.InvalidConfig;
+    // Queries are scaled by `1 + beta * log(1 + floor(pos / original_max_position_embeddings))`.
+    const rp = getObj(obj, "rope_parameters") orelse getObj(obj, "rope_scaling");
+    if (rp) |r| {
+        if (getNum(r, "llama_4_scaling_beta")) |beta| {
+            c.attn_temperature = .{
+                .floor_scale = getF32(r, "original_max_position_embeddings", 8192),
+                .attn_scale = @floatCast(beta),
+                .offset = 0,
+                .all_layers = true,
+            };
         }
     }
 }
@@ -871,13 +1263,17 @@ fn extraCohere(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
 }
 
 fn extraGlm4(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
-    if (getNum(obj, "partial_rotary_factor") == null) c.rotary_dim = c.head_dim / 2;
+    if (getNum(obj, "partial_rotary_factor") == null) {
+        c.rotary_dim = c.head_dim / 2;
+        c.rope_freq_dim = c.rotary_dim;
+    }
     c.attention_bias = getBool(obj, "attention_bias", true);
 }
 
 fn extraChatGlm(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
     // Rotary embeddings cover half of `kv_channels`, interleaved; theta is scaled by rope_ratio.
     c.rotary_dim = c.head_dim / 2;
+    c.rope_freq_dim = c.rotary_dim;
     c.rope_theta = 10000.0 * getF32(obj, "rope_ratio", 1.0);
     c.attention_bias = getBool(obj, "add_qkv_bias", true);
     if (!getBool(obj, "rmsnorm", true)) c.norm = .layer;
@@ -1146,6 +1542,118 @@ pub const registry = [_]Arch{
         },
         .notes = "fixture: (1+w) norms, pre/post norms, per-head (1+w) q/k norms, sqrt(H) embedding scale, sliding layers with a local rope base, query_pre_attn_scalar, linear rope scaling.",
         .extra = extraGemma,
+    },
+    .{
+        .model_type = "gemma3n",
+        .aliases = &.{"gemma3n_text"},
+        .llama_cpp = "gemma3n",
+        .chat = "gemma",
+        .verified = true,
+        .activation = .gelu_tanh,
+        .tie_word_embeddings = true,
+        .embed_scale_sqrt = true,
+        .qk_norm = .head,
+        .names = .{
+            .post_attn_norm = "post_attention_layernorm.weight",
+            .pre_ff_norm = "pre_feedforward_layernorm.weight",
+            .post_ff_norm = "post_feedforward_layernorm.weight",
+            .q_norm = "self_attn.q_norm.weight",
+            .k_norm = "self_attn.k_norm.weight",
+            .ple_embed = "{p}embed_tokens_per_layer.weight",
+            .ple_proj = "{p}per_layer_model_projection.weight",
+            .ple_proj_norm = "{p}per_layer_projection_norm.weight",
+            .ple_gate = "per_layer_input_gate.weight",
+            .ple_out = "per_layer_projection.weight",
+            .ple_norm = "post_per_layer_input_norm.weight",
+            .altup_proj = "{p}altup_projections.{e}.weight",
+            .altup_unembed = "{p}altup_unembed_projections.{e}.weight",
+            .altup_router = "altup.modality_router.weight",
+            .altup_router_norm = "altup.router_norm.weight",
+            .altup_predict = "altup.prediction_coefs.weight",
+            .altup_correct = "altup.correction_coefs.weight",
+            .altup_scale = "altup.correct_output_scale",
+            .laurel_l = "laurel.linear_left.weight",
+            .laurel_r = "laurel.linear_right.weight",
+            .laurel_norm = "laurel.post_laurel_norm.weight",
+        },
+        .notes = "fixture (text): AltUp residual streams (predict / correct, magnitude-matched embed and unembed projections), Laurel blocks, per-layer input embeddings, KV-shared layers, weightless value norm, unit attention scale, gaussian-top-k gate sparsity, sliding layers with a local rope base, final logit softcapping. The gemma3n image/audio wrapper runs its text config; the towers pass through exports untouched.",
+        .extra = extraGemma3n,
+    },
+    .{
+        .model_type = "gemma4",
+        .aliases = &.{"gemma4_text"},
+        .llama_cpp = "gemma4",
+        .chat = "gemma",
+        .verified = true,
+        .activation = .gelu_tanh,
+        .tie_word_embeddings = true,
+        .embed_scale_sqrt = true,
+        .qk_norm = .head,
+        .names = .{
+            .post_attn_norm = "post_attention_layernorm.weight",
+            .pre_ff_norm = "pre_feedforward_layernorm.weight",
+            .post_ff_norm = "post_feedforward_layernorm.weight",
+            .q_norm = "self_attn.q_norm.weight",
+            .k_norm = "self_attn.k_norm.weight",
+            .ple_embed = "{p}embed_tokens_per_layer.weight",
+            .ple_proj = "{p}per_layer_model_projection.weight",
+            .ple_proj_norm = "{p}per_layer_projection_norm.weight",
+            .ple_gate = "per_layer_input_gate.weight",
+            .ple_out = "per_layer_projection.weight",
+            .ple_norm = "post_per_layer_input_norm.weight",
+            .layer_scale = "layer_scalar",
+        },
+        .notes = "fixture (text): global layers with their own head size and KV heads (global_head_dim / per_layer_config), proportional rope on global layers and a local base on sliding ones, keys reused as values (attention_k_eq_v), KV-shared layers, weightless value norm, unit attention scale, per-layer input embeddings, layer_scalar, double-wide MLPs on shared layers. The gemma4 image/audio wrapper runs its text config; the towers pass through exports untouched. The MoE block of gemma-4-26B-A4B (enable_moe_block) is not implemented.",
+        .extra = extraGemma4,
+    },
+    .{
+        .model_type = "seed_oss",
+        .llama_cpp = "seed_oss",
+        .verified = true,
+        .attention_bias = true,
+        .notes = "fixture: llama layout with q/k/v biases and an unbiased o_proj (attention_out_bias), explicit head_dim. Seed-OSS 36B.",
+    },
+    .{
+        .model_type = "lfm2",
+        .llama_cpp = "lfm2",
+        .chat = "chatml",
+        .verified = true,
+        .qk_norm = .head,
+        .tie_word_embeddings = true,
+        .names = .{
+            .final_norm = "{p}embedding_norm.weight",
+            .input_norm = &.{"operator_norm.weight"},
+            .pre_ff_norm = "ffn_norm.weight",
+            .q_norm = "self_attn.q_layernorm.weight",
+            .k_norm = "self_attn.k_layernorm.weight",
+            .o = "self_attn.out_proj.weight",
+            .gate = "feed_forward.w1.weight",
+            .up = "feed_forward.w3.weight",
+            .down = "feed_forward.w2.weight",
+            .conv_in = "conv.in_proj.weight",
+            .conv_kernel = "conv.conv.weight",
+            .conv_out = "conv.out_proj.weight",
+        },
+        .notes = "fixture: gated short-convolution layers (in_proj B/C/x split, depthwise causal conv with conv_L_cache taps, out_proj) mixed with attention layers carrying per-head q/k norms, block_ff_dim sizing, embedding_norm as the final norm. LFM2 / LFM2.5 dense (lfm2_moe is unsupported).",
+        .extra = extraLfm2,
+    },
+    .{
+        .model_type = "mistral4",
+        .aliases = &.{"mistral4_text"},
+        .llama_cpp = "mistral4",
+        .chat = "mistral",
+        .verified = true,
+        .names = .{
+            .q_a = "self_attn.q_a_proj.weight",
+            .q_a_norm = "self_attn.q_a_layernorm.weight",
+            .q_b = "self_attn.q_b_proj.weight",
+            .kv_a = "self_attn.kv_a_proj_with_mqa.weight",
+            .kv_a_norm = "self_attn.kv_a_layernorm.weight",
+            .kv_b = "self_attn.kv_b_proj.weight",
+            .shared_expert = "mlp.shared_experts.",
+        },
+        .notes = "fixture (text): MLA with interleaved rotary, yarn (mscale_all_dim) from rope_parameters, llama_4_scaling_beta query scaling on every layer, softmax group-limited top-k (two best experts per group) with renormalisation, fused [E][2I][H] experts, shared experts, first_k_dense_replace. Mistral Small 4 text config.",
+        .extra = extraMistral4,
     },
     .{
         .model_type = "qwen2_moe",
@@ -1800,6 +2308,9 @@ test "registry lookup and aliases" {
     try std.testing.expect(lookup("llama") != null);
     try std.testing.expectEqualStrings("gemma3", lookup("gemma3_text").?.model_type);
     try std.testing.expectEqualStrings("qwen2", lookup("qwen2_5_vl").?.model_type);
+    try std.testing.expectEqualStrings("gemma4", lookup("gemma4_text").?.model_type);
+    try std.testing.expectEqualStrings("gemma3n", lookup("gemma3n_text").?.model_type);
+    try std.testing.expectEqualStrings("mistral4", lookup("mistral4_text").?.model_type);
     try std.testing.expect(lookup("mamba") == null);
     // Every entry has a unique model_type.
     for (registry, 0..) |a, i| {
@@ -1838,4 +2349,62 @@ test "parseConfig picks family knobs" {
     try std.testing.expect(ds.rope_scaling == .yarn);
     const ms = 0.1 * @log(@as(f32, 40)) + 1.0;
     try std.testing.expectApproxEqRel(ms * ms / @sqrt(@as(f32, 12)), ds.attention_scale, 1e-5);
+}
+
+test "parseConfig picks the Gemma 4, Gemma 3n, LFM2 and Mistral 4 knobs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const g4 = try parseConfig(a,
+        \\{"model_type":"gemma4","text_config":{"model_type":"gemma4_text","hidden_size":64,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":16,"num_hidden_layers":12,"vocab_size":100,"global_head_dim":32,"num_global_key_value_heads":1,"attention_k_eq_v":true,"num_kv_shared_layers":2,"hidden_size_per_layer_input":8,"sliding_window":512,"rope_parameters":{"full_attention":{"rope_type":"proportional","partial_rotary_factor":0.25,"rope_theta":1000000.0},"sliding_attention":{"rope_type":"default","rope_theta":10000.0}}}}
+    );
+    // Default pattern: 5 sliding, 1 global; the last layer is global.
+    try std.testing.expect(g4.sliding_layers[0] and !g4.sliding_layers[5] and g4.sliding_layers[6] and !g4.sliding_layers[11]);
+    try std.testing.expectEqual(@as(usize, 32), g4.layer_head_dim[5]);
+    try std.testing.expectEqual(@as(usize, 1), g4.layer_kv_heads[5]);
+    try std.testing.expectEqual(@as(usize, 16), g4.layer_head_dim[0]);
+    try std.testing.expectEqual(@as(usize, 2), g4.layer_kv_heads[0]);
+    try std.testing.expectEqual(@as(usize, 32), g4.kvDim());
+    try std.testing.expectEqual(@as(f32, 1.0), g4.layer_attn_scale[3]);
+    // Proportional rope: 8 rotated coordinates with frequencies over the 32-wide head.
+    try std.testing.expectEqual(@as(usize, 8), g4.rotary_dim);
+    try std.testing.expectEqual(@as(usize, 32), g4.rope_freq_dim);
+    try std.testing.expectEqual(@as(f32, 1000000.0), g4.rope_theta);
+    try std.testing.expectEqual(@as(f32, 10000.0), g4.rope_local.?.theta);
+    try std.testing.expectEqual(@as(usize, 16), g4.rope_local.?.rotary_dim);
+    // Layers 10 (sliding) and 11 (global) read layers 9 and 5.
+    try std.testing.expectEqual(@as(usize, 9), g4.kv_source[10]);
+    try std.testing.expectEqual(@as(usize, 5), g4.kv_source[11]);
+    try std.testing.expectEqual(@as(usize, 8), g4.kv_source[8]);
+    try std.testing.expect(g4.k_eq_v and g4.v_norm and g4.ple_dim == 8);
+
+    const g3n = try parseConfig(a,
+        \\{"model_type":"gemma3n_text","hidden_size":64,"intermediate_size":[128,256],"num_attention_heads":4,"num_key_value_heads":2,"head_dim":16,"num_hidden_layers":2,"vocab_size":100,"altup_num_inputs":4,"laurel_rank":8,"activation_sparsity_pattern":[0.95,0.0]}
+    );
+    try std.testing.expectEqual(@as(usize, 256), g3n.intermediate_size);
+    try std.testing.expect(g3n.intermediate_varies);
+    try std.testing.expectEqual(@as(usize, 4), g3n.altup_inputs);
+    try std.testing.expectEqual(@as(f32, 0.95), g3n.activation_sparsity[0]);
+    try std.testing.expectEqual(@as(usize, 256), g3n.ple_dim);
+
+    const lfm = try parseConfig(a,
+        \\{"model_type":"lfm2","hidden_size":64,"num_attention_heads":4,"num_key_value_heads":2,"num_hidden_layers":4,"vocab_size":100,"norm_eps":1e-5,"conv_L_cache":3,"block_ff_dim":12288,"block_multiple_of":256,"block_ffn_dim_multiplier":1.0,"block_auto_adjust_ff_dim":true,"full_attn_idxs":[2]}
+    );
+    try std.testing.expect(lfm.conv_layers[0] and lfm.conv_layers[1] and !lfm.conv_layers[2] and lfm.conv_layers[3]);
+    try std.testing.expect(lfm.has_conv);
+    try std.testing.expectEqual(@as(usize, 8192), lfm.intermediate_size);
+    try std.testing.expectEqual(@as(f32, 1000000.0), lfm.rope_theta);
+    try std.testing.expectEqual(QkNorm.head, lfm.qk_norm);
+
+    const m4 = try parseConfig(a,
+        \\{"model_type":"mistral4","hidden_size":64,"num_attention_heads":4,"num_hidden_layers":3,"vocab_size":100,"q_lora_rank":32,"kv_lora_rank":16,"qk_nope_head_dim":8,"qk_rope_head_dim":4,"v_head_dim":8,"n_routed_experts":8,"n_shared_experts":1,"num_experts_per_tok":2,"n_group":2,"topk_group":1,"first_k_dense_replace":1,"rope_parameters":{"rope_type":"yarn","rope_theta":10000.0,"factor":128.0,"original_max_position_embeddings":8192,"beta_fast":32.0,"beta_slow":1.0,"mscale":1.0,"mscale_all_dim":1.0,"llama_4_scaling_beta":0.1}}
+    );
+    try std.testing.expect(m4.rope_scaling == .yarn);
+    try std.testing.expectEqual(RopeStyle.gptj, m4.rope_style);
+    try std.testing.expect(m4.moe.group_top2 and m4.moe.topk_method == .group_limited);
+    try std.testing.expect(!m4.moe_layers[0] and m4.moe_layers[1]);
+    const t = m4.attn_temperature.?;
+    try std.testing.expect(t.all_layers and t.offset == 0 and t.floor_scale == 8192 and t.attn_scale == 0.1);
+    const ms4 = 0.1 * @log(@as(f32, 128)) + 1.0;
+    try std.testing.expectApproxEqRel(ms4 * ms4 / @sqrt(@as(f32, 12)), m4.attention_scale, 1e-5);
 }
