@@ -5,6 +5,11 @@
 //! bounded conversion chunk, regardless of model size. A `.incomplete` marker
 //! is created before the first shard and removed only after everything was
 //! written, so a directory never looks complete when it is not.
+//!
+//! A checkpoint that was dequantised on load (FP8, MXFP4, pack-quantized INT4;
+//! see dequant.zig) is exported as a plain bf16 checkpoint: the store hands
+//! out the decoded tensors, so every one of them is written in bf16 (or the
+//! requested `export_dtype`) and `config.json` loses its `quantization_config`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -245,7 +250,7 @@ fn saveModelInner(gpa: Allocator, io: Io, model: *const Model, dir: Io.Dir, opts
     }
 
     // Config and tokenizer files.
-    try dir.writeFile(io, .{ .sub_path = "config.json", .data = model.config_json });
+    try dir.writeFile(io, .{ .sub_path = "config.json", .data = model.export_config_json });
     try dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = model.tokenizer_json });
     if (model.generation_config_json) |g| try dir.writeFile(io, .{ .sub_path = "generation_config.json", .data = g });
     if (model.tokenizer_config_json) |t| try dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = t });

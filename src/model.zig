@@ -27,6 +27,7 @@ const search = @import("search.zig");
 pub const arch = @import("arch.zig");
 const expert_cache = @import("expert_cache.zig");
 const remote = @import("remote.zig");
+const dequant = @import("dequant.zig");
 
 const Allocator = std.mem.Allocator;
 const Weight = tensor.Weight;
@@ -386,6 +387,11 @@ pub const Model = struct {
     source_dir: []const u8,
     /// Raw JSON texts kept for export.
     config_json: []const u8,
+    /// `config_json` as an export writes it: without `quantization_config`
+    /// when the checkpoint was dequantised on load (exports are bf16).
+    export_config_json: []const u8,
+    /// Tensors dequantised on load (see dequant.zig); 0 for plain checkpoints.
+    dequantised: usize,
     tokenizer_json: []const u8,
     generation_config_json: ?[]const u8,
     tokenizer_config_json: ?[]const u8,
@@ -513,8 +519,10 @@ pub const Model = struct {
             std.log.warn("{s} contains {s}: the export did not finish; refusing to load it", .{ dir_path, export_incomplete_marker });
             return error.IncompleteModel;
         } else |_| {}
+        self.dequantised = 0;
         if (gguf_path) |p| {
             try gguf_model.attach(self, p, opts.store == .mapped, .{ .ignore_embedded = opts.gguf_ignore_embedded });
+            self.export_config_json = self.config_json;
         } else try self.loadHfFiles(dir, dir_path, opts);
         errdefer self.tokenizer.deinit();
         errdefer for (self.files) |f| f.close(gpa, io);
@@ -1124,6 +1132,20 @@ pub const Model = struct {
             for (names.items) |n| try files.append(arena, try safetensors.File.openOptions(gpa, io, dir, n, .{ .map = opts.store == .mapped }));
         }
         self.files = files.items;
+
+        // Quantised checkpoints: every recognised group of storage tensors
+        // becomes one virtual bf16 tensor; anything left over is skipped.
+        const reg = try dequant.register(gpa, io, self.files, self.config.quant);
+        self.dequantised = reg.count;
+        self.export_config_json = self.config_json;
+        if (reg.count > 0) {
+            std.log.info("dequantising {d} tensors on load ({d} fp8, {d} mxfp4, {d} pack-quantized); exports are bf16", .{ reg.count, reg.fp8, reg.mxfp4, reg.int_packed });
+            self.export_config_json = try dequant.stripQuantizationConfig(arena, self.config_json);
+        }
+        for (self.files) |f| {
+            var it = f.raw.iterator();
+            while (it.next()) |kv| std.log.warn("skipping tensor {s} with unsupported dtype {s}", .{ kv.key_ptr.*, kv.value_ptr.dtype });
+        }
     }
 
     fn cat(arena: Allocator, a: []const u8, b: []const u8) ![]const u8 {
