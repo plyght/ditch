@@ -43,6 +43,10 @@ pub const Template = enum {
     kimi_k3,
     /// Jamba: `<|startoftext|><|bom|><|user|> ...<|eom|><|bom|><|assistant|>`.
     jamba,
+    /// ERNIE 4.5: `<|begin_of_sentence|>{system}\nUser: ...\nAssistant: `.
+    ernie,
+    /// Hunyuan (V1 dense): `<｜hy_begin▁of▁sentence｜>{system}<｜hy_place▁holder▁no▁3｜><｜hy_User｜>...<｜hy_Assistant｜>`.
+    hunyuan,
     /// nanochat: `<|user_start|>...<|user_end|><|assistant_start|>`; a system
     /// message is prepended to the first user turn, followed by a blank line.
     nanochat,
@@ -78,6 +82,8 @@ pub fn detect(chat_template: ?[]const u8, model_type: []const u8) Template {
             }
         }.f;
         if (has(t, "<|bom|>")) return .jamba;
+        if (has(t, "<\u{ff5c}hy_User\u{ff5c}>")) return .hunyuan;
+        if (has(t, "<|begin_of_sentence|>") and has(t, "Assistant: ")) return .ernie;
         if (has(t, "<|user_start|>")) return .nanochat;
         if (has(t, "</user>") and has(t, "<assistant>")) return .laguna;
         if (has(t, "<|im_middle|>")) return .kimi;
@@ -311,6 +317,46 @@ pub fn render(gpa: Allocator, template: Template, messages: []const Message) ![]
             }
             try w.writeAll("<|assistant_start|>");
         },
+        .ernie => {
+            // baidu/ERNIE-4.5-*-PT: contents verbatim, no trimming.
+            try w.writeAll("<|begin_of_sentence|>");
+            for (messages) |m| {
+                switch (m.role) {
+                    .system => try w.print("{s}\n", .{m.content}),
+                    .user => try w.print("User: {s}\n", .{m.content}),
+                    .assistant => try w.print("Assistant: {s}<|end_of_sentence|>", .{m.content}),
+                }
+            }
+            try w.writeAll("Assistant: ");
+        },
+        .hunyuan => {
+            // tencent/Hunyuan-*-Instruct: every system message joined by a
+            // blank line in front of the first turn; the user turn carries the
+            // assistant header, and a finished assistant turn ends with the EOS.
+            try w.writeAll("<\u{ff5c}hy_begin\u{2581}of\u{2581}sentence\u{ff5c}>");
+            var any_system = false;
+            for (messages) |m| if (m.role == .system) {
+                if (any_system) try w.writeAll("\n\n");
+                try w.writeAll(m.content);
+                any_system = true;
+            };
+            if (any_system) try w.writeAll("<\u{ff5c}hy_place\u{2581}holder\u{2581}no\u{2581}3\u{ff5c}>");
+            var last_user = false;
+            for (messages) |m| {
+                switch (m.role) {
+                    .system => {},
+                    .user => {
+                        try w.print("<\u{ff5c}hy_User\u{ff5c}>{s}<\u{ff5c}hy_Assistant\u{ff5c}>", .{m.content});
+                        last_user = true;
+                    },
+                    .assistant => {
+                        try w.print("{s}<\u{ff5c}hy_place\u{2581}holder\u{2581}no\u{2581}2\u{ff5c}>", .{m.content});
+                        last_user = false;
+                    },
+                }
+            }
+            if (!last_user) try w.writeAll("<\u{ff5c}hy_Assistant\u{ff5c}>");
+        },
         .llama4 => {
             try w.writeAll("<|begin_of_text|>");
             for (messages) |m| try w.print("<|header_start|>{s}<|header_end|>\n\n{s}<|eot|>", .{ @tagName(m.role), trim(m.content) });
@@ -436,6 +482,19 @@ test "template detection and rendering" {
     const nc2 = try render(gpa, .nanochat, &.{ .{ .role = .user, .content = "Hi" }, .{ .role = .assistant, .content = " Yo " }, .{ .role = .user, .content = "Bye" } });
     defer gpa.free(nc2);
     try std.testing.expectEqualStrings("<|user_start|>Hi<|user_end|><|assistant_start|> Yo <|assistant_end|><|user_start|>Bye<|user_end|><|assistant_start|>", nc2);
+    // ERNIE 4.5 and Hunyuan V1 dense (baidu/ERNIE-4.5-0.3B-PT,
+    // tencent/Hunyuan-0.5B-Instruct; token-for-token against apply_chat_template).
+    try std.testing.expectEqual(Template.ernie, detect("{{- \"Assistant: \" -}}{%- set cls_token = \"<|begin_of_sentence|>\" -%}", "ernie4_5"));
+    try std.testing.expectEqual(Template.hunyuan, detect("{{- '<\u{ff5c}hy_User\u{ff5c}>' + message['content'] }}", "hunyuan_v1_dense"));
+    const er = try render(gpa, .ernie, &.{ .{ .role = .system, .content = "Sys." }, .{ .role = .user, .content = " Hi " }, .{ .role = .assistant, .content = " Yo " }, .{ .role = .user, .content = "Bye" } });
+    defer gpa.free(er);
+    try std.testing.expectEqualStrings("<|begin_of_sentence|>Sys.\nUser:  Hi \nAssistant:  Yo <|end_of_sentence|>User: Bye\nAssistant: ", er);
+    const hy = try render(gpa, .hunyuan, &.{ .{ .role = .system, .content = "Sys." }, .{ .role = .user, .content = " Hi " }, .{ .role = .assistant, .content = " Yo " }, .{ .role = .user, .content = "Bye" } });
+    defer gpa.free(hy);
+    try std.testing.expectEqualStrings("<\u{ff5c}hy_begin\u{2581}of\u{2581}sentence\u{ff5c}>Sys.<\u{ff5c}hy_place\u{2581}holder\u{2581}no\u{2581}3\u{ff5c}><\u{ff5c}hy_User\u{ff5c}> Hi <\u{ff5c}hy_Assistant\u{ff5c}> Yo <\u{ff5c}hy_place\u{2581}holder\u{2581}no\u{2581}2\u{ff5c}><\u{ff5c}hy_User\u{ff5c}>Bye<\u{ff5c}hy_Assistant\u{ff5c}>", hy);
+    const hy_ns = try render(gpa, .hunyuan, &.{.{ .role = .user, .content = "Hi" }});
+    defer gpa.free(hy_ns);
+    try std.testing.expectEqualStrings("<\u{ff5c}hy_begin\u{2581}of\u{2581}sentence\u{ff5c}><\u{ff5c}hy_User\u{ff5c}>Hi<\u{ff5c}hy_Assistant\u{ff5c}>", hy_ns);
     // A template that emits the BOS in front of a family that does not.
     try std.testing.expectEqualStrings("<|begin_of_text|>", templateBos("{{bos_token}}\n{%- if tools %}<|im_start|>", "<|begin_of_text|>"));
     try std.testing.expectEqualStrings("", templateBos("{% for m in messages %}<|im_start|>{{ bos_token }}", "<|begin_of_text|>"));

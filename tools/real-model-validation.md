@@ -1794,3 +1794,41 @@ copied and blocks composition.
     NFKC set (full-width, ligatures, superscripts, circled and Roman numerals, ㎏/℃/№,
     ǅ/Ǳ, decomposed accents, half-width katakana with voiced marks, compatibility
     jamo, conjoining jamo): mismatches 0 of 14
+
+## Bug 34 — ERNIE 4.5 and Hunyuan V1 dense were prompted with a generic template (fixed)
+
+Handoff item 8. Both families fell back to ditch's `raw` template, so every
+study on them used a prompt format neither model was trained on.
+
+**Fix.** two template families, each written from the model's own Jinja and
+checked against it:
+
+* `ernie` — `<|begin_of_sentence|>{system}\nUser: {user}\nAssistant: `, a
+  finished assistant turn ending in `<|end_of_sentence|>`, contents verbatim.
+  The tokenizer adds no BOS, so the family writes it.
+* `hunyuan` — `<｜hy_begin▁of▁sentence｜>{system}<｜hy_place▁holder▁no▁3｜><｜hy_User｜>{user}<｜hy_Assistant｜>`;
+  every system message is joined in front of the first turn, the user turn
+  carries the assistant header, a finished assistant turn ends with the EOS
+  `<｜hy_place▁holder▁no▁2｜>`, and the generation header is added only when
+  the last turn was not a user's. The template writes `bos_token` after its
+  first `{%`, where `templateBos` does not look, so the family writes it.
+  Hunyuan's template leaves `enable_thinking` undefined by default, so the
+  model opens with `<think>` — the same class as the Qwen 3.5 `<think>` gap:
+  what the model's own template does, not something ditch adds.
+
+Detection is by `<｜hy_User｜>`, and by `<|begin_of_sentence|>` together with
+`Assistant: `; the registry names them for `ernie4_5` and `hunyuan_v1_dense`.
+
+**Verification.** prompt token ids against `apply_chat_template(...,
+tokenize=True)` for two system/user pairs each (one with a code block and a
+trailing newline in the system prompt): equal. And end to end, float32:
+
+| Model | family | tokens | residuals | first-token logits | greedy |
+| --- | --- | :---: | :---: | ---: | :---: |
+| baidu/ERNIE-4.5-0.3B-PT | `ernie4_5` | match (own template) | all 19 agree | 1.31e-06 | match |
+| tencent/Hunyuan-0.5B-Instruct | `hunyuan_v1_dense` | match (own template) | all 25 agree | 1.33e-07 | match for 25 tokens, then a near-tie |
+
+(Hunyuan's harmful-prompt continuation parts at its 27th token, "…recalling
+what I know about *hacking* government databases" against "…about
+government databases", with every residual within 4.4e-05 of the reference:
+float32 drift at a near-tie, not a forward-pass difference.)

@@ -4867,6 +4867,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "hunyuan_v1_dense",
+        .chat = "hunyuan",
         .aliases = &.{ "hunyuan_vl_text", "hunyuan_vl" },
         .llama_cpp = "hunyuan-dense",
         .verified = true,
@@ -5065,6 +5066,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "ernie4_5",
+        .chat = "ernie",
         .aliases = &.{"paddleocr_vl_text"},
         .llama_cpp = "ernie4_5",
         .verified = true,
