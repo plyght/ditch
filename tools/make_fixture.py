@@ -261,7 +261,8 @@ def base(**kw):
         parallel=False, pos="rope", rope_style="neox", rotary_dim=None, theta=10000.0, scaling=None, rope_layers=None, attn_scale=None,
         qk_norm=None, q_norm="self_attn.q_norm.weight", k_norm="self_attn.k_norm.weight", clip=None,
         residual_mult=1.0, logit_scale=1.0, embed_scale=1.0, lm_bias=False, sinks=None, temp=None, pos_offset=0,
-        sliding=None, sliding_layers=None, mla=None, moe=None,
+        sliding=None, sliding_layers=None, mla=None, moe=None, linear=None, linear_layers=None, full_interval=0,
+        gated_q=False, gate_swish=False,
         config={}, extra_config={},
     )
     d.update(kw)
@@ -462,6 +463,62 @@ spec("qwen2_moe", tok="qwen2", L=2, attn_bias=True, o_bias=False, lm_head=None,
              "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2, "num_experts": 4, "num_experts_per_tok": 2, "norm_topk_prob": False,
              "decoder_sparse_step": 1, "mlp_only_layers": [], "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "silu",
              "max_position_embeddings": 128, "tie_word_embeddings": True})
+spec("qwen3_next", tok="qwen2", H=32, I=32, L=4, NH=4, NKV=2, HD=8, rotary_dim=2, qk_norm="head", gated_q=True,
+     linear={"KH": 2, "KD": 4, "VH": 4, "VD": 4, "KC": 2, "fused": True}, full_interval=4,
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "shared_inter": 16, "shared_gate": True, "scoring": "softmax", "group_limited": False, "rsf": 1.0, "norm": True,
+          "layers": [0, 1, 2, 3], "corr_bias": False, "layout": "separate", "prefix": "mlp.", "router": "gate.weight", "shared_name": "shared_expert."},
+     config={"model_type": "qwen3_next", "hidden_size": 32, "intermediate_size": 32, "moe_intermediate_size": 12, "shared_expert_intermediate_size": 16,
+             "num_hidden_layers": 4, "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
+             "num_experts": 4, "num_experts_per_tok": 2, "norm_topk_prob": True, "decoder_sparse_step": 1, "mlp_only_layers": [],
+             "linear_num_key_heads": 2, "linear_key_head_dim": 4, "linear_num_value_heads": 4, "linear_value_head_dim": 4,
+             "linear_conv_kernel_dim": 2, "full_attention_interval": 4, "partial_rotary_factor": 0.25,
+             "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "silu", "max_position_embeddings": 128, "tie_word_embeddings": True})
+spec("qwen3_5", tok="qwen2", H=32, I=32, L=2, NH=4, NKV=2, HD=8, rotary_dim=2,
+     qk_norm="head", gated_q=True,
+     linear={"KH": 2, "KD": 4, "VH": 4, "VD": 4, "KC": 2, "fused": False}, linear_layers=[1, 0],
+     config={"model_type": "qwen3_5",
+             "text_config": {"model_type": "qwen3_5_text", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2,
+                             "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
+                             "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "silu", "max_position_embeddings": 128,
+                             "tie_word_embeddings": False, "partial_rotary_factor": 0.25,
+                             "layer_types": ["linear_attention", "full_attention"],
+                             "linear_num_key_heads": 2, "linear_key_head_dim": 4, "linear_num_value_heads": 4,
+                             "linear_value_head_dim": 4, "linear_conv_kernel_dim": 2},
+             "vision_config": {"model_type": "qwen3_5"}})
+spec("qwen3_5_moe", tok="qwen2", prefix="model.language_model.", H=32, I=32, L=4, NH=4, NKV=2, HD=8, rotary_dim=2, qk_norm="head", gated_q=True, gate_swish=True,
+     linear={"KH": 2, "KD": 4, "VH": 4, "VD": 4, "KC": 2, "fused": False}, linear_layers=[1, 1, 1, 0],
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "shared_inter": 16, "shared_gate": True, "scoring": "softmax", "group_limited": False, "rsf": 1.0, "norm": True,
+          "layers": [0, 1, 2, 3], "corr_bias": False, "layout": "fused", "prefix": "mlp.", "router": "gate.weight", "shared_name": "shared_expert."},
+     config={"model_type": "qwen3_5_moe",
+             "text_config": {"model_type": "qwen3_5_moe_text", "hidden_size": 32, "num_hidden_layers": 4, "num_attention_heads": 4,
+                             "num_key_value_heads": 2, "head_dim": 8, "num_experts": 4, "num_experts_per_tok": 2,
+                             "moe_intermediate_size": 12, "shared_expert_intermediate_size": 16, "rms_norm_eps": 1e-6,
+                             "rope_theta": 10000.0, "hidden_act": "silu", "max_position_embeddings": 128, "tie_word_embeddings": False,
+                             "partial_rotary_factor": 0.25, "output_gate_type": "swish",
+                             "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+                             "linear_num_key_heads": 2, "linear_key_head_dim": 4, "linear_num_value_heads": 4,
+                             "linear_value_head_dim": 4, "linear_conv_kernel_dim": 2},
+             "vision_config": {"model_type": "qwen3_5_moe"}})
+spec("glm4_moe", tok="llama3", H=32, I=32, L=3, NH=4, NKV=2, HD=8, rotary_dim=4, qk_norm="head", attn_bias=True, o_bias=False,
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "shared_inter": 16, "scoring": "sigmoid", "group_limited": True, "n_group": 1, "topk_group": 1,
+          "rsf": 2.5, "norm": True, "layers": [1, 2], "corr_bias": True, "layout": "separate", "prefix": "mlp.", "router": "gate.weight",
+          "shared_name": "shared_experts."},
+     config={"model_type": "glm4_moe", "hidden_size": 32, "intermediate_size": 32, "moe_intermediate_size": 12, "num_hidden_layers": 3,
+             "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8, "n_routed_experts": 4, "n_shared_experts": 1,
+             "num_experts_per_tok": 2, "first_k_dense_replace": 1, "n_group": 1, "topk_group": 1, "routed_scaling_factor": 2.5,
+             "norm_topk_prob": True, "use_qk_norm": True, "partial_rotary_factor": 0.5, "attention_bias": True,
+             "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "silu", "max_position_embeddings": 128, "tie_word_embeddings": True})
+spec("glm_moe_dsa", tok="llama3", H=32, I=32, L=3, NH=4, NKV=4, HD=12, VD=8, rope_style="gptj", rotary_dim=4,
+     mla={"q_lora_rank": 12, "kv_lora_rank": 16, "nope": 8, "rope": 4, "v": 8},
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "shared_inter": 16, "scoring": "sigmoid", "group_limited": True, "n_group": 1, "topk_group": 1,
+          "rsf": 2.5, "norm": True, "layers": [1, 2], "corr_bias": True, "layout": "separate", "prefix": "mlp.", "router": "gate.weight",
+          "shared_name": "shared_experts."},
+     config={"model_type": "glm_moe_dsa", "hidden_size": 32, "intermediate_size": 32, "moe_intermediate_size": 12, "num_hidden_layers": 3,
+             "num_attention_heads": 4, "q_lora_rank": 12, "kv_lora_rank": 16, "qk_nope_head_dim": 8, "qk_rope_head_dim": 4,
+             "v_head_dim": 8, "n_routed_experts": 4, "n_shared_experts": 1, "num_experts_per_tok": 2, "first_k_dense_replace": 1,
+             "n_group": 1, "topk_group": 1, "routed_scaling_factor": 2.5, "norm_topk_prob": True,
+             "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "rope_interleave": True, "index_topk": 2048, "hidden_act": "silu",
+             "max_position_embeddings": 128, "tie_word_embeddings": True})
 
 
 # --- generation ------------------------------------------------------------
@@ -509,6 +566,11 @@ def generate_generic(family, out_dir):
     lm_head = mat(s["lm_head"], V, H, 1.0) if s["lm_head"] else embed
     lm_bias = vec(s["lm_head"][:-len(".weight")] + ".bias", V, 0.1) if s["lm_bias"] else None
     layers = []
+    lin_layers = s["linear_layers"]
+    if lin_layers is None and s["full_interval"]:
+        lin_layers = [((i + 1) % s["full_interval"] != 0) for i in range(L)]
+    if lin_layers is None:
+        lin_layers = [False] * L
     for i in range(L):
         lp = P + s["layer"].format(i=i)
         d = {}
@@ -518,7 +580,25 @@ def generate_generic(family, out_dir):
         d["post_ff_norm"] = normw(lp + s["post_ff_norm"], H) if s["post_ff_norm"] else None
         d["mlp_norm"] = normw(lp + s["mlp_norm"], H) if s["mlp_norm"] else None
         qd, kvd = NH * HD, NKV * HD
-        if s["mla"]:
+        if lin_layers[i]:
+            ln, ap = s["linear"], "linear_attn."
+            kd_tot, vd_tot = ln["KH"] * ln["KD"], ln["VH"] * ln["VD"]
+            if ln["fused"]:
+                d["qkvz"] = mat(lp + ap + "in_proj_qkvz.weight", 2 * kd_tot + 2 * vd_tot, H)
+                d["ba"] = mat(lp + ap + "in_proj_ba.weight", 2 * ln["VH"], H)
+            else:
+                d["qkv"] = mat(lp + ap + "in_proj_qkv.weight", 2 * kd_tot + vd_tot, H)
+                d["z"] = mat(lp + ap + "in_proj_z.weight", vd_tot, H)
+                d["b"] = mat(lp + ap + "in_proj_b.weight", ln["VH"], H)
+                d["a"] = mat(lp + ap + "in_proj_a.weight", ln["VH"], H)
+            d["conv"] = bf16_round(rng.normal(0, 0.2, size=(2 * kd_tot + vd_tot, ln["KC"])))
+            weights[lp + ap + "conv1d.weight"] = d["conv"]
+            d["dt"] = vec(lp + ap + "dt_bias", ln["VH"], 0.1)
+            d["alog"] = vec(lp + ap + "A_log", ln["VH"], 0.1)
+            d["lnorm"] = normw(lp + ap + "norm.weight", ln["VD"])[0]
+            d["o"] = mat(lp + ap + "out_proj.weight", H, vd_tot)
+            d["ob"] = None
+        elif s["mla"]:
             m = s["mla"]
             if m["q_lora_rank"]:
                 d["q_a"] = mat(lp + "self_attn.q_a_proj.weight", m["q_lora_rank"], H)
@@ -534,15 +614,16 @@ def generate_generic(family, out_dir):
             b = bias_for(lp + s["qkv"], qd + 2 * kvd, s["attn_bias"])
             d["qkv"], d["qkv_b"] = w, b
         else:
-            d["q"] = mat(lp + s["q"], qd, H)
+            d["q"] = mat(lp + s["q"], (2 * qd if s["gated_q"] else qd), H)
             d["k"] = mat(lp + s["k"], kvd, H)
             d["v"] = mat(lp + s["v"], kvd, H)
             d["qb"] = bias_for(lp + s["q"], qd, s["attn_bias"])
             d["kb"] = bias_for(lp + s["k"], kvd, s["attn_bias"])
             d["vb"] = bias_for(lp + s["v"], kvd, s["attn_bias"])
-        d["o"] = mat(lp + s["o"], H, NH * VD)
-        d["ob"] = bias_for(lp + s["o"], H, s["attn_bias"] if s["o_bias"] is None else s["o_bias"])
-        if s["qk_norm"] in ("head", "heads", "full"):
+        if not lin_layers[i]:
+            d["o"] = mat(lp + s["o"], H, NH * VD)
+            d["ob"] = bias_for(lp + s["o"], H, s["attn_bias"] if s["o_bias"] is None else s["o_bias"])
+        if not lin_layers[i] and s["qk_norm"] in ("head", "heads", "full"):
             qn = {"head": HD, "heads": NH * HD, "full": NH * HD}[s["qk_norm"]]
             kn = {"head": HD, "heads": NKV * HD, "full": NKV * HD}[s["qk_norm"]]
             d["qn"] = normw(lp + s["q_norm"], qn)
@@ -550,7 +631,7 @@ def generate_generic(family, out_dir):
             if s["qk_norm"] == "heads":  # Cohere stores [heads, head_dim]
                 weights[lp + s["q_norm"]] = weights[lp + s["q_norm"]].reshape(NH, HD)
                 weights[lp + s["k_norm"]] = weights[lp + s["k_norm"]].reshape(NKV, HD)
-        if s["sinks"]:
+        if not lin_layers[i] and s["sinks"]:
             d["sinks"] = vec(lp + s["sinks"], NH, 1.0)
         moe = s["moe"]
         if moe and i in moe["layers"]:
@@ -804,6 +885,11 @@ def generate_generic(family, out_dir):
                 q, k, v = h @ d["q"].T, h @ d["k"].T, h @ d["v"].T
                 if d["qb"] is not None:
                     q, k, v = q + d["qb"], k + d["kb"], v + d["vb"]
+                gate = None
+                if s["gated_q"]:
+                    q = q.reshape(T, NH, 2 * HD)
+                    gate = q[:, :, HD:].reshape(T, qd)
+                    q = q[:, :, :HD].reshape(T, qd)
             if s["clip"] is not None:
                 q, k, v = (np.clip(t, -s["clip"], s["clip"]) for t in (q, k, v))
             qn = s["qk_norm"]
@@ -848,7 +934,70 @@ def generate_generic(family, out_dir):
         o = out.reshape(T, NH * VD) @ d["o"].T
         if d["ob"] is not None:
             o = o + d["ob"]
+        if s["gated_q"] and not s["mla"] and not s["qkv"]:
+            gs = 1 / (1 + np.exp(-gate))
+            if s["gate_swish"]:
+                gs = gate * gs
+            o = (out.reshape(T, NH * VD) * gs) @ d["o"].T
+            if d["ob"] is not None:
+                o = o + d["ob"]
         return o
+
+    def linear_attn(d, h):
+        ln = s["linear"]
+        KH, KD, VH, VD, KC = ln["KH"], ln["KD"], ln["VH"], ln["VD"], ln["KC"]
+        kd_tot, vd_tot = KH * KD, VH * VD
+        T = h.shape[0]
+        if "qkvz" in d:
+            p = h @ d["qkvz"].T
+            sub = vd_tot // KH
+            p = p.reshape(T, KH, 2 * KD + 2 * sub)
+            q = p[:, :, :KD].reshape(T, kd_tot)
+            k = p[:, :, KD:2 * KD].reshape(T, kd_tot)
+            v = p[:, :, 2 * KD:2 * KD + sub].reshape(T, vd_tot)
+            z = p[:, :, 2 * KD + sub:].reshape(T, vd_tot)
+            mixed = np.concatenate([q, k, v], -1)
+            pba = h @ d["ba"].T
+            subb = VH // KH
+            pba = pba.reshape(T, KH, 2 * subb)
+            b = pba[:, :, :subb].reshape(T, VH)
+            a = pba[:, :, subb:].reshape(T, VH)
+        else:
+            mixed = h @ d["qkv"].T
+            z = h @ d["z"].T
+            b, a = h @ d["b"].T, h @ d["a"].T
+        conv_dim = 2 * kd_tot + vd_tot
+        y = np.zeros((T, conv_dim), np.float32)
+        for t in range(T):
+            acc = np.zeros(conv_dim, np.float32)
+            for i in range(KC):
+                if t - i >= 0:
+                    acc += d["conv"][:, KC - 1 - i] * mixed[t - i]
+            y[t] = acc / (1 + np.exp(-acc))
+        q = y[:, :kd_tot].reshape(T, KH, KD)
+        k = y[:, kd_tot:2 * kd_tot].reshape(T, KH, KD)
+        v = y[:, 2 * kd_tot:].reshape(T, VH, VD)
+        beta = 1 / (1 + np.exp(-b))
+        g = -np.exp(d["alog"]) * np.log1p(np.exp(a + d["dt"]))
+        if VH > KH:
+            rep = VH // KH
+            q = np.repeat(q, rep, axis=1)
+            k = np.repeat(k, rep, axis=1)
+        q = q / np.sqrt(np.sum(q * q, -1, keepdims=True) + 1e-6) / np.sqrt(KD)
+        k = k / np.sqrt(np.sum(k * k, -1, keepdims=True) + 1e-6)
+        S = np.zeros((VH, KD, VD), np.float32)
+        core = np.zeros((T, VH, VD), np.float32)
+        for t in range(T):
+            S = S * np.exp(g[t])[:, None, None]
+            for vhi in range(VH):
+                mem = S[vhi].T @ k[t, vhi]
+                delta = (v[t, vhi] - mem) * beta[t, vhi]
+                S[vhi] = S[vhi] + np.outer(k[t, vhi], delta)
+                core[t, vhi] = S[vhi].T @ q[t, vhi]
+        o = core.reshape(T, VH, VD)
+        o = o / np.sqrt(np.mean(o * o, -1, keepdims=True) + eps) * d["lnorm"]
+        o = o * (z.reshape(T, VH, VD) / (1 + np.exp(-z.reshape(T, VH, VD))))
+        return o.reshape(T, vd_tot) @ d["o"].T
 
     def expert_out(ex, x, biases=True):
         g, u = x @ ex["gate"].T, x @ ex["up"].T
@@ -944,7 +1093,7 @@ def generate_generic(family, out_dir):
         rm = np.float32(s["residual_mult"])
         for li, d in enumerate(layers):
             h = norm(x, d["in_norm"]) if (d["in_norm"] is not None or s["norm"] == "none") and s["in_norm"] is not None else x
-            a = attention(d, li, h, cos, sin)
+            a = linear_attn(d, h) if lin_layers[li] else attention(d, li, h, cos, sin)
             if d["post_attn_norm"] is not None:
                 a = norm(a, d["post_attn_norm"])
             if s["parallel"]:
