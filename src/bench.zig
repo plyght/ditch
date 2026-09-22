@@ -236,6 +236,9 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings,
         defer ws.deinit();
         var cache = try model_mod.KvCache.init(gpa, c.num_layers, n, longest + m + 1, c.num_kv_heads * c.head_dim);
         defer cache.deinit();
+        if (c.has_linear) {
+            cache.linear = try model_mod.LinearCache.init(gpa, c, n);
+        }
         const logits = try gpa.alloc(f32, n * c.vocab_size);
         defer gpa.free(logits);
         // Warm-up (allocations, page faults on the mapped weights), then the timed runs.
