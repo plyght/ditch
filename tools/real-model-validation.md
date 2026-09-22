@@ -1688,3 +1688,28 @@ That also settles the second pass's `nanochat` gap: HF-format NanoChat
 checkpoints do exist (`nanochat-students/nanochat-d20`,
 `Guilherme34/nanochat-d32-retrained-hf`, `pankajmathur/nanochat-d34-sft-hf`)
 and use the registry's names; only the one nanoGPT-named conversion does not.
+
+Short study on the real checkpoint (same settings as the second pass's):
+
+    $ ditch models/nanochat-students__nanochat-d20 --n-trials 6 --n-startup-trials 3 \
+        --max-response-length 40 --checkpoint-action restart --trial-index 1 \
+        --model-action save --save-directory runs/nanochat-d20 --no-input
+
+| Model | family | Baseline Refusals | Best trial | Best KL |
+| --- | --- | ---: | ---: | ---: |
+| nanochat-students/nanochat-d20 | `nanochat` | 4/100 | 3/100 | 0.0041 |
+
+Front: 3/100@0.0041, 4/100@0.0019, 5/100@0.0014. Export self-validation:
+max |Δ| first-token logit 0.0307, argmax agreement 100%. This small SFT model
+hardly refuses to begin with, so there is little to remove; the point is that
+the whole pipeline — template, tokenizer, forward, edit, export — runs on it.
+
+## The stubs ditch declined to load (handoff item 6)
+
+| stub | verdict |
+| --- | --- |
+| `hf-tiny-v2/tiny-random-NemotronHForCausalLM` | stub artifact: it names the embedding `backbone.embedding.weight`, and transformers does not load that either (`missing_keys: {'model.embeddings.weight'}`, so its reference ran a random embedding). Every release — Nemotron-H 8B, Nemotron Nano 9B v2, Nemotron 3 Nano 30B-A3B — uses `backbone.embeddings.weight`. With the one tensor renamed, ditch matches transformers exactly (all 6 residuals, logits 1.4e-07) on a config that uses the newer `layers_block_type` list rather than `hybrid_override_pattern`. |
+| `hf-tiny-v2/tiny-random-Qwen3_5Model`, `…Qwen3_5MoeModel` | the bare `Qwen3_5Model` save puts the text weights under a plain `language_model.` prefix (releases use `model.language_model.`). `language_model.` is now one of the default prefixes, so these load. transformers' `AutoModelForCausalLM` loads *none* of those weights (all missing, all unexpected), so the comparison was run on a copy renamed to the release layout: exact (all residuals, logits 1.3e-07) for both, and ditch's output on the bare layout is bit-identical to its output on the renamed one. |
+| `hf-tiny-v2/tiny-random-Gemma3nModel` | same bare prefix; now loads. The reference needs `timm` (installed, with the matching CPU torchvision). On the renamed copy: all 5 residuals agree (3.7e-07) and the logits to 2.2e-07 — the first numerical check of `gemma3n` against transformers, whose release is gated. `tools/probe_reference.py` needed two fixes for it: Gemma 3n's `hidden_states` are stacked `[streams, batch, seq, hidden]` (stream 0 is the residual), and its last entry is recorded before the streams are combined and normalised, so the pre-norm hook must not replace it. |
+| `hf-tiny-v2/tiny-random-Kimi_K25Model` | stub artifact: the text layers are saved as `language_model.blocks.N`, a layout no Kimi checkpoint and no transformers mapping uses (the release is `language_model.model.layers.N`, which the second pass config-checked). |
+| `hf-tiny-v2/tiny-random-MiMoV2FlashForCausalLM`, `…DeepseekV4ForCausalLM`, `…Gemma4Model` | see below. |

@@ -403,7 +403,7 @@ pub const DsV4 = struct {
 /// are always optional and named by replacing a trailing `.weight` with
 /// `.bias`; norm biases likewise.
 pub const Names = struct {
-    prefixes: []const []const u8 = &.{ "model.", "language_model.model.", "model.language_model.", "thinker.model.", "" },
+    prefixes: []const []const u8 = &.{ "model.", "language_model.model.", "model.language_model.", "thinker.model.", "language_model.", "" },
     embed: []const u8 = "{p}embed_tokens.weight",
     /// Learned absolute position table `[positions][hidden]`.
     pos_embed: ?[]const u8 = null,

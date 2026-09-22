@@ -64,11 +64,15 @@ def compare_residuals(entry, out, pre_norm, tolerance):
     the *normalised* last hidden state, so the pre-norm hook supplies it.
     """
     got = [np.asarray(r, dtype=np.float32) for r in entry["residuals"]]
-    hidden = [h[0, -1].float().numpy() for h in out.hidden_states]
+    # Gemma 3n stacks its AltUp streams first, `[streams, batch, seq, hidden]`;
+    # stream 0 is the residual the next layer reads.
+    hidden = [(h[0, 0, -1] if h.dim() == 4 else h[0, -1]).float().numpy() for h in out.hidden_states]
     if len(got) != len(hidden):
         print(f"  residuals: ditch has {len(got)} entries, transformers {len(hidden)}")
         return False
-    if pre_norm is not None:
+    # A stacked (Gemma 3n) last entry is recorded before the streams are
+    # combined and normalised, so it is already the pre-norm residual.
+    if pre_norm is not None and out.hidden_states[-1].dim() != 4:
         hidden[-1] = pre_norm[0, -1].float().numpy()
     worst, worst_layer = 0.0, 0
     first_bad = None
