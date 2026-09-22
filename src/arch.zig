@@ -412,10 +412,10 @@ pub fn lookup(model_type: []const u8) ?*const Arch {
 
 fn rejectKnownHybrid(model_type: []const u8) !void {
     const table = .{
-        .{ "kimi_linear", "Kimi K3 hybrid (gated linear attention with MXFP4 weights, no tokenizer.json)" },
-        .{ "kimi_k3", "Kimi K3 hybrid (gated linear attention with MXFP4 weights, no tokenizer.json)" },
+        .{ "kimi_linear", "Kimi K3 hybrid (gated linear attention with MXFP4 weights)" },
+        .{ "kimi_k3", "Kimi K3 hybrid (gated linear attention with MXFP4 weights)" },
         .{ "kimi_k25", "Kimi K2.5+ hybrid (gated linear attention with compressed-tensors INT4 weights)" },
-        .{ "kimi_k2", "Kimi K2 (FP8 E4M3 block-quantised weights, no tokenizer.json)" },
+        .{ "kimi_k2", "Kimi K2 (FP8 E4M3 block-quantised weights)" },
         .{ "qwen4_exp", "Qwen3.8-Flash-Next hybrid (linear attention with sparse indexer and hyper-connections)" },
         .{ "qwen4_exp_text", "Qwen3.8-Flash-Next hybrid (linear attention with sparse indexer and hyper-connections)" },
         .{ "glm5_next", "GLM-5.3-Flash hybrid (linear attention with sparse indexer and hyper-connections)" },
