@@ -1466,3 +1466,27 @@ markers and named by the registry entry.
 and template, four system/user combinations (including a code block and a
 trailing newline in the system prompt): ditch's prompt token ids equal
 `apply_chat_template(..., add_generation_prompt=True)` token for token.
+
+## `ernie4_5_moe`: the stub's router is all zeros (not a ditch bug)
+
+Handoff item 2. The stub's layer-0 residual was off by 2.4e-02, and zeroing
+tensors on both sides narrowed it to the routed experts: with the shared
+expert zeroed the error stays; with the routed `down_proj`s zeroed it is gone;
+with `moe_k = 8` (every expert selected) it is exact, and with `moe_k = 1` it
+is worse. So the experts compute correctly and the two sides *select*
+differently. Replaying layer 0 in PyTorch showed why: every router logit is
+exactly 0 — `hf-tiny-v2`'s generator left `mlp.gate.weight` at its
+`torch.zeros` initialisation — so all eight experts tie, and ditch and
+`torch.topk` break the tie differently. That is not something a trained
+checkpoint can hit.
+
+With a random router and a random, non-zero `moe_statics` correction bias
+written into the same stub (same weights to both sides):
+
+    residuals: all 3 layers agree (worst 1.39e-07 relative, at layer 2)
+    first-token logits: ... 1.50e-07
+
+so the routing (softmax, the bias on the selection only, renormalised top-k)
+and the `moe_layer_start_index = 0` placement are right. None of the other
+three open stubs (`cohere`, `minimax`, `nanochat`) has a constant router; the
+only constant tensors there are norm weights of 1.
