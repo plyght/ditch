@@ -242,12 +242,6 @@ pub fn loadLayer(model: *Model, layer: *Layer, arena: Allocator, li: usize, lp: 
 pub fn loadModel(model: *Model, arena: Allocator) !void {
     const c = &model.config;
     const d = c.dsv4.?;
-    for (model.files) |f| {
-        if (f.skipped_dtype) |dt| {
-            std.log.err("{s} stores tensors as {s}; ditch reads F32/F16/BF16 weights (dequantise the checkpoint first)", .{ f.path, dt });
-            return error.UnsupportedArchitecture;
-        }
-    }
     if (!model.embed_ref.dtype.isFloat() or !model.lm_head_ref.dtype.isFloat()) {
         std.log.err("embedding or lm_head stored as {s}; ditch reads F32/F16/BF16 weights", .{model.embed_ref.dtype.safetensorsName()});
         return error.UnsupportedArchitecture;

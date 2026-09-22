@@ -28,6 +28,7 @@ pub const arch = @import("arch.zig");
 const expert_cache = @import("expert_cache.zig");
 const remote = @import("remote.zig");
 pub const dsv4 = @import("deepseek_v4.zig");
+const dequant = @import("dequant.zig");
 
 const Allocator = std.mem.Allocator;
 const Weight = tensor.Weight;
@@ -71,6 +72,18 @@ pub const Slot = enum {
     lin_a,
     lin_ba,
     lin_conv,
+    lin_q,
+    lin_k,
+    lin_v,
+    lin_conv_q,
+    lin_conv_k,
+    lin_conv_v,
+    lin_f_a,
+    lin_f_b,
+    lin_g_a,
+    lin_g_b,
+    light_qkv,
+    light_gate,
     // DeepSeek V4 / V4.1 (deepseek_v4.zig)
     d_q_a,
     d_q_b,
@@ -153,10 +166,13 @@ pub const MlaWeights = struct {
     kv_b: Weight,
 };
 
-/// Gated DeltaNet linear-attention projections (Qwen hybrids). Either the
-/// fused `qkvz`/`ba` pair (Qwen3-Next) or the split `qkv`/`z`/`b`/`a` set
-/// (Qwen3.5) is present; the output projection lives in `Layer.o` so that
-/// abliteration treats it like any attention output.
+/// Linear-attention projections. Gated DeltaNet (Qwen hybrids) carries
+/// either the fused `qkvz`/`ba` pair (Qwen3-Next) or the split
+/// `qkv`/`z`/`b`/`a` set (Qwen3.5); Kimi Delta Attention carries separate
+/// `q`/`k`/`v`, the low-rank forget gate `f_a`/`f_b`, beta `b` and the
+/// low-rank output gate `g_a`/`g_b`; MiniMax lightning attention carries
+/// `light_qkv`, `light_gate` and `norm`. The output projection lives in
+/// `Layer.o` so that abliteration treats it like any attention output.
 pub const LinearWeights = struct {
     qkvz: ?Weight = null,
     qkv: ?Weight = null,
@@ -164,11 +180,28 @@ pub const LinearWeights = struct {
     b: ?Weight = null,
     a: ?Weight = null,
     ba: ?Weight = null,
-    /// Depthwise causal convolution `[conv_dim][1][kernel]` (stored `[conv_dim][kernel]`).
-    conv: Weight,
-    dt_bias: []const f32,
-    a_log: []const f32,
-    norm: []const f32,
+    q: ?Weight = null,
+    k: ?Weight = null,
+    v: ?Weight = null,
+    f_a: ?Weight = null,
+    f_b: ?Weight = null,
+    g_a: ?Weight = null,
+    g_b: ?Weight = null,
+    /// Depthwise causal convolution `[conv_dim][1][kernel]` (read as
+    /// `[conv_dim][kernel]`), or one tensor per q/k/v projection (original
+    /// Kimi Linear checkpoints).
+    conv: ?Weight = null,
+    conv_q: ?Weight = null,
+    conv_k: ?Weight = null,
+    conv_v: ?Weight = null,
+    /// Gated DeltaNet: `[v_heads]` each; KDA: `dt_bias[heads * head_dim]`, `a_log[heads]`.
+    dt_bias: []const f32 = &.{},
+    a_log: []const f32 = &.{},
+    /// Gated norm weight `[v_dim]` (DeltaNet, KDA) or `[heads * head_dim]` (lightning).
+    norm: []const f32 = &.{},
+    /// Lightning attention `[heads][q | k | v]` projection and sigmoid output gate.
+    light_qkv: ?Weight = null,
+    light_gate: ?Weight = null,
 };
 
 pub const Layer = struct {
@@ -261,6 +294,18 @@ pub const Layer = struct {
             .lin_a => self.linear.?.a = w,
             .lin_ba => self.linear.?.ba = w,
             .lin_conv => self.linear.?.conv = w,
+            .lin_q => self.linear.?.q = w,
+            .lin_k => self.linear.?.k = w,
+            .lin_v => self.linear.?.v = w,
+            .lin_conv_q => self.linear.?.conv_q = w,
+            .lin_conv_k => self.linear.?.conv_k = w,
+            .lin_conv_v => self.linear.?.conv_v = w,
+            .lin_f_a => self.linear.?.f_a = w,
+            .lin_f_b => self.linear.?.f_b = w,
+            .lin_g_a => self.linear.?.g_a = w,
+            .lin_g_b => self.linear.?.g_b = w,
+            .light_qkv => self.linear.?.light_qkv = w,
+            .light_gate => self.linear.?.light_gate = w,
             .d_q_a => self.dsv4.?.q_a = w,
             .d_q_b => self.dsv4.?.q_b = w,
             .d_kv => self.dsv4.?.kv = w,
@@ -431,6 +476,11 @@ pub const Model = struct {
     source_dir: []const u8,
     /// Raw JSON texts kept for export.
     config_json: []const u8,
+    /// `config_json` as an export writes it: without `quantization_config`
+    /// when the checkpoint was dequantised on load (exports are bf16).
+    export_config_json: []const u8,
+    /// Tensors dequantised on load (see dequant.zig); 0 for plain checkpoints.
+    dequantised: usize,
     tokenizer_json: []const u8,
     generation_config_json: ?[]const u8,
     tokenizer_config_json: ?[]const u8,
@@ -564,8 +614,10 @@ pub const Model = struct {
             std.log.warn("{s} contains {s}: the export did not finish; refusing to load it", .{ dir_path, export_incomplete_marker });
             return error.IncompleteModel;
         } else |_| {}
+        self.dequantised = 0;
         if (gguf_path) |p| {
             try gguf_model.attach(self, p, opts.store == .mapped, .{ .ignore_embedded = opts.gguf_ignore_embedded });
+            self.export_config_json = self.config_json;
         } else try self.loadHfFiles(dir, dir_path, opts);
         errdefer self.tokenizer.deinit();
         errdefer for (self.files) |f| f.close(gpa, io);
@@ -623,7 +675,6 @@ pub const Model = struct {
         const vd = c.linear_v_heads * c.linear_v_dim;
         const vh = c.linear_v_heads;
         var lin = LinearWeights{
-            .conv = undefined,
             .dt_bias = &.{},
             .a_log = &.{},
             .norm = &.{},
@@ -682,12 +733,12 @@ pub const Model = struct {
         const conv_name = try cat(arena, lp, names.lin_conv orelse return error.InvalidConfig);
         lin.conv = try self.loadMat(conv_name);
         layer.refs.add(.lin_conv, try self.ref(conv_name), false);
-        if (lin.conv.rows != 2 * kd + vd or lin.conv.cols != c.linear_conv_kernel) {
+        if (lin.conv.?.rows != 2 * kd + vd or lin.conv.?.cols != c.linear_conv_kernel) {
             std.log.err("layer {d}: linear convolution has wrong shape", .{li});
             return error.InvalidConfig;
         }
-        lin.dt_bias = try self.loadVec(try cat(arena, lp, names.lin_dt_bias orelse return error.InvalidConfig));
-        lin.a_log = try self.loadVec(try cat(arena, lp, names.lin_a_log orelse return error.InvalidConfig));
+        lin.dt_bias = try self.loadVec(try self.requireFirst(arena, lp, names.lin_dt_bias));
+        lin.a_log = try self.loadVec(try self.requireFirst(arena, lp, names.lin_a_log));
         lin.norm = try self.loadVec(try cat(arena, lp, names.lin_norm orelse return error.InvalidConfig));
         if (lin.dt_bias.len != vh or lin.a_log.len != vh or lin.norm.len != c.linear_v_dim) {
             std.log.err("layer {d}: linear time-step vectors have wrong shapes", .{li});
@@ -698,6 +749,157 @@ pub const Model = struct {
         layer.refs.add(.o, try self.ref(o_name), false);
         if (layer.o.rows != hidden or layer.o.cols != vd) {
             std.log.err("layer {d}: linear output projection is [{d}][{d}], expected [{d}][{d}]", .{ li, layer.o.rows, layer.o.cols, hidden, vd });
+            return error.InvalidConfig;
+        }
+        layer.linear = lin;
+    }
+
+    /// The first of `templates` (relative to `lp`) that names a tensor of the
+    /// store; an error naming the first alternative when none is present.
+    fn requireFirst(self: *Model, arena: Allocator, lp: []const u8, templates: []const []const u8) ![]const u8 {
+        for (templates) |t| {
+            const n = try cat(arena, lp, t);
+            if (self.store.lookup(n) != null) return n;
+        }
+        if (templates.len == 0) return error.InvalidConfig;
+        std.log.err("missing tensor: {s}{s}", .{ lp, templates[0] });
+        return error.MissingWeights;
+    }
+
+    /// Loads a Kimi Delta Attention layer (`KimiLinearDeltaAttention`): the
+    /// q/k/v projections, their short convolution (one fused tensor, or one
+    /// per projection in the original checkpoints), the low-rank forget gate
+    /// with its time-step bias and decay, the beta projection, the low-rank
+    /// output gate, the gated norm, and the output projection into `layer.o`.
+    fn loadKda(self: *Model, layer: *Layer, arena: Allocator, li: usize, lp: []const u8) !void {
+        const c = &self.config;
+        const names = &c.arch.names;
+        const hidden = c.hidden_size;
+        const heads = c.linear_v_heads;
+        const hd = c.linear_v_dim;
+        const dim = heads * hd;
+        const kc = c.linear_conv_kernel;
+        var lin = LinearWeights{
+            .dt_bias = &.{},
+            .a_log = &.{},
+            .norm = &.{},
+        };
+        const proj_names = .{ names.lin_q, names.lin_k, names.lin_v, names.lin_b, names.lin_g_a, names.lin_g_b };
+        const proj_slots = .{ Slot.lin_q, Slot.lin_k, Slot.lin_v, Slot.lin_b, Slot.lin_g_a, Slot.lin_g_b };
+        const proj_rows = .{ dim, dim, dim, heads, hd, dim };
+        const proj_cols = .{ hidden, hidden, hidden, hidden, hidden, hd };
+        inline for (proj_names, proj_slots, proj_rows, proj_cols) |t, slot, rows, cols| {
+            const n = try cat(arena, lp, t orelse return error.InvalidConfig);
+            const w = try self.loadMat(n);
+            layer.refs.add(slot, try self.ref(n), false);
+            if (w.rows != rows or w.cols != cols) {
+                std.log.err("layer {d}: {s} is [{d}][{d}], expected [{d}][{d}]", .{ li, n, w.rows, w.cols, rows, cols });
+                return error.InvalidConfig;
+            }
+            switch (slot) {
+                .lin_q => lin.q = w,
+                .lin_k => lin.k = w,
+                .lin_v => lin.v = w,
+                .lin_b => lin.b = w,
+                .lin_g_a => lin.g_a = w,
+                .lin_g_b => lin.g_b = w,
+                else => unreachable,
+            }
+        }
+        const fa_name = try self.requireFirst(arena, lp, names.lin_f_a);
+        lin.f_a = try self.loadMat(fa_name);
+        layer.refs.add(.lin_f_a, try self.ref(fa_name), false);
+        const fb_name = try self.requireFirst(arena, lp, names.lin_f_b);
+        lin.f_b = try self.loadMat(fb_name);
+        layer.refs.add(.lin_f_b, try self.ref(fb_name), false);
+        if (lin.f_a.?.rows != hd or lin.f_a.?.cols != hidden or lin.f_b.?.rows != dim or lin.f_b.?.cols != hd) {
+            std.log.err("layer {d}: forget gate projections do not match linear_head_dim {d} / linear_num_heads {d}", .{ li, hd, heads });
+            return error.InvalidConfig;
+        }
+        const fused_conv: ?[]const u8 = if (names.lin_conv) |t| blk: {
+            const n = try cat(arena, lp, t);
+            break :blk if (self.store.lookup(n) != null) n else null;
+        } else null;
+        if (fused_conv) |n| {
+            lin.conv = try self.loadMat(n);
+            layer.refs.add(.lin_conv, try self.ref(n), false);
+            if (lin.conv.?.rows != 3 * dim or lin.conv.?.cols != kc) {
+                std.log.err("layer {d}: {s} is [{d}][{d}], expected [{d}][{d}]", .{ li, n, lin.conv.?.rows, lin.conv.?.cols, 3 * dim, kc });
+                return error.InvalidConfig;
+            }
+        } else if (names.lin_conv_split.len == 3) {
+            const conv_slots = .{ Slot.lin_conv_q, Slot.lin_conv_k, Slot.lin_conv_v };
+            inline for (conv_slots, 0..) |slot, i| {
+                const n = try cat(arena, lp, names.lin_conv_split[i]);
+                const w = try self.loadMat(n);
+                layer.refs.add(slot, try self.ref(n), false);
+                if (w.rows != dim or w.cols != kc) {
+                    std.log.err("layer {d}: {s} is [{d}][{d}], expected [{d}][{d}]", .{ li, n, w.rows, w.cols, dim, kc });
+                    return error.InvalidConfig;
+                }
+                switch (slot) {
+                    .lin_conv_q => lin.conv_q = w,
+                    .lin_conv_k => lin.conv_k = w,
+                    .lin_conv_v => lin.conv_v = w,
+                    else => unreachable,
+                }
+            }
+        } else {
+            std.log.err("layer {d}: no linear-attention convolution found", .{li});
+            return error.MissingWeights;
+        }
+        lin.dt_bias = try self.loadVec(try self.requireFirst(arena, lp, names.lin_dt_bias));
+        lin.a_log = try self.loadVec(try self.requireFirst(arena, lp, names.lin_a_log));
+        lin.norm = try self.loadVec(try cat(arena, lp, names.lin_norm orelse return error.InvalidConfig));
+        if (lin.dt_bias.len != dim or lin.a_log.len != heads or lin.norm.len != hd) {
+            std.log.err("layer {d}: dt_bias / A_log / o_norm have wrong shapes (expected [{d}], [{d}], [{d}])", .{ li, dim, heads, hd });
+            return error.InvalidConfig;
+        }
+        const o_name = try cat(arena, lp, names.lin_out orelse return error.InvalidConfig);
+        layer.o = try self.loadMat(o_name);
+        layer.o_bias = self.loadVecOpt(try biasName(arena, o_name));
+        layer.refs.add(.o, try self.ref(o_name), false);
+        if (layer.o.rows != hidden or layer.o.cols != dim) {
+            std.log.err("layer {d}: linear output projection is [{d}][{d}], expected [{d}][{d}]", .{ li, layer.o.rows, layer.o.cols, hidden, dim });
+            return error.InvalidConfig;
+        }
+        layer.linear = lin;
+    }
+
+    /// Loads a MiniMax lightning-attention layer: the fused `[heads][q|k|v]`
+    /// projection, the sigmoid output gate, the RMSNorm over `heads * head_dim`
+    /// and the output projection into `layer.o`.
+    fn loadLightning(self: *Model, layer: *Layer, arena: Allocator, li: usize, lp: []const u8) !void {
+        const c = &self.config;
+        const names = &c.arch.names;
+        const hidden = c.hidden_size;
+        const qd = c.num_heads * c.head_dim;
+        var lin = LinearWeights{};
+        const qkv_name = try cat(arena, lp, names.light_qkv orelse return error.InvalidConfig);
+        lin.light_qkv = try self.loadMat(qkv_name);
+        layer.refs.add(.light_qkv, try self.ref(qkv_name), false);
+        if (lin.light_qkv.?.rows != 3 * qd or lin.light_qkv.?.cols != hidden) {
+            std.log.err("layer {d}: lightning qkv projection is [{d}][{d}], expected [{d}][{d}]", .{ li, lin.light_qkv.?.rows, lin.light_qkv.?.cols, 3 * qd, hidden });
+            return error.InvalidConfig;
+        }
+        const gate_name = try cat(arena, lp, names.light_gate orelse return error.InvalidConfig);
+        lin.light_gate = try self.loadMat(gate_name);
+        layer.refs.add(.light_gate, try self.ref(gate_name), false);
+        if (lin.light_gate.?.rows != qd or lin.light_gate.?.cols != hidden) {
+            std.log.err("layer {d}: lightning output gate has wrong shape", .{li});
+            return error.InvalidConfig;
+        }
+        lin.norm = try self.loadVec(try cat(arena, lp, names.light_norm orelse return error.InvalidConfig));
+        if (lin.norm.len != qd) {
+            std.log.err("layer {d}: lightning norm has {d} entries, expected {d}", .{ li, lin.norm.len, qd });
+            return error.InvalidConfig;
+        }
+        const o_name = try cat(arena, lp, names.light_out orelse return error.InvalidConfig);
+        layer.o = try self.loadMat(o_name);
+        layer.o_bias = self.loadVecOpt(try biasName(arena, o_name));
+        layer.refs.add(.o, try self.ref(o_name), false);
+        if (layer.o.rows != hidden or layer.o.cols != qd) {
+            std.log.err("layer {d}: lightning output projection is [{d}][{d}], expected [{d}][{d}]", .{ li, layer.o.rows, layer.o.cols, hidden, qd });
             return error.InvalidConfig;
         }
         layer.linear = lin;
@@ -823,7 +1025,11 @@ pub const Model = struct {
             if (c.dsv4 != null) {
                 try dsv4.loadLayer(self, layer, arena, i, lp);
             } else if (c.linear_layers[i]) {
-                try self.loadLinear(layer, arena, i, lp);
+                switch (c.linear_kind) {
+                    .gated_deltanet => try self.loadLinear(layer, arena, i, lp),
+                    .kda => try self.loadKda(layer, arena, i, lp),
+                    .lightning => try self.loadLightning(layer, arena, i, lp),
+                }
             } else if (c.mla) |m| {
                 const kv_a_name = try cat(arena, lp, names.kv_a orelse return error.InvalidConfig);
                 const kv_b_name = try cat(arena, lp, names.kv_b orelse return error.InvalidConfig);
@@ -1093,12 +1299,10 @@ pub const Model = struct {
         self.config = try parseConfig(arena, self.config_json);
         self.generation_config_json = dir.readFileAlloc(io, "generation_config.json", arena, .unlimited) catch null;
         self.tokenizer_config_json = dir.readFileAlloc(io, "tokenizer_config.json", arena, .unlimited) catch null;
-        const tok_json = dir.readFileAlloc(io, "tokenizer.json", arena, .unlimited) catch {
-            std.log.err("tokenizer.json not found in {s} (only fast tokenizers are supported)", .{dir_path});
-            return error.MissingTokenizer;
-        };
-        self.tokenizer_json = tok_json;
-        self.tokenizer = try Tokenizer.parse(gpa, tok_json, self.tokenizer_config_json);
+        // tokenizer.json, else a tiktoken vocabulary (tiktoken.model / tokenizer.model).
+        const loaded = try Tokenizer.loadDir(gpa, io, arena, dir, dir_path, self.tokenizer_config_json);
+        self.tokenizer_json = loaded.json;
+        self.tokenizer = loaded.tokenizer;
         errdefer self.tokenizer.deinit();
         self.chat_template = null;
         if (self.tokenizer_config_json) |tc| {
@@ -1180,6 +1384,20 @@ pub const Model = struct {
             for (names.items) |n| try files.append(arena, try safetensors.File.openOptions(gpa, io, dir, n, .{ .map = opts.store == .mapped }));
         }
         self.files = files.items;
+
+        // Quantised checkpoints: every recognised group of storage tensors
+        // becomes one virtual bf16 tensor; anything left over is skipped.
+        const reg = try dequant.register(gpa, io, self.files, self.config.quant);
+        self.dequantised = reg.count;
+        self.export_config_json = self.config_json;
+        if (reg.count > 0) {
+            std.log.info("dequantising {d} tensors on load ({d} fp8, {d} mxfp4, {d} pack-quantized); exports are bf16", .{ reg.count, reg.fp8, reg.mxfp4, reg.int_packed });
+            self.export_config_json = try dequant.stripQuantizationConfig(arena, self.config_json);
+        }
+        for (self.files) |f| {
+            var it = f.raw.iterator();
+            while (it.next()) |kv| std.log.warn("skipping tensor {s} with unsupported dtype {s}", .{ kv.key_ptr.*, kv.value_ptr.dtype });
+        }
     }
 
     fn cat(arena: Allocator, a: []const u8, b: []const u8) ![]const u8 {
@@ -1387,6 +1605,7 @@ pub const Model = struct {
         const names = &self.config.arch.names;
         if (std.mem.eql(u8, ls.suffix, names.o)) return wholeEdit(layer.o_delta, layer.refs.isTransposed(.o));
         if (names.lin_out) |lo| if (std.mem.eql(u8, ls.suffix, lo)) return wholeEdit(layer.o_delta, false);
+        if (names.light_out) |lo| if (std.mem.eql(u8, ls.suffix, lo)) return wholeEdit(layer.o_delta, false);
         if (layer.moe) |*m| {
             const target = m.exportTarget(ls.suffix) orelse return null;
             return switch (target) {
@@ -1744,7 +1963,7 @@ pub const LinearCache = struct {
 
     pub fn bytesFor(c: *const Config, batch: usize) u64 {
         if (!c.has_linear) return 0;
-        const per: u64 = @intCast(c.linear_v_heads * c.linear_k_dim * c.linear_v_dim + linearConvDim(c) * (c.linear_conv_kernel - 1));
+        const per: u64 = @intCast(linearStateLen(c) + linearConvLen(c));
         var n_lin: u64 = 0;
         for (c.linear_layers) |is_lin| {
             if (is_lin) n_lin += 1;
@@ -1762,8 +1981,8 @@ pub const LinearCache = struct {
                 n_lin += 1;
             } else lin_index[li] = null;
         }
-        const state_len: usize = c.linear_v_heads * c.linear_k_dim * c.linear_v_dim;
-        const conv_len: usize = linearConvDim(c) * (c.linear_conv_kernel - 1);
+        const state_len = linearStateLen(c);
+        const conv_len = linearConvLen(c);
         const buf = try gpa.alloc(f32, n_linear_buflen(n_lin, batch, state_len, conv_len));
         errdefer gpa.free(buf);
         @memset(buf, 0);
@@ -1805,6 +2024,33 @@ pub const LinearCache = struct {
 
 fn linearConvDim(c: *const Config) usize {
     return 2 * c.linear_k_heads * c.linear_k_dim + c.linear_v_heads * c.linear_v_dim;
+}
+
+/// Floats of recurrent state per (linear layer, sequence): `[v_heads][k_dim][v_dim]`
+/// for Gated DeltaNet, `[heads][head_dim][head_dim]` for lightning attention.
+fn linearStateLen(c: *const Config) usize {
+    return switch (c.linear_kind) {
+        .gated_deltanet, .kda => c.linear_v_heads * c.linear_k_dim * c.linear_v_dim,
+        .lightning => c.num_heads * c.head_dim * c.head_dim,
+    };
+}
+
+/// Floats of convolution history per (linear layer, sequence).
+fn linearConvLen(c: *const Config) usize {
+    return switch (c.linear_kind) {
+        .gated_deltanet, .kda => linearConvDim(c) * (c.linear_conv_kernel - 1),
+        .lightning => 0,
+    };
+}
+
+/// Decay rate of lightning-attention head `h` in layer `li`: `2^(-8 (h + 1) / heads)`
+/// scaled by a factor that falls linearly from 1 in the first layer to ~0 in the last.
+fn lightningSlope(c: *const Config, li: usize, h: usize) f32 {
+    const heads: f64 = @floatFromInt(c.num_heads);
+    const base = std.math.pow(f64, 2.0, -8.0 / heads);
+    const rate = std.math.pow(f64, base, @as(f64, @floatFromInt(h + 1)));
+    const factor = 1.0 - @as(f64, @floatFromInt(li)) / (@as(f64, @floatFromInt(c.num_layers)) - 1.0 + 1e-5) + 1e-5;
+    return @floatCast(rate * factor);
 }
 
 /// Describes one row of a batched forward call.
@@ -1949,7 +2195,10 @@ pub const Workspace = struct {
 
     fn linearCols(c: *const Config) usize {
         if (!c.has_linear) return 0;
-        return 2 * c.linear_k_heads * c.linear_k_dim + 3 * c.linear_v_heads * c.linear_v_dim + 2 * c.linear_v_heads;
+        return switch (c.linear_kind) {
+            .gated_deltanet, .kda => 2 * c.linear_k_heads * c.linear_k_dim + 3 * c.linear_v_heads * c.linear_v_dim + 2 * c.linear_v_heads,
+            .lightning => 5 * c.num_heads * c.head_dim,
+        };
     }
 
     pub fn init(gpa: Allocator, c: *const Config, max_rows: usize, max_logit_rows: usize) !Workspace {
@@ -2271,8 +2520,8 @@ fn linearForward(model: *const Model, layer: *const Layer, li: usize, ws: *Works
     defer gpa.free(vv);
     const y = try gpa.alloc(f32, conv_dim);
     defer gpa.free(y);
-    const convw = lin.conv.data;
-    const cdt = lin.conv.dtype;
+    const convw = lin.conv.?.data;
+    const cdt = lin.conv.?.dtype;
     for (0..n) |t| {
         const b = rows[t].b;
         const pos = rows[t].pos;
@@ -2346,6 +2595,225 @@ fn linearForward(model: *const Model, layer: *const Layer, li: usize, ws: *Works
             for (o, 0..) |*v, jj| v.* = v.* * inv * lin.norm[jj] * tensor.silu(z[jj]);
         }
         next.* = pos + 1;
+    }
+    try tensor.matmulT(model.pool, gpa, ws.o, core, n, layer.o, if (layer.o_delta) |*d| d else null);
+    if (layer.o_bias) |bias| addBias(ws.o, n, hidden, bias);
+}
+
+/// Kimi Delta Attention sublayer (`KimiLinearDeltaAttention`): the q/k/v
+/// projections, the depthwise causal convolution over them, the delta-rule
+/// recurrence with a per-channel decay from the low-rank forget gate, the
+/// sigmoid-gated output norm and the output projection (with its delta).
+/// Reads `h`, writes `ws.o`. Like `linearForward`, the projections run over
+/// every row at once and the recurrence runs each batch slot's rows in order
+/// against `cache.linear` (the chunked reference kernel computes the same
+/// recurrence in blocks).
+fn kdaForward(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace, cache: *KvCache, h: []const f32, rows: []const Row) !void {
+    const c = &model.config;
+    const gpa = model.gpa;
+    const lin = layer.linear.?;
+    const lcache = &(cache.linear orelse return error.MissingLinearCache);
+    const n = rows.len;
+    const hidden = c.hidden_size;
+    const nh = c.linear_v_heads;
+    const hd = c.linear_v_dim;
+    const dim = nh * hd;
+    const kc = c.linear_conv_kernel;
+    const conv_dim = 3 * dim;
+    const eps = c.rms_norm_eps;
+
+    // `mixed` holds q | k | v per row (the convolution's channels).
+    const mixed = try gpa.alloc(f32, n * conv_dim);
+    defer gpa.free(mixed);
+    {
+        const tmp = try gpa.alloc(f32, n * dim);
+        defer gpa.free(tmp);
+        const projs = .{ lin.q.?, lin.k.?, lin.v.? };
+        inline for (projs, 0..) |w, s| {
+            try tensor.matmulT(model.pool, gpa, tmp, h, n, w, null);
+            for (0..n) |t| @memcpy(mixed[t * conv_dim + s * dim ..][0..dim], tmp[t * dim ..][0..dim]);
+        }
+    }
+    // Forget gate: g = -exp(A_log[head]) * softplus(f_b(f_a(h)) + dt_bias), per channel.
+    const low = try gpa.alloc(f32, n * hd);
+    defer gpa.free(low);
+    const decay = try gpa.alloc(f32, n * dim);
+    defer gpa.free(decay);
+    try tensor.matmulT(model.pool, gpa, low, h, n, lin.f_a.?, null);
+    try tensor.matmulT(model.pool, gpa, decay, low, n, lin.f_b.?, null);
+    for (0..n) |t| {
+        const g = decay[t * dim ..][0..dim];
+        for (0..nh) |hh| {
+            const rate = -@exp(lin.a_log[hh]);
+            for (0..hd) |i| g[hh * hd + i] = rate * softplus(g[hh * hd + i] + lin.dt_bias[hh * hd + i]);
+        }
+    }
+    const bbuf = try gpa.alloc(f32, n * nh);
+    defer gpa.free(bbuf);
+    try tensor.matmulT(model.pool, gpa, bbuf, h, n, lin.b.?, null);
+    // Output gate: g_b(g_a(h)).
+    const gate = try gpa.alloc(f32, n * dim);
+    defer gpa.free(gate);
+    try tensor.matmulT(model.pool, gpa, low, h, n, lin.g_a.?, null);
+    try tensor.matmulT(model.pool, gpa, gate, low, n, lin.g_b.?, null);
+
+    const core = try gpa.alloc(f32, n * dim);
+    defer gpa.free(core);
+    const y = try gpa.alloc(f32, conv_dim);
+    defer gpa.free(y);
+    const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+    for (0..n) |t| {
+        const b = rows[t].b;
+        const pos = rows[t].pos;
+        const S = lcache.state(li, b);
+        const C = lcache.conv(li, b);
+        const next = lcache.nextPos(li, b);
+        if (pos == 0) {
+            @memset(S, 0);
+            @memset(C, 0);
+            next.* = 0;
+        }
+        if (pos != next.*) return error.NonContiguousRows;
+        const m = mixed[t * conv_dim ..][0..conv_dim];
+        for (0..conv_dim) |j| {
+            var acc: f32 = kdaConvTap(lin, dim, kc, j, kc - 1) * m[j];
+            if (kc > 1) {
+                for (1..kc) |i| acc += kdaConvTap(lin, dim, kc, j, kc - 1 - i) * C[j * (kc - 1) + kc - 1 - i];
+            }
+            y[j] = c.activation.apply(acc);
+            if (kc > 1) {
+                @memmove(C[j * (kc - 1) ..][0 .. kc - 2], C[j * (kc - 1) + 1 ..][0 .. kc - 2]);
+                C[j * (kc - 1) + kc - 2] = m[j];
+            }
+        }
+        const q0 = y[0..dim];
+        const k0 = y[dim .. 2 * dim];
+        const v0 = y[2 * dim ..][0..dim];
+        l2normRows(q0, nh, hd);
+        l2normRows(k0, nh, hd);
+        tensor.scale(q0, qscale);
+        const g = decay[t * dim ..][0..dim];
+        for (0..nh) |hh| {
+            const beta = 1.0 / (1.0 + @exp(-bbuf[t * nh + hh]));
+            const St = S[hh * hd * hd ..][0 .. hd * hd];
+            const q = q0[hh * hd ..][0..hd];
+            const k = k0[hh * hd ..][0..hd];
+            const v = v0[hh * hd ..][0..hd];
+            const gh = g[hh * hd ..][0..hd];
+            // Per-channel decay: row i of the [k_dim][v_dim] state decays by exp(g[i]).
+            for (0..hd) |i| {
+                const dec = @exp(gh[i]);
+                for (St[i * hd ..][0..hd]) |*sv| sv.* *= dec;
+            }
+            const out = core[t * dim + hh * hd ..][0..hd];
+            for (0..hd) |jj| {
+                var mem: f32 = 0;
+                for (0..hd) |i| mem += St[i * hd + jj] * k[i];
+                const delta = (v[jj] - mem) * beta;
+                for (0..hd) |i| St[i * hd + jj] += k[i] * delta;
+            }
+            for (0..hd) |jj| {
+                var sum: f32 = 0;
+                for (0..hd) |i| sum += St[i * hd + jj] * q[i];
+                out[jj] = sum;
+            }
+        }
+        // Gated RMSNorm per head: w * rms(o) * sigmoid(gate).
+        const gg = gate[t * dim ..][0..dim];
+        const oo = core[t * dim ..][0..dim];
+        for (0..nh) |hh| {
+            const o = oo[hh * hd ..][0..hd];
+            const z = gg[hh * hd ..][0..hd];
+            var variance: f32 = 0;
+            for (o) |v| variance += v * v;
+            variance = variance / @as(f32, @floatFromInt(hd)) + eps;
+            const inv = 1.0 / @sqrt(variance);
+            for (o, 0..) |*v, jj| v.* = v.* * inv * lin.norm[jj] / (1.0 + @exp(-z[jj]));
+        }
+        next.* = pos + 1;
+    }
+    try tensor.matmulT(model.pool, gpa, ws.o, core, n, layer.o, if (layer.o_delta) |*d| d else null);
+    if (layer.o_bias) |bias| addBias(ws.o, n, hidden, bias);
+}
+
+/// Tap `i` of channel `j`'s convolution kernel: from the fused `[3 dim][kernel]`
+/// tensor, or from the q/k/v tensor the channel belongs to.
+fn kdaConvTap(lin: LinearWeights, dim: usize, kc: usize, j: usize, i: usize) f32 {
+    if (lin.conv) |w| return elemAt(w.dtype, w.data, j * kc + i);
+    const s = j / dim;
+    const w = switch (s) {
+        0 => lin.conv_q.?,
+        1 => lin.conv_k.?,
+        else => lin.conv_v.?,
+    };
+    return elemAt(w.dtype, w.data, (j - s * dim) * kc + i);
+}
+
+/// MiniMax lightning-attention sublayer: `silu(h Wqkvᵀ)` split per head into
+/// q, k, v; per head the decayed recurrence `S = exp(-s_h) S + kᵀ v`,
+/// `o = q S` (the sequential form of the reference's blocked prefill, which
+/// it equals exactly); RMSNorm over every head, the sigmoid gate `σ(h Wgᵀ)`
+/// and the output projection (with its delta). Reads `h`, writes `ws.o`.
+fn lightningForward(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace, cache: *KvCache, h: []const f32, rows: []const Row) !void {
+    const c = &model.config;
+    const gpa = model.gpa;
+    const lin = layer.linear.?;
+    const lcache = &(cache.linear orelse return error.MissingLinearCache);
+    const n = rows.len;
+    const hidden = c.hidden_size;
+    const nh = c.num_heads;
+    const hd = c.head_dim;
+    const qd = nh * hd;
+    // The reference's `MiniMaxRMSNorm(head_dim * heads)` keeps its default epsilon.
+    const norm_eps: f32 = 1e-6;
+
+    const proj = try gpa.alloc(f32, n * 3 * qd);
+    defer gpa.free(proj);
+    try tensor.matmulT(model.pool, gpa, proj, h, n, lin.light_qkv.?, null);
+    for (proj) |*v| v.* = tensor.silu(v.*);
+    const gate = try gpa.alloc(f32, n * qd);
+    defer gpa.free(gate);
+    try tensor.matmulT(model.pool, gpa, gate, h, n, lin.light_gate.?, null);
+    const core = try gpa.alloc(f32, n * qd);
+    defer gpa.free(core);
+    const decay = try gpa.alloc(f32, nh);
+    defer gpa.free(decay);
+    for (decay, 0..) |*d, hh| d.* = @exp(-lightningSlope(c, li, hh));
+
+    for (0..n) |t| {
+        const b = rows[t].b;
+        const pos = rows[t].pos;
+        const S = lcache.state(li, b);
+        const next = lcache.nextPos(li, b);
+        if (pos == 0) {
+            @memset(S, 0);
+            next.* = 0;
+        }
+        if (pos != next.*) return error.NonContiguousRows;
+        const p = proj[t * 3 * qd ..][0 .. 3 * qd];
+        for (0..nh) |hh| {
+            const q = p[hh * 3 * hd ..][0..hd];
+            const k = p[hh * 3 * hd + hd ..][0..hd];
+            const v = p[hh * 3 * hd + 2 * hd ..][0..hd];
+            const St = S[hh * hd * hd ..][0 .. hd * hd];
+            const r = decay[hh];
+            for (0..hd) |i| {
+                const row = St[i * hd ..][0..hd];
+                for (row, 0..) |*s, j| s.* = r * s.* + k[i] * v[j];
+            }
+            const out = core[t * qd + hh * hd ..][0..hd];
+            @memset(out, 0);
+            for (0..hd) |i| tensor.axpy(out, q[i], St[i * hd ..][0..hd]);
+        }
+        next.* = pos + 1;
+    }
+    const tmp = try gpa.alloc(f32, qd);
+    defer gpa.free(tmp);
+    for (0..n) |t| {
+        const row = core[t * qd ..][0..qd];
+        tensor.rmsnorm(tmp, row, lin.norm, norm_eps, false);
+        const g = gate[t * qd ..][0..qd];
+        for (row, 0..) |*v, j| v.* = tmp[j] / (1.0 + @exp(-g[j]));
     }
     try tensor.matmulT(model.pool, gpa, ws.o, core, n, layer.o, if (layer.o_delta) |*d| d else null);
     if (layer.o_bias) |bias| addBias(ws.o, n, hidden, bias);
@@ -2474,18 +2942,22 @@ fn attentionTail(model: *const Model, layer: *const Layer, li: usize, ws: *Works
                 temp = @log(@floor((p + 1.0) / t.floor_scale) + 1.0) * t.attn_scale + 1.0;
             }
         }
+        const norm_before = do_qk_norm and !c.qk_norm_after_rope;
+        const norm_after = do_qk_norm and c.qk_norm_after_rope;
         var hh: usize = 0;
         while (hh < c.num_heads) : (hh += 1) {
             const q = qrow[hh * hd ..][0..hd];
-            if (do_qk_norm) if (layer.q_norm) |nm| qkNormHead(c, q, nm, hh);
+            if (norm_before) if (layer.q_norm) |nm| qkNormHead(c, q, nm, hh);
             if (use_rope) ropeHead(c, q[rope_off..], cr, sr);
+            if (norm_after) if (layer.q_norm) |nm| qkNormHead(c, q, nm, hh);
             if (temp) |t| tensor.scale(q, t);
         }
         hh = 0;
         while (hh < c.num_kv_heads) : (hh += 1) {
             const k = krow[hh * hd ..][0..hd];
-            if (do_qk_norm) if (layer.k_norm) |nm| qkNormHead(c, k, nm, hh);
+            if (norm_before) if (layer.k_norm) |nm| qkNormHead(c, k, nm, hh);
             if (use_rope) ropeHead(c, k[rope_off..], cr, sr);
+            if (norm_after) if (layer.k_norm) |nm| qkNormHead(c, k, nm, hh);
         }
         @memcpy(cache.kSlot(li, rows[i].b, rows[i].pos), krow);
         @memcpy(cache.vSlot(li, rows[i].b, rows[i].pos), ws.v[i * kvd ..][0..kvd]);
@@ -2553,13 +3025,13 @@ pub fn mlpBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Worksp
             try tensor.matmulT(model.pool, gpa, ws.up, h_in, n, layer.up.?, null);
             if (layer.gate_bias) |b| addBias(ws.gate, n, inter, b);
             if (layer.up_bias) |b| addBias(ws.up, n, inter, b);
-            tensor.gatedActivation(model.pool, c.activation, ws.gate, ws.gate, ws.up, n, inter, inter, inter);
+            if (c.moe.swiglu) |sw| swigluOai(sw, ws.gate, ws.gate, ws.up, n, inter, inter) else tensor.gatedActivation(model.pool, c.activation, ws.gate, ws.gate, ws.up, n, inter, inter, inter);
         },
         .gated_fused => {
             const gu = layer.gate_up.?;
             try tensor.matmulT(model.pool, gpa, ws.gate_up, h_in, n, gu, null);
             if (layer.up_bias) |b| addBias(ws.gate_up, n, 2 * inter, b);
-            tensor.gatedActivation(model.pool, c.activation, ws.gate, ws.gate_up, ws.gate_up[inter..], n, inter, 2 * inter, inter);
+            if (c.moe.swiglu) |sw| swigluOai(sw, ws.gate, ws.gate_up, ws.gate_up[inter..], n, inter, 2 * inter) else tensor.gatedActivation(model.pool, c.activation, ws.gate, ws.gate_up, ws.gate_up[inter..], n, inter, 2 * inter, inter);
         },
         .dense => {
             try tensor.matmulT(model.pool, gpa, ws.up, h_in, n, layer.up.?, null);
@@ -2570,6 +3042,22 @@ pub fn mlpBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Worksp
     }
     try tensor.matmulT(model.pool, gpa, ws.m, din, n, down, if (layer.down_delta) |*d| d else null);
     if (layer.down_bias) |b| addBias(ws.m, n, hidden, b);
+}
+
+/// The clamped gpt-oss / MiniMax M3 swiglu on `n` rows of `gate` and `up`
+/// (row stride `in_stride`): `out = (clamp(up) + 1) · min(gate, limit) · σ(α gate)`,
+/// written densely (`[n][inter]`).
+fn swigluOai(sw: arch.Swiglu, out: []f32, gate: []const f32, up: []const f32, n: usize, inter: usize, in_stride: usize) void {
+    for (0..n) |i| {
+        const g = gate[i * in_stride ..][0..inter];
+        const u = up[i * in_stride ..][0..inter];
+        const o = out[i * inter ..][0..inter];
+        for (o, 0..) |*v, j| {
+            const gc = @min(g[j], sw.limit);
+            const uc = std.math.clamp(u[j], -sw.limit, sw.limit);
+            v.* = (uc + 1.0) * gc / (1.0 + @exp(-sw.alpha * gc));
+        }
+    }
 }
 
 /// Runs the transformer over `tokens`/`rows` (n tokens). Logits for the
@@ -2740,13 +3228,27 @@ fn layerBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Workspac
 
     normRows(c, h, x, n, hidden, layer.input_norm);
     if (c.linear_layers[li]) {
-        try linearForward(model, layer, li, ws, cache, h, rows);
+        switch (c.linear_kind) {
+            .gated_deltanet => try linearForward(model, layer, li, ws, cache, h, rows),
+            .kda => try kdaForward(model, layer, li, ws, cache, h, rows),
+            .lightning => try lightningForward(model, layer, li, ws, cache, h, rows),
+        }
     } else {
         try attention(model, layer, li, ws, cache, h, rows);
     }
     const attn_out = ws.o[0 .. n * hidden];
     if (layer.post_attn_norm) |nm| normRowsInPlace(c, attn_out, n, hidden, nm, ws.h2);
 
+    if (c.residual_layout == .minimax) {
+        // MiniMax-01: the normalised input is the residual of each sublayer.
+        const sa = c.minimax_scales[if (c.linear_layers[li]) 1 else 0];
+        for (x[0 .. n * hidden], h, attn_out) |*xv, hv, av| xv.* = sa[0] * hv + sa[1] * av;
+        normRows(c, h, x, n, hidden, layer.pre_ff_norm);
+        try mlpBlock(model, layer, li, ws, h, n, null);
+        const sm = c.minimax_scales[2];
+        for (x[0 .. n * hidden], h, ws.m[0 .. n * hidden]) |*xv, hv, mv| xv.* = sm[0] * hv + sm[1] * mv;
+        return;
+    }
     if (c.parallel_residual) {
         var mlp_in: []const f32 = h;
         if (layer.mlp_norm) |nm| {

@@ -222,6 +222,48 @@ test "deepseek_v4 fixture" {
 test "deepseek_v41 fixture" {
     try checkFixture("deepseek_v41");
 }
+test "minimax_m2 fixture" {
+    try checkFixture("minimax_m2");
+}
+test "minimax fixture (lightning attention, renormalised residual)" {
+    try checkFixture("minimax");
+}
+test "minimax_m3 fixture" {
+    try checkFixture("minimax_m3");
+}
+test "ernie4_5_moe fixture" {
+    try checkFixture("ernie4_5_moe");
+}
+test "hunyuan_v1_moe fixture" {
+    try checkFixture("hunyuan_v1_moe");
+}
+test "granitemoe fixture" {
+    try checkFixture("granitemoe");
+}
+test "granitemoehybrid fixture (attention only, fused shared_mlp)" {
+    try checkFixture("granitemoehybrid");
+}
+test "kimi_linear fixture (checkpoint layout: split convolutions, block_sparse_moe)" {
+    try checkFixture("kimi_linear");
+}
+test "kimi_linear fixture (Hugging Face layout: forget_gate, fused conv1d, stacked experts)" {
+    try checkFixture("kimi_linear_hf");
+}
+test "kimi_k25 fixture (DeepSeek V3 text config under a multimodal wrapper)" {
+    try checkFixture("kimi_k25");
+}
+
+// Quantised checkpoints (dequantised on load, see dequant.zig): the reference
+// logits were computed on the dequantised weights.
+test "qwen2_fp8 fixture (FP8 E4M3 with block scales)" {
+    try checkFixture("qwen2_fp8");
+}
+test "qwen2_int4 fixture (compressed-tensors pack-quantized, zero points)" {
+    try checkFixture("qwen2_int4");
+}
+test "gpt_oss_mxfp4 fixture (MXFP4 expert blocks and scales)" {
+    try checkFixture("gpt_oss_mxfp4");
+}
 
 // ---------------------------------------------------------------------------
 // Abliteration, export and streaming on the registry layouts
@@ -371,4 +413,102 @@ test "deepseek_v4 edit, export and streamed reload (hyper-connections, hash rout
 }
 test "deepseek_v41 edit, export and streamed reload (shared compressed KV, engram tables)" {
     try checkEditExportStream("deepseek_v41");
+}
+test "minimax_m2 edit, export and streamed reload (full-projection q/k norm, Mixtral expert names)" {
+    try checkEditExportStream("minimax_m2");
+}
+test "minimax edit, export and streamed reload (lightning attention out_proj)" {
+    try checkEditExportStream("minimax");
+}
+test "minimax_m3 edit, export and streamed reload (fused shared expert, pass-through indexer tensors)" {
+    try checkEditExportStream("minimax_m3");
+}
+test "ernie4_5_moe edit, export and streamed reload (moe_statics bias, shared experts)" {
+    try checkEditExportStream("ernie4_5_moe");
+}
+test "hunyuan_v1_moe edit, export and streamed reload (q/k norm after rope, shared_mlp)" {
+    try checkEditExportStream("hunyuan_v1_moe");
+}
+test "granitemoe edit, export and streamed reload (fused input_linear / output_linear experts)" {
+    try checkEditExportStream("granitemoe");
+}
+test "granitemoehybrid edit, export and streamed reload (fused shared_mlp)" {
+    try checkEditExportStream("granitemoehybrid");
+}
+test "kimi_linear edit, export and streamed reload (KDA, block_sparse_moe experts)" {
+    try checkEditExportStream("kimi_linear");
+}
+test "kimi_linear_hf edit, export and streamed reload (fused conv1d, stacked experts)" {
+    try checkEditExportStream("kimi_linear_hf");
+}
+test "kimi_k25 edit, export and streamed reload (language_model prefix)" {
+    try checkEditExportStream("kimi_k25");
+}
+test "qwen2_fp8 edit, export and streamed reload (dequantised on load)" {
+    try checkEditExportStream("qwen2_fp8");
+}
+test "qwen2_int4 edit, export and streamed reload (dequantised on load)" {
+    try checkEditExportStream("qwen2_int4");
+}
+test "gpt_oss_mxfp4 edit, export and streamed reload (dequantised experts)" {
+    try checkEditExportStream("gpt_oss_mxfp4");
+}
+
+/// A quantised checkpoint exports as a plain bf16 one: the storage tensors are
+/// gone, the dequantised weights are written in bf16 under their model names,
+/// `config.json` has no `quantization_config`, and the export reloads (mapped
+/// and streamed) to the same logits as the source.
+fn checkQuantisedExport(comptime family: []const u8, comptime weight: []const u8, comptime storage: []const u8) !void {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const pool = tensor.Pool.init(io, 2);
+    const model = try model_mod.Model.load(gpa, io, &pool, "tests/fixtures/" ++ family);
+    defer model.deinit();
+    try std.testing.expect(model.dequantised > 0);
+    try std.testing.expect(model.find(weight) != null);
+    try std.testing.expect(model.find(storage) == null);
+    try std.testing.expect(std.mem.indexOf(u8, model.config_json, "quantization_config") != null);
+    try std.testing.expect(std.mem.indexOf(u8, model.export_config_json, "quantization_config") == null);
+    const ids = [_]u32{ 40, 100, 200, 7, 3 };
+    const base = try runLogits(model, gpa, &ids);
+    defer gpa.free(base);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path_buf);
+    const out_dir = try std.fs.path.join(gpa, &.{ path_buf[0..n], "exported" });
+    defer gpa.free(out_dir);
+    var sink: std.Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try export_mod.saveModel(gpa, io, model, out_dir, .{}, &sink.writer);
+
+    const reloaded = try model_mod.Model.load(gpa, io, &pool, out_dir);
+    defer reloaded.deinit();
+    try std.testing.expectEqual(@as(usize, 0), reloaded.dequantised);
+    const info = reloaded.find(weight) orelse return error.TensorLost;
+    try std.testing.expectEqual(tensor.DType.bf16, info.dtype);
+    try std.testing.expect(reloaded.find(storage) == null);
+    try std.testing.expect(std.mem.indexOf(u8, reloaded.config_json, "quantization_config") == null);
+    // The dequantised values are bf16 already, so the export is exact.
+    const again = try runLogits(reloaded, gpa, &ids);
+    defer gpa.free(again);
+    try std.testing.expectEqualSlices(f32, base, again);
+    const scratch = try std.fs.path.join(gpa, &.{ path_buf[0..n], "scratch" });
+    defer gpa.free(scratch);
+    const streamed = try model_mod.Model.loadWithOptions(gpa, io, &pool, "tests/fixtures/" ++ family, .{ .store = .streamed, .scratch_dir = scratch, .expert_cache = 0 });
+    defer streamed.deinit();
+    const via_stream = try runLogits(streamed, gpa, &ids);
+    defer gpa.free(via_stream);
+    try std.testing.expectEqualSlices(f32, base, via_stream);
+}
+
+test "qwen2_fp8 exports as bf16 without quantization_config" {
+    try checkQuantisedExport("qwen2_fp8", "model.layers.0.self_attn.q_proj.weight", "model.layers.0.self_attn.q_proj.weight_scale_inv");
+}
+test "qwen2_int4 exports as bf16 without quantization_config" {
+    try checkQuantisedExport("qwen2_int4", "model.layers.1.mlp.down_proj.weight", "model.layers.1.mlp.down_proj.weight_packed");
+}
+test "gpt_oss_mxfp4 exports as bf16 without quantization_config" {
+    try checkQuantisedExport("gpt_oss_mxfp4", "model.layers.2.mlp.experts.gate_up_proj", "model.layers.2.mlp.experts.gate_up_proj_blocks");
 }

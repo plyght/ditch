@@ -23,7 +23,8 @@ What ditch adds:
   Heretic's edit-every-expert as a candidate.
 * **A cheaper search.** Early stopping of dominated trials, warm starts from
   earlier studies, optional multi-direction ablation.
-* **GGUF in and out**, including quantised weights.
+* **GGUF in and out**, including quantised weights, and quantised
+  safetensors (FP8, MXFP4, INT4) dequantised on load.
 * **Reproducible exports** (a Lua manifest with content hashes) and a
   benchmark harness.
 
@@ -86,6 +87,11 @@ a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
   `qwen3_5` / `qwen3_5_moe` (Qwen3.5, Qwen3.8 dense and MoE, text configs;
   the linear recurrence runs sequentially, so long prefills are slower
   than on dense models)
+* Kimi: `kimi_linear` (Kimi-Linear-48B-A3B: Kimi Delta Attention with
+  per-channel decay, 3:1 with MLA layers without RoPE, DeepSeek-V3-style
+  MoE with a shared expert; both the original checkpoint layout and the
+  transformers module layout), `kimi_k25` (Kimi K2.5 / K2.6: the DeepSeek
+  V3 text config of the image-video wrapper)
 * Gemma 2 / Gemma 3 (text), GLM-4 (`glm4`, `glm`) and ChatGLM3 / GLM-4-9B
   (`chatglm`), GLM-4.5 dense and MoE (`glm4_moe`, also the `glm4v_moe`
   image/video text config), GLM-5 family (`glm_moe_dsa`, whose sparse
@@ -96,8 +102,18 @@ a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
 * Mixture of experts: Mixtral, Qwen2/3-MoE (separate and fused expert
   layouts), DeepSeek V2 / V3 (MLA, group-limited and sigmoid routing, shared
   experts), Llama 4 text (top-1 routing, NoPE layers), gpt-oss (attention
-  sinks, interleaved fused experts; BF16 checkpoints only, MXFP4 must be
-  dequantised first)
+  sinks, interleaved fused experts, BF16 or MXFP4 checkpoints), ERNIE 4.5
+  MoE (`ernie4_5_moe`), Hunyuan-A13B (`hunyuan_v1_moe`), GraniteMoE /
+  GraniteMoeShared (`granitemoe`) and the attention-only Granite 4 layout
+  (`granitemoehybrid` without Mamba layers)
+* MiniMax: M2 (`minimax_m2`), MiniMax-Text-01 / M1 (`minimax`: lightning
+  linear attention alternating with softmax attention; the recurrence runs
+  sequentially) and M3 (`minimax_m3_vl` text config, also `minimax_m3`;
+  MiniMax Sparse Attention selects the top-k key blocks per query, which
+  covers every block for prompts up to `index_block_size ×
+  index_topk_blocks` tokens, 2048 with the released config, so ditch runs
+  those layers as dense attention and its results are exact only within
+  that length)
 * DeepSeek V4 (`deepseek_v4`) and V4.1-Flash (`deepseek_v41`, text config):
   manifold-constrained hyper-connections, shared-KV sliding attention with
   sinks and grouped output projection, compressed-KV branches (V4 CSA/HCA,
@@ -108,8 +124,9 @@ a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
   clamped SwiGLU experts, V4 hash-routed (`tid2eid`) layers and V4.1 engram
   n-gram hash layers (table rows are read lazily; the compressed vocabulary
   is rebuilt from the tokenizer and checked against the config). MTP, vision
-  and aligner tensors pass through exports untouched. BF16/F16 checkpoints
-  only (the released FP4/FP8 weights must be dequantised first).
+  and aligner tensors pass through exports untouched. FP8 tensors are
+  dequantised on load like the other families; the FP4 (e2m1) expert weights
+  of the released checkpoints are refused until dequantised.
 
 Implemented from the Hugging Face reference but without a fixture: Falcon
 40B/180B (grouped qkv, `ln_attn`/`ln_mlp`) and Falcon ALiBi, Baichuan 13B
@@ -118,31 +135,76 @@ LayerNorm), Gemma 2 logit softcapping, `dynamic` and `longrope` scaling
 beyond the original context (treated as static / short factors).
 
 Not supported: state-space and hybrid models (Mamba, Jamba, Falcon-H1,
-Nemotron-H, RWKV), Kimi K3 / K2.5+ (gated linear attention with MXFP4 or
-compressed-tensors weights, no `tokenizer.json`), Kimi K2 (FP8 weights, no
-`tokenizer.json`), Qwen3.8-Flash-Next (`qwen4_exp`), GLM-5.3-Flash
-(`glm5_next`), encoder-decoder models, Gemma 3n (per-layer
-inputs), MiniCPM3, GraniteMoE, OPT-350m (projection layers), FP8
-checkpoints, and tokenizers without a `tokenizer.json`
-(SentencePiece-only Baichuan; generate one with
+Nemotron-H, RWKV, Granite 4 `granitemoehybrid` checkpoints with Mamba-2
+layers), Kimi K3 (AttnRes), Kimi K2 (`kimi_k2` standalone config),
+Qwen3.8-Flash-Next (`qwen4_exp`), GLM-5.3-Flash (`glm5_next`),
+encoder-decoder models, Gemma 3n (per-layer inputs), MiniCPM3, HunYuan
+cross-layer attention (`use_cla`), OPT-350m (projection layers),
+quantisation formats other than the ones listed below (GPTQ, AWQ,
+bitsandbytes, ...), and SentencePiece-only tokenizers (Baichuan; generate
+a `tokenizer.json` with
 `AutoTokenizer.from_pretrained(...).save_pretrained(...)` and place it
 next to the model). ditch names the missing piece instead of guessing:
 unknown layer types, quantisation formats and activations are errors, not
 silent fallbacks. Unicode normalisers (NFKC, Precompiled) are
 approximated by the identity.
 
-Image and video models (Qwen2/3-VL, Qwen3.5, GLM-4.5V, Llama 4) run
+Image and video models (Qwen2/3-VL, Qwen3.5, GLM-4.5V, Llama 4, Kimi K2.5) run
 through their text config: the vision tower is never executed, its
 weights pass through exports byte for byte, and refusal directions are
 measured on text prompts.
 
-Weights are read from safetensors (F32/F16/BF16) or GGUF (llama, Mistral,
-Mixtral, Qwen2/3, Qwen MoE and Gemma 2/3 families; the registry carries the
-llama.cpp architecture name of every family for the GGUF writer).
-Abliteration edits each family's attention output projection and MLP down
-projection (per expert on MoE layers) and exports preserve every tensor
-name and layout, including GPT-2's Conv1D transposes and fused expert
-tensors.
+Weights are read from safetensors (F32/F16/BF16, or the quantised formats
+below) or GGUF (llama, Mistral, Mixtral, Qwen2/3, Qwen MoE and Gemma 2/3
+families; the registry carries the llama.cpp architecture name of every
+family for the GGUF writer). Abliteration edits each family's attention
+output projection and MLP down projection (per expert on MoE layers) and
+exports preserve every tensor name and layout, including GPT-2's Conv1D
+transposes and fused expert tensors.
+
+### Quantised checkpoints
+
+Quantised safetensors checkpoints are dequantised as they are read
+(`src/dequant.zig`), so the loader, the kernels and the exporter see a bf16
+model:
+
+* **FP8** (`quant_method = "fp8"`: DeepSeek V3 / R1, Kimi K2 and the
+  Qwen3 FP8 releases; also `fbgemm_fp8` and compressed-tensors
+  `float-quantized`): `weight` in F8_E4M3 or F8_E5M2 with a
+  `weight_scale_inv` / `weight_scale` tensor holding one scale per
+  `weight_block_size` tile, per row or per tensor.
+* **MXFP4** (`quant_method = "mxfp4"`: gpt-oss as shipped): `*_blocks`
+  (E2M1 nibble pairs) and `*_scales` (E8M0 exponents) per 32 elements; the
+  experts are presented in the `[E, hidden, 2I]` / `[E, I, hidden]` layout
+  of the bf16 gpt-oss checkpoints.
+* **compressed-tensors pack-quantized** (Kimi K2.5 and other
+  llm-compressor INT4/INT8 models): `weight_packed` with `num_bits`-wide
+  fields, per-group `weight_scale`, optional `weight_zero_point` and
+  `weight_shape` from `quantization_config`.
+
+Values are decoded to bf16, which is what the Hugging Face integrations
+produce. With `--max-ram` (streamed weights) a tensor is decoded row-chunk
+by row-chunk as it is read, so a quantised MoE never holds more than one
+expert of decoded weights; without a budget the decoded tensors stay
+resident, so a quantised checkpoint then needs the memory of its bf16
+equivalent. `expert_dtype` values naming one of these formats are accepted.
+Any other `quantization_config` is an error naming the format.
+
+Tokenizers are read from `tokenizer.json` (Hugging Face fast tokenizers:
+byte-level and SentencePiece-style BPE), or, when a model ships none, from
+a tiktoken rank file: Moonshot's `tiktoken.model` (Kimi K2, K2.5, K3,
+Kimi-Linear, with the pattern and special tokens of `tokenization_kimi.py`)
+or Meta's Llama 3 `tokenizer.model`. Names of the special tokens come from
+`added_tokens_decoder` in `tokenizer_config.json`, with the families'
+defaults for the rest. Merging follows tiktoken exactly (the pair whose
+concatenation has the lowest rank is merged first, a whole pre-token that is
+in the vocabulary is one token) and is verified against the `tiktoken`
+package on fixtures generated by `tools/make_tiktoken_fixture.py`. Exports
+of such models carry a `tokenizer.json` synthesised from the ranks (merges
+reconstructed the way Hugging Face converts tiktoken vocabularies, with
+`ignore_merges`) next to a copy of the original vocabulary file. The Kimi
+K2 chat template (`<|im_user|>user<|im_middle|>...<|im_end|>`) and the K3
+XTML message markers are built in.
 
 ### Datasets
 
@@ -208,6 +270,17 @@ scoring batch many tokens per read and suffer far less. Measure with
 the metadata); `--export-format gguf` writes one with llama.cpp's tensor
 names, metadata and permutations. Untouched tensors are copied byte for
 byte; edited tensors are re-quantised to the source type.
+
+A quantised safetensors source (FP8, MXFP4, pack-quantized INT4; see
+"Quantised checkpoints") is exported as a plain bf16 checkpoint: every
+tensor, edited or not, is written in bf16 (or `--export-dtype`) under its
+model name, the storage tensors (`*_blocks`, `*_scales`, `weight_scale_inv`,
+`weight_packed`, ...) are dropped and `quantization_config` is removed from
+the exported `config.json`, so the result loads as an ordinary bf16 model in
+transformers and in ditch. Quantised tensors are never passed through byte
+for byte, because a file mixing bf16 edits with the source encoding would
+not match any `quantization_config`. For a smaller file, export GGUF with
+`--gguf-dtype q8_0` (or another quantised type).
 
 | ggml type | read | written |
 | :--- | :---: | :---: |
