@@ -33,6 +33,9 @@ pub fn checkFixture(comptime family: []const u8) !void {
     if (c.has_linear) {
         cache.linear = try model_mod.LinearCache.init(gpa, c, ref.value.cases.len);
     }
+    if (c.dsv4 != null) {
+        cache.compress = try model_mod.dsv4.CompressCache.init(gpa, c, ref.value.cases.len, 64);
+    }
 
     var prompts = std.ArrayList([]const u32).empty;
     defer {
@@ -213,6 +216,12 @@ test "glm4_moe fixture" {
 test "glm_moe_dsa fixture" {
     try checkFixture("glm_moe_dsa");
 }
+test "deepseek_v4 fixture" {
+    try checkFixture("deepseek_v4");
+}
+test "deepseek_v41 fixture" {
+    try checkFixture("deepseek_v41");
+}
 
 // ---------------------------------------------------------------------------
 // Abliteration, export and streaming on the registry layouts
@@ -356,4 +365,10 @@ test "glm4_moe edit, export and streamed reload (per-head q/k norms, sigmoid MoE
 }
 test "glm_moe_dsa edit, export and streamed reload (MLA sparse indexer as dense)" {
     try checkEditExportStream("glm_moe_dsa");
+}
+test "deepseek_v4 edit, export and streamed reload (hyper-connections, hash routing, MTP pass-through)" {
+    try checkEditExportStream("deepseek_v4");
+}
+test "deepseek_v41 edit, export and streamed reload (shared compressed KV, engram tables)" {
+    try checkEditExportStream("deepseek_v41");
 }
