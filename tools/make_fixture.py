@@ -7,6 +7,7 @@ Usage: make_fixture.py <family> [<out_dir>] [--gguf]
             or any family of the registry-driven generator (`SPECS` below:
             phi3, phi, gpt_neox, gpt2, falcon, ... , gpt_oss, deepseek_v3, kimi_linear,
             and the quantised variants qwen2_fp8, qwen2_int4, gpt_oss_mxfp4)
+            | deepseek_v4 | deepseek_v41 (hyper-connection families, own generator)
             | qwen3_moe_big
     --gguf: additionally write <out_dir>_gguf/model.gguf, the same model as a
             llama.cpp GGUF file (f16 attention and embedding matrices, Q8_0
@@ -390,6 +391,13 @@ def base(**kw):
         residual_mult=1.0, logit_scale=1.0, embed_scale=1.0, lm_bias=False, sinks=None, temp=None, pos_offset=0,
         sliding=None, sliding_layers=None, mla=None, moe=None, linear=None, linear_layers=None, full_interval=0,
         gated_q=False, gate_swish=False,
+        # Gemma 3n / 4 and LFM2 features: per-layer head size / KV heads, KV
+        # sharing, keys reused as values, weightless value norm, a local rope
+        # table (theta, rotary dim) and a global (rotary dim, freq dim) pair,
+        # per-layer inputs, AltUp / Laurel, gate sparsity, conv layers,
+        # per-layer output scalars, per-layer FFN widths, final softcapping.
+        layer_hd=None, layer_nkv=None, kv_shared=0, k_eq_v=False, v_norm=False, local_rope=None, global_rotary=None,
+        ple_dim=0, altup=None, sparsity=None, conv_layers=None, conv_K=3, layer_scale=False, layer_inter=None, final_softcap=None,
         # "gdn" (Gated DeltaNet) or "lightning" (MiniMax) linear-attention layers.
         linear_kind="gdn",
         # "pre" or "minimax" (h = norm(x); x = alpha * h + beta * f(h)); scales per sublayer.
@@ -849,6 +857,66 @@ spec("granitemoehybrid", tok="starcoder", L=3, embed_scale=2.0, attn_scale=0.25,
      config=dict(GRANITE_CONFIG, model_type="granitemoehybrid", num_hidden_layers=3, shared_intermediate_size=16, position_embedding_type="rope",
                  layer_types=["attention", "attention", "attention"], mamba_n_heads=4, mamba_d_state=8, mamba_d_conv=4, mamba_expand=2))
 
+spec("seed_oss", tok="llama3", HD=16, attn_bias=True, o_bias=False, lm_head="lm_head.weight",
+     config={"model_type": "seed_oss", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4,
+             "num_key_value_heads": 2, "head_dim": 16, "rms_norm_eps": 1e-6, "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0},
+             "attention_bias": True, "attention_out_bias": False, "mlp_bias": False, "hidden_act": "silu", "max_position_embeddings": 128,
+             "tie_word_embeddings": False})
+spec("lfm2", tok="qwen2", L=3, eps=1e-5, theta=1000000.0, qk_norm="head", q_norm="self_attn.q_layernorm.weight", k_norm="self_attn.k_layernorm.weight",
+     o="self_attn.out_proj.weight", final_norm="embedding_norm.weight", in_norm="operator_norm.weight", pre_ff_norm="ffn_norm.weight",
+     gate="feed_forward.w1.weight", up="feed_forward.w3.weight", down="feed_forward.w2.weight", lm_head=None, conv_layers=[1, 0, 1], conv_K=3,
+     config={"model_type": "lfm2", "vocab_size": 0, "hidden_size": 32, "num_hidden_layers": 3, "num_attention_heads": 4, "num_key_value_heads": 2,
+             "norm_eps": 1e-5, "rope_theta": 1000000.0, "conv_bias": False, "conv_L_cache": 3, "block_ff_dim": 48, "block_multiple_of": 16,
+             "block_ffn_dim_multiplier": 1.0, "block_auto_adjust_ff_dim": True, "full_attn_idxs": [1], "layer_types": ["conv", "full_attention", "conv"],
+             "max_position_embeddings": 128, "tie_word_embeddings": True})
+spec("mistral4", tok="llama3", NKV=4, HD=12, VD=8, L=3, prefix="model.language_model.", rope_style="gptj", rotary_dim=4, lm_head="lm_head.weight",
+     mla={"q_lora_rank": 12, "kv_lora_rank": 16, "nope": 8, "rope": 4, "v": 8},
+     scaling={"type": "yarn", "factor": 4.0, "beta_fast": 32, "beta_slow": 1, "mscale": 1.0, "mscale_all_dim": 1.0, "original_max_position_embeddings": 32},
+     temp={"floor_scale": 32.0, "attn_scale": 0.1, "offset": 0.0, "all": True},
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "scoring": "softmax", "group_limited": True, "group_top2": True, "n_group": 2, "topk_group": 1,
+          "rsf": 1.5, "norm": True, "layers": [1, 2], "corr_bias": False, "layout": "fused_eih", "prefix": "mlp.", "router": "gate.weight",
+          "shared_name": "shared_experts."},
+     config={"model_type": "mistral3", "architectures": ["Mistral3ForConditionalGeneration"],
+             "text_config": {"model_type": "mistral4", "hidden_size": 32, "intermediate_size": 32, "moe_intermediate_size": 12, "num_hidden_layers": 3,
+                             "num_attention_heads": 4, "num_key_value_heads": 4, "q_lora_rank": 12, "kv_lora_rank": 16, "qk_nope_head_dim": 8,
+                             "qk_rope_head_dim": 4, "v_head_dim": 8, "n_routed_experts": 4, "n_shared_experts": 1, "num_experts_per_tok": 2,
+                             "first_k_dense_replace": 1, "n_group": 2, "topk_group": 1, "routed_scaling_factor": 1.5, "norm_topk_prob": True,
+                             "rms_norm_eps": 1e-6, "rope_interleave": True, "hidden_act": "silu", "max_position_embeddings": 128, "tie_word_embeddings": False,
+                             "rope_parameters": {"rope_type": "yarn", "rope_theta": 10000.0, "factor": 4.0, "original_max_position_embeddings": 32,
+                                                 "beta_fast": 32.0, "beta_slow": 1.0, "mscale": 1.0, "mscale_all_dim": 1.0, "llama_4_scaling_beta": 0.1,
+                                                 "partial_rotary_factor": 4 / 12}},
+             "vision_config": {"model_type": "pixtral"}})
+spec("gemma4", tok="spm", L=5, NH=4, NKV=2, HD=8, prefix="model.language_model.", lm_head=None, act="gelu_tanh", attn_scale=1.0,
+     post_attn_norm="post_attention_layernorm.weight", pre_ff_norm="pre_feedforward_layernorm.weight", post_ff_norm="post_feedforward_layernorm.weight",
+     embed_scale=np.sqrt(32.0), qk_norm="head", v_norm=True, k_eq_v=True, sliding=4, sliding_layers=[1, 0, 1, 1, 0], layer_hd=[8, 16, 8, 8, 16],
+     layer_nkv=[2, 1, 2, 2, 1], kv_shared=2, theta=1000000.0, local_rope=(10000.0, 8), global_rotary=(4, 16), ple_dim=4, layer_scale=True,
+     layer_inter=[32, 32, 32, 64, 64],
+     config={"model_type": "gemma4", "architectures": ["Gemma4ForConditionalGeneration"],
+             "text_config": {"model_type": "gemma4_text", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 5, "num_attention_heads": 4,
+                             "num_key_value_heads": 2, "head_dim": 8, "global_head_dim": 16, "num_global_key_value_heads": 1, "attention_k_eq_v": True,
+                             "num_kv_shared_layers": 2, "use_double_wide_mlp": True, "hidden_size_per_layer_input": 4, "vocab_size_per_layer_input": 0,
+                             "sliding_window": 4, "layer_types": ["sliding_attention", "full_attention", "sliding_attention", "sliding_attention", "full_attention"],
+                             "rope_parameters": {"full_attention": {"rope_type": "proportional", "partial_rotary_factor": 0.25, "rope_theta": 1000000.0},
+                                                 "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0}},
+                             "rms_norm_eps": 1e-6, "hidden_activation": "gelu_pytorch_tanh", "final_logit_softcapping": None, "enable_moe_block": False,
+                             "max_position_embeddings": 128, "tie_word_embeddings": True},
+             "vision_config": {"model_type": "gemma4_vision"}})
+spec("gemma3n", tok="spm", L=4, NH=4, NKV=2, HD=8, prefix="model.language_model.", lm_head=None, act="gelu_tanh", attn_scale=1.0,
+     post_attn_norm="post_attention_layernorm.weight", pre_ff_norm="pre_feedforward_layernorm.weight", post_ff_norm="post_feedforward_layernorm.weight",
+     embed_scale=np.sqrt(32.0), qk_norm="head", v_norm=True, sliding=4, sliding_layers=[1, 1, 0, 1], kv_shared=1, theta=1000000.0, local_rope=(10000.0, 8),
+     ple_dim=4, altup={"A": 3, "active": 0, "correct_scale": True, "rank": 6}, sparsity=[0.95, 0.5, 0.0, 0.0], layer_inter=[32, 32, 48, 32],
+     final_softcap=30.0,
+     config={"model_type": "gemma3n", "architectures": ["Gemma3nForConditionalGeneration"],
+             "text_config": {"model_type": "gemma3n_text", "hidden_size": 32, "intermediate_size": [32, 32, 48, 32], "num_hidden_layers": 4,
+                             "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8, "sliding_window": 4,
+                             "layer_types": ["sliding_attention", "sliding_attention", "full_attention", "sliding_attention"],
+                             "rope_theta": 1000000.0, "rope_local_base_freq": 10000.0, "rope_scaling": None, "rms_norm_eps": 1e-6,
+                             "hidden_activation": "gelu_pytorch_tanh", "final_logit_softcapping": 30.0, "hidden_size_per_layer_input": 4,
+                             "vocab_size_per_layer_input": 0, "altup_num_inputs": 3, "altup_active_idx": 0, "altup_coef_clip": 120.0,
+                             "altup_correct_scale": True, "num_kv_shared_layers": 1, "laurel_rank": 6, "activation_sparsity_pattern": [0.95, 0.5, 0.0, 0.0],
+                             "max_position_embeddings": 128, "tie_word_embeddings": True},
+             "vision_config": {"model_type": "gemma3n_vision"}, "audio_config": {"model_type": "gemma3n_audio"}})
+
 
 # --- generation ------------------------------------------------------------
 
@@ -927,18 +995,43 @@ def generate_generic(family, out_dir):
         lin_layers = [((i + 1) % s["full_interval"] != 0) for i in range(L)]
     if lin_layers is None:
         lin_layers = [False] * L
+    conv_layers = [bool(v) for v in (s["conv_layers"] or [0] * L)]
+    layer_hd = s["layer_hd"] or [HD] * L
+    layer_nkv = s["layer_nkv"] or [NKV] * L
+    sliding_of = [bool(v) for v in (s["sliding_layers"] or [0] * L)]
+    # KV sharing: the last `kv_shared` layers read the last earlier layer of their kind.
+    kv_source = list(range(L))
+    for i in range(L - s["kv_shared"], L):
+        kv_source[i] = max(j for j in range(L - s["kv_shared"]) if sliding_of[j] == sliding_of[i])
+    ple_dim = s["ple_dim"]
+    if ple_dim:
+        ple_embed = mat(P + "embed_tokens_per_layer.weight", V, L * ple_dim, 1.0)
+        ple_proj = mat(P + "per_layer_model_projection.weight", L * ple_dim, H)
+        ple_norm = normw(P + "per_layer_projection_norm.weight", ple_dim)[0]
+    altup = s["altup"]
+    if altup:
+        altup_proj = [mat(P + f"altup_projections.{e}.weight", H, H) for e in range(altup["A"] - 1)]
+        altup_unembed = [mat(P + f"altup_unembed_projections.{e}.weight", H, H) for e in range(altup["A"] - 1)]
     for i in range(L):
         lp = P + s["layer"].format(i=i)
         d = {}
+        hd_l, nkv_l = layer_hd[i], layer_nkv[i]
+        vd_l = VD if s["mla"] else hd_l
         d["in_norm"] = normw(lp + s["in_norm"], H) if s["in_norm"] else None
         d["post_attn_norm"] = normw(lp + s["post_attn_norm"], H) if s["post_attn_norm"] else None
         d["pre_ff_norm"] = normw(lp + s["pre_ff_norm"], H) if s["pre_ff_norm"] else None
         d["post_ff_norm"] = normw(lp + s["post_ff_norm"], H) if s["post_ff_norm"] else None
         d["mlp_norm"] = normw(lp + s["mlp_norm"], H) if s["mlp_norm"] else None
-        qd, kvd = NH * HD, NKV * HD
+        qd, kvd = NH * hd_l, nkv_l * hd_l
         for name, shape in s["extra_layer_tensors"].get(i, []):
             weights[lp + name] = bf16_round(rng.normal(0, 0.2, size=shape))
-        if lin_layers[i] and s["linear_kind"] == "lightning":
+        if conv_layers[i]:
+            d["conv_in"] = mat(lp + "conv.in_proj.weight", 3 * H, H)
+            d["conv_w"] = bf16_round(rng.normal(0, 0.3, size=(H, s["conv_K"])))
+            weights[lp + "conv.conv.weight"] = d["conv_w"].reshape(H, 1, s["conv_K"])
+            d["o"] = mat(lp + "conv.out_proj.weight", H, H)
+            d["ob"] = None
+        elif lin_layers[i] and s["linear_kind"] == "lightning":
             d["light_qkv"] = mat(lp + "self_attn.qkv_proj.weight", 3 * qd, H)
             d["light_gate"] = mat(lp + "self_attn.output_gate.weight", qd, H)
             d["light_norm"] = normw(lp + "self_attn.norm.weight", qd)[0]
@@ -1012,27 +1105,51 @@ def generate_generic(family, out_dir):
             d["qkv"], d["qkv_b"] = w, b
         else:
             d["q"] = mat(lp + s["q"], (2 * qd if s["gated_q"] else qd), H)
-            d["k"] = mat(lp + s["k"], kvd, H)
-            d["v"] = mat(lp + s["v"], kvd, H)
+            own_kv = kv_source[i] == i
+            has_v = own_kv and not (s["k_eq_v"] and not sliding_of[i])
+            if own_kv:
+                d["k"] = mat(lp + s["k"], kvd, H)
+            if has_v:
+                d["v"] = mat(lp + s["v"], kvd, H)
             d["qb"] = bias_for(lp + s["q"], qd, s["attn_bias"])
-            d["kb"] = bias_for(lp + s["k"], kvd, s["attn_bias"])
-            d["vb"] = bias_for(lp + s["v"], kvd, s["attn_bias"])
-        if not lin_layers[i]:
-            d["o"] = mat(lp + s["o"], H, NH * VD)
+            d["kb"] = bias_for(lp + s["k"], kvd, s["attn_bias"]) if own_kv else None
+            d["vb"] = bias_for(lp + s["v"], kvd, s["attn_bias"]) if has_v else None
+        if not lin_layers[i] and not conv_layers[i]:
+            d["o"] = mat(lp + s["o"], H, NH * vd_l)
             d["ob"] = bias_for(lp + s["o"], H, s["attn_bias"] if s["o_bias"] is None else s["o_bias"])
-        if not lin_layers[i] and s["qk_norm"] in ("head", "heads", "full"):
-            qn = {"head": HD, "heads": NH * HD, "full": NH * HD}[s["qk_norm"]]
-            kn = {"head": HD, "heads": NKV * HD, "full": NKV * HD}[s["qk_norm"]]
+        if not lin_layers[i] and not conv_layers[i] and s["qk_norm"] in ("head", "heads", "full"):
+            qn = {"head": hd_l, "heads": NH * hd_l, "full": NH * hd_l}[s["qk_norm"]]
+            kn = {"head": hd_l, "heads": nkv_l * hd_l, "full": nkv_l * hd_l}[s["qk_norm"]]
             d["qn"] = normw(lp + s["q_norm"], qn)
-            d["kn"] = normw(lp + s["k_norm"], kn)
+            if kv_source[i] == i:
+                d["kn"] = normw(lp + s["k_norm"], kn)
             if s["qk_norm"] == "heads":  # Cohere stores [heads, head_dim]
-                weights[lp + s["q_norm"]] = weights[lp + s["q_norm"]].reshape(NH, HD)
-                weights[lp + s["k_norm"]] = weights[lp + s["k_norm"]].reshape(NKV, HD)
+                weights[lp + s["q_norm"]] = weights[lp + s["q_norm"]].reshape(NH, hd_l)
+                weights[lp + s["k_norm"]] = weights[lp + s["k_norm"]].reshape(nkv_l, hd_l)
+        elif conv_layers[i] and s["qk_norm"] == "head":
+            pass
         if not lin_layers[i] and s["sinks"]:
             d["sinks"] = vec(lp + s["sinks"], NH, 1.0)
         if s["attn_res"]:
             d["attn_res"] = res_scorer(lp + "self_attention_res_")
             d["mlp_res"] = res_scorer(lp + "mlp_res_")
+        if ple_dim:
+            d["ple_gate"] = mat(lp + "per_layer_input_gate.weight", ple_dim, H)
+            d["ple_out"] = mat(lp + "per_layer_projection.weight", H, ple_dim)
+            d["ple_norm"] = normw(lp + "post_per_layer_input_norm.weight", H)[0]
+        if altup:
+            A = altup["A"]
+            d["altup_scale"] = vec(lp + "altup.correct_output_scale", H, 0.5) if altup["correct_scale"] else None
+            d["altup_correct"] = mat(lp + "altup.correction_coefs.weight", A, A, 0.5)
+            d["altup_predict"] = mat(lp + "altup.prediction_coefs.weight", A * A, A, 0.5)
+            d["altup_router"] = mat(lp + "altup.modality_router.weight", A, H, 2.0)
+            d["altup_router_norm"] = normw(lp + "altup.router_norm.weight", H)[0]
+            d["laurel_l"] = mat(lp + "laurel.linear_left.weight", altup["rank"], H)
+            d["laurel_r"] = mat(lp + "laurel.linear_right.weight", H, altup["rank"])
+            d["laurel_norm"] = normw(lp + "laurel.post_laurel_norm.weight", H)[0]
+        if s["layer_scale"]:
+            d["layer_scale"] = bf16_round(1.0 + rng.normal(0, 0.1, size=(1,)))
+            weights[lp + "layer_scalar"] = d["layer_scale"]
         moe = s["moe"]
         if moe and i in moe["layers"]:
             mp = lp + moe["prefix"]
@@ -1128,7 +1245,7 @@ def generate_generic(family, out_dir):
                     d["shared"] = {"gate": mat(sp + "gate_proj.weight", si, H), "up": mat(sp + "up_proj.weight", si, H), "down": mat(sp + "down_proj.weight", H, si),
                                    "gate_vec": mat(lp + "mlp.shared_expert_gate.weight", 1, H)[0] if moe.get("shared_gate") else None}
         else:
-            inter = I
+            inter = s["layer_inter"][i] if s["layer_inter"] else I
             if s["mlp"] == "gated":
                 d["gate"] = mat(lp + s["gate"], inter, H)
                 d["up"] = mat(lp + s["up"], inter, H)
@@ -1154,7 +1271,7 @@ def generate_generic(family, out_dir):
             tc[key] = V
     if "vocab_size" not in tc and "padded_vocab_size" not in tc:
         tc["vocab_size"] = V
-    if s["scaling"] and "rope_scaling" not in tc:
+    if s["scaling"] and "rope_scaling" not in tc and "rope_parameters" not in tc:
         tc["rope_scaling"] = s["scaling"]
     json.dump(config, open(f"{out_dir}/config.json", "w"), indent=1)
     json.dump({"eos_token_id": vocab[eos], "bos_token_id": vocab[bos] if bos else None, "do_sample": False}, open(f"{out_dir}/generation_config.json", "w"))
@@ -1233,10 +1350,12 @@ def generate_generic(family, out_dir):
         raise KeyError(a)
 
     rd = s["rotary_dim"]
+    # Global table: `rd` coordinates rotate with frequencies over `fd` (proportional rope).
+    rd, fd = s["global_rotary"] if s["global_rotary"] else (rd, rd)
 
-    def inv_freq_and_factor(theta):
-        inv = 1.0 / (theta ** (np.arange(0, rd, 2, dtype=np.float64) / rd))
-        sc = s["scaling"]
+    def inv_freq_and_factor(theta, rd=rd, fd=fd, sc=None):
+        inv = 1.0 / (theta ** (np.arange(0, rd, 2, dtype=np.float64) / fd))
+        sc = s["scaling"] if sc is None else (sc or None)
         factor = 1.0
         if sc and sc.get("type", sc.get("rope_type")) == "yarn":
             f = sc["factor"]
@@ -1276,7 +1395,14 @@ def generate_generic(family, out_dir):
         ang = np.outer(np.arange(T, dtype=np.float64), inv)
         return (np.cos(ang) * factor).astype(np.float32), (np.sin(ang) * factor).astype(np.float32)
 
+    def rope_tables_local(T):
+        theta, lrd = s["local_rope"]
+        inv, factor = inv_freq_and_factor(theta, lrd, lrd, {})
+        ang = np.outer(np.arange(T, dtype=np.float64), inv)
+        return (np.cos(ang) * factor).astype(np.float32), (np.sin(ang) * factor).astype(np.float32)
+
     def apply_rope(x, cos, sin, off):  # x [T, nh, HD]
+        rd = 2 * cos.shape[1]
         rot = x[..., off:off + rd]
         c, sn = cos[:, None, :], sin[:, None, :]
         if s["rope_style"] == "neox":
@@ -1308,9 +1434,14 @@ def generate_generic(family, out_dir):
             attn_scale = attn_scale * ms * ms
     rope_layers = s["rope_layers"] or ([1] * L if s["pos"] == "rope" else [0] * L)
     sliding_layers = s["sliding_layers"] or [0] * L
+    shared_kv = {}
+
+    def head_rms(x):
+        return x / np.sqrt(np.mean(x * x, -1, keepdims=True) + eps)
 
     def attention(d, li, h, cos, sin):
         T = h.shape[0]
+        HD, NKV, VD = layer_hd[li], layer_nkv[li], (s["VD"] if s["mla"] else layer_hd[li])
         if s["mla"]:
             m = s["mla"]
             nope, rp, vd = m["nope"], m["rope"], m["v"]
@@ -1351,9 +1482,18 @@ def generate_generic(family, out_dir):
                     k = f[:, :, g].reshape(T, kvd)
                     v = f[:, :, g + 1].reshape(T, kvd)
             else:
-                q, k, v = h @ d["q"].T, h @ d["k"].T, h @ d["v"].T
+                q = h @ d["q"].T
                 if d["qb"] is not None:
-                    q, k, v = q + d["qb"], k + d["kb"], v + d["vb"]
+                    q = q + d["qb"]
+                if kv_source[li] == li:
+                    k = h @ d["k"].T
+                    v = h @ d["v"].T if "v" in d else k.copy()
+                    if d["kb"] is not None:
+                        k = k + d["kb"]
+                    if d["vb"] is not None:
+                        v = v + d["vb"]
+                else:
+                    k = v = None
                 gate = None
                 if s["gated_q"]:
                     q = q.reshape(T, NH, 2 * HD)
@@ -1363,25 +1503,41 @@ def generate_generic(family, out_dir):
                 q, k, v = (np.clip(t, -s["clip"], s["clip"]) for t in (q, k, v))
             qn = s["qk_norm"]
             use_rope = bool(rope_layers[li])
+            own_kv = kv_source[li] == li
             if qn == "full":
                 q = head_norm(q, *d["qn"])
-                k = head_norm(k, *d["kn"])
-            q, k, v = q.reshape(T, NH, HD), k.reshape(T, NKV, HD), v.reshape(T, NKV, HD)
+                if own_kv:
+                    k = head_norm(k, *d["kn"])
+            q = q.reshape(T, NH, HD)
+            if own_kv:
+                k, v = k.reshape(T, NKV, HD), v.reshape(T, NKV, HD)
             if qn == "head" and not s["qk_norm_after_rope"]:
-                q, k = head_norm(q, *d["qn"]), head_norm(k, *d["kn"])
+                q = head_norm(q, *d["qn"])
+                if own_kv:
+                    k = head_norm(k, *d["kn"])
             elif qn == "heads":
                 q = head_norm(q, d["qn"][0].reshape(NH, HD), None)
                 k = head_norm(k, d["kn"][0].reshape(NKV, HD), None)
             elif qn == "l2" and use_rope:
                 q, k = head_norm(q, None, None), head_norm(k, None, None)
             if use_rope:
-                q, k = apply_rope(q, cos, sin, 0), apply_rope(k, cos, sin, 0)
-            elif s["temp"]:
+                q = apply_rope(q, cos, sin, 0)
+                if own_kv:
+                    k = apply_rope(k, cos, sin, 0)
+            if s["temp"] and (not use_rope or s["temp"].get("all")):
                 p = np.arange(T, dtype=np.float32)
-                scl = np.log(np.floor((p + 1.0) / s["temp"]["floor_scale"]) + 1.0) * s["temp"]["attn_scale"] + 1.0
+                scl = np.log(np.floor((p + s["temp"].get("offset", 1.0)) / s["temp"]["floor_scale"]) + 1.0) * s["temp"]["attn_scale"] + 1.0
                 q = q * scl[:, None, None]
             if qn == "head" and s["qk_norm_after_rope"]:
-                q, k = head_norm(q, *d["qn"]), head_norm(k, *d["kn"])
+                q = head_norm(q, *d["qn"])
+                if own_kv:
+                    k = head_norm(k, *d["kn"])
+            if own_kv:
+                if s["v_norm"]:
+                    v = head_rms(v)
+                shared_kv[li] = (k, v)
+            else:
+                k, v = shared_kv[kv_source[li]]
             groups = NH // NKV
         slopes = alibi_slopes(NH) if s["pos"] == "alibi" else None
         out = np.zeros((T, NH, VD), np.float32)
@@ -1417,6 +1573,35 @@ def generate_generic(family, out_dir):
                 o = o + d["ob"]
         return o
 
+    def conv_block(d, h):
+        # LFM2 short convolution: B * x through a depthwise causal conv, gated by C.
+        T = h.shape[0]
+        bcx = h @ d["conv_in"].T
+        B, C, x = bcx[:, :H], bcx[:, H:2 * H], bcx[:, 2 * H:]
+        bx = B * x
+        K = d["conv_w"].shape[1]
+        y = np.zeros((T, H), np.float32)
+        for t in range(T):
+            for i in range(K):
+                if t - (K - 1 - i) >= 0:
+                    y[t] += d["conv_w"][:, i] * bx[t - (K - 1 - i)]
+        return (C * y) @ d["o"].T
+
+    def normal_ppf(p):
+        from math import erf
+        lo, hi = -10.0, 10.0
+        for _ in range(200):
+            mid = (lo + hi) / 2
+            if 0.5 * (1 + erf(mid / np.sqrt(2))) < p:
+                lo = mid
+            else:
+                hi = mid
+        return (lo + hi) / 2
+
+    def gaussian_topk(g, sparsity):
+        mean = g.mean(-1, keepdims=True)
+        std = np.sqrt(((g - mean) ** 2).mean(-1, keepdims=True))
+        return np.maximum(g - (mean + std * normal_ppf(sparsity)), 0)
     def lightning_attn(d, li, h):
         """MiniMax lightning attention (modeling_minimax.MiniMaxLightningAttention),
         as the per-token recurrence the blocked prefill is equivalent to."""
@@ -1555,7 +1740,7 @@ def generate_generic(family, out_dir):
             y = y + ex["db"]
         return y
 
-    def mlp(d, h):
+    def mlp(d, h, li=0):
         if "experts" in d:
             moe = s["moe"]
             E, K = moe["E"], moe["K"]
@@ -1587,7 +1772,7 @@ def generate_generic(family, out_dir):
                     gs = []
                     for g in range(ng):
                         grp = np.sort(choice[g * per:(g + 1) * per])[::-1]
-                        gs.append(grp[:2].sum() if d["corr_b"] is not None else grp[0])
+                        gs.append(grp[:2].sum() if (d["corr_b"] is not None or moe.get("group_top2")) else grp[0])
                     keep = np.argsort(-np.array(gs), kind="stable")[:moe["topk_group"]]
                     masked = np.full(E, -np.inf)
                     for g in keep:
@@ -1618,6 +1803,8 @@ def generate_generic(family, out_dir):
             g, u = h @ d["gate"].T, h @ d["up"].T
             if d["gb"] is not None:
                 g, u = g + d["gb"], u + d["ub"]
+            if s["sparsity"] and s["sparsity"][li] > 0:
+                g = gaussian_topk(g, s["sparsity"][li])
             m = glu(g, u)
         elif s["mlp"] == "gated_fused":
             gu = h @ d["gate_up"].T
@@ -1641,6 +1828,82 @@ def generate_generic(family, out_dir):
             y = y + d["db"]
         return y
 
+    def rms_magnitude(x):
+        return np.sqrt(np.mean(x * x, -1, keepdims=True))
+
+    def per_layer_inputs(tokens, x):
+        # Gemma 3n / 4: normalised projection of the embedding plus the token's per-layer embedding.
+        T = len(tokens)
+        proj = (x @ ple_proj.T) * np.float32(H ** -0.5)
+        proj = proj.reshape(T, L, ple_dim)
+        proj = proj / np.sqrt(np.mean(proj * proj, -1, keepdims=True) + eps) * ple_norm
+        emb = ple_embed[tokens].reshape(T, L, ple_dim) * np.float32(np.sqrt(ple_dim))
+        return (proj + emb) * np.float32(2 ** -0.5)
+
+    def ple_block(d, first, ple_li):
+        g = act_fn(first @ d["ple_gate"].T) * ple_li
+        return norm(g @ d["ple_out"].T, (d["ple_norm"], None))
+
+    def modalities(d, x):
+        r = norm(x, (d["altup_router_norm"], None)) * np.float32(1.0 / H)
+        return np.tanh(r @ d["altup_router"].T)
+
+    def layer_std(d, li, x, h_fn, ple_li):
+        # Standard layer; returns the new residual.
+        rm = np.float32(s["residual_mult"])
+        h = norm(x, d["in_norm"]) if (d["in_norm"] is not None or s["norm"] == "none") and s["in_norm"] is not None else x
+        a = h_fn(h)
+        if d["post_attn_norm"] is not None:
+            a = norm(a, d["post_attn_norm"])
+        if s["residual_layout"] == "minimax":
+            # h = norm(x); x = alpha * h + beta * f(h) for both sublayers.
+            sa = s["mm_scales"]["linear" if lin_layers[li] else "full"]
+            x = np.float32(sa[0]) * h + np.float32(sa[1]) * a
+            h2 = norm(x, d["pre_ff_norm"])
+            sm = s["mm_scales"]["mlp"]
+            return np.float32(sm[0]) * h2 + np.float32(sm[1]) * mlp(d, h2, li)
+        if s["parallel"]:
+            m_in = norm(x, d["mlp_norm"]) if d["mlp_norm"] is not None else h
+            m = mlp(d, m_in, li)
+            if d["post_ff_norm"] is not None:
+                m = norm(m, d["post_ff_norm"])
+            x = x + rm * (a + m)
+        else:
+            x = x + rm * a
+            h2 = norm(x, d["pre_ff_norm"]) if (d["pre_ff_norm"] is not None or s["norm"] == "none") and s["pre_ff_norm"] is not None else x
+            m = mlp(d, h2, li)
+            if d["post_ff_norm"] is not None:
+                m = norm(m, d["post_ff_norm"])
+            x = x + rm * m
+        if "ple_gate" in d:
+            x = x + ple_block(d, x, ple_li)
+        if "layer_scale" in d:
+            x = x * d["layer_scale"]
+        return x
+
+    def layer_altup(d, li, streams, h_fn, ple_li):
+        # Gemma 3n: predict every stream, run the block on the active one, correct all streams.
+        A, active = altup["A"], altup["active"]
+        T = streams.shape[1]
+        mod = modalities(d, streams[active])
+        coefs = (mod @ d["altup_predict"].T).reshape(T, A, A)  # [t][a][i]
+        pred = streams + np.einsum("tai,itd->atd", coefs, streams)
+        act = pred[active]
+        h = norm(act, d["in_norm"])
+        laurel = h + norm((h @ d["laurel_l"].T) @ d["laurel_r"].T, (d["laurel_norm"], None))
+        a = norm(h_fn(h), d["post_attn_norm"])
+        attn_laurel = (act + a + laurel) / np.float32(np.sqrt(2))
+        m = norm(mlp(d, norm(attn_laurel, d["pre_ff_norm"]), li), d["post_ff_norm"])
+        activated = attn_laurel + m
+        cc = modalities(d, activated) @ d["altup_correct"].T + 1.0  # [t][a]
+        innovation = activated - pred[active]
+        corrected = pred + cc.T[:, :, None] * innovation[None]
+        first = corrected[active].copy()
+        if d["altup_scale"] is not None:
+            first = first * d["altup_scale"]
+        corrected[1:] += ple_block(d, first, ple_li)
+        return corrected
+
     def forward(tokens):
         T = len(tokens)
         x = embed[tokens] * np.float32(s["embed_scale"])
@@ -1650,45 +1913,49 @@ def generate_generic(family, out_dir):
             x = norm(x, embed_norm)
         hidden = [x.copy()]
         cos, sin = rope_tables(T)
-        rm = np.float32(s["residual_mult"])
+        cos_l, sin_l = rope_tables_local(T) if s["local_rope"] else (cos, sin)
+        ple = per_layer_inputs(tokens, x) if ple_dim else None
+        shared_kv.clear()
+        streams = None
+        if altup:
+            target = rms_magnitude(x)
+            extra = []
+            for pw in altup_proj:
+                y = x @ pw.T
+                extra.append(y * target / np.sqrt(np.maximum(np.mean(y * y, -1, keepdims=True), 1e-5)))
+            streams = np.stack([x] + extra)
         if s["attn_res"]:
             return forward_attn_res(x, cos, sin)
         for li, d in enumerate(layers):
-            h = norm(x, d["in_norm"]) if (d["in_norm"] is not None or s["norm"] == "none") and s["in_norm"] is not None else x
-            if lin_layers[li] and s["linear_kind"] == "lightning":
-                a = lightning_attn(d, li, h)
+            c_, s_ = (cos_l, sin_l) if sliding_layers[li] else (cos, sin)
+
+            def h_fn(h, d=d, li=li, c_=c_, s_=s_):
+                if conv_layers[li]:
+                    return conv_block(d, h)
+                if lin_layers[li] and s["linear_kind"] == "lightning":
+                    return lightning_attn(d, li, h)
+                return linear_attn(d, h) if lin_layers[li] else attention(d, li, h, c_, s_)
+            ple_li = ple[:, li] if ple is not None else None
+            if altup:
+                streams = layer_altup(d, li, streams, h_fn, ple_li)
+                x = streams[0]
             else:
-                a = linear_attn(d, h) if lin_layers[li] else attention(d, li, h, cos, sin)
-            if d["post_attn_norm"] is not None:
-                a = norm(a, d["post_attn_norm"])
-            if s["residual_layout"] == "minimax":
-                # h = norm(x); x = alpha * h + beta * f(h) for both sublayers.
-                sa = s["mm_scales"]["linear" if lin_layers[li] else "full"]
-                x = np.float32(sa[0]) * h + np.float32(sa[1]) * a
-                h2 = norm(x, d["pre_ff_norm"])
-                sm = s["mm_scales"]["mlp"]
-                x = np.float32(sm[0]) * h2 + np.float32(sm[1]) * mlp(d, h2)
-                hidden.append(x.copy())
-                continue
-            if s["parallel"]:
-                m_in = norm(x, d["mlp_norm"]) if d["mlp_norm"] is not None else h
-                m = mlp(d, m_in)
-                if d["post_ff_norm"] is not None:
-                    m = norm(m, d["post_ff_norm"])
-                x = x + rm * (a + m)
-            else:
-                x = x + rm * a
-                h2 = norm(x, d["pre_ff_norm"]) if (d["pre_ff_norm"] is not None or s["norm"] == "none") and s["pre_ff_norm"] is not None else x
-                m = mlp(d, h2)
-                if d["post_ff_norm"] is not None:
-                    m = norm(m, d["post_ff_norm"])
-                x = x + rm * m
+                x = layer_std(d, li, x, h_fn, ple_li)
             hidden.append(x.copy())
+        if altup:
+            target = rms_magnitude(streams[0])
+            merged = [streams[0]]
+            for e, uw in enumerate(altup_unembed):
+                y = streams[e + 1] @ uw.T
+                merged.append(y * target / np.sqrt(np.maximum(np.mean(y * y, -1, keepdims=True), 1e-5)))
+            x = np.mean(np.stack(merged), 0)
         hfin = norm(x, final_norm) if s["norm"] != "none" else norm(x, None)
         logits = hfin @ lm_head.T
         if lm_bias is not None:
             logits = logits + lm_bias
         logits = logits * np.float32(s["logit_scale"])
+        if s["final_softcap"]:
+            logits = s["final_softcap"] * np.tanh(logits / s["final_softcap"])
         return logits, hidden
 
     def attn_res_mix(bank, p, scorer):
@@ -1741,6 +2008,597 @@ def generate_generic(family, out_dir):
 if FAMILY in SPECS:
     generate_generic(FAMILY, OUT)
     sys.exit(0)
+
+# ---------------------------------------------------------------------------
+# DeepSeek V4 / V4.1 fixtures: hyper-connections (hc_mult residual streams),
+# shared-KV sliding attention with sinks, compressed-KV branches, sqrtsoftplus
+# MoE with a clamped SwiGLU and, per family, hash-routed layers plus MTP
+# tensors (V4) or CSA2 KV sharing, FP8/FP4 fake quantisation and an engram
+# n-gram memory layer (V4.1). The reference forward pass follows
+# transformers' modeling_deepseek_v4.py / modeling_deepseek_v41.py.
+# ---------------------------------------------------------------------------
+
+import unicodedata
+
+RUST_WHITESPACE = set([chr(c) for c in range(0x09, 0x0E)] + [" ", "\x85", "\xa0", " "] +
+                      [chr(c) for c in range(0x2000, 0x200B)] + [" ", " ", " ", " ", "　"])
+
+
+def engram_normalize(text):
+    """The engram token normaliser: NFKC, NFD, strip nonspacing marks, lowercase,
+    collapse ASCII whitespace runs, keep a lone space, else strip Unicode whitespace."""
+    s = unicodedata.normalize("NFD", unicodedata.normalize("NFKC", text))
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    s = "".join(c.lower() for c in s)
+    s = re.sub(r"[ \t\r\n]+", " ", s)
+    if s == " ":
+        return " "
+    i, j = 0, len(s)
+    while i < j and s[i] in RUST_WHITESPACE:
+        i += 1
+    while j > i and s[j - 1] in RUST_WHITESPACE:
+        j -= 1
+    return s[i:j]
+
+
+def compressed_token_map(id_to_token, added_ids):
+    """`build_compressed_token_map` over a byte-level vocabulary."""
+    u2b = {v: k for k, v in b2u().items()}
+    keys, lookup = {}, []
+    for tid in range(len(id_to_token)):
+        tok = id_to_token[tid]
+        if tid in added_ids:
+            text = tok
+        else:
+            raw = bytes(u2b[ch] for ch in tok)
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                text = None
+        if text is None or "�" in text:
+            key = tok
+        else:
+            key = engram_normalize(text) or text
+        lookup.append(keys.setdefault(key, len(keys)))
+    return lookup, len(keys)
+
+
+def is_prime(n):
+    if n < 2:
+        return False
+    if n % 2 == 0:
+        return n == 2
+    i = 3
+    while i * i <= n:
+        if n % i == 0:
+            return False
+        i += 2
+    return True
+
+
+def engram_layout(layer_ids, max_ngram, n_heads, vocab_size):
+    primes, seen = [], set()
+    for _ in layer_ids:
+        per = []
+        for _ in range(max_ngram - 1):
+            sizes, cur = [], vocab_size - 1
+            for _ in range(n_heads):
+                cur += 1
+                while not is_prime(cur) or cur in seen:
+                    cur += 1
+                seen.add(cur)
+                sizes.append(cur)
+            per.append(sizes)
+        primes.append(per)
+    offsets, totals = [], []
+    for layer in primes:
+        row, total = [], 0
+        for p in (p for per in layer for p in per):
+            row.append(total)
+            total += p
+        offsets.append(row)
+        totals.append(total)
+    return primes, offsets, totals
+
+
+def hash_multipliers(layer_ids, max_ngram, compressed_vocab_size):
+    bound = max(1, (np.iinfo(np.int64).max // compressed_vocab_size) // 2)
+    rows = []
+    for lid in layer_ids:
+        g = np.random.default_rng(10007 * lid)
+        rows.append(g.integers(low=0, high=bound, size=(max_ngram,), dtype=np.int64) * 2 + 1)
+    return np.stack(rows)
+
+
+def pow2_ceil(t):
+    bits = np.ascontiguousarray(t, dtype=np.float32).view(np.uint32)
+    e = ((bits >> 23) & 0xFF).astype(np.int32)
+    m = bits & 0x7FFFFF
+    return np.ldexp(np.float32(1.0), e - 127 + (m != 0)).astype(np.float32)
+
+
+def round_e4m3(v):
+    """Round-to-nearest-even onto float8 e4m3fn (inputs are clamped to +-448)."""
+    v = np.clip(np.asarray(v, dtype=np.float32), -448.0, 448.0)
+    a = np.abs(v)
+    safe = np.where(a > 0, a, np.float32(1.0))
+    step = np.where(a < 2.0 ** -6, np.float32(2.0 ** -9), np.ldexp(np.float32(1.0), np.floor(np.log2(safe)).astype(np.int32) - 3)).astype(np.float32)
+    q = (np.rint(a / step) * step).astype(np.float32)
+    return np.where(v < 0, -q, q).astype(np.float32)
+
+
+def fake_quant_fp8(x, block=32):
+    n = x.shape[-1]
+    if n % block:
+        return x
+    blocks = x.astype(np.float32).reshape(*x.shape[:-1], n // block, block)
+    amax = np.maximum(np.abs(blocks).max(-1), np.float32(1e-4))
+    scale = pow2_ceil(amax * np.float32(1.0 / 448.0))
+    q = np.clip(blocks / scale[..., None], -448.0, 448.0).astype(np.float32)
+    return (round_e4m3(q) * scale[..., None]).reshape(x.shape).astype(np.float32)
+
+
+FP4_TABLE = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], dtype=np.float32)
+
+
+def e2m1_codes(q):
+    mag = np.abs(q).astype(np.float32)
+    boundaries = np.array([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], dtype=np.float32)
+    ties_up = np.array([False, True, False, True, False, True, False])
+    thresholds = np.where(ties_up, boundaries, np.nextafter(boundaries, np.float32(np.inf)))
+    codes = (mag[..., None] >= thresholds).sum(-1).astype(np.uint8)
+    return codes | (np.signbit(q).astype(np.uint8) << 3)
+
+
+def fake_quant_fp4(x, block, e4m3_scales=False):
+    n = x.shape[-1]
+    if n % block:
+        return x
+    blocks = x.astype(np.float32).reshape(*x.shape[:-1], n // block, block)
+    amax = np.abs(blocks).max(-1)
+    if e4m3_scales:
+        scale = round_e4m3(np.maximum(amax, np.float32(6.0 * 2.0 ** -9)) / np.float32(6.0))
+    else:
+        scale = pow2_ceil(np.maximum(amax, np.float32(6.0 * 2.0 ** -126)) * np.float32(1.0 / 6.0))
+    q = np.clip(blocks / scale[..., None], -6.0, 6.0).astype(np.float32)
+    return (FP4_TABLE[e2m1_codes(q)] * scale[..., None]).reshape(x.shape).astype(np.float32)
+
+
+def generate_dsv4(family, out_dir):
+    v41 = family == "deepseek_v41"
+    os.makedirs(out_dir, exist_ok=True)
+    rng = np.random.default_rng(2026 if v41 else 2025)
+    vocab, encode, bos, eos = make_tokenizer("deepseek3", out_dir)
+    V = len(vocab)
+    tok_json = json.load(open(f"{out_dir}/tokenizer.json"))
+    id_to_token = [None] * V
+    for t, i in vocab.items():
+        id_to_token[i] = t
+    added_ids = set(a["id"] for a in tok_json["added_tokens"])
+    H, HC, E, K, MI = 32, 2, 4, 2, 12
+    SW, QLR, OG, OLR = 4, 12, 2, 8
+    if v41:
+        L, NH, HD, RD = 4, 2, 32, 8
+        ratios = [0, 2, 1, 1]
+        kv_sources, index_sources, cand_source = [1, 2], [1, 2], 2
+        cand_blocks, cand_block = 16, 2
+        index_topk, index_n_heads, index_head_dim = 32, 2, 8
+        eps, gate_temp, limit, rsf = 1e-20, 1.5, 1.0, 1.5
+        engram_ids, eg_vocab, eg_ngram, eg_heads, eg_hd = [1], 16, 4, 2, 8
+        hash_layers = [False] * L
+    else:
+        L, NH, HD, RD = 4, 4, 16, 4
+        layer_types = ["sliding_attention", "compressed_sparse_attention", "heavily_compressed_attention", "compressed_sparse_attention"]
+        rates = {"compressed_sparse_attention": 2, "heavily_compressed_attention": 3}
+        ratios = [0 if t == "sliding_attention" else rates[t] for t in layer_types]
+        kv_sources = [i for i in range(L) if ratios[i]]
+        index_topk, index_n_heads, index_head_dim = 64, 2, 8
+        eps, gate_temp, limit, rsf = 1e-6, 1.0, 1.0, 1.5
+        hash_layers = [True, True, False, False]
+    theta, ctheta = 10000.0, 20000.0
+    yarn = {"rope_type": "yarn", "factor": 4.0, "beta_fast": 32, "beta_slow": 1, "original_max_position_embeddings": 32}
+    hc_iters, hc_eps = 20, 1e-6
+    MIX = (2 + HC) * HC
+    weights = {}
+
+    def mat(name, rows, cols, scale=0.2):
+        w = bf16_round(rng.normal(0, scale, size=(rows, cols)))
+        weights[name] = w
+        return w
+
+    def vec(name, n, scale=0.2, mean=0.0):
+        w = bf16_round(mean + rng.normal(0, scale, size=(n,)))
+        weights[name] = w
+        return w
+
+    P = "model."
+    embed = mat(P + "embed_tokens.weight", V, H, 1.0)
+    final_norm = vec(P + "norm.weight", H, 0.1, 1.0)
+    lm_head = mat("lm_head.weight", V, H, 1.0)
+    if not v41:
+        hc_head = {"fn": mat(P + "hc_head.hc_fn", HC, HC * H, 0.5), "base": vec(P + "hc_head.hc_base", HC, 0.3),
+                   "scale": vec(P + "hc_head.hc_scale", 1, 0.2, 1.0)[0]}
+    # Engram hash state (V4.1).
+    if v41:
+        token_map, cvs = compressed_token_map(id_to_token, added_ids)
+        eg_primes, eg_offsets, eg_totals = engram_layout(engram_ids, eg_ngram, eg_heads, eg_vocab)
+        eg_mult = hash_multipliers(engram_ids, eg_ngram, cvs)
+        eg_pad = vocab[eos]
+        n_cols = (eg_ngram - 1) * eg_heads
+        eg_tables = {li: mat(P + f"engram_tables.{li}.weight", eg_totals[k], eg_hd, 0.5) for k, li in enumerate(engram_ids)}
+    layers = []
+    for i in range(L):
+        lp = P + f"layers.{i}."
+        d = {"in_norm": vec(lp + "input_layernorm.weight", H, 0.1, 1.0), "post_norm": vec(lp + "post_attention_layernorm.weight", H, 0.1, 1.0)}
+        for site in ("attn_hc", "ffn_hc"):
+            d[site] = {"fn": mat(lp + site + ".fn", MIX, HC * H, 0.5), "base": vec(lp + site + ".base", MIX, 0.3), "scale": vec(lp + site + ".scale", 3, 0.2, 1.0)}
+        d["q_a"] = mat(lp + "self_attn.q_a_proj.weight", QLR, H)
+        d["q_a_norm"] = vec(lp + "self_attn.q_a_norm.weight", QLR, 0.1, 1.0)
+        d["q_b"] = mat(lp + "self_attn.q_b_proj.weight", NH * HD, QLR, 0.3)
+        d["kv"] = mat(lp + "self_attn.kv_proj.weight", HD, H)
+        d["kv_norm"] = vec(lp + "self_attn.kv_norm.weight", HD, 0.1, 1.0)
+        d["o_a"] = mat(lp + "self_attn.o_a_proj.weight", OG * OLR, NH * HD // OG)
+        d["o_b"] = mat(lp + "self_attn.o_b_proj.weight", H, OG * OLR)
+        d["sinks"] = vec(lp + "self_attn.sinks", NH, 1.0)
+        if ratios[i] and i in kv_sources:
+            cp = lp + "self_attn.compressor."
+            width = 2 * HD if (not v41 and layer_types[i] == "compressed_sparse_attention") else HD
+            d["c_kv"] = mat(cp + "kv_proj.weight", width, H)
+            d["c_gate"] = mat(cp + "gate_proj.weight", width, H) if (not v41 or ratios[i] > 1) else None
+            d["c_pb"] = mat(cp + "position_bias", ratios[i], width, 0.5) if not v41 else None
+            d["c_norm"] = vec(cp + "kv_norm.weight", HD, 0.1, 1.0)
+            if not v41 and layer_types[i] == "compressed_sparse_attention":
+                ip = cp + "indexer."
+                mat(ip + "kv_proj.weight", 2 * index_head_dim, H)
+                mat(ip + "gate_proj.weight", 2 * index_head_dim, H)
+                mat(ip + "position_bias", ratios[i], 2 * index_head_dim, 0.5)
+                vec(ip + "kv_norm.weight", index_head_dim, 0.1, 1.0)
+                mat(ip + "q_b_proj.weight", index_n_heads * index_head_dim, QLR)
+                mat(ip + "scorer.weights_proj.weight", index_n_heads, H)
+        if v41 and i in index_sources:
+            ip = lp + "self_attn.indexer."
+            mat(ip + "q_b_proj.weight", index_n_heads * index_head_dim, QLR)
+            mat(ip + "weights_proj.weight", index_n_heads, H)
+            if i in kv_sources:
+                mat(ip + "k_proj.weight", index_head_dim, HD)
+                vec(ip + "k_norm.weight", index_head_dim, 0.1, 1.0)
+        if v41 and i in engram_ids:
+            ep = lp + "engram."
+            d["eg_wkv"] = mat(ep + "wkv.weight", H * (HC + 1), n_cols * eg_hd, 0.3)
+            d["eg_q"] = mat(ep + "q_weight", HC, H, 0.3)
+            d["eg_k"] = mat(ep + "k_weight", HC, H, 0.3)
+        d["router"] = mat(lp + "mlp.gate.weight", E, H)
+        d["corr_b"] = vec(lp + "mlp.gate.e_score_correction_bias", E, 0.5)
+        if v41:
+            vec(lp + "mlp.gate.e_score_correction_bias_vl", E, 0.5)
+        if hash_layers[i]:
+            table = np.stack([rng.permutation(E)[:K] for _ in range(V)]).astype(np.int64)
+            weights[lp + "mlp.gate.tid2eid"] = table
+            d["tid2eid"] = table
+        experts = []
+        gu = np.zeros((E, 2 * MI, H), np.float32)
+        dn = np.zeros((E, H, MI), np.float32)
+        for e in range(E):
+            ex = {"gate": bf16_round(rng.normal(0, 0.2, size=(MI, H))), "up": bf16_round(rng.normal(0, 0.2, size=(MI, H))),
+                  "down": bf16_round(rng.normal(0, 0.2, size=(H, MI)))}
+            gu[e] = np.concatenate([ex["gate"], ex["up"]], 0)
+            dn[e] = ex["down"]
+            experts.append(ex)
+        weights[lp + "mlp.experts.gate_up_proj"] = gu
+        weights[lp + "mlp.experts.down_proj"] = dn
+        d["experts"] = experts
+        sp = lp + "mlp.shared_experts."
+        d["shared"] = {"gate": mat(sp + "gate_proj.weight", MI, H), "up": mat(sp + "up_proj.weight", MI, H), "down": mat(sp + "down_proj.weight", H, MI)}
+        layers.append(d)
+    # Tensors ditch never runs but must carry through exports.
+    mat(P + "mtp.0.eh_proj.weight", H, 2 * H)
+    vec(P + "mtp.0.norm.weight", H, 0.1, 1.0)
+    mat(P + f"layers.{L}.self_attn.q_a_proj.weight", QLR, H)
+    if v41:
+        mat("vision.blocks.0.attn.qkv.weight", 3 * H, H)
+        mat("aligner.weight", H, H)
+        vec("image_start", H, 0.5)
+
+    text_cfg = {"hidden_size": H, "num_hidden_layers": L, "num_attention_heads": NH, "num_key_value_heads": 1, "head_dim": HD,
+                "q_lora_rank": QLR, "qk_rope_head_dim": RD, "o_groups": OG, "o_lora_rank": OLR, "sliding_window": SW,
+                "n_routed_experts": E, "n_shared_experts": 1, "num_experts_per_tok": K, "moe_intermediate_size": MI,
+                "scoring_func": "sqrtsoftplus", "norm_topk_prob": True, "routed_scaling_factor": rsf, "swiglu_limit": limit,
+                "hc_mult": HC, "hc_sinkhorn_iters": hc_iters, "hc_eps": hc_eps, "rms_norm_eps": eps, "rope_theta": theta,
+                "compress_rope_theta": ctheta, "rope_scaling": dict(yarn), "max_position_embeddings": 128,
+                "index_n_heads": index_n_heads, "index_head_dim": index_head_dim, "index_topk": index_topk,
+                "hidden_act": "silu", "tie_word_embeddings": False, "vocab_size": V, "torch_dtype": "bfloat16"}
+    if v41:
+        text_cfg.update({"model_type": "deepseek_v41_text", "compress_ratios": ratios + [0, 0, 0], "kv_source_layer_ids": kv_sources,
+                         "index_source_layer_ids": index_sources, "candidate_source_layer_id": cand_source,
+                         "candidate_topk_blocks": cand_blocks, "candidate_block_size": cand_block, "gate_temp": gate_temp,
+                         "topk_method": "noaux_tc", "num_nextn_predict_layers": 3, "engram_layer_ids": engram_ids,
+                         "engram_vocab_size": eg_vocab, "engram_num_embeddings": eg_totals, "engram_max_ngram_size": eg_ngram,
+                         "engram_n_heads": eg_heads, "engram_head_dim": eg_hd, "engram_pad_id": eg_pad,
+                         "engram_compressed_vocab_size": cvs})
+        config = {"model_type": "deepseek_v41", "architectures": ["DeepseekV41ForCausalLM"], "text_config": text_cfg,
+                  "vision_config": {"model_type": "deepseek_v41_vision", "hidden_size": H, "num_hidden_layers": 1},
+                  "image_token_id": vocab[eos], "tie_word_embeddings": False}
+    else:
+        text_cfg.update({"model_type": "deepseek_v4", "architectures": ["DeepseekV4ForCausalLM"], "layer_types": layer_types,
+                         "compress_rates": rates, "mlp_layer_types": ["hash_moe" if h else "moe" for h in hash_layers],
+                         "num_nextn_predict_layers": 1})
+        config = text_cfg
+    json.dump(config, open(f"{out_dir}/config.json", "w"), indent=1)
+    json.dump({"eos_token_id": vocab[eos], "bos_token_id": None, "do_sample": False}, open(f"{out_dir}/generation_config.json", "w"))
+    header, blobs, offset = {}, [], 0
+    for n in sorted(weights):
+        w = weights[n]
+        if w.dtype == np.int64:
+            u, dtype = w, "I64"
+        else:
+            u, dtype = bf16_bits(w), "BF16"
+        header[n] = {"dtype": dtype, "shape": list(u.shape), "data_offsets": [offset, offset + u.nbytes]}
+        blobs.append(u.tobytes())
+        offset += u.nbytes
+    hb = json.dumps(header).encode()
+    hb += b" " * ((8 - len(hb) % 8) % 8)
+    with open(f"{out_dir}/model.safetensors", "wb") as f:
+        f.write(struct.pack("<Q", len(hb)))
+        f.write(hb)
+        for b in blobs:
+            f.write(b)
+
+    # --- reference forward pass (float32) ---
+    f32 = np.float32
+
+    def rms(x, w):
+        return (x / np.sqrt(np.mean(x * x, -1, keepdims=True) + f32(eps)) * w).astype(f32)
+
+    def sigmoid(x):
+        return (1 / (1 + np.exp(-x))).astype(f32)
+
+    def rope_tables(base, scaling, T):
+        inv = 1.0 / (base ** (np.arange(0, RD, 2, dtype=np.float64) / RD))
+        factor = 1.0
+        if scaling:
+            f = scaling["factor"]
+            om = scaling["original_max_position_embeddings"]
+            bf, bs_ = scaling.get("beta_fast", 32), scaling.get("beta_slow", 1)
+
+            def corr_dim(rot):
+                return (RD * np.log(om / (rot * 2 * np.pi))) / (2 * np.log(base))
+            low, high = np.floor(corr_dim(bf)), np.ceil(corr_dim(bs_))
+            low, high = max(low, 0), min(high, RD - 1)
+            if low == high:
+                high += 0.001
+            ramp = np.clip((np.arange(RD // 2) - low) / (high - low), 0, 1)
+            inv = (inv / f) * ramp + inv * (1 - ramp)
+            factor = scaling.get("attention_factor", 1.0)
+        ang = np.outer(np.arange(T, dtype=np.float64), inv)
+        return (np.cos(ang) * factor).astype(f32), (np.sin(ang) * factor).astype(f32)
+
+    def rope_tail(x, cos, sin, sign=1.0):
+        """Interleaved rope on the trailing RD channels; x [..., D], cos/sin [T, RD/2] broadcast over leading dims."""
+        nope, rot = x[..., :-RD], x[..., -RD:]
+        ev, od = rot[..., 0::2], rot[..., 1::2]
+        s = sin * f32(sign)
+        out = np.empty_like(rot)
+        out[..., 0::2] = ev * cos - od * s
+        out[..., 1::2] = od * cos + ev * s
+        return np.concatenate([nope, out], -1).astype(f32)
+
+    def hc_site(x, site):  # x [T, HC, H]
+        T = x.shape[0]
+        flat = x.reshape(T, HC * H)
+        flat = flat / np.sqrt(np.mean(flat * flat, -1, keepdims=True) + f32(eps))
+        p = flat @ site["fn"].T
+        base, scale = site["base"], site["scale"]
+        pre = sigmoid(p[:, :HC] * scale[0] + base[:HC]) + f32(hc_eps)
+        post = 2 * sigmoid(p[:, HC:2 * HC] * scale[1] + base[HC:2 * HC])
+        logits = (p[:, 2 * HC:] * scale[2] + base[2 * HC:]).reshape(T, HC, HC)
+        ex = np.exp(logits - logits.max(-1, keepdims=True))
+        comb = ex / ex.sum(-1, keepdims=True) + f32(hc_eps)
+        comb = comb / (comb.sum(-2, keepdims=True) + f32(hc_eps))
+        for _ in range(hc_iters - 1):
+            comb = comb / (comb.sum(-1, keepdims=True) + f32(hc_eps))
+            comb = comb / (comb.sum(-2, keepdims=True) + f32(hc_eps))
+        return pre.astype(f32), post.astype(f32), comb.astype(f32)
+
+    def collapse(x, pre):
+        return (pre[:, :, None] * x).sum(1).astype(f32)
+
+    def expand(y, x, post, comb):
+        return (post[:, :, None] * y[:, None, :] + np.einsum("tjk,tjd->tkd", comb, x)).astype(f32)
+
+    def compressor(d, li, h, ccos, csin):
+        """Compressed entries [G, HD] of the layer owning the compressor."""
+        T, ratio = h.shape[0], ratios[li]
+        G = T // ratio
+        if G == 0:
+            return np.zeros((0, HD), f32)
+        kvp = (h @ d["c_kv"].T).astype(f32)
+        gp = (h @ d["c_gate"].T).astype(f32) if d["c_gate"] is not None else None
+        if v41:
+            gk = kvp[:G * ratio].reshape(G, ratio, HD)
+            if gp is None:
+                latent = gk[:, 0]
+            else:
+                gg = gp[:G * ratio].reshape(G, ratio, HD)
+                w = np.exp(gg - gg.max(1, keepdims=True))
+                w = w / w.sum(1, keepdims=True)
+                latent = (gk * w).sum(1)
+        else:
+            width = kvp.shape[1]
+            ck = kvp[:G * ratio].reshape(G, ratio, width)
+            cg = gp[:G * ratio].reshape(G, ratio, width) + d["c_pb"][None]
+            if layer_types[li] == "compressed_sparse_attention":
+                nk = np.zeros((G, 2 * ratio, HD), f32)
+                ng = np.full((G, 2 * ratio, HD), -np.inf, f32)
+                nk[:, ratio:] = ck[..., HD:]
+                ng[:, ratio:] = cg[..., HD:]
+                if G > 1:
+                    nk[1:, :ratio] = ck[:-1, :, :HD]
+                    ng[1:, :ratio] = cg[:-1, :, :HD]
+            else:
+                nk, ng = ck, cg
+            w = np.exp(ng - ng.max(1, keepdims=True))
+            w = w / w.sum(1, keepdims=True)
+            latent = (nk * w).sum(1)
+        latent = rms(latent.astype(f32), d["c_norm"])
+        pos = np.arange(G) * ratio
+        latent = rope_tail(latent, ccos[pos], csin[pos])
+        if v41:
+            latent = fake_quant_fp4(latent, 16, e4m3_scales=True)
+        return latent.astype(f32)
+
+    def attention(d, li, h, entries, mcos, msin, ccos, csin):
+        T = h.shape[0]
+        use_c = ratios[li] > 0
+        cos, sin = (ccos, csin) if use_c else (mcos, msin)
+        q_res = rms(h @ d["q_a"].T, d["q_a_norm"])
+        q = (q_res @ d["q_b"].T).reshape(T, NH, HD)
+        if not v41:
+            q = q / np.sqrt(np.mean(q * q, -1, keepdims=True) + f32(eps))
+        q = rope_tail(q, cos[:T, None, :], sin[:T, None, :])
+        kv = rms(h @ d["kv"].T, d["kv_norm"])
+        kv = rope_tail(kv, cos[:T], sin[:T])
+        if v41:
+            kv = fake_quant_fp8(kv, 32)
+        scale = f32(1.0 / np.sqrt(HD))
+        idx = np.arange(T)
+        wmask = (idx[None, :] > idx[:, None]) | (idx[:, None] - idx[None, :] >= SW)
+        G = entries.shape[0] if use_c else 0
+        if use_c:
+            reach = (idx + 1) // ratios[li]
+            assert reach.max() <= index_topk
+            cmask = np.arange(G)[None, :] >= reach[:, None]
+        out = np.zeros((T, NH, HD), f32)
+        for hh in range(NH):
+            s = (q[:, hh, :] @ kv.T) * scale
+            s = np.where(wmask, -np.inf, s)
+            if use_c:
+                sc = (q[:, hh, :] @ entries.T) * scale
+                sc = np.where(cmask, -np.inf, sc)
+                s = np.concatenate([s, sc], 1)
+            s = np.concatenate([s, np.full((T, 1), d["sinks"][hh], f32)], 1)
+            s = s - s.max(-1, keepdims=True)
+            p = np.exp(s)
+            p = p / p.sum(-1, keepdims=True)
+            o = p[:, :T] @ kv
+            if use_c:
+                o = o + p[:, T:T + G] @ entries
+            out[:, hh, :] = o
+        out = rope_tail(out, cos[:T, None, :], sin[:T, None, :], -1.0)
+        per = NH * HD // OG
+        grouped = out.reshape(T, OG, per)
+        ya = np.stack([grouped[:, g] @ d["o_a"][g * OLR:(g + 1) * OLR].T for g in range(OG)], 1).reshape(T, OG * OLR)
+        return (ya @ d["o_b"].T).astype(f32)
+
+    def expert_out(ex, x):
+        g = np.minimum(x @ ex["gate"].T, f32(limit))
+        u = np.clip(x @ ex["up"].T, -limit, limit)
+        return ((g / (1 + np.exp(-g)) * u) @ ex["down"].T).astype(f32)
+
+    def moe(d, h, tokens):
+        T = h.shape[0]
+        logits = (h @ d["router"].T) / f32(gate_temp)
+        scores = np.sqrt(np.log1p(np.exp(logits))).astype(f32)
+        out = np.zeros_like(h)
+        for t in range(T):
+            if "tid2eid" in d:
+                idx = d["tid2eid"][tokens[t]]
+            else:
+                idx = np.argsort(-(scores[t] + d["corr_b"]), kind="stable")[:K]
+            w = scores[t][idx]
+            w = w / (w.sum() + f32(1e-20)) * f32(rsf)
+            for e, we in zip(idx, w):
+                out[t] += we * expert_out(d["experts"][e], h[t])
+        return out + expert_out(d["shared"], h)
+
+    def engram(d, li, x, tokens):
+        T = x.shape[0]
+        k = engram_ids.index(li)
+        cids = [token_map[t] for t in tokens]
+        ctx = eg_ngram - 1
+        hashes = np.zeros((T, n_cols), np.int64)
+        for t in range(T):
+            grams, blocked = [], False
+            for shift in range(eg_ngram):
+                src = cids[t - shift] if t - shift >= 0 else -1
+                blocked = blocked or src < 0
+                grams.append(eg_pad_cid if blocked else src)
+            prod = np.array(grams, np.int64) * eg_mult[k]
+            rolling = prod[0]
+            for i in range(1, eg_ngram):
+                rolling = np.bitwise_xor(rolling, prod[i])
+                for hh in range(eg_heads):
+                    col = (i - 1) * eg_heads + hh
+                    hashes[t, col] = rolling % np.int64(eg_primes[k][i - 1][hh]) + eg_offsets[k][col]
+        rows = eg_tables[li][hashes]  # [T, n_cols, eg_hd]
+        kv = rows.reshape(T, -1) @ d["eg_wkv"].T
+        key, value = kv[:, :HC * H].reshape(T, HC, H), kv[:, HC * H:]
+        weight = d["eg_q"] * d["eg_k"]
+        rstd = (1 / np.sqrt(np.mean(x * x, -1) + f32(eps))) * (1 / np.sqrt(np.mean(key * key, -1) + f32(eps)))
+        dot = (x * weight * key).sum(-1) * rstd * f32(H ** -0.5)
+        gate = sigmoid(np.copysign(np.sqrt(np.maximum(np.abs(dot), f32(1e-6))), dot))
+        return (x + gate[..., None] * value[:, None, :]).astype(f32)
+
+    if v41:
+        eg_pad_cid = token_map[eg_pad]
+
+    def forward(tokens):
+        T = len(tokens)
+        x = np.repeat(embed[tokens][:, None, :], HC, axis=1).astype(f32)
+        mcos, msin = rope_tables(theta, None, T)
+        ccos, csin = rope_tables(ctheta, yarn, T)
+        hidden = []
+        pre_mix = np.zeros((T, HC), f32)
+        pre_mix[:, 0] = 1.0
+        entries = {}
+        for li, d in enumerate(layers):
+            if v41 and li in engram_ids:
+                x = engram(d, li, x, tokens)
+            pre, post, comb = hc_site(x, d["attn_hc"])
+            collapsed = collapse(x, pre_mix if v41 else pre)
+            hidden.append(collapsed.copy())
+            h = rms(collapsed, d["in_norm"])
+            ent = None
+            if ratios[li]:
+                src = max(s for s in kv_sources if s <= li) if v41 else li
+                if src == li:
+                    entries[li] = compressor(d, li, h, ccos, csin)
+                ent = entries[src]
+            a = attention(d, li, h, ent, mcos, msin, ccos, csin)
+            x = expand(a, x, post, comb)
+            if v41:
+                pre_mix = pre
+            pre, post, comb = hc_site(x, d["ffn_hc"])
+            collapsed = collapse(x, pre_mix if v41 else pre)
+            m = moe(d, rms(collapsed, d["post_norm"]), tokens)
+            x = expand(m, x, post, comb)
+            if v41:
+                pre_mix = pre
+        if v41:
+            final = collapse(x, pre_mix)
+        else:
+            flat = x.reshape(T, HC * H)
+            flat = flat / np.sqrt(np.mean(flat * flat, -1, keepdims=True) + f32(eps))
+            p = flat @ hc_head["fn"].T
+            pre = sigmoid(p * hc_head["scale"] + hc_head["base"]) + f32(hc_eps)
+            final = collapse(x, pre)
+        hidden.append(final.copy())
+        logits = rms(final, final_norm) @ lm_head.T
+        return logits, hidden
+
+    cases = []
+    for t in ["the ant or you", "hello 42 the ant or you an era in the"]:
+        ids = encode(t)
+        logits, hidden = forward(ids)
+        cases.append({"text": t, "ids": ids, "last_logits": [round(float(v), 4) for v in logits[-1]], "argmax": int(np.argmax(logits[-1])),
+                      "last_hidden": [[round(float(v), 4) for v in hh[-1]] for hh in hidden]})
+    json.dump({"family": family, "cases": cases}, open(f"{out_dir}/reference.json", "w"), separators=(",", ":"))
+    print(f"wrote fixture to {out_dir}: vocab={V}, layers={L}, hidden={H}, streams={HC}")
+
+
+if FAMILY in ("deepseek_v4", "deepseek_v41"):
+    generate_dsv4(FAMILY, OUT)
+    sys.exit(0)
+
 
 
 # ---------------------------------------------------------------------------

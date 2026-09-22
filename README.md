@@ -79,7 +79,9 @@ a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
 * Llama 2/3 layout: `llama` (Yi, SOLAR, TinyLlama, SmolLM 1/2), `mistral`,
   `mistral3` text, `smollm3`, `granite`, `minicpm`, `baichuan` (7B, RoPE),
   `exaone`, `exaone4`, `internlm2`, `olmo`, `olmo2`, `cohere` (Command R),
-  `stablelm`, `starcoder2`, `nemotron`
+  `stablelm`, `starcoder2`, `nemotron`, `seed_oss` (Seed-OSS 36B)
+* LFM2 / LFM2.5 (`lfm2`): gated short-convolution layers mixed with
+  attention (`lfm2_moe` is not supported)
 * Qwen: `qwen2` / `qwen2.5` (also the `qwen2_vl` / `qwen2_5_vl` text configs),
   `qwen3` (also `qwen3_vl` text), `qwen2_moe`, `qwen3_moe`
 * Qwen hybrids (Gated DeltaNet linear attention + sigmoid/swish-gated full
@@ -97,18 +99,25 @@ a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
   gate, MLA layers with a sigmoid output gate, latent MoE with 896 experts,
   SiTU activation and two shared experts; bf16 or the released
   compressed-tensors MXFP4 experts; see "Attention Residual" below)
-* Gemma 2 / Gemma 3 (text), GLM-4 (`glm4`, `glm`) and ChatGLM3 / GLM-4-9B
-  (`chatglm`), GLM-4.5 dense and MoE (`glm4_moe`, also the `glm4v_moe`
-  image/video text config), GLM-5 family (`glm_moe_dsa`, whose sparse
-  indexer runs as dense attention, exact for the short contexts ditch
-  scores), Phi-1/1.5/2 (`phi`), Phi-3 / 3.5 / 4 (`phi3`)
+* Gemma 2 / Gemma 3 (text), Gemma 3n (`gemma3n` text: AltUp residual
+  streams, Laurel blocks, per-layer input embeddings, KV-shared layers),
+  Gemma 4 dense (`gemma4` text: global layers with their own head size,
+  proportional RoPE, keys reused as values, KV-shared layers, per-layer
+  inputs; the MoE block of gemma-4-26B-A4B is not implemented), GLM-4
+  (`glm4`, `glm`) and ChatGLM3 / GLM-4-9B (`chatglm`), GLM-4.5 dense and
+  MoE (`glm4_moe`, also the `glm4v_moe` image/video text config), GLM-5
+  family (`glm_moe_dsa`, whose sparse indexer runs as dense attention,
+  exact for the short contexts ditch scores), Phi-1/1.5/2 (`phi`),
+  Phi-3 / 3.5 / 4 (`phi3`)
 * GPT-2, GPT-NeoX / Pythia, GPT-BigCode (StarCoder 1), Falcon (7B layout),
   BLOOM, OPT, MPT
 * Mixture of experts: Mixtral, Qwen2/3-MoE (separate and fused expert
   layouts), DeepSeek V2 / V3 (MLA, group-limited and sigmoid routing, shared
-  experts), Llama 4 text (top-1 routing, NoPE layers), gpt-oss (attention
-  sinks, interleaved fused experts, BF16 or MXFP4 checkpoints), ERNIE 4.5
-  MoE (`ernie4_5_moe`), Hunyuan-A13B (`hunyuan_v1_moe`), GraniteMoE /
+  experts), Mistral Small 4 text (`mistral4`: MLA, position-scaled
+  queries, group-limited softmax routing, fused experts), Llama 4 text
+  (top-1 routing, NoPE layers), gpt-oss (attention sinks, interleaved
+  fused experts, BF16 or MXFP4 checkpoints), ERNIE 4.5 MoE
+  (`ernie4_5_moe`), Hunyuan-A13B (`hunyuan_v1_moe`), GraniteMoE /
   GraniteMoeShared (`granitemoe`) and the attention-only Granite 4 layout
   (`granitemoehybrid` without Mamba layers)
 * MiniMax: M2 (`minimax_m2`), MiniMax-Text-01 / M1 (`minimax`: lightning
@@ -119,6 +128,19 @@ a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
   index_topk_blocks` tokens, 2048 with the released config, so ditch runs
   those layers as dense attention and its results are exact only within
   that length)
+* DeepSeek V4 (`deepseek_v4`) and V4.1-Flash (`deepseek_v41`, text config):
+  manifold-constrained hyper-connections, shared-KV sliding attention with
+  sinks and grouped output projection, compressed-KV branches (V4 CSA/HCA,
+  V4.1 CSA2 shared groups) whose Lightning Indexer runs as its dense
+  equivalent (exact while every reachable compressed entry fits
+  `index_topk`; longer prompts are refused, not approximated), V4.1's FP8/FP4
+  quantisation-aware rounding of the KV caches, sqrtsoftplus routing with
+  clamped SwiGLU experts, V4 hash-routed (`tid2eid`) layers and V4.1 engram
+  n-gram hash layers (table rows are read lazily; the compressed vocabulary
+  is rebuilt from the tokenizer and checked against the config). MTP, vision
+  and aligner tensors pass through exports untouched. FP8 tensors are
+  dequantised on load like the other families; the FP4 (e2m1) expert weights
+  of the released checkpoints are refused until dequantised.
 
 Implemented from the Hugging Face reference but without a fixture: Falcon
 40B/180B (grouped qkv, `ln_attn`/`ln_mlp`) and Falcon ALiBi, Baichuan 13B
@@ -129,11 +151,10 @@ beyond the original context (treated as static / short factors).
 Not supported: state-space and hybrid models (Mamba, Jamba, Falcon-H1,
 Nemotron-H, RWKV, Granite 4 `granitemoehybrid` checkpoints with Mamba-2
 layers), Kimi K2 (`kimi_k2` standalone config),
-Qwen3.8-Flash-Next (`qwen4_exp`), GLM-5.3-Flash (`glm5_next`) and
-DeepSeek V4 (sparse indexers with hyper-connections and hash layers),
-encoder-decoder models, Gemma 3n (per-layer inputs), MiniCPM3, HunYuan
-cross-layer attention (`use_cla`), OPT-350m (projection layers),
-quantisation formats other than the ones listed below (GPTQ, AWQ,
+Qwen3.8-Flash-Next (`qwen4_exp`), GLM-5.3-Flash (`glm5_next`),
+encoder-decoder models, Gemma 4 MoE (`enable_moe_block`), LFM2-MoE,
+MiniCPM3, HunYuan cross-layer attention (`use_cla`), OPT-350m (projection
+layers), quantisation formats other than the ones listed below (GPTQ, AWQ,
 bitsandbytes, ...), and SentencePiece-only tokenizers (Baichuan; generate
 a `tokenizer.json` with
 `AutoTokenizer.from_pretrained(...).save_pretrained(...)` and place it
@@ -142,10 +163,11 @@ unknown layer types, quantisation formats and activations are errors, not
 silent fallbacks. Unicode normalisers (NFKC, Precompiled) are
 approximated by the identity.
 
-Image and video models (Qwen2/3-VL, Qwen3.5, GLM-4.5V, Llama 4, Kimi K2.5,
-Kimi K3) run through their text config: the vision tower is never
-executed, its weights pass through exports byte for byte, and refusal
-directions are measured on text prompts.
+Image, video and audio models (Qwen2/3-VL, Qwen3.5, GLM-4.5V, Llama 4,
+Kimi K2.5, Kimi K3, Gemma 3n, Gemma 4, Mistral Small 4) run through their text
+config: the vision and audio towers are never executed, their weights pass
+through exports byte for byte, and refusal directions are measured on text
+prompts.
 
 ### Attention Residual (Kimi K3)
 
@@ -370,7 +392,12 @@ RAM. The Pareto fronts are close.
    minus harmless prompts, normalised (optionally projected orthogonal to
    the harmless direction). With `--n-directions K`, further principal
    components of the harmful residuals are added from a streaming covariance
-   sketch.
+   sketch. For the hyper-connection families (DeepSeek V4 / V4.1), whose
+   residual is several parallel streams, "the residual at layer L" is the
+   single mixed vector that enters layer L's attention block (the collapsed
+   block input, before its norm) and the last entry is the final collapse
+   that enters the output norm; the edited weights are the same output and
+   down projections as everywhere else.
 2. **Edit.** For every attention output and MLP down projection, the
    direction is projected out with a per-layer weight from a small kernel
    (maximum weight at a position, decaying to a minimum over a distance),

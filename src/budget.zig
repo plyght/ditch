@@ -577,7 +577,7 @@ pub fn estimate(model: *const model_mod.Model, p: EstimateParams) Estimate {
     const rows = @max(1, p.batch_size * p.max_prompt_tokens);
     const ws = workspaceBytes(c, rows, @max(1, p.batch_size));
     const ws_min = workspaceBytes(c, 1, 1);
-    const kvd: u64 = c.num_kv_heads * c.head_dim;
+    const kvd: u64 = c.kvDim();
     const kv = @as(u64, c.num_layers) * @max(1, p.batch_size) * (p.max_prompt_tokens + p.max_response_length + 1) * kvd * 4 * 2;
     const scratch = @as(u64, @max(1, p.threads)) * (max_cols + 1) * 4 * 2;
     const hidden: u64 = c.hidden_size;
