@@ -28,7 +28,7 @@ pub fn checkFixture(comptime family: []const u8) !void {
     const c = &model.config;
     var ws = try model_mod.Workspace.init(gpa, c, 64, 8);
     defer ws.deinit();
-    var cache = try model_mod.KvCache.init(gpa, c.num_layers, ref.value.cases.len, 64, c.num_kv_heads * c.head_dim);
+    var cache = try model_mod.KvCache.init(gpa, c.num_layers, ref.value.cases.len, 64, c.kvDim());
     defer cache.deinit();
     if (c.hasRecurrent()) {
         cache.linear = try model_mod.LinearCache.init(gpa, c, ref.value.cases.len);
@@ -216,6 +216,21 @@ test "glm4_moe fixture" {
 test "glm_moe_dsa fixture" {
     try checkFixture("glm_moe_dsa");
 }
+test "seed_oss fixture" {
+    try checkFixture("seed_oss");
+}
+test "lfm2 fixture" {
+    try checkFixture("lfm2");
+}
+test "mistral4 fixture" {
+    try checkFixture("mistral4");
+}
+test "gemma4 fixture" {
+    try checkFixture("gemma4");
+}
+test "gemma3n fixture" {
+    try checkFixture("gemma3n");
+}
 test "deepseek_v4 fixture" {
     try checkFixture("deepseek_v4");
 }
@@ -400,8 +415,9 @@ fn runLogits(model: *const model_mod.Model, gpa: std.mem.Allocator, ids: []const
 
 fn bothComponents() std.EnumMap(model_mod.Component, abliterate.Params) {
     var params = std.EnumMap(model_mod.Component, abliterate.Params){};
-    params.put(.attn_o_proj, .{ .max_weight = 1.0, .max_weight_position = 1, .min_weight = 0.5, .min_weight_distance = 2 });
-    params.put(.mlp_down_proj, .{ .max_weight = 1.0, .max_weight_position = 1, .min_weight = 0.5, .min_weight_distance = 2 });
+    // The kernel reaches every layer of every fixture (the deepest has 5).
+    params.put(.attn_o_proj, .{ .max_weight = 1.0, .max_weight_position = 1, .min_weight = 0.5, .min_weight_distance = 4 });
+    params.put(.mlp_down_proj, .{ .max_weight = 1.0, .max_weight_position = 1, .min_weight = 0.5, .min_weight_distance = 4 });
     return params;
 }
 
@@ -539,6 +555,21 @@ test "jamba edit, export and streamed reload (Mamba1, separate expert tensors)" 
 }
 test "granitemoehybrid edit, export and streamed reload (fused input_linear experts, shared_mlp)" {
     try checkEditExportStream("granitemoehybrid");
+}
+test "seed_oss edit, export and streamed reload (biased q/k/v, explicit head_dim)" {
+    try checkEditExportStream("seed_oss");
+}
+test "lfm2 edit, export and streamed reload (short-conv out_proj as the attention output)" {
+    try checkEditExportStream("lfm2");
+}
+test "mistral4 edit, export and streamed reload (MLA, fused softmax MoE, shared experts)" {
+    try checkEditExportStream("mistral4");
+}
+test "gemma4 edit, export and streamed reload (per-layer head sizes, KV sharing, per-layer inputs)" {
+    try checkEditExportStream("gemma4");
+}
+test "gemma3n edit, export and streamed reload (AltUp streams, Laurel, per-layer inputs)" {
+    try checkEditExportStream("gemma3n");
 }
 test "deepseek_v4 edit, export and streamed reload (hyper-connections, hash routing, MTP pass-through)" {
     try checkEditExportStream("deepseek_v4");

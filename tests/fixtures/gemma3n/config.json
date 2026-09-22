@@ -1,0 +1,56 @@
+{
+ "model_type": "gemma3n",
+ "architectures": [
+  "Gemma3nForConditionalGeneration"
+ ],
+ "text_config": {
+  "model_type": "gemma3n_text",
+  "hidden_size": 32,
+  "intermediate_size": [
+   32,
+   32,
+   48,
+   32
+  ],
+  "num_hidden_layers": 4,
+  "num_attention_heads": 4,
+  "num_key_value_heads": 2,
+  "head_dim": 8,
+  "sliding_window": 4,
+  "layer_types": [
+   "sliding_attention",
+   "sliding_attention",
+   "full_attention",
+   "sliding_attention"
+  ],
+  "rope_theta": 1000000.0,
+  "rope_local_base_freq": 10000.0,
+  "rope_scaling": null,
+  "rms_norm_eps": 1e-06,
+  "hidden_activation": "gelu_pytorch_tanh",
+  "final_logit_softcapping": 30.0,
+  "hidden_size_per_layer_input": 4,
+  "vocab_size_per_layer_input": 0,
+  "altup_num_inputs": 3,
+  "altup_active_idx": 0,
+  "altup_coef_clip": 120.0,
+  "altup_correct_scale": true,
+  "num_kv_shared_layers": 1,
+  "laurel_rank": 6,
+  "activation_sparsity_pattern": [
+   0.95,
+   0.5,
+   0.0,
+   0.0
+  ],
+  "max_position_embeddings": 128,
+  "tie_word_embeddings": true,
+  "vocab_size": 374
+ },
+ "vision_config": {
+  "model_type": "gemma3n_vision"
+ },
+ "audio_config": {
+  "model_type": "gemma3n_audio"
+ }
+}

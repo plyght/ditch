@@ -99,6 +99,16 @@ pub const Slot = enum {
     d_comp_kv,
     d_comp_gate,
     d_engram_wkv,
+    // LFM2 short convolution, Gemma 3n / 4 per-layer inputs, AltUp and Laurel
+    conv_in,
+    conv_kernel,
+    ple_gate,
+    ple_out,
+    laurel_l,
+    laurel_r,
+    altup_router,
+    altup_predict,
+    altup_correct,
 };
 
 /// Where a layer's matrices live on disk. `Model.acquireLayer` turns these
@@ -113,7 +123,7 @@ pub const LayerRefs = struct {
     transposed: [max]bool = [_]bool{false} ** max,
     n: usize = 0,
 
-    pub const max = 16;
+    pub const max = 20;
 
     pub fn add(self: *LayerRefs, slot: Slot, ref: WeightRef, transposed: bool) void {
         std.debug.assert(self.n < max);
@@ -242,6 +252,40 @@ pub const SsmWeights = struct {
     out_bias: ?[]const f32 = null,
 };
 
+/// Gated short convolution of an LFM2 conv layer (`in_proj` produces the B, C
+/// and x thirds; the depthwise causal kernel is `[hidden][taps]`); its output
+/// projection lives in `Layer.o`.
+pub const ConvWeights = struct {
+    in: Weight,
+    in_bias: ?[]const f32,
+    kernel: Weight,
+    kernel_bias: ?[]const f32,
+};
+
+/// Per-layer input embedding block (Gemma 3n / 4): `gate` `[ple_dim][hidden]`,
+/// `out` `[hidden][ple_dim]` and the norm on its output.
+pub const PleWeights = struct {
+    gate: Weight,
+    out: Weight,
+    norm: Norm,
+};
+
+/// AltUp and Laurel parameters of a Gemma 3n layer.
+pub const AltUpWeights = struct {
+    /// `[altup_inputs][hidden]` modality router and its norm.
+    router: Weight,
+    router_norm: Norm,
+    /// `[altup_inputs²][altup_inputs]` prediction and `[altup_inputs][altup_inputs]` correction coefficients.
+    predict: Weight,
+    correct: Weight,
+    /// `[hidden]` scale of the corrected active stream (null when `altup_correct_scale` is off).
+    scale: ?[]const f32,
+    /// Laurel: `[rank][hidden]`, `[hidden][rank]` and the norm on the result.
+    laurel_l: Weight,
+    laurel_r: Weight,
+    laurel_norm: Norm,
+};
+
 pub const Layer = struct {
     input_norm: ?Norm,
     /// Norm on the attention output (Gemma, OLMo 2, GLM-4).
@@ -271,6 +315,14 @@ pub const Layer = struct {
     linear: ?LinearWeights = null,
     /// Mamba block weights (null for layers without one).
     ssm: ?SsmWeights = null,
+    /// Short-convolution weights (LFM2 conv layers).
+    conv: ?ConvWeights = null,
+    /// Per-layer input embedding block (Gemma 3n / 4).
+    ple: ?PleWeights = null,
+    /// AltUp / Laurel parameters (Gemma 3n).
+    altup: ?AltUpWeights = null,
+    /// Scalar on the layer output (Gemma 4 `layer_scalar`).
+    layer_scale: ?f32 = null,
     /// DeepSeek V4 / V4.1 weights (hyper-connections, low-rank and grouped
     /// projections, compressor, engram); null for other families.
     dsv4: ?dsv4.LayerWeights = null,
@@ -340,6 +392,15 @@ pub const Layer = struct {
             .ssm_x => self.ssm.?.x_proj = w,
             .ssm_dt => self.ssm.?.dt_proj = w,
             .ssm_out => self.ssm.?.out = w,
+            .conv_in => self.conv.?.in = w,
+            .conv_kernel => self.conv.?.kernel = w,
+            .ple_gate => self.ple.?.gate = w,
+            .ple_out => self.ple.?.out = w,
+            .laurel_l => self.altup.?.laurel_l = w,
+            .laurel_r => self.altup.?.laurel_r = w,
+            .altup_router => self.altup.?.router = w,
+            .altup_predict => self.altup.?.predict = w,
+            .altup_correct => self.altup.?.correct = w,
             .lin_q => self.linear.?.q = w,
             .lin_k => self.linear.?.k = w,
             .lin_v => self.linear.?.v = w,
@@ -363,6 +424,15 @@ pub const Layer = struct {
             .d_engram_wkv => self.dsv4.?.engram.?.wkv = w,
         }
     }
+};
+
+/// Cosine / sine table of one rotary embedding: `[len][half]` with `dim = 2 * half` rotated coordinates.
+pub const RopeTable = struct {
+    cos: []f32,
+    sin: []f32,
+    half: usize,
+    dim: usize,
+    len: usize,
 };
 
 /// A layer whose matrices are resident. `layer` is a copy of the model's
@@ -505,6 +575,16 @@ pub const Model = struct {
     pos_embed_ref: ?WeightRef,
     /// LayerNorm on the embeddings (BLOOM).
     embed_norm: ?Norm,
+    /// Per-layer input embeddings (Gemma 3n / 4): the packed
+    /// `[ple_vocab][layers * ple_dim]` table, the `[layers * ple_dim][hidden]`
+    /// projection of the token embedding and the `[ple_dim]` norm on it.
+    ple_embed_ref: ?WeightRef,
+    ple_proj_ref: ?WeightRef,
+    ple_proj_norm: ?Norm,
+    /// AltUp (Gemma 3n): `[hidden][hidden]` projections that expand the
+    /// embedding into the extra residual streams and fold them back.
+    altup_proj_refs: []WeightRef,
+    altup_unembed_refs: []WeightRef,
     largest_layer_bytes: u64,
     /// Largest layer without its routed experts (attention, norms, router, shared expert).
     largest_trunk_layer_bytes: u64,
@@ -532,11 +612,10 @@ pub const Model = struct {
     tokenizer_config_json: ?[]const u8,
     chat_template: ?[]const u8,
     dtype: tensor.DType,
-    rope_cos: []f32, // [max_pos][rotary_dim/2]
-    rope_sin: []f32,
-    rope_cos_local: []f32,
-    rope_sin_local: []f32,
-    rope_len: usize,
+    /// Rotary tables of the global layers and (Gemma 3 family) the sliding
+    /// layers; `rope_local` aliases `rope` when there is no separate table.
+    rope: RopeTable,
+    rope_local: RopeTable,
     /// ALiBi slope per head (empty unless `config.positional == .alibi`).
     alibi_slopes: []f32,
     /// RoPE tables of the compressed branches (DeepSeek V4 / V4.1; empty otherwise).
@@ -884,6 +963,101 @@ pub const Model = struct {
         layer.ssm = s;
     }
 
+    /// Loads an LFM2 short-convolution layer: `in_proj` `[3 hidden][hidden]`,
+    /// the depthwise kernel `[hidden][taps]` and `out_proj` into `layer.o`.
+    fn loadConv(self: *Model, layer: *Layer, arena: Allocator, li: usize, lp: []const u8) !void {
+        const c = &self.config;
+        const names = &c.arch.names;
+        const hidden = c.hidden_size;
+        const in_name = try cat(arena, lp, names.conv_in orelse return error.InvalidConfig);
+        const kernel_name = try cat(arena, lp, names.conv_kernel orelse return error.InvalidConfig);
+        const out_name = try cat(arena, lp, names.conv_out orelse return error.InvalidConfig);
+        const cw = ConvWeights{
+            .in = try self.loadMat(in_name),
+            .in_bias = self.loadVecOpt(try biasName(arena, in_name)),
+            .kernel = try self.loadMat(kernel_name),
+            .kernel_bias = self.loadVecOpt(try biasName(arena, kernel_name)),
+        };
+        layer.refs.add(.conv_in, try self.ref(in_name), false);
+        layer.refs.add(.conv_kernel, try self.ref(kernel_name), false);
+        if (cw.in.rows != 3 * hidden or cw.in.cols != hidden) {
+            std.log.err("layer {d}: conv in_proj is [{d}][{d}], expected [{d}][{d}]", .{ li, cw.in.rows, cw.in.cols, 3 * hidden, hidden });
+            return error.InvalidConfig;
+        }
+        if (cw.kernel.rows != hidden or cw.kernel.cols != c.conv_kernel) {
+            std.log.err("layer {d}: conv kernel is [{d}][{d}], expected [{d}][{d}] (conv_L_cache)", .{ li, cw.kernel.rows, cw.kernel.cols, hidden, c.conv_kernel });
+            return error.InvalidConfig;
+        }
+        if (cw.in_bias) |b| if (b.len != 3 * hidden) return error.InvalidConfig;
+        if (cw.kernel_bias) |b| if (b.len != hidden) return error.InvalidConfig;
+        layer.o = try self.loadMat(out_name);
+        layer.o_bias = self.loadVecOpt(try biasName(arena, out_name));
+        layer.refs.add(.o, try self.ref(out_name), false);
+        if (layer.o.rows != hidden or layer.o.cols != hidden) {
+            std.log.err("layer {d}: conv out_proj is [{d}][{d}], expected [{d}][{d}]", .{ li, layer.o.rows, layer.o.cols, hidden, hidden });
+            return error.InvalidConfig;
+        }
+        layer.conv = cw;
+    }
+
+    /// Loads the per-layer input embedding block of a layer (Gemma 3n / 4).
+    fn loadPle(self: *Model, layer: *Layer, arena: Allocator, li: usize, lp: []const u8) !void {
+        const c = &self.config;
+        const names = &c.arch.names;
+        const gate_name = try cat(arena, lp, names.ple_gate orelse return error.InvalidConfig);
+        const out_name = try cat(arena, lp, names.ple_out orelse return error.InvalidConfig);
+        const ple = PleWeights{
+            .gate = try self.loadMat(gate_name),
+            .out = try self.loadMat(out_name),
+            .norm = try self.loadNorm(try cat(arena, lp, names.ple_norm orelse return error.InvalidConfig)),
+        };
+        layer.refs.add(.ple_gate, try self.ref(gate_name), false);
+        layer.refs.add(.ple_out, try self.ref(out_name), false);
+        if (ple.gate.rows != c.ple_dim or ple.gate.cols != c.hidden_size or ple.out.rows != c.hidden_size or ple.out.cols != c.ple_dim) {
+            std.log.err("layer {d}: per-layer input projections do not match hidden_size_per_layer_input {d}", .{ li, c.ple_dim });
+            return error.InvalidConfig;
+        }
+        layer.ple = ple;
+    }
+
+    /// Loads the AltUp and Laurel parameters of a layer (Gemma 3n).
+    fn loadAltUp(self: *Model, layer: *Layer, arena: Allocator, li: usize, lp: []const u8) !void {
+        const c = &self.config;
+        const names = &c.arch.names;
+        const a = c.altup_inputs;
+        const router_name = try cat(arena, lp, names.altup_router orelse return error.InvalidConfig);
+        const predict_name = try cat(arena, lp, names.altup_predict orelse return error.InvalidConfig);
+        const correct_name = try cat(arena, lp, names.altup_correct orelse return error.InvalidConfig);
+        const ll_name = try cat(arena, lp, names.laurel_l orelse return error.InvalidConfig);
+        const lr_name = try cat(arena, lp, names.laurel_r orelse return error.InvalidConfig);
+        const alt = AltUpWeights{
+            .router = try self.loadMat(router_name),
+            .router_norm = try self.loadNorm(try cat(arena, lp, names.altup_router_norm orelse return error.InvalidConfig)),
+            .predict = try self.loadMat(predict_name),
+            .correct = try self.loadMat(correct_name),
+            .scale = if (c.altup_correct_scale) try self.loadVec(try cat(arena, lp, names.altup_scale orelse return error.InvalidConfig)) else null,
+            .laurel_l = try self.loadMat(ll_name),
+            .laurel_r = try self.loadMat(lr_name),
+            .laurel_norm = try self.loadNorm(try cat(arena, lp, names.laurel_norm orelse return error.InvalidConfig)),
+        };
+        layer.refs.add(.altup_router, try self.ref(router_name), false);
+        layer.refs.add(.altup_predict, try self.ref(predict_name), false);
+        layer.refs.add(.altup_correct, try self.ref(correct_name), false);
+        layer.refs.add(.laurel_l, try self.ref(ll_name), false);
+        layer.refs.add(.laurel_r, try self.ref(lr_name), false);
+        const hidden = c.hidden_size;
+        if (alt.router.rows != a or alt.router.cols != hidden or alt.predict.rows != a * a or alt.predict.cols != a or alt.correct.rows != a or alt.correct.cols != a) {
+            std.log.err("layer {d}: AltUp coefficient shapes do not match altup_num_inputs {d}", .{ li, a });
+            return error.InvalidConfig;
+        }
+        if (alt.laurel_l.rows != c.laurel_rank or alt.laurel_l.cols != hidden or alt.laurel_r.rows != hidden or alt.laurel_r.cols != c.laurel_rank) {
+            std.log.err("layer {d}: Laurel projections do not match laurel_rank {d}", .{ li, c.laurel_rank });
+            return error.InvalidConfig;
+        }
+        if (alt.scale) |s| if (s.len != hidden) return error.InvalidConfig;
+        layer.altup = alt;
+    }
+
     /// The first of `templates` (relative to `lp`) that names a tensor of the
     /// store; an error naming the first alternative when none is present.
     fn requireFirst(self: *Model, arena: Allocator, lp: []const u8, templates: []const []const u8) ![]const u8 {
@@ -1087,6 +1261,37 @@ pub const Model = struct {
         self.lm_head_ref = lm orelse self.embed_ref;
         self.lm_head = try self.loadMat(self.lm_head_ref.name);
 
+        // Per-layer input embeddings and AltUp projections (Gemma 3n / 4).
+        self.ple_embed_ref = null;
+        self.ple_proj_ref = null;
+        self.ple_proj_norm = null;
+        if (c.ple_dim > 0) {
+            const emb = try self.ref(try self.name(names.ple_embed orelse return error.InvalidConfig));
+            const proj = try self.ref(try self.name(names.ple_proj orelse return error.InvalidConfig));
+            if (emb.cols != c.num_layers * c.ple_dim or proj.rows != c.num_layers * c.ple_dim or proj.cols != c.hidden_size) {
+                std.log.err("per-layer embedding tensors do not match {d} layers x hidden_size_per_layer_input {d}", .{ c.num_layers, c.ple_dim });
+                return error.InvalidConfig;
+            }
+            self.ple_embed_ref = emb;
+            self.ple_proj_ref = proj;
+            self.ple_proj_norm = try self.loadNorm(try self.name(names.ple_proj_norm orelse return error.InvalidConfig));
+            if (self.ple_proj_norm.?.w.len != c.ple_dim) return error.InvalidConfig;
+        }
+        self.altup_proj_refs = &.{};
+        self.altup_unembed_refs = &.{};
+        if (c.altup_inputs > 1) {
+            const n_extra = c.altup_inputs - 1;
+            self.altup_proj_refs = try arena.alloc(WeightRef, n_extra);
+            self.altup_unembed_refs = try arena.alloc(WeightRef, n_extra);
+            for (0..n_extra) |e| {
+                self.altup_proj_refs[e] = try self.ref(try resolveName(arena, names.altup_proj orelse return error.InvalidConfig, self.prefix, 0, e));
+                self.altup_unembed_refs[e] = try self.ref(try resolveName(arena, names.altup_unembed orelse return error.InvalidConfig, self.prefix, 0, e));
+                for ([_]WeightRef{ self.altup_proj_refs[e], self.altup_unembed_refs[e] }) |r| {
+                    if (r.rows != c.hidden_size or r.cols != c.hidden_size) return error.InvalidConfig;
+                }
+            }
+        }
+
         self.largest_tensor_bytes = 0;
         for (self.files) |f| {
             var it = f.tensors.iterator();
@@ -1153,6 +1358,9 @@ pub const Model = struct {
 
             // Attention projections.
             layer.o = .{ .data = &.{}, .dtype = self.dtype, .rows = 0, .cols = 0 };
+            const hd = c.layer_head_dim[i];
+            const nkv = c.layer_kv_heads[i];
+            const kv_shared = c.kvShared(i);
             if (c.dsv4 != null) {
                 try dsv4.loadLayer(self, layer, arena, i, lp);
             } else if (c.linear_layers[i]) {
@@ -1161,6 +1369,8 @@ pub const Model = struct {
                     .kda => try self.loadKda(layer, arena, i, lp),
                     .lightning => try self.loadLightning(layer, arena, i, lp),
                 }
+            } else if (c.conv_layers[i]) {
+                try self.loadConv(layer, arena, i, lp);
             } else if (!c.attn_layers[i]) {
                 // A Mamba, MLP or MoE block (loaded below).
             } else if (c.mla) |m| {
@@ -1199,41 +1409,73 @@ pub const Model = struct {
                 layer.qkv = try self.loadMatT(qkv_name, c.arch.conv1d);
                 layer.qkv_bias = self.loadVecOpt(try biasName(arena, qkv_name));
                 layer.refs.add(.qkv, try self.ref(qkv_name), c.arch.conv1d);
-                const want = c.num_heads * c.head_dim + 2 * c.num_kv_heads * c.head_dim;
+                const want = c.num_heads * hd + 2 * nkv * hd;
                 if (layer.qkv.?.rows != want or layer.qkv.?.cols != c.hidden_size) {
                     std.log.err("layer {d}: fused qkv tensor is [{d}][{d}], expected [{d}][{d}]", .{ i, layer.qkv.?.rows, layer.qkv.?.cols, want, c.hidden_size });
                     return error.InvalidConfig;
                 }
             } else {
                 const q_name = try cat(arena, lp, names.q orelse return error.InvalidConfig);
-                const k_name = try cat(arena, lp, names.k orelse return error.InvalidConfig);
-                const v_name = try cat(arena, lp, names.v orelse return error.InvalidConfig);
                 layer.q = try self.loadMat(q_name);
-                layer.k = try self.loadMat(k_name);
-                layer.v = try self.loadMat(v_name);
                 layer.q_bias = self.loadVecOpt(try biasName(arena, q_name));
-                layer.k_bias = self.loadVecOpt(try biasName(arena, k_name));
-                layer.v_bias = self.loadVecOpt(try biasName(arena, v_name));
                 layer.refs.add(.q, try self.ref(q_name), false);
-                layer.refs.add(.k, try self.ref(k_name), false);
-                layer.refs.add(.v, try self.ref(v_name), false);
-                const qwant = if (c.gated_attention) 2 * c.num_heads * c.head_dim else c.num_heads * c.head_dim;
-                if (layer.q.?.rows != qwant or layer.k.?.rows != c.num_kv_heads * c.head_dim) {
-                    std.log.err("layer {d}: q/k projection shapes do not match the config (heads {d}, kv heads {d}, head_dim {d})", .{ i, c.num_heads, c.num_kv_heads, c.head_dim });
+                const qwant = if (c.gated_attention) 2 * c.num_heads * hd else c.num_heads * hd;
+                if (layer.q.?.rows != qwant or layer.q.?.cols != c.hidden_size) {
+                    std.log.err("layer {d}: q projection is [{d}][{d}], expected [{d}][{d}] (heads {d}, head_dim {d})", .{ i, layer.q.?.rows, layer.q.?.cols, qwant, c.hidden_size, c.num_heads, hd });
                     return error.InvalidConfig;
                 }
+                // A KV-shared layer (Gemma 3n / 4) has no key/value projections.
+                if (!kv_shared) {
+                    const k_name = try cat(arena, lp, names.k orelse return error.InvalidConfig);
+                    const v_name = try cat(arena, lp, names.v orelse return error.InvalidConfig);
+                    layer.k = try self.loadMat(k_name);
+                    layer.k_bias = self.loadVecOpt(try biasName(arena, k_name));
+                    layer.refs.add(.k, try self.ref(k_name), false);
+                    if (c.k_eq_v and self.store.lookup(v_name) == null) {
+                        // Keys double as values (Gemma 4 global layers).
+                        layer.v = null;
+                    } else {
+                        layer.v = try self.loadMat(v_name);
+                        layer.v_bias = self.loadVecOpt(try biasName(arena, v_name));
+                        layer.refs.add(.v, try self.ref(v_name), false);
+                        if (layer.v.?.rows != nkv * hd or layer.v.?.cols != c.hidden_size) {
+                            std.log.err("layer {d}: v projection is [{d}][{d}], expected [{d}][{d}]", .{ i, layer.v.?.rows, layer.v.?.cols, nkv * hd, c.hidden_size });
+                            return error.InvalidConfig;
+                        }
+                    }
+                    if (layer.k.?.rows != nkv * hd or layer.k.?.cols != c.hidden_size) {
+                        std.log.err("layer {d}: k projection is [{d}][{d}], expected [{d}][{d}] (kv heads {d}, head_dim {d})", .{ i, layer.k.?.rows, layer.k.?.cols, nkv * hd, c.hidden_size, nkv, hd });
+                        return error.InvalidConfig;
+                    }
+                }
+            }
+            if (kv_shared) {
+                if (layer.k != null or layer.v != null or layer.qkv != null or layer.mla != null) {
+                    std.log.err("layer {d}: KV sharing needs separate q/k/v projections", .{i});
+                    return error.UnsupportedArchitecture;
+                }
+                layer.k_norm = null;
             }
             if (c.attn_layers[i] and c.dsv4 == null) {
                 const o_name = try cat(arena, lp, names.o);
                 layer.o = try self.loadMatT(o_name, c.arch.conv1d);
                 layer.o_bias = self.loadVecOpt(try biasName(arena, o_name));
                 layer.refs.add(.o, try self.ref(o_name), c.arch.conv1d);
-                if (layer.o.rows != c.hidden_size or layer.o.cols != c.num_heads * c.v_head_dim) {
-                    std.log.err("layer {d}: output projection is [{d}][{d}], expected [{d}][{d}]", .{ i, layer.o.rows, layer.o.cols, c.hidden_size, c.num_heads * c.v_head_dim });
+                const owant = c.num_heads * c.layerVDim(i);
+                if (layer.o.rows != c.hidden_size or layer.o.cols != owant) {
+                    std.log.err("layer {d}: output projection is [{d}][{d}], expected [{d}][{d}]", .{ i, layer.o.rows, layer.o.cols, c.hidden_size, owant });
                     return error.InvalidConfig;
                 }
             }
             if (c.ssm_layers[i]) try self.loadSsm(layer, arena, i, lp, c.attn_layers[i]);
+            if (c.ple_dim > 0) try self.loadPle(layer, arena, i, lp);
+            if (c.altup_inputs > 0) try self.loadAltUp(layer, arena, i, lp);
+            if (names.layer_scale) |t| {
+                if (self.loadVecOpt(try cat(arena, lp, t))) |s| {
+                    if (s.len != 1) return error.InvalidConfig;
+                    layer.layer_scale = s[0];
+                }
+            }
 
             // MLP.
             if (!c.mlp_layers[i]) {
@@ -1271,7 +1513,7 @@ pub const Model = struct {
                 layer.down_bias = self.loadVecOpt(try biasName(arena, down_name));
                 layer.refs.add(.down, try self.ref(down_name), c.arch.conv1d);
                 const inter = if (layer.gate_up) |g| g.rows / 2 else layer.up.?.rows;
-                if (i == 0 and inter != c.intermediate_size) {
+                if (i == 0 and inter != c.intermediate_size and !c.intermediate_varies) {
                     std.log.warn("intermediate_size {d} in config, {d} in the weights; using the weights", .{ c.intermediate_size, inter });
                 }
                 if (inter > c.intermediate_size) c.intermediate_size = inter;
@@ -1613,38 +1855,32 @@ pub const Model = struct {
 
     fn buildRope(self: *Model) !void {
         const c = &self.config;
-        const arena = self.arena.allocator();
-        const half = c.rotary_dim / 2;
-        self.rope_len = @min(c.max_position_embeddings, 8192);
-        self.rope_cos = try arena.alloc(f32, self.rope_len * half);
-        self.rope_sin = try arena.alloc(f32, self.rope_len * half);
-        try self.fillRope(self.rope_cos, self.rope_sin, c.rope_theta, c.rope_scaling);
-        if (c.arch.norm == .rms_gemma and std.mem.startsWith(u8, c.model_type, "gemma3")) {
-            self.rope_cos_local = try arena.alloc(f32, self.rope_len * half);
-            self.rope_sin_local = try arena.alloc(f32, self.rope_len * half);
-            try self.fillRope(self.rope_cos_local, self.rope_sin_local, c.rope_local_theta, .none);
-        } else {
-            self.rope_cos_local = self.rope_cos;
-            self.rope_sin_local = self.rope_sin;
-        }
+        const len = @min(c.max_position_embeddings, 8192);
+        self.rope = try self.fillRope(len, c.rope_theta, c.rotary_dim, c.rope_freq_dim, c.rope_scaling);
+        self.rope_local = if (c.rope_local) |l| try self.fillRope(len, l.theta, l.rotary_dim, l.freq_dim, .none) else self.rope;
         self.rope_cos_compress = &.{};
         self.rope_sin_compress = &.{};
         if (c.dsv4) |d| {
-            self.rope_cos_compress = try arena.alloc(f32, self.rope_len * half);
-            self.rope_sin_compress = try arena.alloc(f32, self.rope_len * half);
-            try self.fillRope(self.rope_cos_compress, self.rope_sin_compress, d.compress_rope_theta, d.compress_rope_scaling);
+            const t = try self.fillRope(len, d.compress_rope_theta, c.rotary_dim, c.rotary_dim, d.compress_rope_scaling);
+            self.rope_cos_compress = t.cos;
+            self.rope_sin_compress = t.sin;
         }
     }
 
-    fn fillRope(self: *Model, cos: []f32, sin: []f32, theta: f32, scaling: RopeScaling) !void {
-        const c = &self.config;
-        const dim = c.rotary_dim;
+    /// Builds a `[len][dim / 2]` table: `dim` coordinates rotate with
+    /// frequencies `theta^(-2i / freq_dim)` (`freq_dim == dim` except for
+    /// proportional RoPE, which derives them from the whole head).
+    fn fillRope(self: *Model, len: usize, theta: f32, dim: usize, freq_dim: usize, scaling: RopeScaling) !RopeTable {
+        const arena = self.arena.allocator();
         const half = dim / 2;
-        if (half == 0) return;
+        const cos = try arena.alloc(f32, len * half);
+        const sin = try arena.alloc(f32, len * half);
+        const table = RopeTable{ .cos = cos, .sin = sin, .half = half, .dim = 2 * half, .len = len };
+        if (half == 0) return table;
         const inv_freq = try self.gpa.alloc(f64, half);
         defer self.gpa.free(inv_freq);
         for (inv_freq, 0..) |*f, i| {
-            const exponent: f64 = @as(f64, @floatFromInt(2 * i)) / @as(f64, @floatFromInt(dim));
+            const exponent: f64 = @as(f64, @floatFromInt(2 * i)) / @as(f64, @floatFromInt(freq_dim));
             f.* = 1.0 / std.math.pow(f64, theta, exponent);
         }
         var attention_factor: f64 = 1.0;
@@ -1705,13 +1941,14 @@ pub const Model = struct {
             },
         }
         var pos: usize = 0;
-        while (pos < self.rope_len) : (pos += 1) {
+        while (pos < len) : (pos += 1) {
             for (inv_freq, 0..) |f, i| {
                 const angle = @as(f64, @floatFromInt(pos)) * f;
                 cos[pos * half + i] = @floatCast(@cos(angle) * attention_factor);
                 sin[pos * half + i] = @floatCast(@sin(angle) * attention_factor);
             }
         }
+        return table;
     }
 
     pub fn isEos(self: *const Model, id: u32) bool {
@@ -1747,6 +1984,7 @@ pub const Model = struct {
                 return wholeEdit(if (s.out != null) layer.ssm_out_delta else layer.o_delta, false);
             }
         }
+        if (names.conv_out) |co| if (std.mem.eql(u8, ls.suffix, co)) return wholeEdit(layer.o_delta, false);
         if (names.light_out) |lo| if (std.mem.eql(u8, ls.suffix, lo)) return wholeEdit(layer.o_delta, false);
         if (layer.moe) |*m| {
             const target = m.exportTarget(ls.suffix) orelse return null;
@@ -2044,7 +2282,7 @@ pub const KvCache = struct {
     /// Picks RAM or scratch backing depending on the model's budget.
     pub fn initFor(model: *const Model, gpa: Allocator, batch: usize, max_len: usize) !KvCache {
         const c = &model.config;
-        const kvd = c.num_kv_heads * c.head_dim;
+        const kvd = c.kvDim();
         var use_scratch = model.spill_always;
         if (model.budget) |b| {
             const need = bytesFor(c.num_layers, batch, max_len, kvd) + LinearCache.bytesFor(c, batch) + model.residentWeightNeed();
@@ -2129,99 +2367,118 @@ pub const KvCache = struct {
     }
 };
 
-/// Recurrent state of the linear-attention (Gated DeltaNet, Qwen hybrids)
-/// or Mamba layers: per (recurrent layer, batch slot) an f32 state
-/// (`[v_heads][k_dim][v_dim]`, `[heads][head_dim][state]` or
-/// `[inter][state]`) plus the causal-convolution history, with the next
-/// expected position. Slots reset when a sequence restarts at position 0,
-/// so caches stay reusable across batch operations like the KV cache;
-/// anything else discontinuous is an error rather than a silent wrong result.
+/// Recurrent state of the sequence-mixing layers that carry state between
+/// tokens: the linear-attention layers (Gated DeltaNet and KDA: a
+/// `[v_heads][k_dim][v_dim]` f32 state plus the causal-convolution history;
+/// lightning attention: a `[heads][head_dim][head_dim]` state) and LFM2
+/// short-convolution layers (the `[hidden][taps - 1]` history). One
+/// slot per (recurrent layer, batch slot) with the next expected position.
+/// Slots reset when a sequence restarts at position 0, so caches stay
+/// reusable across batch operations like the KV cache; anything else
+/// discontinuous is an error rather than a silent wrong result.
 pub const LinearCache = struct {
     gpa: Allocator,
     batch: usize,
-    /// Per model layer: recurrent-layer index or null.
-    lin_index: []?u32,
+    /// Per model layer: index among the recurrent layers, or null.
+    rec_index: []?u32,
+    /// Per recurrent layer: offset of its first slot in `buf` and slot length.
+    offsets: []usize,
+    lens: []usize,
     state_len: usize,
     conv_len: usize,
     buf: []f32,
     next_pos: []usize,
 
-    const Lens = struct { state: usize, conv: usize };
-
-    /// State and convolution-history floats per (layer, slot).
-    fn lens(c: *const Config) Lens {
-        if (c.has_linear) return .{ .state = linearStateLen(c), .conv = linearConvLen(c) };
-        const d = &c.ssm;
-        return switch (d.kind) {
-            .mamba2 => .{ .state = d.heads * d.head_dim * d.state, .conv = ssmConvDim(c) * (d.conv_kernel - 1) },
-            .mamba1 => .{ .state = d.inter * d.state, .conv = d.inter * (d.conv_kernel - 1) },
-            .none => .{ .state = 0, .conv = 0 },
-        };
-    }
-
-    fn isRecurrent(c: *const Config, li: usize) bool {
-        return c.linear_layers[li] or c.ssm_layers[li];
+    fn slotLenOf(c: *const Config, li: usize) usize {
+        if (c.linear_layers[li]) return linearStateLen(c) + linearConvLen(c);
+        if (c.ssm_layers[li]) return ssmStateLen(c) + ssmConvLen(c);
+        if (c.conv_layers[li]) return c.hidden_size * (c.conv_kernel - 1);
+        return 0;
     }
 
     pub fn bytesFor(c: *const Config, batch: usize) u64 {
         if (!c.hasRecurrent()) return 0;
-        const l = lens(c);
-        const per: u64 = @intCast(l.state + l.conv);
-        var n_lin: u64 = 0;
+        var floats: u64 = 0;
+        var n_rec: u64 = 0;
         for (0..c.num_layers) |li| {
-            if (isRecurrent(c, li)) n_lin += 1;
+            const len = slotLenOf(c, li);
+            if (len == 0) continue;
+            floats += @as(u64, len) * batch;
+            n_rec += 1;
         }
-        return n_lin * @as(u64, batch) * per * 4 + n_lin * @as(u64, batch) * 8;
+        return floats * 4 + n_rec * @as(u64, batch) * 8;
     }
 
     pub fn init(gpa: Allocator, c: *const Config, batch: usize) !LinearCache {
-        var n_lin: usize = 0;
-        const lin_index = try gpa.alloc(?u32, c.num_layers);
-        errdefer gpa.free(lin_index);
+        var n_rec: usize = 0;
+        const rec_index = try gpa.alloc(?u32, c.num_layers);
+        errdefer gpa.free(rec_index);
         for (0..c.num_layers) |li| {
-            if (isRecurrent(c, li)) {
-                lin_index[li] = @intCast(n_lin);
-                n_lin += 1;
-            } else lin_index[li] = null;
+            if (slotLenOf(c, li) > 0) {
+                rec_index[li] = @intCast(n_rec);
+                n_rec += 1;
+            } else rec_index[li] = null;
         }
-        const l = lens(c);
-        const state_len: usize = l.state;
-        const conv_len: usize = l.conv;
-        const buf = try gpa.alloc(f32, n_linear_buflen(n_lin, batch, state_len, conv_len));
+        const offsets = try gpa.alloc(usize, n_rec);
+        errdefer gpa.free(offsets);
+        const lens = try gpa.alloc(usize, n_rec);
+        errdefer gpa.free(lens);
+        var total: usize = 0;
+        for (0..c.num_layers) |li| {
+            const idx = rec_index[li] orelse continue;
+            offsets[idx] = total;
+            lens[idx] = slotLenOf(c, li);
+            total += lens[idx] * batch;
+        }
+        const buf = try gpa.alloc(f32, total);
         errdefer gpa.free(buf);
         @memset(buf, 0);
-        const next_pos = try gpa.alloc(usize, n_lin * batch);
+        const next_pos = try gpa.alloc(usize, n_rec * batch);
         errdefer gpa.free(next_pos);
         @memset(next_pos, 0);
-        return .{ .gpa = gpa, .batch = batch, .lin_index = lin_index, .state_len = state_len, .conv_len = conv_len, .buf = buf, .next_pos = next_pos };
-    }
-
-    fn n_linear_buflen(n_lin: usize, batch: usize, state_len: usize, conv_len: usize) usize {
-        return n_lin * batch * (state_len + conv_len);
+        return .{
+            .gpa = gpa,
+            .batch = batch,
+            .rec_index = rec_index,
+            .offsets = offsets,
+            .lens = lens,
+            .state_len = if (c.has_linear) linearStateLen(c) else if (c.has_ssm) ssmStateLen(c) else 0,
+            .conv_len = if (c.has_linear) linearConvLen(c) else if (c.has_ssm) ssmConvLen(c) else 0,
+            .buf = buf,
+            .next_pos = next_pos,
+        };
     }
 
     pub fn deinit(self: *LinearCache) void {
         self.gpa.free(self.buf);
         self.gpa.free(self.next_pos);
-        self.gpa.free(self.lin_index);
+        self.gpa.free(self.offsets);
+        self.gpa.free(self.lens);
+        self.gpa.free(self.rec_index);
     }
 
-    fn slotLen(self: *const LinearCache) usize {
-        return self.state_len + self.conv_len;
+    fn slot(self: *LinearCache, li: usize, b: usize) []f32 {
+        const idx = self.rec_index[li].?;
+        return self.buf[self.offsets[idx] + b * self.lens[idx] ..][0..self.lens[idx]];
     }
 
+    /// Delta-rule state of a linear-attention layer.
     pub fn state(self: *LinearCache, li: usize, b: usize) []f32 {
-        const idx = self.lin_index[li].?;
-        return self.buf[(idx * self.batch + b) * self.slotLen() ..][0..self.state_len];
+        return self.slot(li, b)[0..self.state_len];
     }
 
+    /// Convolution history of a linear-attention layer.
     pub fn conv(self: *LinearCache, li: usize, b: usize) []f32 {
-        const idx = self.lin_index[li].?;
-        return self.buf[(idx * self.batch + b) * self.slotLen() + self.state_len ..][0..self.conv_len];
+        return self.slot(li, b)[self.state_len..][0..self.conv_len];
+    }
+
+    /// Convolution history `[hidden][taps - 1]` of a short-convolution layer.
+    pub fn shortConv(self: *LinearCache, li: usize, b: usize) []f32 {
+        return self.slot(li, b);
     }
 
     pub fn nextPos(self: *LinearCache, li: usize, b: usize) *usize {
-        const idx = self.lin_index[li].?;
+        const idx = self.rec_index[li].?;
         return &self.next_pos[idx * self.batch + b];
     }
 };
@@ -2239,6 +2496,22 @@ fn ssmConvDim(c: *const Config) usize {
         .mamba1 => d.inter,
         .none => 0,
     };
+}
+
+/// Floats of recurrent state per (Mamba layer, sequence): `[heads][head_dim][state]`
+/// for Mamba2, `[inter][state]` for Mamba1.
+fn ssmStateLen(c: *const Config) usize {
+    const d = &c.ssm;
+    return switch (d.kind) {
+        .mamba2 => d.heads * d.head_dim * d.state,
+        .mamba1 => d.inter * d.state,
+        .none => 0,
+    };
+}
+
+/// Floats of convolution history per (Mamba layer, sequence).
+fn ssmConvLen(c: *const Config) usize {
+    return if (c.ssm.kind == .none) 0 else ssmConvDim(c) * (c.ssm.conv_kernel - 1);
 }
 
 /// Floats of recurrent state per (linear layer, sequence): `[v_heads][k_dim][v_dim]`
@@ -2279,10 +2552,16 @@ pub const Row = struct {
 const AttnCtx = struct {
     model: *const Model,
     cache: *KvCache,
+    /// Layer whose keys/values are read (the source layer of a KV-shared layer).
     layer: usize,
     rows: []const Row,
-    q: []f32, // [n][heads*head_dim] (already roped)
-    out: []f32, // [n][heads*head_dim]; per head the first v_head_dim entries are written
+    q: []f32, // [n][heads*hd] (already roped)
+    out: []f32, // [n][heads*hd]; per head the first vd entries are written
+    /// Head geometry of the layer.
+    hd: usize,
+    vd: usize,
+    groups: usize,
+    scale: f32,
     sliding: bool,
     sinks: ?[]const f32,
     /// Tasks are `(row, head)` pairs; the pool's chunk `c` handles tasks
@@ -2299,9 +2578,9 @@ const AttnCtx = struct {
 fn attentionWorker(ctx: *const AttnCtx, start: usize, end: usize) void {
     const model = ctx.model;
     const c = &model.config;
-    const hd = c.head_dim;
-    const vd = c.v_head_dim;
-    const groups = c.num_heads / c.num_kv_heads;
+    const hd = ctx.hd;
+    const vd = ctx.vd;
+    const groups = ctx.groups;
     const slot = start / ctx.per;
     const scores_buf = ctx.scores[slot * ctx.max_keys ..][0..ctx.max_keys];
     const stride = ctx.cache.kv_dim;
@@ -2329,9 +2608,9 @@ fn attentionWorker(ctx: *const AttnCtx, start: usize, end: usize) void {
         const kbase = ctx.cache.kSlot(ctx.layer, row.b, lo).ptr + kvh * hd;
         const vbase = ctx.cache.vSlot(ctx.layer, row.b, lo).ptr + kvh * hd;
         if (vectorised) {
-            tensor.attentionScores(scores, q, kbase, stride, c.attention_scale);
+            tensor.attentionScores(scores, q, kbase, stride, ctx.scale);
         } else {
-            for (scores, 0..) |*s, p| s.* = tensor.dot(q, kbase[p * stride ..][0..hd]) * c.attention_scale;
+            for (scores, 0..) |*s, p| s.* = tensor.dot(q, kbase[p * stride ..][0..hd]) * ctx.scale;
         }
         if (c.attn_logit_softcapping) |cap| {
             for (scores) |*s| s.* = cap * std.math.tanh(s.* / cap);
@@ -2382,6 +2661,10 @@ pub const Workspace = struct {
     up: []f32,
     /// Fused gate/up product `[rows][2 I]` (empty unless the MLP is `gated_fused`).
     gate_up: []f32,
+    /// Extra AltUp residual streams `[rows][(altup_inputs - 1) * hidden]` (Gemma 3n).
+    alt: []f32,
+    /// Per-layer inputs `[rows][layers * ple_dim]` (Gemma 3n / 4).
+    ple: []f32,
     logits: []f32,
     max_rows: usize,
     max_logit_rows: usize,
@@ -2389,15 +2672,23 @@ pub const Workspace = struct {
     /// Bytes `init` allocates per row (everything but the logits).
     pub fn bytesPerRow(c: *const Config) u64 {
         const hidden: u64 = c.hidden_size;
-        const qd: u64 = c.num_heads * c.head_dim;
-        const kvd: u64 = c.num_kv_heads * c.head_dim;
+        const qd: u64 = c.maxQDim();
+        const kvd: u64 = c.kvDim();
         const inter: u64 = c.intermediate_size;
-        return (4 * hidden + streamWidth(c) + 2 * qd + 2 * kvd + fusedQkvRows(c) + 2 * inter + fusedGateUpCols(c) + linearCols(c)) * 4;
+        return (4 * hidden + streamWidth(c) + 2 * qd + 2 * kvd + fusedQkvRows(c) + 2 * inter + fusedGateUpCols(c) + linearCols(c) + altCols(c) + pleCols(c)) * 4;
     }
 
     /// Width of one residual row: `hidden` times the number of residual streams.
     pub fn streamWidth(c: *const Config) usize {
         return c.hc_mult * c.hidden_size;
+    }
+
+    fn altCols(c: *const Config) usize {
+        return if (c.altup_inputs > 1) (c.altup_inputs - 1) * c.hidden_size else 0;
+    }
+
+    fn pleCols(c: *const Config) usize {
+        return c.num_layers * c.ple_dim;
     }
 
     fn fusedQkvRows(c: *const Config) usize {
@@ -2418,8 +2709,8 @@ pub const Workspace = struct {
 
     pub fn init(gpa: Allocator, c: *const Config, max_rows: usize, max_logit_rows: usize) !Workspace {
         const hidden = c.hidden_size;
-        const qd = c.num_heads * c.head_dim;
-        const kvd = c.num_kv_heads * c.head_dim;
+        const qd = c.maxQDim();
+        const kvd = c.kvDim();
         const qkv_rows = fusedQkvRows(c);
         const gu = fusedGateUpCols(c);
         var self = Workspace{
@@ -2437,6 +2728,8 @@ pub const Workspace = struct {
             .gate = &.{},
             .up = &.{},
             .gate_up = &.{},
+            .alt = &.{},
+            .ple = &.{},
             .logits = &.{},
             .max_rows = max_rows,
             .max_logit_rows = max_logit_rows,
@@ -2455,6 +2748,8 @@ pub const Workspace = struct {
         self.gate = try gpa.alloc(f32, max_rows * c.intermediate_size);
         self.up = try gpa.alloc(f32, max_rows * c.intermediate_size);
         self.gate_up = try gpa.alloc(f32, max_rows * gu);
+        self.alt = try gpa.alloc(f32, max_rows * altCols(c));
+        self.ple = try gpa.alloc(f32, max_rows * pleCols(c));
         self.logits = try gpa.alloc(f32, max_logit_rows * c.vocab_size);
         return self;
     }
@@ -2473,6 +2768,8 @@ pub const Workspace = struct {
         self.gpa.free(self.gate);
         self.gpa.free(self.up);
         self.gpa.free(self.gate_up);
+        self.gpa.free(self.alt);
+        self.gpa.free(self.ple);
         self.gpa.free(self.logits);
     }
 };
@@ -2545,9 +2842,13 @@ fn qkNormHead(c: *const Config, head: []f32, nm: Norm, h: usize) void {
     }
 }
 
-fn ropeHead(c: *const Config, x: []f32, cos_row: []const f32, sin_row: []const f32) void {
-    const d = c.rotary_dim;
+/// Rotates the first `table.dim` coordinates of a head vector at position `pos`.
+fn ropeHead(c: *const Config, x: []f32, table: *const RopeTable, pos: usize) void {
+    const d = table.dim;
     if (d == 0) return;
+    const p = @min(pos, table.len - 1);
+    const cos_row = table.cos[p * table.half ..][0..table.half];
+    const sin_row = table.sin[p * table.half ..][0..table.half];
     switch (c.rope_style) {
         .neox => tensor.applyRope(x[0..d], cos_row, sin_row),
         .gptj => tensor.applyRopeInterleaved(x[0..d], cos_row, sin_row),
@@ -3375,15 +3676,66 @@ fn mamba1Scan(model: *const Model, s: *const SsmWeights, li: usize, rc: *LinearC
     model.pool.parallelFor(inter, &ctx, mamba1Worker);
 }
 
+/// Gated short-convolution sublayer (LFM2 conv layers): `in_proj` splits into
+/// B, C and x; `B * x` runs through a depthwise causal convolution whose
+/// history lives in `cache.linear`; the result is gated by C and projected by
+/// `out_proj` (with its delta). Reads `h`, writes `ws.o`.
+fn convForward(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace, cache: *KvCache, h: []const f32, rows: []const Row) !void {
+    const c = &model.config;
+    const gpa = model.gpa;
+    const cw = layer.conv.?;
+    const lcache = &(cache.linear orelse return error.MissingLinearCache);
+    const n = rows.len;
+    const hidden = c.hidden_size;
+    const kc = c.conv_kernel;
+    const bcx = try gpa.alloc(f32, n * 3 * hidden);
+    defer gpa.free(bcx);
+    try tensor.matmulT(model.pool, gpa, bcx, h, n, cw.in, null);
+    if (cw.in_bias) |b| addBias(bcx, n, 3 * hidden, b);
+    const y = try gpa.alloc(f32, n * hidden);
+    defer gpa.free(y);
+    const kw = cw.kernel.data;
+    const kdt = cw.kernel.dtype;
+    for (0..n) |t| {
+        const b = rows[t].b;
+        const pos = rows[t].pos;
+        const hist = lcache.shortConv(li, b);
+        const next = lcache.nextPos(li, b);
+        if (pos == 0) {
+            @memset(hist, 0);
+            next.* = 0;
+        }
+        if (pos != next.*) return error.NonContiguousRows;
+        const row = bcx[t * 3 * hidden ..][0 .. 3 * hidden];
+        const bg = row[0..hidden];
+        const cg = row[hidden .. 2 * hidden];
+        const xg = row[2 * hidden ..][0..hidden];
+        const out = y[t * hidden ..][0..hidden];
+        for (0..hidden) |ch| {
+            const bx = bg[ch] * xg[ch];
+            const hrow = hist[ch * (kc - 1) ..][0 .. kc - 1];
+            var acc: f32 = elemAt(kdt, kw, ch * kc + kc - 1) * bx;
+            for (0..kc - 1) |i| acc += elemAt(kdt, kw, ch * kc + i) * hrow[i];
+            if (cw.kernel_bias) |kb| acc += kb[ch];
+            if (kc > 2) @memmove(hrow[0 .. kc - 2], hrow[1 .. kc - 1]);
+            hrow[kc - 2] = bx;
+            out[ch] = cg[ch] * acc;
+        }
+        next.* = pos + 1;
+    }
+    try tensor.matmulT(model.pool, gpa, ws.o, y, n, layer.o, if (layer.o_delta) |*d| d else null);
+    if (layer.o_bias) |bias| addBias(ws.o, n, hidden, bias);
+}
+
 /// Attention sublayer: projections, q/k norms, RoPE, KV cache update,
 /// attention and the output projection (with its delta). Reads `h`, writes `ws.o`.
 fn attention(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace, cache: *KvCache, h: []const f32, rows: []const Row) !void {
     const c = &model.config;
     const gpa = model.gpa;
     const n = rows.len;
-    const hd = c.head_dim;
+    const hd = c.layer_head_dim[li];
     const qd = c.num_heads * hd;
-    const kvd = c.num_kv_heads * hd;
+    const kvd = c.layer_kv_heads[li] * hd;
 
     if (layer.mla != null) {
         try mlaProject(model, layer, ws, h, n);
@@ -3422,11 +3774,19 @@ fn attention(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace
         return;
     } else {
         try tensor.matmulT(model.pool, gpa, ws.q, h, n, layer.q.?, null);
-        try tensor.matmulT(model.pool, gpa, ws.k, h, n, layer.k.?, null);
-        try tensor.matmulT(model.pool, gpa, ws.v, h, n, layer.v.?, null);
         if (layer.q_bias) |b| addBias(ws.q, n, qd, b);
-        if (layer.k_bias) |b| addBias(ws.k, n, kvd, b);
-        if (layer.v_bias) |b| addBias(ws.v, n, kvd, b);
+        // A KV-shared layer reads its source layer's cache and projects nothing else.
+        if (!c.kvShared(li)) {
+            try tensor.matmulT(model.pool, gpa, ws.k, h, n, layer.k.?, null);
+            if (layer.v) |vw| {
+                try tensor.matmulT(model.pool, gpa, ws.v, h, n, vw, null);
+            } else {
+                // Keys double as values (Gemma 4 `attention_k_eq_v`), before the norms.
+                @memcpy(ws.v[0 .. n * kvd], ws.k[0 .. n * kvd]);
+            }
+            if (layer.k_bias) |b| addBias(ws.k, n, kvd, b);
+            if (layer.v_bias) |b| addBias(ws.v, n, kvd, b);
+        }
     }
     try attentionTail(model, layer, li, ws, cache, rows, null);
 }
@@ -3439,40 +3799,39 @@ fn attentionTail(model: *const Model, layer: *const Layer, li: usize, ws: *Works
     const gpa = model.gpa;
     const n = rows.len;
     const hidden = c.hidden_size;
-    const hd = c.head_dim;
+    const hd = c.layer_head_dim[li];
+    const nkv = c.layer_kv_heads[li];
     const qd = c.num_heads * hd;
-    const kvd = c.num_kv_heads * hd;
-    const half = c.rotary_dim / 2;
+    const kvd = nkv * hd;
+    const shared = c.kvShared(li);
     if (c.clip_qkv) |clip| {
         clampAll(ws.q[0 .. n * qd], clip);
-        clampAll(ws.k[0 .. n * kvd], clip);
-        clampAll(ws.v[0 .. n * kvd], clip);
+        if (!shared) {
+            clampAll(ws.k[0 .. n * kvd], clip);
+            clampAll(ws.v[0 .. n * kvd], clip);
+        }
     }
     if (c.mult.key != 1.0) tensor.scale(ws.k[0 .. n * kvd], c.mult.key);
 
     const use_rope = c.rope_layers[li];
     const sliding = c.sliding_layers[li];
-    const local = sliding and model.rope_cos_local.ptr != model.rope_cos.ptr;
-    const cos = if (local) model.rope_cos_local else model.rope_cos;
-    const sin = if (local) model.rope_sin_local else model.rope_sin;
+    const table: *const RopeTable = if (sliding) &model.rope_local else &model.rope;
     const rope_off: usize = if (c.mla) |m| m.qk_nope_head_dim else 0;
     const do_qk_norm = !(c.qk_norm_rope_only and !use_rope);
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        const pos = @min(rows[i].pos, model.rope_len - 1);
-        const cr = cos[pos * half ..][0..half];
-        const sr = sin[pos * half ..][0..half];
+        const pos = rows[i].pos;
         const qrow = ws.q[i * qd ..][0..qd];
         const krow = ws.k[i * kvd ..][0..kvd];
         if (do_qk_norm and c.qk_norm == .full) {
             if (layer.q_norm) |nm| normVecInPlace(c, qrow, nm.w, nm.b);
-            if (layer.k_norm) |nm| normVecInPlace(c, krow, nm.w, nm.b);
+            if (!shared) if (layer.k_norm) |nm| normVecInPlace(c, krow, nm.w, nm.b);
         }
         var temp: ?f32 = null;
-        if (!use_rope) {
-            if (c.attn_temperature) |t| {
-                const p: f32 = @floatFromInt(rows[i].pos);
-                temp = @log(@floor((p + 1.0) / t.floor_scale) + 1.0) * t.attn_scale + 1.0;
+        if (c.attn_temperature) |t| {
+            if (!use_rope or t.all_layers) {
+                const p: f32 = @floatFromInt(pos);
+                temp = @log(@floor((p + t.offset) / t.floor_scale) + 1.0) * t.attn_scale + 1.0;
             }
         }
         const norm_before = do_qk_norm and !c.qk_norm_after_rope;
@@ -3481,20 +3840,23 @@ fn attentionTail(model: *const Model, layer: *const Layer, li: usize, ws: *Works
         while (hh < c.num_heads) : (hh += 1) {
             const q = qrow[hh * hd ..][0..hd];
             if (norm_before) if (layer.q_norm) |nm| qkNormHead(c, q, nm, hh);
-            if (use_rope) ropeHead(c, q[rope_off..], cr, sr);
+            if (use_rope) ropeHead(c, q[rope_off..], table, pos);
             if (norm_after) if (layer.q_norm) |nm| qkNormHead(c, q, nm, hh);
             if (temp) |t| tensor.scale(q, t);
         }
+        if (shared) continue;
+        const vrow = ws.v[i * kvd ..][0..kvd];
         hh = 0;
-        while (hh < c.num_kv_heads) : (hh += 1) {
+        while (hh < nkv) : (hh += 1) {
             const k = krow[hh * hd ..][0..hd];
             if (norm_before) if (layer.k_norm) |nm| qkNormHead(c, k, nm, hh);
-            if (use_rope) ropeHead(c, k[rope_off..], cr, sr);
+            if (use_rope) ropeHead(c, k[rope_off..], table, pos);
             if (norm_after) if (layer.k_norm) |nm| qkNormHead(c, k, nm, hh);
+            if (c.v_norm) normVecInPlace(c, vrow[hh * hd ..][0..hd], &.{}, null);
         }
-        @memcpy(cache.kSlot(li, rows[i].b, rows[i].pos), krow);
-        @memcpy(cache.vSlot(li, rows[i].b, rows[i].pos), ws.v[i * kvd ..][0..kvd]);
-        cache.noteWrite(rows[i].pos);
+        @memcpy(cache.kSlot(li, rows[i].b, pos)[0..kvd], krow);
+        @memcpy(cache.vSlot(li, rows[i].b, pos)[0..kvd], vrow);
+        cache.noteWrite(pos);
     }
     const n_tasks = n * c.num_heads;
     const chunks = @max(1, @min(model.pool.threads, n_tasks));
@@ -3503,13 +3865,18 @@ fn attentionTail(model: *const Model, layer: *const Layer, li: usize, ws: *Works
     for (rows) |row| max_keys = @max(max_keys, row.pos + 1);
     const scores = try model.pool.allocScratch(gpa, chunks * max_keys);
     defer model.pool.freeScratch(gpa, scores);
+    const vd = c.layerVDim(li);
     const actx = AttnCtx{
         .model = model,
         .cache = cache,
-        .layer = li,
+        .layer = c.kv_source[li],
         .rows = rows,
         .q = ws.q,
         .out = ws.attn,
+        .hd = hd,
+        .vd = vd,
+        .groups = c.num_heads / nkv,
+        .scale = c.layer_attn_scale[li],
         .sliding = sliding,
         .sinks = layer.sinks,
         .n_tasks = n_tasks,
@@ -3530,7 +3897,6 @@ fn attentionTail(model: *const Model, layer: *const Layer, li: usize, ws: *Works
             }
         }
     }
-    const vd = c.v_head_dim;
     if (vd != hd) {
         // Compact `[n][heads][head_dim]` (v_head_dim valid per head) to `[n][heads * v_head_dim]`.
         var dst: usize = 0;
@@ -3541,6 +3907,44 @@ fn attentionTail(model: *const Model, layer: *const Layer, li: usize, ws: *Works
     }
     try tensor.matmulT(model.pool, gpa, ws.o, ws.attn, n, layer.o, if (layer.o_delta) |*d| d else null);
     if (layer.o_bias) |b| addBias(ws.o, n, hidden, b);
+}
+
+/// Inverse of the standard normal CDF (Acklam's rational approximation,
+/// relative error below 1.2e-9), for the gaussian top-k cutoff.
+fn normalPpf(p: f64) f64 {
+    const a = [_]f64{ -3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02, 1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00 };
+    const b = [_]f64{ -5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02, 6.680131188771972e+01, -1.328068155288572e+01 };
+    const cc = [_]f64{ -7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00, -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00 };
+    const d = [_]f64{ 7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00, 3.754408661907416e+00 };
+    const plow = 0.02425;
+    if (p < plow) {
+        const q = @sqrt(-2.0 * @log(p));
+        return (((((cc[0] * q + cc[1]) * q + cc[2]) * q + cc[3]) * q + cc[4]) * q + cc[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0);
+    }
+    if (p > 1.0 - plow) {
+        const q = @sqrt(-2.0 * @log(1.0 - p));
+        return -(((((cc[0] * q + cc[1]) * q + cc[2]) * q + cc[3]) * q + cc[4]) * q + cc[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0);
+    }
+    const q = p - 0.5;
+    const r = q * q;
+    return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0);
+}
+
+/// Gemma 3n activation sparsity: keeps the gate values above
+/// `mean + std * ppf(sparsity)` of their row (population std), relu-shifted.
+fn gaussianTopk(gate: []f32, n: usize, width: usize, sparsity: f32) void {
+    const mult: f32 = @floatCast(normalPpf(sparsity));
+    for (0..n) |r| {
+        const row = gate[r * width ..][0..width];
+        var mean: f32 = 0;
+        for (row) |v| mean += v;
+        mean /= @floatFromInt(width);
+        var variance: f32 = 0;
+        for (row) |v| variance += (v - mean) * (v - mean);
+        variance /= @floatFromInt(width);
+        const cutoff = mean + @sqrt(variance) * mult;
+        for (row) |*v| v.* = @max(v.* - cutoff, 0);
+    }
 }
 
 /// MLP sublayer (dense or mixture of experts): reads `h_in`, writes `ws.m`.
@@ -3559,6 +3963,7 @@ pub fn mlpBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Worksp
             if (layer.gate_bias) |b| addBias(ws.gate, n, inter, b);
             if (layer.up_bias) |b| addBias(ws.up, n, inter, b);
             if (c.mult.mlp_gate != 1.0) tensor.scale(ws.gate[0 .. n * inter], c.mult.mlp_gate);
+            if (c.activation_sparsity[li] > 0) gaussianTopk(ws.gate, n, inter, c.activation_sparsity[li]);
             if (c.moe.swiglu) |sw| swigluOai(sw, ws.gate, ws.gate, ws.up, n, inter, inter) else tensor.gatedActivation(model.pool, c.activation, ws.gate, ws.gate, ws.up, n, inter, inter, inter);
         },
         .gated_fused => {
@@ -3577,6 +3982,105 @@ pub fn mlpBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Worksp
     try tensor.matmulT(model.pool, gpa, ws.m, din, n, down, if (layer.down_delta) |*d| d else null);
     if (layer.down_bias) |b| addBias(ws.m, n, hidden, b);
     if (c.mult.mlp_down != 1.0) tensor.scale(ws.m[0 .. n * hidden], c.mult.mlp_down);
+}
+
+/// Per-layer input block (Gemma 3n / 4): `norm(out(act(gate(src)) * ple[li]))`
+/// for `n` rows, written to `ws.m`. `ple` holds `[n][layers * ple_dim]`.
+fn pleBlock(model: *const Model, p: *const PleWeights, li: usize, ws: *Workspace, src: []const f32, ple: []const f32, n: usize) !void {
+    const c = &model.config;
+    const gpa = model.gpa;
+    const hidden = c.hidden_size;
+    const pd = c.ple_dim;
+    const stride = c.num_layers * pd;
+    const g = try gpa.alloc(f32, n * pd);
+    defer gpa.free(g);
+    try tensor.matmulT(model.pool, gpa, g, src, n, p.gate, null);
+    for (0..n) |r| {
+        const row = g[r * pd ..][0..pd];
+        const inp = ple[r * stride + li * pd ..][0..pd];
+        for (row, 0..) |*v, j| v.* = c.activation.apply(v.*) * inp[j];
+    }
+    try tensor.matmulT(model.pool, gpa, ws.m, g, n, p.out, null);
+    normRowsInPlace(c, ws.m, n, hidden, p.norm, ws.h2);
+}
+
+/// RMS magnitude `sqrt(mean(x²))` of a row.
+fn rowMagnitude(x: []const f32) f32 {
+    var ss: f32 = 0;
+    for (x) |v| ss += v * v;
+    return @sqrt(ss / @as(f32, @floatFromInt(x.len)));
+}
+
+/// Projects an AltUp stream and rescales it to `target` (`x * target / max(rms(x), sqrt(1e-5))`).
+fn altupProjectRows(model: *const Model, out: []f32, src: []const f32, n: usize, w: Weight, targets: []const f32) !void {
+    const hidden = model.config.hidden_size;
+    try tensor.matmulT(model.pool, model.gpa, out, src, n, w, null);
+    for (0..n) |r| {
+        const row = out[r * hidden ..][0..hidden];
+        const mag = @sqrt(@max(rowMagnitude(row) * rowMagnitude(row), 1e-5));
+        tensor.scale(row, targets[r] / mag);
+    }
+}
+
+/// Expands the embeddings `xs` (`[n][hidden]`) into the extra AltUp streams
+/// `alt` (`[n][(altup_inputs - 1) * hidden]`), each magnitude-matched to the embedding.
+fn altupExpand(model: *const Model, ws: *Workspace, leases: []const stream.Lease, xs: []const f32, alt: []f32, n: usize) !void {
+    const c = &model.config;
+    const gpa = model.gpa;
+    const hidden = c.hidden_size;
+    const alt_w = (c.altup_inputs - 1) * hidden;
+    const targets = try gpa.alloc(f32, n);
+    defer gpa.free(targets);
+    for (0..n) |r| targets[r] = rowMagnitude(xs[r * hidden ..][0..hidden]);
+    for (leases, 0..) |lease, e| {
+        const tmp = ws.h2[0 .. n * hidden];
+        try altupProjectRows(model, tmp, xs, n, lease.weight, targets);
+        for (0..n) |r| @memcpy(alt[r * alt_w + e * hidden ..][0..hidden], tmp[r * hidden ..][0..hidden]);
+    }
+}
+
+/// Folds the AltUp streams of one row back into `out`: the mean of the active
+/// stream and the unembedded extra streams, each magnitude-matched to it.
+fn altupFold(model: *const Model, leases: []const stream.Lease, x: []const f32, alt: []const f32, out: []f32, tmp: []f32) !void {
+    const c = &model.config;
+    const hidden = c.hidden_size;
+    const target = [_]f32{rowMagnitude(x)};
+    @memcpy(out[0..hidden], x[0..hidden]);
+    for (leases, 0..) |lease, e| {
+        try altupProjectRows(model, tmp[0..hidden], alt[e * hidden ..][0..hidden], 1, lease.weight, &target);
+        tensor.axpy(out[0..hidden], 1.0, tmp[0..hidden]);
+    }
+    tensor.scale(out[0..hidden], 1.0 / @as(f32, @floatFromInt(c.altup_inputs)));
+}
+
+/// Fills `ple` (`[n][layers * ple_dim]`) with the per-layer inputs of `tokens`:
+/// the projected, normalised embedding plus the token's own per-layer
+/// embedding, scaled by `1/sqrt(2)`.
+fn perLayerInputs(model: *const Model, proj: Weight, tokens: []const u32, xs: []const f32, ple: []f32, n: usize) !void {
+    const c = &model.config;
+    const gpa = model.gpa;
+    const pd = c.ple_dim;
+    const width = c.num_layers * pd;
+    const store: *stream.WeightStore = @constCast(&model.store);
+    const emb_ref = model.ple_embed_ref.?;
+    try tensor.matmulT(model.pool, gpa, ple, xs, n, proj, null);
+    const emb = try gpa.alloc(f32, width);
+    defer gpa.free(emb);
+    const tmp = try gpa.alloc(f32, pd);
+    defer gpa.free(tmp);
+    const proj_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.hidden_size)));
+    const emb_scale = @sqrt(@as(f32, @floatFromInt(pd)));
+    const mix_scale = 1.0 / @sqrt(2.0);
+    for (0..n) |r| {
+        try store.readRow(emb_ref, @min(tokens[r], emb_ref.rows - 1), emb);
+        const row = ple[r * width ..][0..width];
+        for (0..c.num_layers) |l| {
+            const seg = row[l * pd ..][0..pd];
+            tensor.scale(seg, proj_scale);
+            applyNorm(c, tmp, seg, model.ple_proj_norm.?);
+            for (seg, 0..) |*v, j| v.* = (tmp[j] + emb[l * pd + j] * emb_scale) * mix_scale;
+        }
+    }
 }
 
 /// The clamped gpt-oss / MiniMax M3 swiglu on `n` rows of `gate` and `up`
@@ -3607,6 +4111,10 @@ fn swigluOai(sw: arch.Swiglu, out: []f32, gate: []const f32, up: []const f32, n:
 /// loaded only once per call. In streamed mode a decode step therefore costs
 /// one full read of every layer plus the LM head: decode throughput is bounded
 /// by storage bandwidth, not compute.
+///
+/// Gemma 3n carries `altup_inputs - 1` extra residual streams and Gemma 3n / 4
+/// per-layer inputs alongside the residual; they are computed with the
+/// embeddings and chunked the same way.
 pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []const u32, rows: []const Row, opts: ForwardOptions) !void {
     const c = &model.config;
     const gpa = model.gpa;
@@ -3618,15 +4126,39 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
     const sw = hc * hidden;
     const chunk_rows = ws.max_rows;
     const single = n <= chunk_rows;
-    var act: ?stream.Activations = null;
-    defer if (act) |*a| a.deinit();
-    if (!single) act = try stream.Activations.init(gpa, model.io, n, sw, .{
+    const alt_w = if (c.altup_inputs > 1) (c.altup_inputs - 1) * hidden else 0;
+    const ple_w = c.num_layers * c.ple_dim;
+    const act_opts = stream.Activations.InitOptions{
         .budget = model.budget,
         .scratch_dir = model.scratch_dir,
         .reserve = model.residentWeightNeed(),
         .evictable = model.expertCacheEvictable(),
         .force_scratch = model.spill_always,
-    });
+    };
+    var act: ?stream.Activations = null;
+    defer if (act) |*a| a.deinit();
+    var act_alt: ?stream.Activations = null;
+    defer if (act_alt) |*a| a.deinit();
+    var act_ple: ?stream.Activations = null;
+    defer if (act_ple) |*a| a.deinit();
+    if (!single) {
+        act = try stream.Activations.init(gpa, model.io, n, sw, act_opts);
+        if (alt_w > 0) act_alt = try stream.Activations.init(gpa, model.io, n, alt_w, act_opts);
+        if (ple_w > 0) act_ple = try stream.Activations.init(gpa, model.io, n, ple_w, act_opts);
+    }
+    // Model-level projections of the embedding stage and the final fold.
+    const store: *stream.WeightStore = @constCast(&model.store);
+    var ple_proj: ?stream.Lease = null;
+    defer if (ple_proj) |l| store.release(l);
+    if (ple_w > 0) ple_proj = try store.acquire(model.ple_proj_ref.?);
+    const alt_leases = try gpa.alloc(stream.Lease, model.altup_proj_refs.len);
+    defer gpa.free(alt_leases);
+    var n_alt_leases: usize = 0;
+    defer for (alt_leases[0..n_alt_leases]) |l| store.release(l);
+    for (model.altup_proj_refs) |r| {
+        alt_leases[n_alt_leases] = try store.acquire(r);
+        n_alt_leases += 1;
+    }
 
     // Embeddings.
     var start: usize = 0;
@@ -3648,6 +4180,16 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
             }
             // Every stream starts as a copy of the embedding.
             for (1..hc) |j| @memcpy(xs[i * sw + j * hidden ..][0..hidden], x);
+        }
+        if (ple_w > 0) {
+            const ps = if (single) ws.ple[0 .. n * ple_w] else act_ple.?.chunkUninit(start, cn, ws.ple);
+            try perLayerInputs(model, ple_proj.?.weight, tokens[start..][0..cn], xs, ps, cn);
+            if (!single) try act_ple.?.commit(start, cn, ps);
+        }
+        if (alt_w > 0) {
+            const as = if (single) ws.alt[0 .. n * alt_w] else act_alt.?.chunkUninit(start, cn, ws.alt);
+            try altupExpand(model, ws, alt_leases[0..n_alt_leases], xs, as, cn);
+            if (!single) try act_alt.?.commit(start, cn, as);
         }
         if (!single) try act.?.commit(start, cn, xs);
         if (hc == 1) captureResiduals(opts, 0, hidden, start, cn, xs);
@@ -3673,7 +4215,9 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
         var lease = try model.acquireLayer(li);
         defer lease.release();
         const layer = &lease.layer;
-        try cache.beginLayer(li);
+        // A KV-shared layer reads (and never writes) its source layer's cache.
+        const kv_layer = c.kv_source[li];
+        try cache.beginLayer(kv_layer);
         start = 0;
         while (start < n) : (start += chunk_rows) {
             const cn = @min(chunk_rows, n - start);
@@ -3683,12 +4227,15 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
                 try dsv4.layerBlock(model, layer, li, ws, cache, xs, rows[start..][0..cn], tokens[start..][0..cn], pm, capture_buf);
                 if (capture_buf) |cb| captureResiduals(opts, li, hidden, start, cn, cb);
             } else {
-                try layerBlock(model, layer, li, ws, cache, xs, rows[start..][0..cn]);
+                const alts: []f32 = if (alt_w == 0) &.{} else if (single) ws.alt[0 .. n * alt_w] else try act_alt.?.chunk(start, cn, ws.alt);
+                const ples: []const f32 = if (ple_w == 0) &.{} else if (single) ws.ple[0 .. n * ple_w] else try act_ple.?.chunk(start, cn, ws.ple);
+                try layerBlock(model, layer, li, ws, cache, xs, alts, ples, rows[start..][0..cn]);
+                if (!single and alt_w > 0) try act_alt.?.commit(start, cn, alts);
             }
             if (!single) try act.?.commit(start, cn, xs);
             if (hc == 1) captureResiduals(opts, li + 1, hidden, start, cn, xs);
         }
-        try cache.endLayer(li);
+        if (kv_layer == li) try cache.endLayer(li);
     }
 
     // Hyper-connections: the final collapse is the last residual entry.
@@ -3710,6 +4257,16 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
         // `ws.h` holds `max_rows` rows, which may be fewer than the logit rows under chunking.
         const h = try gpa.alloc(f32, opts.logit_rows.len * hidden);
         defer gpa.free(h);
+        const unembed = try gpa.alloc(stream.Lease, model.altup_unembed_refs.len);
+        defer gpa.free(unembed);
+        var n_unembed: usize = 0;
+        defer for (unembed[0..n_unembed]) |l| store.release(l);
+        for (model.altup_unembed_refs) |r| {
+            unembed[n_unembed] = try store.acquire(r);
+            n_unembed += 1;
+        }
+        const alt_row = try gpa.alloc(f32, alt_w);
+        defer gpa.free(alt_row);
         const tmp = try gpa.alloc(f32, sw);
         defer gpa.free(tmp);
         for (opts.logit_rows, 0..) |r, i| {
@@ -3721,6 +4278,15 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
                 try act.?.readRow(r, tmp);
                 src = tmp;
             }
+            if (alt_w > 0) {
+                // Gemma 3n: mean of the active stream and the unembedded extra streams.
+                const alts: []const f32 = if (single) ws.alt[r * alt_w ..][0..alt_w] else blk: {
+                    try act_alt.?.readRow(r, alt_row);
+                    break :blk alt_row;
+                };
+                try altupFold(model, unembed[0..n_unembed], src[0..hidden], alts, ws.h2[0..hidden], ws.h[0..hidden]);
+                src = ws.h2[0..hidden];
+            }
             if (hc > 1) {
                 const pm: ?[]const f32 = if (pre_mix) |p| p[r * hc ..][0..hc] else null;
                 dsv4.finalCollapse(model, src, pm, ws.h2[0..hidden]);
@@ -3729,7 +4295,7 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
             applyNorm(c, dst, src, model.final_norm);
         }
         const lm = try model.acquireLmHead();
-        defer @constCast(&model.store).release(lm);
+        defer store.release(lm);
         try tensor.matmulT(model.pool, gpa, ws.logits, h, opts.logit_rows.len, lm.weight, null);
         const logits = ws.logits[0 .. opts.logit_rows.len * c.vocab_size];
         if (model.lm_head_bias) |b| addBias(logits, opts.logit_rows.len, c.vocab_size, b);
@@ -3748,18 +4314,23 @@ fn captureResiduals(opts: ForwardOptions, entry: usize, hidden: usize, start: us
 }
 
 /// One transformer layer (attention + MLP) applied in place to the residual
-/// rows `x` (`rows.len` tokens). `layer` must hold resident weights.
+/// rows `x` (`rows.len` tokens). `layer` must hold resident weights. `alt`
+/// carries the extra AltUp streams and `ple` the per-layer inputs of the rows
+/// (both empty when the family has none).
 ///
 /// Sequential layout: `x += attn(norm(x)); x += mlp(norm(x))`, with optional
 /// norms on the sublayer outputs (Gemma, OLMo 2, GLM-4) and no input norm for
 /// the post-norm families. Parallel layout (GPT-NeoX, Falcon, Phi, Cohere):
 /// `x += attn(h) + mlp(h)` with `h = norm(x)` (or a second norm for the MLP).
 ///
-/// The "attention" half may be a Gated DeltaNet or Mamba block instead, or
-/// (Falcon-H1) a Mamba block and attention side by side on the same input
-/// whose outputs are summed; single-block layers (Mamba2, Nemotron-H) run
-/// only one of the two halves behind the layer norm.
-fn layerBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace, cache: *KvCache, x: []f32, rows: []const Row) !void {
+/// The "attention" half may be a linear-attention, short-convolution or
+/// Mamba block instead, or (Falcon-H1) a Mamba block and attention side by
+/// side on the same input whose outputs are summed; single-block layers
+/// (Mamba2, Nemotron-H) run only one of the two halves behind the layer
+/// norm. Gemma 4 then adds the per-layer input block and its output scalar;
+/// Gemma 3n takes the AltUp path.
+fn layerBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace, cache: *KvCache, x: []f32, alt: []f32, ple: []const f32, rows: []const Row) !void {
+    if (layer.altup != null) return altupLayer(model, layer, li, ws, cache, x, alt, ple, rows);
     const c = &model.config;
     const gpa = model.gpa;
     const n = rows.len;
@@ -3768,19 +4339,13 @@ fn layerBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Workspac
     const rm = c.residual_multiplier;
     const has_attn = c.attn_layers[li];
     const has_ssm = c.ssm_layers[li];
-    const has_mixer = has_attn or has_ssm or c.linear_layers[li];
+    const has_mixer = has_attn or has_ssm or c.linear_layers[li] or c.conv_layers[li];
     const has_mlp = c.mlp_layers[li];
     const attn_out = ws.o[0 .. n * hidden];
 
     if (has_mixer) {
         normRows(c, h, x, n, hidden, layer.input_norm);
-        if (c.linear_layers[li]) {
-            switch (c.linear_kind) {
-                .gated_deltanet => try linearForward(model, layer, li, ws, cache, h, rows),
-                .kda => try kdaForward(model, layer, li, ws, cache, h, rows),
-                .lightning => try lightningForward(model, layer, li, ws, cache, h, rows),
-            }
-        } else if (has_attn and has_ssm) {
+        if (has_attn and has_ssm) {
             // Parallel Mamba + attention with the muP multipliers.
             var attn_in: []const f32 = h;
             var scaled: ?[]f32 = null;
@@ -3801,7 +4366,7 @@ fn layerBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Workspac
         } else if (has_ssm) {
             try ssmForward(model, layer, li, cache, h, rows, attn_out);
         } else {
-            try attention(model, layer, li, ws, cache, h, rows);
+            try mixer(model, layer, li, ws, cache, h, rows);
         }
         if (layer.post_attn_norm) |nm| normRowsInPlace(c, attn_out, n, hidden, nm, ws.h2);
     }
@@ -3829,13 +4394,147 @@ fn layerBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Workspac
         tensor.axpy(x[0 .. n * hidden], rm, m);
     } else {
         if (has_mixer) tensor.axpy(x[0 .. n * hidden], rm, attn_out);
-        if (!has_mlp) return;
-        // A single-block MLP layer is normalised by the layer's only norm.
-        normRows(c, h, x, n, hidden, if (has_mixer) layer.pre_ff_norm else layer.input_norm);
-        try mlpBlock(model, layer, li, ws, h, n, null);
-        const m = ws.m[0 .. n * hidden];
-        if (layer.post_ff_norm) |nm| normRowsInPlace(c, m, n, hidden, nm, ws.h2);
-        tensor.axpy(x[0 .. n * hidden], rm, m);
+        if (has_mlp) {
+            // A single-block MLP layer is normalised by the layer's only norm.
+            normRows(c, h, x, n, hidden, if (has_mixer) layer.pre_ff_norm else layer.input_norm);
+            try mlpBlock(model, layer, li, ws, h, n, null);
+            const m = ws.m[0 .. n * hidden];
+            if (layer.post_ff_norm) |nm| normRowsInPlace(c, m, n, hidden, nm, ws.h2);
+            tensor.axpy(x[0 .. n * hidden], rm, m);
+        }
+    }
+    if (layer.ple) |*p| {
+        try pleBlock(model, p, li, ws, x, ple, n);
+        tensor.axpy(x[0 .. n * hidden], 1.0, ws.m[0 .. n * hidden]);
+    }
+    if (layer.layer_scale) |s| tensor.scale(x[0 .. n * hidden], s);
+}
+
+/// The sequence-mixing sublayer of a layer: attention, one of the linear
+/// attention recurrences or a short convolution. Reads `h`, writes `ws.o`.
+fn mixer(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace, cache: *KvCache, h: []const f32, rows: []const Row) !void {
+    const c = &model.config;
+    if (c.linear_layers[li]) {
+        return switch (c.linear_kind) {
+            .gated_deltanet => linearForward(model, layer, li, ws, cache, h, rows),
+            .kda => kdaForward(model, layer, li, ws, cache, h, rows),
+            .lightning => lightningForward(model, layer, li, ws, cache, h, rows),
+        };
+    }
+    if (c.conv_layers[li]) return convForward(model, layer, li, ws, cache, h, rows);
+    return attention(model, layer, li, ws, cache, h, rows);
+}
+
+/// AltUp modality router: `tanh(router(norm(x) / hidden))` for `n` rows into `out` (`[n][altup_inputs]`).
+fn altupModalities(model: *const Model, au: *const AltUpWeights, ws: *Workspace, out: []f32, x: []const f32, n: usize) !void {
+    const c = &model.config;
+    const hidden = c.hidden_size;
+    const tmp = ws.h2[0 .. n * hidden];
+    normRows(c, tmp, x, n, hidden, au.router_norm);
+    tensor.scale(tmp, 1.0 / @as(f32, @floatFromInt(hidden)));
+    try tensor.matmulT(model.pool, model.gpa, out, tmp, n, au.router, null);
+    for (out[0 .. n * c.altup_inputs]) |*v| v.* = std.math.tanh(v.*);
+}
+
+/// A Gemma 3n layer over its `altup_inputs` residual streams (`x` is stream
+/// 0, `alt` the others): predict every stream from the active one, run
+/// attention + Laurel and the MLP on the active prediction, correct every
+/// stream by the innovation, then add the gated per-layer input to the
+/// non-active streams.
+fn altupLayer(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace, cache: *KvCache, x: []f32, alt: []f32, ple: []const f32, rows: []const Row) !void {
+    const c = &model.config;
+    const gpa = model.gpa;
+    const au = layer.altup.?;
+    const n = rows.len;
+    const hidden = c.hidden_size;
+    const na = c.altup_inputs;
+    const active = c.altup_active;
+    const alt_w = (na - 1) * hidden;
+    const inv_sqrt2: f32 = 1.0 / @sqrt(2.0);
+
+    // Streams of row r: stream 0 is x[r], stream a >= 1 is alt[r][a - 1].
+    const streamOf = struct {
+        fn get(xx: []f32, aa: []f32, hid: usize, aw: usize, r: usize, a: usize) []f32 {
+            return if (a == 0) xx[r * hid ..][0..hid] else aa[r * aw + (a - 1) * hid ..][0..hid];
+        }
+    };
+
+    // Predict: pred[a] = s[a] + sum_i coef[a][i] * s[i], coefficients from the active stream.
+    const act_in = try gpa.alloc(f32, n * hidden);
+    defer gpa.free(act_in);
+    for (0..n) |r| @memcpy(act_in[r * hidden ..][0..hidden], streamOf.get(x, alt, hidden, alt_w, r, active));
+    const modal = try gpa.alloc(f32, n * na);
+    defer gpa.free(modal);
+    try altupModalities(model, &au, ws, modal, act_in, n);
+    const coefs = try gpa.alloc(f32, n * na * na);
+    defer gpa.free(coefs);
+    try tensor.matmulT(model.pool, gpa, coefs, modal, n, au.predict, null);
+    const pred = try gpa.alloc(f32, n * na * hidden);
+    defer gpa.free(pred);
+    for (0..n) |r| {
+        for (0..na) |a| {
+            const dst = pred[(r * na + a) * hidden ..][0..hidden];
+            @memcpy(dst, streamOf.get(x, alt, hidden, alt_w, r, a));
+            for (0..na) |i| tensor.axpy(dst, coefs[r * na * na + a * na + i], streamOf.get(x, alt, hidden, alt_w, r, i));
+        }
+    }
+
+    // Attention and Laurel on the normalised active prediction.
+    const h = ws.h[0 .. n * hidden];
+    for (0..n) |r| @memcpy(act_in[r * hidden ..][0..hidden], pred[(r * na + active) * hidden ..][0..hidden]);
+    normRows(c, h, act_in, n, hidden, layer.input_norm);
+    const laurel = try gpa.alloc(f32, n * hidden);
+    defer gpa.free(laurel);
+    {
+        const lr = try gpa.alloc(f32, n * c.laurel_rank);
+        defer gpa.free(lr);
+        try tensor.matmulT(model.pool, gpa, lr, h, n, au.laurel_l, null);
+        try tensor.matmulT(model.pool, gpa, laurel, lr, n, au.laurel_r, null);
+        normRowsInPlace(c, laurel, n, hidden, au.laurel_norm, ws.h2);
+        tensor.axpy(laurel, 1.0, h);
+    }
+    try mixer(model, layer, li, ws, cache, h, rows);
+    const attn_out = ws.o[0 .. n * hidden];
+    if (layer.post_attn_norm) |nm| normRowsInPlace(c, attn_out, n, hidden, nm, ws.h2);
+    // attn_laurel = (active + attn + laurel) / sqrt(2), kept in `act_in`.
+    tensor.axpy(act_in, 1.0, attn_out);
+    tensor.axpy(act_in, 1.0, laurel);
+    tensor.scale(act_in, inv_sqrt2);
+
+    // MLP; `act_in` becomes the activated output.
+    normRows(c, h, act_in, n, hidden, layer.pre_ff_norm);
+    try mlpBlock(model, layer, li, ws, h, n, null);
+    const m = ws.m[0 .. n * hidden];
+    if (layer.post_ff_norm) |nm| normRowsInPlace(c, m, n, hidden, nm, ws.h2);
+    tensor.axpy(act_in, 1.0, m);
+
+    // Correct: corrected[a] = pred[a] + (activated - pred[active]) * (coef[a] + 1).
+    try altupModalities(model, &au, ws, modal, act_in, n);
+    const cc = try gpa.alloc(f32, n * na);
+    defer gpa.free(cc);
+    try tensor.matmulT(model.pool, gpa, cc, modal, n, au.correct, null);
+    for (0..n) |r| {
+        const innovation = ws.h2[r * hidden ..][0..hidden];
+        @memcpy(innovation, act_in[r * hidden ..][0..hidden]);
+        tensor.axpy(innovation, -1.0, pred[(r * na + active) * hidden ..][0..hidden]);
+        for (0..na) |a| {
+            const dst = streamOf.get(x, alt, hidden, alt_w, r, a);
+            @memcpy(dst, pred[(r * na + a) * hidden ..][0..hidden]);
+            tensor.axpy(dst, cc[r * na + a] + 1.0, innovation);
+        }
+    }
+
+    // Per-layer input from the (scaled) corrected active stream, added to the other streams.
+    for (0..n) |r| {
+        const src = act_in[r * hidden ..][0..hidden];
+        @memcpy(src, streamOf.get(x, alt, hidden, alt_w, r, active));
+        if (au.scale) |s| for (src, 0..) |*v, j| {
+            v.* *= s[j];
+        };
+    }
+    try pleBlock(model, &layer.ple.?, li, ws, act_in, ple, n);
+    for (0..n) |r| {
+        for (1..na) |a| tensor.axpy(streamOf.get(x, alt, hidden, alt_w, r, a), 1.0, ws.m[r * hidden ..][0..hidden]);
     }
 }
 

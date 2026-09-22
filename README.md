@@ -79,7 +79,9 @@ a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
 * Llama 2/3 layout: `llama` (Yi, SOLAR, TinyLlama, SmolLM 1/2), `mistral`,
   `mistral3` text, `smollm3`, `granite`, `minicpm`, `baichuan` (7B, RoPE),
   `exaone`, `exaone4`, `internlm2`, `olmo`, `olmo2`, `cohere` (Command R),
-  `stablelm`, `starcoder2`, `nemotron`
+  `stablelm`, `starcoder2`, `nemotron`, `seed_oss` (Seed-OSS 36B)
+* LFM2 / LFM2.5 (`lfm2`): gated short-convolution layers mixed with
+  attention (`lfm2_moe` is not supported)
 * Qwen: `qwen2` / `qwen2.5` (also the `qwen2_vl` / `qwen2_5_vl` text configs),
   `qwen3` (also `qwen3_vl` text), `qwen2_moe`, `qwen3_moe`
 * Qwen hybrids (Gated DeltaNet linear attention + sigmoid/swish-gated full
@@ -103,18 +105,25 @@ a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
   MoE with a shared expert; both the original checkpoint layout and the
   transformers module layout), `kimi_k25` (Kimi K2.5 / K2.6: the DeepSeek
   V3 text config of the image-video wrapper)
-* Gemma 2 / Gemma 3 (text), GLM-4 (`glm4`, `glm`) and ChatGLM3 / GLM-4-9B
-  (`chatglm`), GLM-4.5 dense and MoE (`glm4_moe`, also the `glm4v_moe`
-  image/video text config), GLM-5 family (`glm_moe_dsa`, whose sparse
-  indexer runs as dense attention, exact for the short contexts ditch
-  scores), Phi-1/1.5/2 (`phi`), Phi-3 / 3.5 / 4 (`phi3`)
+* Gemma 2 / Gemma 3 (text), Gemma 3n (`gemma3n` text: AltUp residual
+  streams, Laurel blocks, per-layer input embeddings, KV-shared layers),
+  Gemma 4 dense (`gemma4` text: global layers with their own head size,
+  proportional RoPE, keys reused as values, KV-shared layers, per-layer
+  inputs; the MoE block of gemma-4-26B-A4B is not implemented), GLM-4
+  (`glm4`, `glm`) and ChatGLM3 / GLM-4-9B (`chatglm`), GLM-4.5 dense and
+  MoE (`glm4_moe`, also the `glm4v_moe` image/video text config), GLM-5
+  family (`glm_moe_dsa`, whose sparse indexer runs as dense attention,
+  exact for the short contexts ditch scores), Phi-1/1.5/2 (`phi`),
+  Phi-3 / 3.5 / 4 (`phi3`)
 * GPT-2, GPT-NeoX / Pythia, GPT-BigCode (StarCoder 1), Falcon (7B layout),
   BLOOM, OPT, MPT
 * Mixture of experts: Mixtral, Qwen2/3-MoE (separate and fused expert
   layouts), DeepSeek V2 / V3 (MLA, group-limited and sigmoid routing, shared
-  experts), Llama 4 text (top-1 routing, NoPE layers), gpt-oss (attention
-  sinks, interleaved fused experts, BF16 or MXFP4 checkpoints), ERNIE 4.5
-  MoE (`ernie4_5_moe`), Hunyuan-A13B (`hunyuan_v1_moe`), GraniteMoE /
+  experts), Mistral Small 4 text (`mistral4`: MLA, position-scaled
+  queries, group-limited softmax routing, fused experts), Llama 4 text
+  (top-1 routing, NoPE layers), gpt-oss (attention sinks, interleaved
+  fused experts, BF16 or MXFP4 checkpoints), ERNIE 4.5 MoE
+  (`ernie4_5_moe`), Hunyuan-A13B (`hunyuan_v1_moe`), GraniteMoE /
   GraniteMoeShared (`granitemoe`; Granite 4.0 H is `granitemoehybrid` above)
 * MiniMax: M2 (`minimax_m2`), MiniMax-Text-01 / M1 (`minimax`: lightning
   linear attention alternating with softmax attention; the recurrence runs
@@ -147,9 +156,9 @@ beyond the original context (treated as static / short factors).
 Not supported: Mamba1-only models (`mamba`, FalconMamba) and RWKV, Kimi
 K3 (AttnRes), Kimi K2 (`kimi_k2` standalone config),
 Qwen3.8-Flash-Next (`qwen4_exp`), GLM-5.3-Flash (`glm5_next`),
-encoder-decoder models, Gemma 3n (per-layer inputs), MiniCPM3, HunYuan
-cross-layer attention (`use_cla`), OPT-350m (projection layers),
-quantisation formats other than the ones listed below (GPTQ, AWQ,
+encoder-decoder models, Gemma 4 MoE (`enable_moe_block`), LFM2-MoE,
+MiniCPM3, HunYuan cross-layer attention (`use_cla`), OPT-350m (projection
+layers), quantisation formats other than the ones listed below (GPTQ, AWQ,
 bitsandbytes, ...), and SentencePiece-only tokenizers (Baichuan; generate
 a `tokenizer.json` with
 `AutoTokenizer.from_pretrained(...).save_pretrained(...)` and place it
@@ -158,10 +167,11 @@ unknown layer types, quantisation formats and activations are errors, not
 silent fallbacks. Unicode normalisers (NFKC, Precompiled) are
 approximated by the identity.
 
-Image and video models (Qwen2/3-VL, Qwen3.5, GLM-4.5V, Llama 4, Kimi K2.5) run
-through their text config: the vision tower is never executed, its
-weights pass through exports byte for byte, and refusal directions are
-measured on text prompts.
+Image, video and audio models (Qwen2/3-VL, Qwen3.5, GLM-4.5V, Llama 4,
+Kimi K2.5, Gemma 3n, Gemma 4, Mistral Small 4) run through their text
+config: the vision and audio towers are never executed, their weights pass
+through exports byte for byte, and refusal directions are measured on text
+prompts.
 
 Weights are read from safetensors (F32/F16/BF16, or the quantised formats
 below) or GGUF (llama, Mistral, Mixtral, Qwen2/3, Qwen MoE and Gemma 2/3

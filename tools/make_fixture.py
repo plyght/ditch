@@ -382,6 +382,13 @@ def base(**kw):
         # the Mamba block and attention side by side (Falcon-H1); `mult` holds
         # its muP multipliers.
         ssm=None, ssm_layers=None, attn_layers=None, mlp_layers=None, parallel_ssm=False, mult=None,
+        # Gemma 3n / 4 and LFM2 features: per-layer head size / KV heads, KV
+        # sharing, keys reused as values, weightless value norm, a local rope
+        # table (theta, rotary dim) and a global (rotary dim, freq dim) pair,
+        # per-layer inputs, AltUp / Laurel, gate sparsity, conv layers,
+        # per-layer output scalars, per-layer FFN widths, final softcapping.
+        layer_hd=None, layer_nkv=None, kv_shared=0, k_eq_v=False, v_norm=False, local_rope=None, global_rotary=None,
+        ple_dim=0, altup=None, sparsity=None, conv_layers=None, conv_K=3, layer_scale=False, layer_inter=None, final_softcap=None,
         # "gdn" (Gated DeltaNet) or "lightning" (MiniMax) linear-attention layers.
         linear_kind="gdn",
         # "pre" or "minimax" (h = norm(x); x = alpha * h + beta * f(h)); scales per sublayer.
@@ -879,6 +886,65 @@ spec("granitemoehybrid_dense", tok="starcoder", L=2, embed_scale=2.0, attn_scale
              "layer_types": ["linear_attention", "full_attention"], "mamba_n_heads": 4, "mamba_n_groups": 1, "mamba_d_state": 8,
              "mamba_d_head": 16, "mamba_d_conv": 4, "mamba_expand": 2, "mamba_conv_bias": True, "mamba_proj_bias": False,
              "attention_bias": False, "tie_word_embeddings": True})
+spec("seed_oss", tok="llama3", HD=16, attn_bias=True, o_bias=False, lm_head="lm_head.weight",
+     config={"model_type": "seed_oss", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4,
+             "num_key_value_heads": 2, "head_dim": 16, "rms_norm_eps": 1e-6, "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0},
+             "attention_bias": True, "attention_out_bias": False, "mlp_bias": False, "hidden_act": "silu", "max_position_embeddings": 128,
+             "tie_word_embeddings": False})
+spec("lfm2", tok="qwen2", L=3, eps=1e-5, theta=1000000.0, qk_norm="head", q_norm="self_attn.q_layernorm.weight", k_norm="self_attn.k_layernorm.weight",
+     o="self_attn.out_proj.weight", final_norm="embedding_norm.weight", in_norm="operator_norm.weight", pre_ff_norm="ffn_norm.weight",
+     gate="feed_forward.w1.weight", up="feed_forward.w3.weight", down="feed_forward.w2.weight", lm_head=None, conv_layers=[1, 0, 1], conv_K=3,
+     config={"model_type": "lfm2", "vocab_size": 0, "hidden_size": 32, "num_hidden_layers": 3, "num_attention_heads": 4, "num_key_value_heads": 2,
+             "norm_eps": 1e-5, "rope_theta": 1000000.0, "conv_bias": False, "conv_L_cache": 3, "block_ff_dim": 48, "block_multiple_of": 16,
+             "block_ffn_dim_multiplier": 1.0, "block_auto_adjust_ff_dim": True, "full_attn_idxs": [1], "layer_types": ["conv", "full_attention", "conv"],
+             "max_position_embeddings": 128, "tie_word_embeddings": True})
+spec("mistral4", tok="llama3", NKV=4, HD=12, VD=8, L=3, prefix="model.language_model.", rope_style="gptj", rotary_dim=4, lm_head="lm_head.weight",
+     mla={"q_lora_rank": 12, "kv_lora_rank": 16, "nope": 8, "rope": 4, "v": 8},
+     scaling={"type": "yarn", "factor": 4.0, "beta_fast": 32, "beta_slow": 1, "mscale": 1.0, "mscale_all_dim": 1.0, "original_max_position_embeddings": 32},
+     temp={"floor_scale": 32.0, "attn_scale": 0.1, "offset": 0.0, "all": True},
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "scoring": "softmax", "group_limited": True, "group_top2": True, "n_group": 2, "topk_group": 1,
+          "rsf": 1.5, "norm": True, "layers": [1, 2], "corr_bias": False, "layout": "fused_eih", "prefix": "mlp.", "router": "gate.weight",
+          "shared_name": "shared_experts."},
+     config={"model_type": "mistral3", "architectures": ["Mistral3ForConditionalGeneration"],
+             "text_config": {"model_type": "mistral4", "hidden_size": 32, "intermediate_size": 32, "moe_intermediate_size": 12, "num_hidden_layers": 3,
+                             "num_attention_heads": 4, "num_key_value_heads": 4, "q_lora_rank": 12, "kv_lora_rank": 16, "qk_nope_head_dim": 8,
+                             "qk_rope_head_dim": 4, "v_head_dim": 8, "n_routed_experts": 4, "n_shared_experts": 1, "num_experts_per_tok": 2,
+                             "first_k_dense_replace": 1, "n_group": 2, "topk_group": 1, "routed_scaling_factor": 1.5, "norm_topk_prob": True,
+                             "rms_norm_eps": 1e-6, "rope_interleave": True, "hidden_act": "silu", "max_position_embeddings": 128, "tie_word_embeddings": False,
+                             "rope_parameters": {"rope_type": "yarn", "rope_theta": 10000.0, "factor": 4.0, "original_max_position_embeddings": 32,
+                                                 "beta_fast": 32.0, "beta_slow": 1.0, "mscale": 1.0, "mscale_all_dim": 1.0, "llama_4_scaling_beta": 0.1,
+                                                 "partial_rotary_factor": 4 / 12}},
+             "vision_config": {"model_type": "pixtral"}})
+spec("gemma4", tok="spm", L=5, NH=4, NKV=2, HD=8, prefix="model.language_model.", lm_head=None, act="gelu_tanh", attn_scale=1.0,
+     post_attn_norm="post_attention_layernorm.weight", pre_ff_norm="pre_feedforward_layernorm.weight", post_ff_norm="post_feedforward_layernorm.weight",
+     embed_scale=np.sqrt(32.0), qk_norm="head", v_norm=True, k_eq_v=True, sliding=4, sliding_layers=[1, 0, 1, 1, 0], layer_hd=[8, 16, 8, 8, 16],
+     layer_nkv=[2, 1, 2, 2, 1], kv_shared=2, theta=1000000.0, local_rope=(10000.0, 8), global_rotary=(4, 16), ple_dim=4, layer_scale=True,
+     layer_inter=[32, 32, 32, 64, 64],
+     config={"model_type": "gemma4", "architectures": ["Gemma4ForConditionalGeneration"],
+             "text_config": {"model_type": "gemma4_text", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 5, "num_attention_heads": 4,
+                             "num_key_value_heads": 2, "head_dim": 8, "global_head_dim": 16, "num_global_key_value_heads": 1, "attention_k_eq_v": True,
+                             "num_kv_shared_layers": 2, "use_double_wide_mlp": True, "hidden_size_per_layer_input": 4, "vocab_size_per_layer_input": 0,
+                             "sliding_window": 4, "layer_types": ["sliding_attention", "full_attention", "sliding_attention", "sliding_attention", "full_attention"],
+                             "rope_parameters": {"full_attention": {"rope_type": "proportional", "partial_rotary_factor": 0.25, "rope_theta": 1000000.0},
+                                                 "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0}},
+                             "rms_norm_eps": 1e-6, "hidden_activation": "gelu_pytorch_tanh", "final_logit_softcapping": None, "enable_moe_block": False,
+                             "max_position_embeddings": 128, "tie_word_embeddings": True},
+             "vision_config": {"model_type": "gemma4_vision"}})
+spec("gemma3n", tok="spm", L=4, NH=4, NKV=2, HD=8, prefix="model.language_model.", lm_head=None, act="gelu_tanh", attn_scale=1.0,
+     post_attn_norm="post_attention_layernorm.weight", pre_ff_norm="pre_feedforward_layernorm.weight", post_ff_norm="post_feedforward_layernorm.weight",
+     embed_scale=np.sqrt(32.0), qk_norm="head", v_norm=True, sliding=4, sliding_layers=[1, 1, 0, 1], kv_shared=1, theta=1000000.0, local_rope=(10000.0, 8),
+     ple_dim=4, altup={"A": 3, "active": 0, "correct_scale": True, "rank": 6}, sparsity=[0.95, 0.5, 0.0, 0.0], layer_inter=[32, 32, 48, 32],
+     final_softcap=30.0,
+     config={"model_type": "gemma3n", "architectures": ["Gemma3nForConditionalGeneration"],
+             "text_config": {"model_type": "gemma3n_text", "hidden_size": 32, "intermediate_size": [32, 32, 48, 32], "num_hidden_layers": 4,
+                             "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8, "sliding_window": 4,
+                             "layer_types": ["sliding_attention", "sliding_attention", "full_attention", "sliding_attention"],
+                             "rope_theta": 1000000.0, "rope_local_base_freq": 10000.0, "rope_scaling": None, "rms_norm_eps": 1e-6,
+                             "hidden_activation": "gelu_pytorch_tanh", "final_logit_softcapping": 30.0, "hidden_size_per_layer_input": 4,
+                             "vocab_size_per_layer_input": 0, "altup_num_inputs": 3, "altup_active_idx": 0, "altup_coef_clip": 120.0,
+                             "altup_correct_scale": True, "num_kv_shared_layers": 1, "laurel_rank": 6, "activation_sparsity_pattern": [0.95, 0.5, 0.0, 0.0],
+                             "max_position_embeddings": 128, "tie_word_embeddings": True},
+             "vision_config": {"model_type": "gemma3n_vision"}, "audio_config": {"model_type": "gemma3n_audio"}})
 
 
 # --- generation ------------------------------------------------------------
@@ -950,8 +1016,25 @@ def generate_generic(family, out_dir):
         lin_layers = [((i + 1) % s["full_interval"] != 0) for i in range(L)]
     if lin_layers is None:
         lin_layers = [False] * L
+    conv_layers = [bool(v) for v in (s["conv_layers"] or [0] * L)]
+    layer_hd = s["layer_hd"] or [HD] * L
+    layer_nkv = s["layer_nkv"] or [NKV] * L
+    sliding_of = [bool(v) for v in (s["sliding_layers"] or [0] * L)]
+    # KV sharing: the last `kv_shared` layers read the last earlier layer of their kind.
+    kv_source = list(range(L))
+    for i in range(L - s["kv_shared"], L):
+        kv_source[i] = max(j for j in range(L - s["kv_shared"]) if sliding_of[j] == sliding_of[i])
+    ple_dim = s["ple_dim"]
+    if ple_dim:
+        ple_embed = mat(P + "embed_tokens_per_layer.weight", V, L * ple_dim, 1.0)
+        ple_proj = mat(P + "per_layer_model_projection.weight", L * ple_dim, H)
+        ple_norm = normw(P + "per_layer_projection_norm.weight", ple_dim)[0]
+    altup = s["altup"]
+    if altup:
+        altup_proj = [mat(P + f"altup_projections.{e}.weight", H, H) for e in range(altup["A"] - 1)]
+        altup_unembed = [mat(P + f"altup_unembed_projections.{e}.weight", H, H) for e in range(altup["A"] - 1)]
     ssm_layers = [bool(x) for x in (s["ssm_layers"] or [0] * L)]
-    attn_layers = [bool(x) for x in s["attn_layers"]] if s["attn_layers"] is not None else [not (lin_layers[i] or ssm_layers[i]) for i in range(L)]
+    attn_layers = [bool(x) for x in s["attn_layers"]] if s["attn_layers"] is not None else [not (lin_layers[i] or ssm_layers[i] or conv_layers[i]) for i in range(L)]
     mlp_layers = [bool(x) for x in (s["mlp_layers"] or [1] * L)]
 
     def raw(name, arr):
@@ -997,15 +1080,23 @@ def generate_generic(family, out_dir):
     for i in range(L):
         lp = P + s["layer"].format(i=i)
         d = {}
+        hd_l, nkv_l = layer_hd[i], layer_nkv[i]
+        vd_l = VD if s["mla"] else hd_l
         d["in_norm"] = normw(lp + s["in_norm"], H) if s["in_norm"] else None
         d["post_attn_norm"] = normw(lp + s["post_attn_norm"], H) if s["post_attn_norm"] else None
         d["pre_ff_norm"] = normw(lp + s["pre_ff_norm"], H) if s["pre_ff_norm"] else None
         d["post_ff_norm"] = normw(lp + s["post_ff_norm"], H) if s["post_ff_norm"] else None
         d["mlp_norm"] = normw(lp + s["mlp_norm"], H) if s["mlp_norm"] else None
-        qd, kvd = NH * HD, NKV * HD
+        qd, kvd = NH * hd_l, nkv_l * hd_l
         for name, shape in s["extra_layer_tensors"].get(i, []):
             weights[lp + name] = bf16_round(rng.normal(0, 0.2, size=shape))
-        if lin_layers[i] and s["linear_kind"] == "lightning":
+        if conv_layers[i]:
+            d["conv_in"] = mat(lp + "conv.in_proj.weight", 3 * H, H)
+            d["conv_w"] = bf16_round(rng.normal(0, 0.3, size=(H, s["conv_K"])))
+            weights[lp + "conv.conv.weight"] = d["conv_w"].reshape(H, 1, s["conv_K"])
+            d["o"] = mat(lp + "conv.out_proj.weight", H, H)
+            d["ob"] = None
+        elif lin_layers[i] and s["linear_kind"] == "lightning":
             d["light_qkv"] = mat(lp + "self_attn.qkv_proj.weight", 3 * qd, H)
             d["light_gate"] = mat(lp + "self_attn.output_gate.weight", qd, H)
             d["light_norm"] = normw(lp + "self_attn.norm.weight", qd)[0]
@@ -1076,26 +1167,50 @@ def generate_generic(family, out_dir):
             d["qkv"], d["qkv_b"] = w, b
         else:
             d["q"] = mat(lp + s["q"], (2 * qd if s["gated_q"] else qd), H)
-            d["k"] = mat(lp + s["k"], kvd, H)
-            d["v"] = mat(lp + s["v"], kvd, H)
+            own_kv = kv_source[i] == i
+            has_v = own_kv and not (s["k_eq_v"] and not sliding_of[i])
+            if own_kv:
+                d["k"] = mat(lp + s["k"], kvd, H)
+            if has_v:
+                d["v"] = mat(lp + s["v"], kvd, H)
             d["qb"] = bias_for(lp + s["q"], qd, s["attn_bias"])
-            d["kb"] = bias_for(lp + s["k"], kvd, s["attn_bias"])
-            d["vb"] = bias_for(lp + s["v"], kvd, s["attn_bias"])
+            d["kb"] = bias_for(lp + s["k"], kvd, s["attn_bias"]) if own_kv else None
+            d["vb"] = bias_for(lp + s["v"], kvd, s["attn_bias"]) if has_v else None
         if attn_layers[i]:
-            d["o"] = mat(lp + s["o"], H, NH * VD)
+            d["o"] = mat(lp + s["o"], H, NH * vd_l)
             d["ob"] = bias_for(lp + s["o"], H, s["attn_bias"] if s["o_bias"] is None else s["o_bias"])
         if ssm_layers[i]:
             d["ssm"] = ssm_weights(lp)
         if attn_layers[i] and s["qk_norm"] in ("head", "heads", "full"):
-            qn = {"head": HD, "heads": NH * HD, "full": NH * HD}[s["qk_norm"]]
-            kn = {"head": HD, "heads": NKV * HD, "full": NKV * HD}[s["qk_norm"]]
+            qn = {"head": hd_l, "heads": NH * hd_l, "full": NH * hd_l}[s["qk_norm"]]
+            kn = {"head": hd_l, "heads": nkv_l * hd_l, "full": nkv_l * hd_l}[s["qk_norm"]]
             d["qn"] = normw(lp + s["q_norm"], qn)
-            d["kn"] = normw(lp + s["k_norm"], kn)
+            if kv_source[i] == i:
+                d["kn"] = normw(lp + s["k_norm"], kn)
             if s["qk_norm"] == "heads":  # Cohere stores [heads, head_dim]
-                weights[lp + s["q_norm"]] = weights[lp + s["q_norm"]].reshape(NH, HD)
-                weights[lp + s["k_norm"]] = weights[lp + s["k_norm"]].reshape(NKV, HD)
+                weights[lp + s["q_norm"]] = weights[lp + s["q_norm"]].reshape(NH, hd_l)
+                weights[lp + s["k_norm"]] = weights[lp + s["k_norm"]].reshape(nkv_l, hd_l)
+        elif conv_layers[i] and s["qk_norm"] == "head":
+            pass
         if attn_layers[i] and s["sinks"]:
             d["sinks"] = vec(lp + s["sinks"], NH, 1.0)
+        if ple_dim:
+            d["ple_gate"] = mat(lp + "per_layer_input_gate.weight", ple_dim, H)
+            d["ple_out"] = mat(lp + "per_layer_projection.weight", H, ple_dim)
+            d["ple_norm"] = normw(lp + "post_per_layer_input_norm.weight", H)[0]
+        if altup:
+            A = altup["A"]
+            d["altup_scale"] = vec(lp + "altup.correct_output_scale", H, 0.5) if altup["correct_scale"] else None
+            d["altup_correct"] = mat(lp + "altup.correction_coefs.weight", A, A, 0.5)
+            d["altup_predict"] = mat(lp + "altup.prediction_coefs.weight", A * A, A, 0.5)
+            d["altup_router"] = mat(lp + "altup.modality_router.weight", A, H, 2.0)
+            d["altup_router_norm"] = normw(lp + "altup.router_norm.weight", H)[0]
+            d["laurel_l"] = mat(lp + "laurel.linear_left.weight", altup["rank"], H)
+            d["laurel_r"] = mat(lp + "laurel.linear_right.weight", H, altup["rank"])
+            d["laurel_norm"] = normw(lp + "laurel.post_laurel_norm.weight", H)[0]
+        if s["layer_scale"]:
+            d["layer_scale"] = bf16_round(1.0 + rng.normal(0, 0.1, size=(1,)))
+            weights[lp + "layer_scalar"] = d["layer_scale"]
         moe = s["moe"]
         if moe and i in moe["layers"] and mlp_layers[i]:
             mp = lp + moe["prefix"]
@@ -1190,7 +1305,7 @@ def generate_generic(family, out_dir):
         elif not mlp_layers[i]:
             pass  # single-block layer without an MLP
         else:
-            inter = I
+            inter = s["layer_inter"][i] if s["layer_inter"] else I
             if s["mlp"] == "gated":
                 d["gate"] = mat(lp + s["gate"], inter, H)
                 d["up"] = mat(lp + s["up"], inter, H)
@@ -1216,7 +1331,7 @@ def generate_generic(family, out_dir):
             tc[key] = V
     if "vocab_size" not in tc and "padded_vocab_size" not in tc:
         tc["vocab_size"] = V
-    if s["scaling"] and "rope_scaling" not in tc:
+    if s["scaling"] and "rope_scaling" not in tc and "rope_parameters" not in tc:
         tc["rope_scaling"] = s["scaling"]
     json.dump(config, open(f"{out_dir}/config.json", "w"), indent=1)
     json.dump({"eos_token_id": vocab[eos], "bos_token_id": vocab[bos] if bos else None, "do_sample": False}, open(f"{out_dir}/generation_config.json", "w"))
@@ -1285,10 +1400,12 @@ def generate_generic(family, out_dir):
         raise KeyError(a)
 
     rd = s["rotary_dim"]
+    # Global table: `rd` coordinates rotate with frequencies over `fd` (proportional rope).
+    rd, fd = s["global_rotary"] if s["global_rotary"] else (rd, rd)
 
-    def inv_freq_and_factor(theta):
-        inv = 1.0 / (theta ** (np.arange(0, rd, 2, dtype=np.float64) / rd))
-        sc = s["scaling"]
+    def inv_freq_and_factor(theta, rd=rd, fd=fd, sc=None):
+        inv = 1.0 / (theta ** (np.arange(0, rd, 2, dtype=np.float64) / fd))
+        sc = s["scaling"] if sc is None else (sc or None)
         factor = 1.0
         if sc and sc.get("type", sc.get("rope_type")) == "yarn":
             f = sc["factor"]
@@ -1328,7 +1445,14 @@ def generate_generic(family, out_dir):
         ang = np.outer(np.arange(T, dtype=np.float64), inv)
         return (np.cos(ang) * factor).astype(np.float32), (np.sin(ang) * factor).astype(np.float32)
 
+    def rope_tables_local(T):
+        theta, lrd = s["local_rope"]
+        inv, factor = inv_freq_and_factor(theta, lrd, lrd, {})
+        ang = np.outer(np.arange(T, dtype=np.float64), inv)
+        return (np.cos(ang) * factor).astype(np.float32), (np.sin(ang) * factor).astype(np.float32)
+
     def apply_rope(x, cos, sin, off):  # x [T, nh, HD]
+        rd = 2 * cos.shape[1]
         rot = x[..., off:off + rd]
         c, sn = cos[:, None, :], sin[:, None, :]
         if s["rope_style"] == "neox":
@@ -1360,9 +1484,14 @@ def generate_generic(family, out_dir):
             attn_scale = attn_scale * ms * ms
     rope_layers = s["rope_layers"] or ([1] * L if s["pos"] == "rope" else [0] * L)
     sliding_layers = s["sliding_layers"] or [0] * L
+    shared_kv = {}
+
+    def head_rms(x):
+        return x / np.sqrt(np.mean(x * x, -1, keepdims=True) + eps)
 
     def attention(d, li, h, cos, sin):
         T = h.shape[0]
+        HD, NKV, VD = layer_hd[li], layer_nkv[li], (s["VD"] if s["mla"] else layer_hd[li])
         if s["mla"]:
             m = s["mla"]
             nope, rp, vd = m["nope"], m["rope"], m["v"]
@@ -1403,10 +1532,19 @@ def generate_generic(family, out_dir):
                     k = f[:, :, g].reshape(T, kvd)
                     v = f[:, :, g + 1].reshape(T, kvd)
             else:
-                q, k, v = h @ d["q"].T, h @ d["k"].T, h @ d["v"].T
+                q = h @ d["q"].T
                 if d["qb"] is not None:
-                    q, k, v = q + d["qb"], k + d["kb"], v + d["vb"]
-                k = k * np.float32(s["mult"]["key"])
+                    q = q + d["qb"]
+                if kv_source[li] == li:
+                    k = h @ d["k"].T
+                    v = h @ d["v"].T if "v" in d else k.copy()
+                    if d["kb"] is not None:
+                        k = k + d["kb"]
+                    if d["vb"] is not None:
+                        v = v + d["vb"]
+                    k = k * np.float32(s["mult"]["key"])
+                else:
+                    k = v = None
                 gate = None
                 if s["gated_q"]:
                     q = q.reshape(T, NH, 2 * HD)
@@ -1416,25 +1554,41 @@ def generate_generic(family, out_dir):
                 q, k, v = (np.clip(t, -s["clip"], s["clip"]) for t in (q, k, v))
             qn = s["qk_norm"]
             use_rope = bool(rope_layers[li])
+            own_kv = kv_source[li] == li
             if qn == "full":
                 q = head_norm(q, *d["qn"])
-                k = head_norm(k, *d["kn"])
-            q, k, v = q.reshape(T, NH, HD), k.reshape(T, NKV, HD), v.reshape(T, NKV, HD)
+                if own_kv:
+                    k = head_norm(k, *d["kn"])
+            q = q.reshape(T, NH, HD)
+            if own_kv:
+                k, v = k.reshape(T, NKV, HD), v.reshape(T, NKV, HD)
             if qn == "head" and not s["qk_norm_after_rope"]:
-                q, k = head_norm(q, *d["qn"]), head_norm(k, *d["kn"])
+                q = head_norm(q, *d["qn"])
+                if own_kv:
+                    k = head_norm(k, *d["kn"])
             elif qn == "heads":
                 q = head_norm(q, d["qn"][0].reshape(NH, HD), None)
                 k = head_norm(k, d["kn"][0].reshape(NKV, HD), None)
             elif qn == "l2" and use_rope:
                 q, k = head_norm(q, None, None), head_norm(k, None, None)
             if use_rope:
-                q, k = apply_rope(q, cos, sin, 0), apply_rope(k, cos, sin, 0)
-            elif s["temp"]:
+                q = apply_rope(q, cos, sin, 0)
+                if own_kv:
+                    k = apply_rope(k, cos, sin, 0)
+            if s["temp"] and (not use_rope or s["temp"].get("all")):
                 p = np.arange(T, dtype=np.float32)
-                scl = np.log(np.floor((p + 1.0) / s["temp"]["floor_scale"]) + 1.0) * s["temp"]["attn_scale"] + 1.0
+                scl = np.log(np.floor((p + s["temp"].get("offset", 1.0)) / s["temp"]["floor_scale"]) + 1.0) * s["temp"]["attn_scale"] + 1.0
                 q = q * scl[:, None, None]
             if qn == "head" and s["qk_norm_after_rope"]:
-                q, k = head_norm(q, *d["qn"]), head_norm(k, *d["kn"])
+                q = head_norm(q, *d["qn"])
+                if own_kv:
+                    k = head_norm(k, *d["kn"])
+            if own_kv:
+                if s["v_norm"]:
+                    v = head_rms(v)
+                shared_kv[li] = (k, v)
+            else:
+                k, v = shared_kv[kv_source[li]]
             groups = NH // NKV
         slopes = alibi_slopes(NH) if s["pos"] == "alibi" else None
         out = np.zeros((T, NH, VD), np.float32)
@@ -1467,6 +1621,35 @@ def generate_generic(family, out_dir):
                 o = o + d["ob"]
         return o
 
+    def conv_block(d, h):
+        # LFM2 short convolution: B * x through a depthwise causal conv, gated by C.
+        T = h.shape[0]
+        bcx = h @ d["conv_in"].T
+        B, C, x = bcx[:, :H], bcx[:, H:2 * H], bcx[:, 2 * H:]
+        bx = B * x
+        K = d["conv_w"].shape[1]
+        y = np.zeros((T, H), np.float32)
+        for t in range(T):
+            for i in range(K):
+                if t - (K - 1 - i) >= 0:
+                    y[t] += d["conv_w"][:, i] * bx[t - (K - 1 - i)]
+        return (C * y) @ d["o"].T
+
+    def normal_ppf(p):
+        from math import erf
+        lo, hi = -10.0, 10.0
+        for _ in range(200):
+            mid = (lo + hi) / 2
+            if 0.5 * (1 + erf(mid / np.sqrt(2))) < p:
+                lo = mid
+            else:
+                hi = mid
+        return (lo + hi) / 2
+
+    def gaussian_topk(g, sparsity):
+        mean = g.mean(-1, keepdims=True)
+        std = np.sqrt(((g - mean) ** 2).mean(-1, keepdims=True))
+        return np.maximum(g - (mean + std * normal_ppf(sparsity)), 0)
     def lightning_attn(d, li, h):
         """MiniMax lightning attention (modeling_minimax.MiniMaxLightningAttention),
         as the per-token recurrence the blocked prefill is equivalent to."""
@@ -1702,7 +1885,7 @@ def generate_generic(family, out_dir):
             y = y + ex["db"]
         return y
 
-    def mlp(d, h):
+    def mlp(d, h, li=0):
         if "experts" in d:
             moe = s["moe"]
             E, K = moe["E"], moe["K"]
@@ -1731,7 +1914,7 @@ def generate_generic(family, out_dir):
                     gs = []
                     for g in range(ng):
                         grp = np.sort(choice[g * per:(g + 1) * per])[::-1]
-                        gs.append(grp[:2].sum() if d["corr_b"] is not None else grp[0])
+                        gs.append(grp[:2].sum() if (d["corr_b"] is not None or moe.get("group_top2")) else grp[0])
                     keep = np.argsort(-np.array(gs), kind="stable")[:moe["topk_group"]]
                     masked = np.full(E, -np.inf)
                     for g in keep:
@@ -1758,6 +1941,8 @@ def generate_generic(family, out_dir):
             g, u = h @ d["gate"].T, h @ d["up"].T
             if d["gb"] is not None:
                 g, u = g + d["gb"], u + d["ub"]
+            if s["sparsity"] and s["sparsity"][li] > 0:
+                g = gaussian_topk(g, s["sparsity"][li])
             m = act_fn(g * np.float32(s["mult"]["mlp_gate"])) * u
         elif s["mlp"] == "gated_fused":
             gu = h @ d["gate_up"].T
@@ -1781,6 +1966,89 @@ def generate_generic(family, out_dir):
             y = y + d["db"]
         return y * np.float32(s["mult"]["mlp_down"])
 
+    def rms_magnitude(x):
+        return np.sqrt(np.mean(x * x, -1, keepdims=True))
+
+    def per_layer_inputs(tokens, x):
+        # Gemma 3n / 4: normalised projection of the embedding plus the token's per-layer embedding.
+        T = len(tokens)
+        proj = (x @ ple_proj.T) * np.float32(H ** -0.5)
+        proj = proj.reshape(T, L, ple_dim)
+        proj = proj / np.sqrt(np.mean(proj * proj, -1, keepdims=True) + eps) * ple_norm
+        emb = ple_embed[tokens].reshape(T, L, ple_dim) * np.float32(np.sqrt(ple_dim))
+        return (proj + emb) * np.float32(2 ** -0.5)
+
+    def ple_block(d, first, ple_li):
+        g = act_fn(first @ d["ple_gate"].T) * ple_li
+        return norm(g @ d["ple_out"].T, (d["ple_norm"], None))
+
+    def modalities(d, x):
+        r = norm(x, (d["altup_router_norm"], None)) * np.float32(1.0 / H)
+        return np.tanh(r @ d["altup_router"].T)
+
+    def layer_std(d, li, x, h_fn, ple_li):
+        # Standard layer; returns the new residual. Single-block layers (Mamba2,
+        # Nemotron-H) hold either the mixer or the MLP behind the layer's one norm.
+        rm = np.float32(s["residual_mult"])
+        has_mixer = attn_layers[li] or ssm_layers[li] or lin_layers[li] or conv_layers[li]
+        h, a = x, None
+        if has_mixer:
+            h = norm(x, d["in_norm"]) if (d["in_norm"] is not None or s["norm"] == "none") and s["in_norm"] is not None else x
+            a = h_fn(h)
+            if d["post_attn_norm"] is not None:
+                a = norm(a, d["post_attn_norm"])
+        if s["residual_layout"] == "minimax":
+            # h = norm(x); x = alpha * h + beta * f(h) for both sublayers.
+            sa = s["mm_scales"]["linear" if lin_layers[li] else "full"]
+            x = np.float32(sa[0]) * h + np.float32(sa[1]) * a
+            h2 = norm(x, d["pre_ff_norm"])
+            sm = s["mm_scales"]["mlp"]
+            return np.float32(sm[0]) * h2 + np.float32(sm[1]) * mlp(d, h2, li)
+        if s["parallel"]:
+            m_in = norm(x, d["mlp_norm"]) if d["mlp_norm"] is not None else h
+            m = mlp(d, m_in, li)
+            if d["post_ff_norm"] is not None:
+                m = norm(m, d["post_ff_norm"])
+            x = x + rm * (a + m)
+        else:
+            if has_mixer:
+                x = x + rm * a
+            if mlp_layers[li]:
+                nw, tmpl = (d["pre_ff_norm"], s["pre_ff_norm"]) if has_mixer else (d["in_norm"], s["in_norm"])
+                h2 = norm(x, nw) if (nw is not None or s["norm"] == "none") and tmpl is not None else x
+                m = mlp(d, h2, li)
+                if d["post_ff_norm"] is not None:
+                    m = norm(m, d["post_ff_norm"])
+                x = x + rm * m
+        if "ple_gate" in d:
+            x = x + ple_block(d, x, ple_li)
+        if "layer_scale" in d:
+            x = x * d["layer_scale"]
+        return x
+
+    def layer_altup(d, li, streams, h_fn, ple_li):
+        # Gemma 3n: predict every stream, run the block on the active one, correct all streams.
+        A, active = altup["A"], altup["active"]
+        T = streams.shape[1]
+        mod = modalities(d, streams[active])
+        coefs = (mod @ d["altup_predict"].T).reshape(T, A, A)  # [t][a][i]
+        pred = streams + np.einsum("tai,itd->atd", coefs, streams)
+        act = pred[active]
+        h = norm(act, d["in_norm"])
+        laurel = h + norm((h @ d["laurel_l"].T) @ d["laurel_r"].T, (d["laurel_norm"], None))
+        a = norm(h_fn(h), d["post_attn_norm"])
+        attn_laurel = (act + a + laurel) / np.float32(np.sqrt(2))
+        m = norm(mlp(d, norm(attn_laurel, d["pre_ff_norm"]), li), d["post_ff_norm"])
+        activated = attn_laurel + m
+        cc = modalities(d, activated) @ d["altup_correct"].T + 1.0  # [t][a]
+        innovation = activated - pred[active]
+        corrected = pred + cc.T[:, :, None] * innovation[None]
+        first = corrected[active].copy()
+        if d["altup_scale"] is not None:
+            first = first * d["altup_scale"]
+        corrected[1:] += ple_block(d, first, ple_li)
+        return corrected
+
     def forward(tokens):
         T = len(tokens)
         x = embed[tokens] * np.float32(s["embed_scale"])
@@ -1790,60 +2058,54 @@ def generate_generic(family, out_dir):
             x = norm(x, embed_norm)
         hidden = [x.copy()]
         cos, sin = rope_tables(T)
-        rm = np.float32(s["residual_mult"])
-        mult = s["mult"]
-
-        def maybe_norm(v, nw, template):
-            return norm(v, nw) if (nw is not None or s["norm"] == "none") and template is not None else v
-
+        cos_l, sin_l = rope_tables_local(T) if s["local_rope"] else (cos, sin)
+        ple = per_layer_inputs(tokens, x) if ple_dim else None
+        shared_kv.clear()
+        streams = None
+        if altup:
+            target = rms_magnitude(x)
+            extra = []
+            for pw in altup_proj:
+                y = x @ pw.T
+                extra.append(y * target / np.sqrt(np.maximum(np.mean(y * y, -1, keepdims=True), 1e-5)))
+            streams = np.stack([x] + extra)
         for li, d in enumerate(layers):
-            has_mixer = attn_layers[li] or ssm_layers[li] or lin_layers[li]
-            a = None
-            if has_mixer:
-                h = maybe_norm(x, d["in_norm"], s["in_norm"])
+            c_, s_ = (cos_l, sin_l) if sliding_layers[li] else (cos, sin)
+
+            def h_fn(h, d=d, li=li, c_=c_, s_=s_):
+                if conv_layers[li]:
+                    return conv_block(d, h)
                 if lin_layers[li] and s["linear_kind"] == "lightning":
-                    a = lightning_attn(d, li, h)
-                elif lin_layers[li]:
-                    a = linear_attn(d, h)
-                elif ssm_layers[li] and attn_layers[li]:
-                    a = ssm_block(d, h) * np.float32(mult["ssm_out"]) + attention(d, li, h * np.float32(mult["attn_in"]), cos, sin) * np.float32(mult["attn_out"])
-                elif ssm_layers[li]:
-                    a = ssm_block(d, h)
-                else:
-                    a = attention(d, li, h, cos, sin)
-                if d["post_attn_norm"] is not None:
-                    a = norm(a, d["post_attn_norm"])
-            if s["residual_layout"] == "minimax":
-                # h = norm(x); x = alpha * h + beta * f(h) for both sublayers.
-                sa = s["mm_scales"]["linear" if lin_layers[li] else "full"]
-                x = np.float32(sa[0]) * h + np.float32(sa[1]) * a
-                h2 = norm(x, d["pre_ff_norm"])
-                sm = s["mm_scales"]["mlp"]
-                x = np.float32(sm[0]) * h2 + np.float32(sm[1]) * mlp(d, h2)
-                hidden.append(x.copy())
-                continue
-            if s["parallel"]:
-                m_in = norm(x, d["mlp_norm"]) if d["mlp_norm"] is not None else h
-                m = mlp(d, m_in)
-                if d["post_ff_norm"] is not None:
-                    m = norm(m, d["post_ff_norm"])
-                x = x + rm * (a + m)
+                    return lightning_attn(d, li, h)
+                if lin_layers[li]:
+                    return linear_attn(d, h)
+                if ssm_layers[li] and attn_layers[li]:
+                    mult = s["mult"]
+                    return ssm_block(d, h) * np.float32(mult["ssm_out"]) + attention(d, li, h * np.float32(mult["attn_in"]), c_, s_) * np.float32(mult["attn_out"])
+                if ssm_layers[li]:
+                    return ssm_block(d, h)
+                return attention(d, li, h, c_, s_)
+            ple_li = ple[:, li] if ple is not None else None
+            if altup:
+                streams = layer_altup(d, li, streams, h_fn, ple_li)
+                x = streams[0]
             else:
-                if has_mixer:
-                    x = x + rm * a
-                if mlp_layers[li]:
-                    # A single-block MLP layer is normalised by the layer's only norm.
-                    h2 = maybe_norm(x, d["pre_ff_norm"], s["pre_ff_norm"]) if has_mixer else maybe_norm(x, d["in_norm"], s["in_norm"])
-                    m = mlp(d, h2)
-                    if d["post_ff_norm"] is not None:
-                        m = norm(m, d["post_ff_norm"])
-                    x = x + rm * m
+                x = layer_std(d, li, x, h_fn, ple_li)
             hidden.append(x.copy())
+        if altup:
+            target = rms_magnitude(streams[0])
+            merged = [streams[0]]
+            for e, uw in enumerate(altup_unembed):
+                y = streams[e + 1] @ uw.T
+                merged.append(y * target / np.sqrt(np.maximum(np.mean(y * y, -1, keepdims=True), 1e-5)))
+            x = np.mean(np.stack(merged), 0)
         hfin = norm(x, final_norm) if s["norm"] != "none" else norm(x, None)
         logits = hfin @ lm_head.T
         if lm_bias is not None:
             logits = logits + lm_bias
         logits = logits * np.float32(s["logit_scale"])
+        if s["final_softcap"]:
+            logits = s["final_softcap"] * np.tanh(logits / s["final_softcap"])
         return logits, hidden
 
     cases = []

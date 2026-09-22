@@ -1370,7 +1370,7 @@ fn runLogits(model: *const Model, gpa: Allocator, ids: []const u32) ![]f32 {
     const c = &model.config;
     var ws = try model_mod.Workspace.init(gpa, c, 16, 1);
     defer ws.deinit();
-    var cache = try model_mod.KvCache.init(gpa, c.num_layers, 1, 16, c.num_kv_heads * c.head_dim);
+    var cache = try model_mod.KvCache.init(gpa, c.num_layers, 1, 16, c.kvDim());
     defer cache.deinit();
     const logits = try gpa.alloc(f32, c.vocab_size);
     errdefer gpa.free(logits);
