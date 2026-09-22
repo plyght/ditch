@@ -72,9 +72,9 @@ Families are described by an architecture registry (`src/arch.zig`), one entry
 per Hugging Face `model_type`. **93 families** are registered, from GPT-2,
 GPT-NeoX and BLOOM to Llama, Qwen, Gemma, Phi, GLM, Mistral, Granite, Kimi K3
 and DeepSeek V4.1 — dense and mixture-of-experts, Mamba and linear-attention
-hybrids, and quantised checkpoints; 88 of them are verified against a NumPy
-reference forward pass (`tools/make_fixture.py`), the rest implemented from the
-Hugging Face reference. **[docs/models.md](docs/models.md) is the full list**:
+hybrids, and quantised checkpoints; every one of them is verified against a
+NumPy reference forward pass (`tools/make_fixture.py`).
+**[docs/models.md](docs/models.md) is the full list**:
 every `model_type`, its aliases, what each fixture covers, and every caveat.
 
 The caveats worth knowing up front: image, video and audio models run through

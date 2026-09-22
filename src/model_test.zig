@@ -96,6 +96,9 @@ test "qwen3 fixture" {
 test "gemma3 fixture" {
     try checkFixture("gemma3");
 }
+test "gemma2 fixture (alternating local layers, attention and logit softcapping)" {
+    try checkFixture("gemma2");
+}
 test "qwen3_moe fixture (separate expert tensors)" {
     try checkFixture("qwen3_moe");
 }
@@ -237,6 +240,43 @@ test "lfm2 fixture" {
 test "mistral4 fixture" {
     try checkFixture("mistral4");
 }
+test "deepseek_v32 fixture (indexed_attention layers as dense, indexer tensors unread)" {
+    try checkFixture("deepseek_v32");
+}
+
+// The lightning indexer of DeepSeek V3.2 keeps the best `index_topk` keys, so
+// running the layer as dense attention is exactly the reference only while the
+// context fits that many tokens. The fixture prompts (and the tokens generated
+// from them) stay inside the bound; one token past it the forward pass refuses
+// rather than silently approximating.
+test "deepseek_v32 indexed_attention layers carry the index_topk bound" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const pool = tensor.Pool.init(io, 2);
+    const model = try model_mod.Model.load(gpa, io, &pool, "tests/fixtures/deepseek_v32");
+    defer model.deinit();
+    const c = &model.config;
+    const bound = c.index_bound orelse return error.NoIndexBound;
+    // One key per block, `index_topk` of them: exact up to 16 tokens.
+    try std.testing.expectEqual(@as(usize, 1), bound.block);
+    try std.testing.expectEqual(@as(usize, 16), bound.max_blocks);
+    try std.testing.expect(bound.fits(15));
+    try std.testing.expect(!bound.fits(16));
+    // Every layer is an `indexed_attention` layer, so none of them is sliding,
+    // linear or convolutional, and the indexer's own tensors are present in the
+    // checkpoint but bound to no weight the forward pass reads.
+    for (0..c.num_layers) |li| {
+        try std.testing.expect(!c.sliding_layers[li]);
+        try std.testing.expect(!c.linear_layers[li]);
+        try std.testing.expect(!c.conv_layers[li]);
+    }
+    for ([_][]const u8{ "wq_b.weight", "wk.weight", "k_norm.weight", "k_norm.bias", "weights_proj.weight" }) |suffix| {
+        const name = try std.fmt.allocPrint(gpa, "model.layers.0.self_attn.indexer.{s}", .{suffix});
+        defer gpa.free(name);
+        try std.testing.expect(model.find(name) != null);
+    }
+}
+
 test "gemma4 fixture" {
     try checkFixture("gemma4");
 }
@@ -684,6 +724,21 @@ test "lfm2 edit, export and streamed reload (short-conv out_proj as the attentio
 }
 test "mistral4 edit, export and streamed reload (MLA, fused softmax MoE, shared experts)" {
     try checkEditExportStream("mistral4");
+}
+test "mistral edit, export and streamed reload (sliding window on every layer, explicit head_dim)" {
+    try checkEditExportStream("mistral");
+}
+test "gemma2 edit, export and streamed reload (alternating local layers, softcapping)" {
+    try checkEditExportStream("gemma2");
+}
+test "mixtral edit, export and streamed reload (block_sparse_moe w1/w2/w3 experts)" {
+    try checkEditExportStream("mixtral");
+}
+test "qwen2_moe edit, export and streamed reload (gated shared expert, dense mlp_only layer)" {
+    try checkEditExportStream("qwen2_moe");
+}
+test "deepseek_v32 edit, export and streamed reload (indexer tensors pass through)" {
+    try checkEditExportStream("deepseek_v32");
 }
 test "gemma4 edit, export and streamed reload (per-layer head sizes, KV sharing, per-layer inputs)" {
     try checkEditExportStream("gemma4");

@@ -22,8 +22,7 @@ How a checkpoint is matched:
 
 **Verified** means the family's forward pass is checked against a NumPy
 reference built from the Hugging Face implementation (`tools/make_fixture.py`,
-`src/model_test.zig`). 88 of the 93 entries have such a fixture; the 5 that do
-not are implemented from the reference implementation and are marked below.
+`src/model_test.zig`). All 93 entries have such a fixture.
 
 | Group | Families |
 | --- | ---: |
@@ -43,7 +42,7 @@ Pre-norm attention with a gated (or relu²) MLP and llama-style tensor names.
 | `model_type` | Also matches | Fixture | What it covers / caveats |
 | --- | --- | :---: | --- |
 | `llama` | `mistral3_text`, `smollm`, `cwm`, `emu3_text_model`, `emu3` | yes | GQA, llama3 rope scaling, untied `lm_head`, byte-level BPE. Yi, SOLAR, TinyLlama, SmolLM 1/2 and Mistral 3 text configs are plain llama. |
-| `mistral` | `ministral` | no | llama layout with a sliding window on every layer and an explicit `head_dim`; covered by the llama fixture except the sliding window. |
+| `mistral` | `ministral` | yes | llama layout with a sliding window on every layer (the fixture window is shorter than the prompt, so the local mask bites) and an explicit `head_dim` that is not `hidden_size / num_attention_heads`. |
 | `ministral3` | — | yes | Ministral 3 query scaling on every layer, optional sliding window. |
 | `qwen2` | `qwen2_vl(_text)`, `qwen2_5_vl(_text)`, `qwen2_5_omni(_thinker/_text)` | yes | q/k/v biases, tied embeddings. The VL and Omni text configs take the same path. |
 | `qwen3` | `qwen3_vl`, `qwen3_vl_text` | yes | per-head q/k RMSNorm. Qwen3-VL text config uses the same path. |
@@ -76,7 +75,7 @@ Pre-norm attention with a gated (or relu²) MLP and llama-style tensor names.
 
 | `model_type` | Also matches | Fixture | What it covers / caveats |
 | --- | --- | :---: | --- |
-| `gemma2` | — | no | the gemma3 layout with alternating local layers plus logit softcapping; covered by the gemma3 fixture except the softcapping. |
+| `gemma2` | — | yes | (1+w) norms, pre/post feedforward norms, alternating local (sliding) and global layers, `query_pre_attn_scalar`, sqrt(H) embedding scale, `tanh` softcapping on the attention logits and on the output logits. |
 | `gemma3` | `gemma3_text` | yes | (1+w) norms, pre/post norms, per-head (1+w) q/k norms, sqrt(H) embedding scale, sliding layers with a local rope base, `query_pre_attn_scalar`, linear rope scaling. |
 | `gemma3n` | `gemma3n_text` | yes | AltUp residual streams, Laurel blocks, per-layer input embeddings, KV-shared layers, weightless value norm, gaussian-top-k gate sparsity, final logit softcapping. |
 | `gemma4` | `gemma4_text` | yes | global layers with their own head size and KV heads, proportional rope on global layers, keys reused as values (`attention_k_eq_v`), KV-shared layers, per-layer inputs, `layer_scalar`, double-wide MLPs on shared layers. The MoE block of gemma-4-26B-A4B (`enable_moe_block`) is not implemented. |
@@ -109,12 +108,12 @@ Dense attention with routed experts. Experts are edited per expert; see
 
 | `model_type` | Also matches | Fixture | What it covers / caveats |
 | --- | --- | :---: | --- |
-| `mixtral` | — | no | softmax top-k renormalised routing with Mixtral tensor names; shares the `qwen3_moe` routing path, no fixture of its own. |
-| `qwen2_moe` | — | no | the `qwen3_moe` routing plus a sigmoid-gated shared expert (no fixture for the shared expert). |
+| `mixtral` | — | yes | softmax top-k renormalised routing over the separate per-expert tensors released Mixtral checkpoints store (`block_sparse_moe.experts.{e}.w1` / `w2` / `w3`). |
+| `qwen2_moe` | — | yes | softmax top-k routing over experts of `moe_intermediate_size` plus a shared expert of `shared_expert_intermediate_size` behind a sigmoid `shared_expert_gate`, both different from the dense `intermediate_size` an `mlp_only_layers` layer keeps; `decoder_sparse_step` picks the routed layers. |
 | `qwen3_moe` | `qwen3_vl_moe(_text)`, `qwen3_omni_moe(_thinker/_text)` | yes | softmax top-k with renormalisation, dense layers via `mlp_only_layers`, separate / fused / transposed-fused expert tensors. |
 | `deepseek_v2` | `deepseek_ocr2`, `deepseek_ocr2_text`, `youtu` | yes | MLA with and without `q_lora_rank`, softmax group-limited top-k, shared experts, `first_k_dense_replace`, yarn with mscale. BF16/F16 and FP8 block-quantised checkpoints. |
 | `deepseek_v3` | — | yes | MLA, sigmoid routing with `e_score_correction_bias`, group-limited (`noaux_tc`) top-k, `routed_scaling_factor`, shared experts. BF16/F16 and FP8 checkpoints. |
-| `deepseek_v32` | — | no | DeepSeek V3.2-Exp: the V3 layout whose `indexed_attention` layers run as dense attention (see [exactness bounds](#sparse-indexer-exactness-bounds)). Covered by the `deepseek_v3` fixture. |
+| `deepseek_v32` | — | yes | DeepSeek V3.2-Exp: the V3 layout whose `indexed_attention` layers run as dense attention (see [exactness bounds](#sparse-indexer-exactness-bounds)). The fixture checks that dense equivalence inside `index_topk` and that the lightning indexer's own tensors are never read and pass through exports untouched. |
 | `kimi_k25` | — | yes | the Kimi K2.5 / K2.6 image-video wrapper around a DeepSeek V3 text config (`kimi_k2` or `deepseek_v3` under `text_config`), `language_model` prefix. Vision tower and projector pass through exports untouched. |
 | `llama4` | `llama4_text` | yes | top-1 sigmoid routing scaling the expert input, shared expert, transposed fused experts, `no_rope_layers` with attention temperature tuning, L2 qk norm. Chunked attention runs as full attention. |
 | `gpt_oss` | — | yes | attention sinks, alternating sliding layers, yarn, router bias with top-k softmax, interleaved fused experts with biases and the clamped swiglu. BF16 and MXFP4 checkpoints. |

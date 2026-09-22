@@ -7,9 +7,9 @@
 //! or moe.zig.
 //!
 //! Every entry documents what was verified against a NumPy reference fixture
-//! (`tools/make_fixture.py`, `src/model_test.zig`); entries marked
-//! `verified = false` are implemented from the Hugging Face reference
-//! implementation but have no fixture.
+//! (`tools/make_fixture.py`, `src/model_test.zig`). Every entry has such a
+//! fixture; `verified = false` marks a family implemented from the Hugging
+//! Face reference implementation but not yet checked against one.
 
 const std = @import("std");
 const tensor = @import("tensor.zig");
@@ -329,6 +329,13 @@ pub const Hyper = struct {
 pub const IndexBound = struct {
     block: usize,
     max_blocks: usize,
+
+    /// Whether dense attention is still exactly the reference for a query at
+    /// (zero-based) position `pos`: every complete key block it can reach is
+    /// one the indexer would have selected.
+    pub fn fits(self: IndexBound, pos: usize) bool {
+        return (pos + 1) / self.block <= self.max_blocks;
+    }
 };
 
 /// Qwen4-Exp per-layer n-gram embeddings (PLE, qwen4_exp.zig): hashed
@@ -3547,7 +3554,8 @@ pub const registry = [_]Arch{
         .aliases = &.{"ministral"},
         .llama_cpp = "llama",
         .chat = "mistral",
-        .notes = "llama layout with sliding window on every layer and an explicit head_dim; covered by the llama fixture (no sliding-window fixture).",
+        .verified = true,
+        .notes = "fixture: a sliding window on every layer (shorter than the prompt, so the local mask bites) and an explicit head_dim that is not hidden_size / num_attention_heads. Otherwise the llama layout.",
     },
     .{
         .model_type = "qwen2",
@@ -3578,7 +3586,8 @@ pub const registry = [_]Arch{
         .tie_word_embeddings = true,
         .embed_scale_sqrt = true,
         .names = gemma_names,
-        .notes = "gemma3 layout with alternating local layers and logit softcapping; covered by the gemma3 fixture except softcapping.",
+        .verified = true,
+        .notes = "fixture: (1 + w) norms, pre/post feedforward norms, alternating local (sliding) and global layers, query_pre_attn_scalar, sqrt(H) embedding scale, tanh softcapping on the attention logits and on the output logits.",
         .extra = extraGemma,
     },
     .{
@@ -3719,8 +3728,9 @@ pub const registry = [_]Arch{
         .llama_cpp = "qwen2moe",
         .chat = "chatml",
         .attention_bias = true,
+        .verified = true,
         .names = .{ .shared_expert = "mlp.shared_expert.", .shared_expert_gate = "mlp.shared_expert_gate.weight" },
-        .notes = "qwen3_moe routing plus a sigmoid-gated shared expert (no fixture for the shared expert).",
+        .notes = "fixture: softmax top-k routing over experts of moe_intermediate_size plus a shared expert of shared_expert_intermediate_size behind a sigmoid shared_expert_gate, both widths different from the dense intermediate_size a mlp_only_layers layer keeps; decoder_sparse_step picks the routed layers.",
     },
     .{
         .model_type = "qwen3_moe",
@@ -3745,7 +3755,8 @@ pub const registry = [_]Arch{
             .fused_gate_up = &.{},
             .fused_down = &.{},
         },
-        .notes = "qwen3_moe routing (softmax, top-k renormalised) with Mixtral tensor names; no fixture.",
+        .verified = true,
+        .notes = "fixture: softmax top-k routing with renormalisation over the separate per-expert tensors released Mixtral checkpoints store (block_sparse_moe.experts.{e}.w1 / w2 / w3).",
         .extra = extraMixtral,
     },
     .{
@@ -5135,7 +5146,8 @@ pub const registry = [_]Arch{
         .llama_cpp = "deepseek2",
         .chat = "deepseek",
         .names = deepseek_v3_names,
-        .notes = "DeepSeek V3.2-Exp: the V3 layout (MLA, sigmoid group-limited routing, shared experts) whose `indexed_attention` layers select the top `index_topk` keys with a lightning indexer; ditch runs them as dense attention, which is exact for prompts up to index_topk tokens. Covered by the deepseek_v3 fixture.",
+        .verified = true,
+        .notes = "fixture: DeepSeek V3.2-Exp, the V3 layout (MLA, sigmoid group-limited routing, shared experts) whose `indexed_attention` layers select the top `index_topk` keys with a lightning indexer; ditch runs them as dense attention, which is exactly the reference for prompts up to index_topk tokens and refused beyond it. The indexer's own tensors are never read and pass through exports untouched.",
         .extra = extraDeepseekV32,
     },
 };
@@ -5351,6 +5363,28 @@ test "parseConfig handles the swept families' keys" {
     );
     try std.testing.expectEqual(AttnGate.softplus, lag.attn_gate);
     try std.testing.expectEqual(@as(?f32, 5.0), lag.moe.router_softcap);
+    // Gemma 2 alternates local and global layers, scales the queries by
+    // `query_pre_attn_scalar` and softcaps both the attention and the output
+    // logits.
+    const g2 = try parseConfig(a,
+        \\{"model_type":"gemma2","hidden_size":32,"intermediate_size":32,"num_attention_heads":4,"num_key_value_heads":2,"num_hidden_layers":4,"head_dim":8,"vocab_size":100,"sliding_window":4,"query_pre_attn_scalar":16,"attn_logit_softcapping":1.0,"final_logit_softcapping":20.0}
+    );
+    try std.testing.expectEqualSlices(bool, &.{ true, false, true, false }, g2.sliding_layers);
+    try std.testing.expectEqual(@as(f32, 0.25), g2.attention_scale);
+    try std.testing.expectEqual(@as(?f32, 1.0), g2.attn_logit_softcapping);
+    try std.testing.expectEqual(@as(?f32, 20.0), g2.final_logit_softcapping);
+    // Qwen2-MoE: `decoder_sparse_step` picks the routed layers and
+    // `mlp_only_layers` takes some of them back out.
+    const q2m = try parseConfig(a,
+        \\{"model_type":"qwen2_moe","hidden_size":32,"intermediate_size":32,"moe_intermediate_size":12,"shared_expert_intermediate_size":16,"num_attention_heads":4,"num_key_value_heads":2,"num_hidden_layers":4,"vocab_size":100,"num_experts":4,"num_experts_per_tok":2,"decoder_sparse_step":2}
+    );
+    try std.testing.expectEqualSlices(bool, &.{ false, true, false, true }, q2m.moe_layers);
+    try std.testing.expectEqual(@as(usize, 12), q2m.moe_intermediate_size);
+    try std.testing.expectEqual(@as(usize, 32), q2m.intermediate_size);
+    const q2m_only = try parseConfig(a,
+        \\{"model_type":"qwen2_moe","hidden_size":32,"intermediate_size":32,"moe_intermediate_size":12,"num_attention_heads":4,"num_key_value_heads":2,"num_hidden_layers":4,"vocab_size":100,"num_experts":4,"num_experts_per_tok":2,"decoder_sparse_step":2,"mlp_only_layers":[3]}
+    );
+    try std.testing.expectEqualSlices(bool, &.{ false, true, false, false }, q2m_only.moe_layers);
     // Ministral 3 scales every layer's queries; Persimmon and CodeGen pick
     // their fused-qkv layouts.
     const min3 = try parseConfig(a,

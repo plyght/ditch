@@ -4304,9 +4304,9 @@ fn checkIndexBound(c: *const Config, li: usize, rows: []const Row) !void {
     const b = c.index_bound orelse return;
     if (c.linear_layers[li] or c.conv_layers[li]) return;
     var worst: usize = 0;
-    for (rows) |row| worst = @max(worst, (row.pos + 1) / b.block);
-    if (worst <= b.max_blocks) return;
-    std.log.err("layer {d}: {d} complete key blocks are reachable but the indexer keeps {d}; the dense equivalent is only exact for contexts up to {d} tokens", .{ li, worst, b.max_blocks, b.block * b.max_blocks });
+    for (rows) |row| worst = @max(worst, row.pos);
+    if (b.fits(worst)) return;
+    std.log.err("layer {d}: {d} complete key blocks are reachable but the indexer keeps {d}; the dense equivalent is only exact for contexts up to {d} tokens", .{ li, (worst + 1) / b.block, b.max_blocks, b.block * b.max_blocks });
     return error.ContextExceedsSparseIndexer;
 }
 
