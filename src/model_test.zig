@@ -30,7 +30,7 @@ pub fn checkFixture(comptime family: []const u8) !void {
     defer ws.deinit();
     var cache = try model_mod.KvCache.init(gpa, c.num_layers, ref.value.cases.len, 64, c.num_kv_heads * c.head_dim);
     defer cache.deinit();
-    if (c.has_linear) {
+    if (c.hasRecurrent()) {
         cache.linear = try model_mod.LinearCache.init(gpa, c, ref.value.cases.len);
     }
 
@@ -214,6 +214,111 @@ test "glm_moe_dsa fixture" {
     try checkFixture("glm_moe_dsa");
 }
 
+// Mamba families (selective state-space blocks with a per-sequence recurrent state).
+test "mamba2 fixture" {
+    try checkFixture("mamba2");
+}
+test "nemotron_h fixture" {
+    try checkFixture("nemotron_h");
+}
+test "falcon_h1 fixture" {
+    try checkFixture("falcon_h1");
+}
+test "falcon_h1 fixture (no gated norm)" {
+    try checkFixture("falcon_h1_nonorm");
+}
+test "jamba fixture" {
+    try checkFixture("jamba");
+}
+test "granitemoehybrid fixture" {
+    try checkFixture("granitemoehybrid");
+}
+test "granitemoehybrid fixture (no experts, rope)" {
+    try checkFixture("granitemoehybrid_dense");
+}
+
+/// Decoding one token at a time from the recurrent state must give the
+/// logits a fresh prefill of the longer prompt gives: the Mamba state of a
+/// sequence survives across forward calls exactly like the KV cache.
+fn checkDecodeMatchesPrefill(comptime family: []const u8) !void {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "tests/fixtures/" ++ family;
+    const pool = tensor.Pool.init(io, 2);
+    const model = try model_mod.Model.load(gpa, io, &pool, dir);
+    defer model.deinit();
+    const c = &model.config;
+    try std.testing.expect(c.has_ssm);
+    const prompt = [_]u32{ 40, 100, 200, 7, 3, 66 };
+    const extra = [_]u32{ 12, 90 };
+    var ws = try model_mod.Workspace.init(gpa, c, 16, 2);
+    defer ws.deinit();
+    // Two slots: the second sequence starts later and restarts once, so the
+    // per-slot bookkeeping (reset at position 0) is exercised too.
+    var cache = try model_mod.KvCache.initFor(model, gpa, 2, 16);
+    defer cache.deinit();
+    const step_logits = try gpa.alloc(f32, extra.len * c.vocab_size);
+    defer gpa.free(step_logits);
+    try model_mod.prefill(model, &ws, &cache, &.{ &prompt, prompt[0..3] }, null, null);
+    for (extra, 0..) |t, k| {
+        const rows = [_]model_mod.Row{.{ .b = 0, .pos = prompt.len + k }};
+        try model_mod.forward(model, &ws, &cache, &.{t}, &rows, .{ .logit_rows = &.{0} });
+        @memcpy(step_logits[k * c.vocab_size ..][0..c.vocab_size], ws.logits[0..c.vocab_size]);
+    }
+    for (0..extra.len) |k| {
+        const full = prompt ++ extra;
+        var fresh = try model_mod.KvCache.initFor(model, gpa, 1, 16);
+        defer fresh.deinit();
+        const logits = try gpa.alloc(f32, c.vocab_size);
+        defer gpa.free(logits);
+        try model_mod.prefill(model, &ws, &fresh, &.{full[0 .. prompt.len + k + 1]}, logits, null);
+        var max_err: f32 = 0;
+        for (logits, step_logits[k * c.vocab_size ..][0..c.vocab_size]) |a, b| max_err = @max(max_err, @abs(a - b));
+        try std.testing.expect(max_err < 1e-4);
+    }
+    // A slot that restarts at position 0 forgets its state; a gap is an error.
+    try model_mod.prefill(model, &ws, &cache, &.{ prompt[0..2], prompt[0..4] }, null, null);
+    const gap = [_]model_mod.Row{.{ .b = 1, .pos = 6 }};
+    try std.testing.expectError(error.NonContiguousRows, model_mod.forward(model, &ws, &cache, &.{1}, &gap, .{}));
+}
+
+// Warp mode (streamed weights with an expert cache) on the non-gated
+// Nemotron-H experts: two matrices per cache entry, same logits as mapped.
+test "nemotron_h warp mode matches mapped mode" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const pool = tensor.Pool.init(io, 2);
+    const dir = "tests/fixtures/nemotron_h";
+    const mapped = try model_mod.Model.load(gpa, io, &pool, dir);
+    defer mapped.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path_buf);
+    const scratch = try std.fs.path.join(gpa, &.{ path_buf[0..n], "scratch" });
+    defer gpa.free(scratch);
+    const warp = try model_mod.Model.loadWithOptions(gpa, io, &pool, dir, .{ .store = .streamed, .scratch_dir = scratch });
+    defer warp.deinit();
+    try std.testing.expect(warp.warp());
+    const ids = [_]u32{ 40, 100, 200, 7, 3 };
+    const a = try runLogits(mapped, gpa, &ids);
+    defer gpa.free(a);
+    const b = try runLogits(warp, gpa, &ids);
+    defer gpa.free(b);
+    try std.testing.expectEqualSlices(f32, a, b);
+    try std.testing.expect(warp.expert_cache.?.anyVisited());
+}
+
+test "mamba2 decode from the recurrent state matches prefill" {
+    try checkDecodeMatchesPrefill("mamba2");
+}
+test "jamba decode from the recurrent state matches prefill" {
+    try checkDecodeMatchesPrefill("jamba");
+}
+test "falcon_h1 decode from the recurrent state matches prefill" {
+    try checkDecodeMatchesPrefill("falcon_h1");
+}
+
 // ---------------------------------------------------------------------------
 // Abliteration, export and streaming on the registry layouts
 // ---------------------------------------------------------------------------
@@ -269,14 +374,26 @@ fn checkEditExportStream(comptime family: []const u8) !void {
     const dirs = try randomDirs(gpa, model.config.num_layers + 1, hidden, 7);
     defer gpa.free(dirs);
     try abliterate.apply(model, dirs, null, bothComponents(), .{ .row_normalization = .full, .lora_rank = 2 });
+    var n_edits: usize = 0;
     for (model.layers, 0..) |*layer, li| {
-        try std.testing.expect(model.getDelta(li, .attn_o_proj) != null);
+        // Single-block layers (Mamba2, Nemotron-H) hold only one of the two components.
+        if (model.hasComponent(li, .attn_o_proj)) {
+            try std.testing.expect(model.getDelta(li, .attn_o_proj) != null);
+            n_edits += 1;
+        } else try std.testing.expect(model.getDelta(li, .attn_o_proj) == null);
+        if (model.hasSsmOut(li)) {
+            try std.testing.expect(model.getSsmOutDelta(li) != null);
+            n_edits += 1;
+        }
         if (layer.moe) |*m| {
             for (0..m.experts.len) |e| try std.testing.expect(model.getExpertDelta(li, e) != null);
-        } else {
+            n_edits += 1;
+        } else if (model.hasComponent(li, .mlp_down_proj)) {
             try std.testing.expect(model.getDelta(li, .mlp_down_proj) != null);
-        }
+            n_edits += 1;
+        } else try std.testing.expect(model.getDelta(li, .mlp_down_proj) == null);
     }
+    try std.testing.expect(n_edits >= model.layers.len);
     const edited = try runLogits(model, gpa, &ids);
     defer gpa.free(edited);
     var moved: f32 = 0;
@@ -356,4 +473,19 @@ test "glm4_moe edit, export and streamed reload (per-head q/k norms, sigmoid MoE
 }
 test "glm_moe_dsa edit, export and streamed reload (MLA sparse indexer as dense)" {
     try checkEditExportStream("glm_moe_dsa");
+}
+test "mamba2 edit, export and streamed reload (Mamba out_proj as the attention output)" {
+    try checkEditExportStream("mamba2");
+}
+test "nemotron_h edit, export and streamed reload (single-block layers, non-gated experts)" {
+    try checkEditExportStream("nemotron_h");
+}
+test "falcon_h1 edit, export and streamed reload (o_proj and Mamba out_proj side by side)" {
+    try checkEditExportStream("falcon_h1");
+}
+test "jamba edit, export and streamed reload (Mamba1, separate expert tensors)" {
+    try checkEditExportStream("jamba");
+}
+test "granitemoehybrid edit, export and streamed reload (fused input_linear experts, shared_mlp)" {
+    try checkEditExportStream("granitemoehybrid");
 }
