@@ -316,3 +316,54 @@ What blocked completion on this machine (not a ditch bug):
 
 Peak RSS (warp, --max-ram 2GB): 1.06 GiB. hf:// stream: worked. Run completion:
 blocked by disk size on this machine, reported as above.
+
+## Step 5 — heretic comparison (Qwen/Qwen2.5-0.5B-Instruct, 30/10 trials, CPU)
+
+    $ heretic --model Qwen/Qwen2.5-0.5B-Instruct --n-trials 30 --n-startup-trials 10 \
+        --export-strategy MERGE   # heretic-llm 1.4.0, default (matching) datasets
+
+Notes on running heretic here: heretic 1.4.0 takes the model as `--model`
+(not positional as tools/compare_heretic.md's template says), its default
+`--study-checkpoint-dir` is `checkpoints` (the same as ditch's, so point it
+elsewhere or its optuna journal collides with ditch's and dies with
+`KeyError: 'op_code'`), and its menus were driven by setting
+`KAGGLE_KERNEL_RUN_TYPE` so `prompt_select` falls back to numbered stdin input.
+Its `pip` install replaced torch with a CUDA build (`2.14.0+cu130`), but with no
+GPU it runs on CPU (bitsandbytes' cu130 kernel warnings are harmless at the
+default `quantization=NONE`).
+
+Both tools, same model, same default datasets, 30 trials / 10 startup, CPU:
+
+| | ditch | heretic |
+| --- | ---: | ---: |
+| Wall clock (30 trials) | 49m56s | 21m24s |
+| Peak RSS (VmHWM / Max RSS) | 1.63 GiB | 3.07 GiB |
+| Per-trial (approx) | ~100 s | ~30 s |
+| Batch size (auto) | 32 | 128 |
+| Baseline Refusals | 90/100 | 92/100 |
+| Best-trial Refusals (own scorer) | 5/100 | 4/100 |
+| Best-trial KL (own scorer) | 0.0432 | 0.0358 |
+
+heretic is ~2.3x faster wall-clock here (torch's CPU BLAS with batch 128 vs
+ditch's pure-Zig kernels at the default max batch 32), while ditch uses about
+half the RAM and no Python/torch. The Pareto fronts are close: at ~5 refusals
+heretic is 4/100 @ 0.036 and ditch 5/100 @ 0.043; at ~10-15 refusals ditch
+10/100 @ 0.028 vs heretic 12/100 @ 0.027.
+
+### Same yardstick: ditch --evaluate-model on both exports
+
+Both exported models scored by ditch's *default* scorers (generation Refusals,
+first-token KL), so they are directly comparable:
+
+| Exported model (selected trial) | ditch Refusals | ditch KL |
+| --- | ---: | ---: |
+| ditch out/qwen2.5-0.5b-ditch (trial 8) | 5/100 | 0.0432 |
+| heretic out/heretic-qwen (trial 18) | 9/100 | 0.1401 |
+
+By ditch's common yardstick ditch's selected export has both fewer refusals
+(5 vs 9) and much lower KL (0.043 vs 0.140). heretic drove refusals to 4/100 by
+its own metric, but the trial it selected diverges more from the base model
+when re-measured with ditch's first-token KL. Seeds and the exact TPE streams
+differ between the tools, so this is one selected trial versus another, not a
+trial-by-trial equivalence; the fronts themselves (above) are the fairer
+comparison and are close.

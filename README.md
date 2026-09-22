@@ -218,8 +218,39 @@ hashes and rebuilds the model without a search.
 `ditch bench MODEL` prints prefill and decode throughput, direction
 extraction, apply and per-trial times, and peak memory as a Markdown table
 (`--bench-output file.md`). `tools/compare_heretic.md` describes how to
-measure Heretic on the same machine for a fair comparison; ditch does not
-publish real-model numbers it has not measured.
+measure Heretic on the same machine for a fair comparison.
+
+The numbers below were **measured on one machine** (4 vCPU x86-64, 15 GiB RAM,
+no GPU; a `ReleaseFast` build, CPU only) with the default Heretic datasets;
+they are a data point, not a spec, and your hardware will differ. The full run
+log is in [`tools/real-model-validation.md`](tools/real-model-validation.md).
+
+Automatic abliteration, 30 trials (10 startup), refusals out of 100:
+
+| Model | arch | Baseline → best refusals | Best-trial KL | Wall clock | Peak RSS |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Qwen2.5-0.5B-Instruct | qwen2 | 90 → 5 | 0.043 | 50 min | 1.6 GiB |
+| Qwen3-0.6B | qwen3 | 56 → 21 | 0.003 | 37 min* | 6.4 GiB |
+| SmolLM2-1.7B-Instruct | llama | 35 → 9 | 0.080 | 50 min* | 8.8 GiB |
+
+\* 10 trials. Phi-4-mini-instruct (`phi3`) and Qwen1.5-MoE-A2.7B-Chat
+(`qwen2_moe`, warp mode via `hf://`, peak RSS 1.1 GiB for a 27 GB model) also
+load and run; see the log for the partial results the machine's disk allowed.
+
+ditch vs. Heretic, Qwen2.5-0.5B-Instruct, same 30/10 trials and datasets, both
+CPU. Each exported model is also re-scored by ditch's default scorers so the
+two are on one yardstick:
+
+| | ditch | Heretic |
+| --- | ---: | ---: |
+| Wall clock | 50 min | 21 min |
+| Peak RSS | 1.6 GiB | 3.1 GiB |
+| Best-trial refusals / KL (own scorer) | 5 / 0.043 | 4 / 0.036 |
+| Export re-scored by ditch (refusals / KL) | 5 / 0.043 | 9 / 0.140 |
+
+Heretic is faster here (PyTorch BLAS, batch 128 vs ditch's default 32); ditch
+uses about half the RAM, no Python or PyTorch, and streams models larger than
+RAM. The Pareto fronts are close.
 
 ## How it works
 
