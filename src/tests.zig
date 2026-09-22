@@ -33,6 +33,7 @@ comptime {
     _ = @import("reproduce.zig");
     _ = @import("bench.zig");
     _ = @import("probe.zig");
+    _ = @import("pool_test.zig");
     _ = @import("compute.zig");
     _ = @import("selftest.zig");
     _ = @import("metal/shaders_test.zig");
