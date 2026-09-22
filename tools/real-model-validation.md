@@ -1050,3 +1050,284 @@ covers the selective scan, its per-sequence state and the Granite multipliers
 on a real checkpoint. `granite-4.0-micro` (3B) loads and probes correctly too,
 but a float32 transformers reference for it does not fit in 15 GiB, so the
 350m sibling carries the comparison.
+
+## Bug 19 — AFMoE roped its full-attention layers (fixed)
+
+**Symptom.** `onnx-internal-testing/tiny-random-AfmoeForCausalLM` — the only
+public AFMoE checkpoint small enough to put next to transformers — diverged:
+
+    residuals diverge first at layer 2: max |difference| 0.71739 = 1.70e-01 of |reference| 4.2087
+    first-token logits: max |diff| = 0.0498, relative to range 0.99: 5.04e-02
+
+Residual 2 is the output of layer 1, and layer 1 is the one full-attention
+layer in the stub (`global_attn_every_n_layers` makes every *n*-th layer
+global and the rest sliding).
+
+**Cause.** `AfmoeAttention` applies its rotary embedding under
+`if self.is_local_attention`: AFMoE's full-attention layers are NoPE. ditch
+roped every layer, so the global layer got positions it should not have.
+`arcee-ai/Trinity-Nano-Preview`, the released `afmoe`, has 56 layers of which
+14 are global, so this was wrong on a real checkpoint too — it just was not
+visible in a config check.
+
+**Fix.** `extraAfmoe` copies `sliding_layers` into `rope_layers`; the
+attention kernel already honours `rope_layers` per layer. The fixture
+generator's `afmoe` spec gets the matching `rope_layers=[1, 0, 1]` and the
+fixture is regenerated.
+
+**Verification.** `onnx-internal-testing/tiny-random-AfmoeForCausalLM`,
+float32, both prompts:
+
+| | before | after |
+| --- | --- | --- |
+| first layer that diverges | 2 | none: all 5 agree |
+| worst residual, relative | 1.70e-01 | 9.99e-07 |
+| first-token logits, relative to range | 5.04e-02 | 3.93e-07 |
+
+## Bug 20 — a per-layer-type rope kept the global rotary width (fixed)
+
+**Symptom.** found while chasing Laguna (see the handoff). A config whose
+`rope_parameters` is a table keyed by layer type can give each type its own
+`partial_rotary_factor` as well as its own base.
+`hf-tiny-v2/tiny-random-LagunaForCausalLM` is the first registered family
+that does:
+
+    "rope_parameters": {
+      "full_attention":    { "partial_rotary_factor": 0.5, "rope_theta": 500000.0 },
+      "sliding_attention": { "partial_rotary_factor": 1.0, "rope_theta": 10000.0  }
+    }
+
+**Cause.** `parseConfig` read the local entry's `rope_theta` into
+`rope_local` but reused the *global* `rotary_dim` for its `rotary_dim` and
+`freq_dim`, so the sliding layers rotated the full-attention width. In the
+stub that is half a head instead of a whole one.
+
+`LagunaRotaryEmbedding.forward` builds `inv_freq` per layer type from that
+type's own `dim = int(head_dim * partial_rotary_factor)`, and
+`apply_rotary_pos_emb` slices `q[..., :cos.shape[-1]]`, so the rotated width
+follows the per-type factor.
+
+**Fix.** the local entry's own `partial_rotary_factor`, where it has one,
+sets `rotary_dim`/`freq_dim` for `rope_local`, rounded down to an even number
+of coordinates exactly as the global one is.
+
+**Effect.** Laguna's worst relative residual falls from 9.76e-02 to 2.40e-02
+and its first-token logits from 5.98e-02 to 1.22e-02. It is *not* exact — the
+rest is a separate problem, recorded in the handoff below. No other family
+regresses: `zig build test` is 253/253 and `tests/e2e.sh` passes.
+
+## Tiny random-weight stubs: one forward-pass comparison per family
+
+Most of the registry's families have no checkpoint this machine can hold. The
+`hf-tiny-v2/tiny-random-*` repos (and the `onnx-internal-testing/`,
+`optimum-intel-internal-testing/`, `peft-internal-testing/` and
+`tiny-random/` ones) are 10–70 MB models with random weights but the family's
+real module layout, safetensors and `tokenizer.json`. The weights are
+meaningless, which does not matter: ditch and transformers read the *same*
+weights, so the comparison still exercises every kernel, name template and
+config hook the family uses.
+
+    $ ditch probe models/<repo> --prompt 'The capital of France is' --prompt 'Hello world' \
+        --raw --residuals --json > p.json
+    $ python3 tools/probe_reference.py models/<repo> p.json --dtype float32 --raw
+
+**57 families compare exactly** (every residual within 1e-5 relative, and
+first-token logits under 1e-5 of the logit range):
+
+`afmoe` (after bug 19), `apertus`, `arcee`, `bloom`, `codegen`,
+`deepseek_v2`, `deepseek_v3`, `deepseek_v32`, `dots1`, `ernie4_5`, `exaone4`,
+`exaone_moe`, `falcon`, `falcon_h1`, `flex_olmo`, `gemma2`, `glm4`,
+`glm4_moe`, `glm4_moe_lite`, `glm_moe_dsa`, `gpt2`, `gpt_bigcode`, `gpt_neo`,
+`gpt_neox`, `gpt_oss`, `gptj`, `granite`, `granite_swa`, `granitemoe`,
+`granitemoehybrid`, `helium`, `hunyuan_v1_dense`, `hunyuan_v1_moe`, `hy_v3`,
+`jais2`, `jamba`, `lfm2`, `mellum`, `minimax_m2`, `mpt`, `nemotron`, `olmo`,
+`olmo2`, `olmoe`, `opt`, `persimmon`, `phi`, `phi3`, `qwen2_moe`,
+`qwen3_moe`, `qwen3_next`, `seed_oss`, `smollm3`, `solar_open`, `stablelm`,
+`starcoder2`, `xglm`.
+
+That is the first numerical check for `jais2`, `persimmon`, `gptj`,
+`flex_olmo`, `hy_v3` and `granite_swa`, none of which has a released
+checkpoint this machine can load (gated, no safetensors, or a SentencePiece
+tokenizer ditch does not read).
+
+Five families do **not** compare exactly. In every one of them the argmax and
+the top-5 still match, so the error is small but real:
+
+| family | stub | first divergence | worst residual | first-token logits |
+| --- | --- | :---: | ---: | ---: |
+| `laguna` | `hf-tiny-v2/tiny-random-LagunaForCausalLM` | layer 2 | 2.40e-02 | 1.22e-02 |
+| `ernie4_5_moe` | `hf-tiny-v2/tiny-random-Ernie4_5_MoeForCausalLM` | layer 1 | 2.70e-02 | 1.88e-02 |
+| `cohere` | `hf-tiny-v2/tiny-random-CohereForCausalLM` | layer 1 | 4.82e-03 | 2.10e-03 |
+| `nanochat` | `hf-tiny-v2/tiny-random-NanoChatForCausalLM` | layer 1 | 4.70e-03 | 2.45e-03 |
+| `minimax` | `hf-tiny-v2/tiny-random-MiniMaxForCausalLM` | layer 2 | 3.98e-03 | 2.00e-03 |
+
+`mamba2` (`hf-tiny-v2/tiny-random-Mamba2ForCausalLM`) reads as a divergence
+of 8.91e-01 "at layer 0, the embedding output" while its first-token logits
+agree to 2.86e-07 — transformers' Mamba2 does not report the raw embedding as
+`hidden_states[0]`, so that one is the comparison script's, not ditch's. The
+same applies to `gemma3_text` via `hf-tiny-v2/tiny-random-Gemma3Model`: all
+residuals agree to 3e-07 but the logits differ by 7.6e-01 with a different
+argmax, because the stub is the bare `Gemma3Model` with no `lm_head`, so
+`AutoModelForCausalLM` gives the reference a freshly initialised random head.
+Neither needs a fix in ditch; both need a better harness.
+
+Nine stubs ditch declines to load:
+
+| stub | error |
+| --- | --- |
+| `hf-tiny-v2/tiny-random-Qwen3_5Model` | `embedding tensor '{p}embed_tokens.weight' not found under any known prefix` |
+| `hf-tiny-v2/tiny-random-Qwen3_5MoeModel` | same |
+| `hf-tiny-v2/tiny-random-Kimi_K25Model` | same |
+| `hf-tiny-v2/tiny-random-Gemma3nModel` | same |
+| `hf-tiny-v2/tiny-random-NemotronHForCausalLM` | `embedding tensor '{p}embeddings.weight' not found under any known prefix` |
+| `hf-tiny-v2/tiny-random-MiMoV2FlashForCausalLM` | `InvalidConfig` |
+| `hf-tiny-v2/tiny-random-DeepseekV4ForCausalLM` | `missing tensor: model.layers.0.post_attention_layernorm.weight` |
+| `hf-tiny-v2/tiny-random-Gemma4Model` | `Gemma 4 MoE block … is not implemented` (a documented limitation) |
+| `tiny-random/minicpm4` | reference needs `trust_remote_code` |
+
+The first seven are very likely stub-layout artifacts rather than registry
+bugs: every one of the corresponding *released* checkpoints —
+`Qwen/Qwen3.5-397B-A17B`, `moonshotai/Kimi-K2.5`,
+`XiaomiMiMo/MiMo-V2-Flash`, `deepseek-ai/DeepSeek-V4-Flash` and the
+Nemotron-H family — resolved all of its tensor names in the `hf://` config
+checks above. They are worth a second look all the same; see the handoff.
+
+## Handoff
+
+Where the 26 families this pass added stand, what is still open, and what to
+run next.
+
+### The 26 newly registered families
+
+None is untouched. "stub" is the tiny-random forward-pass comparison of the
+section above; "real" is a comparison against transformers on a released
+checkpoint; "config" is `ditch --dry-run hf://…`, which resolves every tensor
+name and the memory estimate without downloading weights.
+
+| family | stub | real | config | note |
+| --- | :---: | :---: | :---: | --- |
+| `afmoe` | exact | — | `arcee-ai/Trinity-Nano-Preview` | bug 19 |
+| `apertus` | exact | — | `swiss-ai/Apertus-8B-Instruct-2509` | |
+| `arcee` | exact | — | `arcee-ai/AFM-4.5B` | |
+| `biogpt` | — | exact forward pass | — | no fast tokenizer; not runnable from its released files |
+| `bitnet` | — | — | — | refused: no released checkpoint can be run (bug 15) |
+| `codegen` | exact | `Salesforce/codegen-350M-mono` | — | `.bin` only; re-saved as safetensors |
+| `deepseek_v32` | exact | — | `deepseek-ai/DeepSeek-V3.2-Exp` | |
+| `dots1` | exact | — | `rednote-hilab/dots.llm1.inst` | |
+| `ernie4_5` | exact | `baidu/ERNIE-4.5-0.3B-PT` | — | chat template is not the model's |
+| `exaone_moe` | exact | — | — | |
+| `flex_olmo` | exact | — | — | released checkpoint is 401 |
+| `gpt_neo` | exact | `EleutherAI/gpt-neo-125m` | — | |
+| `gptj` | exact | — | — | `EleutherAI/gpt-j-6b` has no safetensors at all |
+| `granite_swa` | exact | — | — | |
+| `helium` | exact | `kyutai/helium-1-preview-2b` | — | bugs 16, 17, 18 |
+| `hunyuan_v1_dense` | exact | `tencent/Hunyuan-0.5B-Instruct` | — | chat template is not the model's |
+| `hy_v3` | exact | — | — | no released text checkpoint exists |
+| `jais2` | exact | — | — | `inception42/Jais-2-8B-Chat` is gated |
+| `laguna` | **2.40e-02** | — | — | **open**, see below |
+| `mellum` | exact | — | `JetBrains/Mellum2-12B-A2.5B-Instruct` | |
+| `ministral3` | — | — | `mistralai/Ministral-3-3B-Instruct-2512` | |
+| `nanochat` | **4.70e-03** | — | — | **open**; no HF-format release either |
+| `olmoe` | exact | — | `allenai/OLMoE-1B-7B-0924-Instruct` | |
+| `persimmon` | exact | — | — | `adept/persimmon-8b-chat` ships a SentencePiece `tokenizer.model` only |
+| `solar_open` | exact | — | `upstage/Solar-Open-100B` | |
+| `xglm` | exact | `facebook/xglm-564M` | — | bug 14 |
+
+### Open: `laguna` diverges inside its sliding-attention layer
+
+**Symptom.** after bug 20, `hf-tiny-v2/tiny-random-LagunaForCausalLM` still
+differs from transformers:
+
+    residuals diverge first at layer 2: max |difference| 0.00118 = 2.40e-02 of |reference| 0.0491
+    first-token logits: max |diff| = 0.0123, relative to range 1.01: 1.22e-02
+
+**What is already ruled out.** The stub has two layers: layer 0 is
+`full_attention` + dense MLP, layer 1 is `sliding_attention` + the sparse MoE.
+Residual 1 (the output of layer 0) agrees to 3.7e-09, so the shared pieces —
+embedding, the per-head q/k RMSNorm, the softplus gate, the attention scale,
+the partial rotary on the *global* width and base, the dense MLP — are all
+right. The MoE block was replicated in NumPy from the checkpoint's own
+weights (sigmoid router, `e_score_correction_bias` on the selection only,
+top-2 renormalised, `gate_up_proj`/`down_proj` 3-D experts, shared expert) and
+matches the reference to 2.3e-10. So the error is in the *sliding*
+attention of layer 1, and nowhere else.
+
+**Suspects, in the order worth trying.**
+1. The sliding layer's rope. Its entry is `theta 10000`,
+   `partial_rotary_factor 1.0`, versus `theta 500000`, `0.5` for the global
+   layer. Check that ditch is applying `rope_local` to the layers
+   `layer_types` marks `sliding_attention` and not the complement, and that
+   `freq_dim` and `rotary_dim` are both 8 (the whole head) for it after
+   bug 20. A one-layer NumPy replication of `LagunaAttention` on layer 1,
+   fed the reference's own layer-1 input, would settle it in minutes.
+2. The sliding-window mask. `sliding_window` is 32 and the prompts are 5 and
+   2 tokens, so it should not bite at all — but if ditch offsets the window
+   by one it would, and that is cheap to check by re-running with a prompt
+   longer than 32 tokens and seeing whether the error grows.
+3. `num_attention_heads_per_layer` (`[2, 2]` in the stub, so inert here, but
+   a released Laguna may vary it per layer, and the registry has nowhere to
+   put a per-layer head count).
+
+**Reproduction** (the stub is 32 MB):
+
+    $ python3 /home/user/val/dl.py hf-tiny-v2/tiny-random-LagunaForCausalLM
+    $ ditch probe models/hf-tiny-v2__tiny-random-LagunaForCausalLM \
+        --prompt 'The capital of France is' --prompt 'Hello world' \
+        --raw --residuals --json > p.json
+    $ python3 tools/probe_reference.py models/hf-tiny-v2__tiny-random-LagunaForCausalLM \
+        p.json --dtype float32 --raw
+
+The reference is `transformers/models/laguna/modeling_laguna.py`, which is
+readable and short.
+
+### What to run next, in priority order
+
+1. **Finish `laguna`** as above. It is the only known wrong forward pass.
+2. **`ernie4_5_moe`, 2.70e-02 at layer 1** —
+   `hf-tiny-v2/tiny-random-Ernie4_5_MoeForCausalLM`. The dense `ernie4_5` is
+   exact on a real checkpoint, so the error is in the MoE block: check the
+   router (`moe_statics.e_score_correction_bias`, `moe_use_aux_free`), the
+   shared expert, and whether `moe_layer_start_index` puts the first routed
+   layer where ditch puts it. `baidu/ERNIE-4.5-21B-A3B-PT` is the released
+   one and is config-checked only.
+3. **`cohere`, 4.82e-03 at layer 1** —
+   `hf-tiny-v2/tiny-random-CohereForCausalLM`. Cohere's layer is the parallel
+   attention+MLP one with a single input norm and `logit_scale`; the parallel
+   residual is the thing to check. A real check is cheap:
+   `CohereForAI/aya-expanse-8b` fits on this machine at bfloat16.
+4. **`minimax`, 3.98e-03 at layer 2** —
+   `hf-tiny-v2/tiny-random-MiniMaxForCausalLM`, the lightning-attention M1
+   family (`minimax_m2` is exact). The stub alternates lightning and softmax
+   layers; the divergence is at the first lightning layer's output.
+5. **`nanochat`, 4.70e-03 at layer 1** —
+   `hf-tiny-v2/tiny-random-NanoChatForCausalLM`. Note that this stub uses the
+   Hugging Face tensor names, so it exercises the registry entry that the one
+   third-party conversion (`dnakov/nanochat-d20`, nanoGPT names) does not.
+6. **Re-check the seven stubs ditch would not load**, to be sure they are
+   layout artifacts and not registry bugs. The quickest test is
+   `ditch --dry-run` on each stub with `--print-debug-information` and a
+   comparison of the printed names against
+   `python3 -c "from safetensors import safe_open; ..."` on the same file.
+   Start with `hf-tiny-v2/tiny-random-NemotronHForCausalLM`, whose
+   `embeddings.weight` spelling is a plausible real gap.
+7. **Four comparisons never produced a verdict** and should simply be re-run:
+   `onnx-internal-testing/tiny-random-Mistral4ForCausalLM` (reference raised a
+   `ValueError`), `optimum-intel-internal-testing/tiny-random-llama4`
+   (`TypeError`), `optimum-intel-internal-testing/tiny-random-exaone` and
+   `tiny-random/minicpm4` (both need `trust_remote_code=True`, which
+   `tools/probe_reference.py` does not pass).
+8. **Two chat-template gaps**, both recorded above and neither a forward-pass
+   bug: `ernie4_5` renders `<|begin_of_sentence|>You are …\nUser: …\nAssistant: `
+   and `hunyuan_v1_dense` renders `…<｜hy_User｜>…<｜hy_Assistant｜>`. ditch
+   falls back to a generic template for both, so its studies on those families
+   do not see the prompts the model was trained on. Same class as the
+   Qwen 3.5 `<think>` gap.
+
+### Tools left behind
+
+`tools/probe_reference.py` grew `--raw`, `--residual-tolerance` and the
+final-norm hook this pass; `ditch probe --residuals` is what feeds it. The
+helper scripts used here (`dl.py`, `cfgcheck.sh`, `runtiny.sh`, `runraw.sh`,
+`tokcheck.py`, `dequant_ref.py`) live in `/home/user/val` on the validation
+machine and are not part of the repository — they are three-line wrappers
+around the two commands above and are quicker to rewrite than to port.
