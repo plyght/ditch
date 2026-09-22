@@ -100,9 +100,22 @@ pub const Source = struct {
         defer dir.close(io);
         try out.print("* Remote weights from {s} (chunk cache {s})\n", .{ self.base_url, self.dir_path });
         try out.flush();
-        const required = [_][]const u8{ "config.json", "tokenizer.json" };
+        try self.fetchSmall(dir, "config.json", true, out);
+        // tokenizer.json, else the tiktoken vocabularies of Kimi (tiktoken.model) and Llama 3 (tokenizer.model).
+        const tokenizer_files = [_][]const u8{ "tokenizer.json", "tiktoken.model", "tokenizer.model" };
+        var have_tokenizer = false;
+        for (tokenizer_files) |name| {
+            try self.fetchSmall(dir, name, false, out);
+            if (dir.access(io, name, .{})) |_| {
+                have_tokenizer = true;
+                break;
+            } else |_| {}
+        }
+        if (!have_tokenizer) {
+            std.log.err("no tokenizer.json, tiktoken.model or tokenizer.model at {s}", .{self.base_url});
+            return error.ModelNotFound;
+        }
         const optional = [_][]const u8{ "tokenizer_config.json", "generation_config.json", "special_tokens_map.json", "chat_template.jinja", "model.safetensors.index.json" };
-        for (required) |name| try self.fetchSmall(dir, name, true, out);
         for (optional) |name| try self.fetchSmall(dir, name, false, out);
 
         // Shard list from the index (or the single-file layout).

@@ -5,9 +5,10 @@ forward pass, used to validate ditch's inference against known-good numbers.
 Usage: make_fixture.py <family> [<out_dir>] [--gguf]
     family: llama | qwen2 | qwen3 | gemma3 | qwen3_moe | qwen3_moe_fused | qwen3_moe_fused_t
             or any family of the registry-driven generator (`SPECS` below:
-            phi3, phi, gpt_neox, gpt2, falcon, ... , gpt_oss, deepseek_v3,
-            the Mamba families mamba2, nemotron_h, falcon_h1, jamba,
-            granitemoehybrid and their variants)
+            phi3, phi, gpt_neox, gpt2, falcon, ... , gpt_oss, deepseek_v3, kimi_linear,
+            the Mamba families mamba2, nemotron_h, falcon_h1, jamba, granitemoehybrid
+            and their variants, and the quantised variants qwen2_fp8, qwen2_int4,
+            gpt_oss_mxfp4)
             | qwen3_moe_big
     --gguf: additionally write <out_dir>_gguf/model.gguf, the same model as a
             llama.cpp GGUF file (f16 attention and embedding matrices, Q8_0
@@ -65,6 +66,115 @@ def bf16_bits(a):
     a = np.ascontiguousarray(a, dtype=np.float32)
     u = a.view(np.uint32)
     return ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16)
+
+
+# ---------------------------------------------------------------------------
+# Quantised checkpoint variants. A spec with `quant` stores its linear weights
+# (or, for MXFP4, its fused expert tensors) in one of the quantised safetensors
+# layouts ditch dequantises on load; the reference forward pass runs on the
+# dequantised (bf16-rounded) values, exactly what the loader must produce.
+#   fp8:   DeepSeek V3 / Kimi K2 style `weight` F8_E4M3 + `weight_scale_inv` F32
+#          with block scales (`weight_block_size` in quantization_config).
+#   int:   compressed-tensors pack-quantized: `weight_packed` I32 (num_bits-wide
+#          fields packed densely, little end first), `weight_scale` BF16 per
+#          group, `weight_zero_point` (asymmetric, packed along the rows) and
+#          `weight_shape` I64.
+#   mxfp4: gpt-oss `*_blocks` U8 (E2M1 nibble pairs, low nibble first) and
+#          `*_scales` U8 (E8M0, bias 127) per 32 elements of the natural
+#          [E, out, in] layout; the bf16 tensor is its [E, in, out] transpose.
+# ---------------------------------------------------------------------------
+
+E2M1_VALUES = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], np.float32)
+
+
+def fp8_e4m3_table():
+    """Value of every F8_E4M3 code (OCP fn variant: no infinities, 0x7f/0xff are NaN)."""
+    codes = np.arange(256, dtype=np.uint32)
+    sign, exp, man = codes >> 7, (codes >> 3) & 0xF, (codes & 7).astype(np.float64)
+    val = np.where(exp == 0, man / 8 * 2.0 ** -6, (1 + man / 8) * 2.0 ** (exp.astype(np.float64) - 7))
+    val = np.where((exp == 15) & (man == 7), np.nan, val)
+    return np.where(sign == 1, -val, val).astype(np.float32)
+
+
+def nearest_code(x, table):
+    """Index of the table entry nearest to every element of `x` (NaN entries never match)."""
+    t = np.where(np.isnan(table), np.inf, table)
+    return np.abs(np.asarray(x, np.float32)[..., None] - t).argmin(-1)
+
+
+def quant_fp8_block(name, w, block):
+    """DeepSeek-style FP8: one f32 scale per `block` (rows, cols) tile, `w = code * scale`."""
+    table = fp8_e4m3_table()
+    br, bc = block
+    out_, in_ = w.shape
+    nb0, nb1 = -(-out_ // br), -(-in_ // bc)
+    scale = np.zeros((nb0, nb1), np.float32)
+    codes = np.zeros(w.shape, np.uint8)
+    deq = np.zeros(w.shape, np.float32)
+    for i in range(nb0):
+        for j in range(nb1):
+            blk = w[i * br:(i + 1) * br, j * bc:(j + 1) * bc]
+            s = np.float32(max(float(np.abs(blk).max()), 1e-12) / 448.0)
+            scale[i, j] = s
+            c = nearest_code(blk / s, table)
+            codes[i * br:(i + 1) * br, j * bc:(j + 1) * bc] = c
+            deq[i * br:(i + 1) * br, j * bc:(j + 1) * bc] = table[c] * s
+    return bf16_round(deq), [(name, "F8_E4M3", codes), (name + "_scale_inv", "F32", scale)]
+
+
+def pack_bits(vals, bits):
+    """compressed-tensors `pack_to_int32` along the last axis: element i occupies bits
+    [i * bits, (i + 1) * bits) of the little-endian word stream of its row."""
+    vals = np.asarray(vals, np.int64)
+    rows, n = vals.shape
+    words = -(-n * bits // 32)
+    out = np.zeros((rows, words), np.uint64)
+    for i in range(n):
+        start = i * bits
+        w, off = start // 32, start % 32
+        out[:, w] |= (vals[:, i].astype(np.uint64) << np.uint64(off)) & np.uint64(0xFFFFFFFF)
+        if off + bits > 32:
+            out[:, w + 1] |= vals[:, i].astype(np.uint64) >> np.uint64(32 - off)
+    return out.astype(np.uint32).view(np.int32)
+
+
+def quant_int_packed(name, w, bits, group, symmetric):
+    """compressed-tensors pack-quantized INT weights with per-group scales."""
+    out_, in_ = w.shape
+    assert in_ % group == 0
+    groups = in_ // group
+    wg = w.reshape(out_, groups, group)
+    qmin, qmax = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+    if symmetric:
+        scale = bf16_round(np.maximum(np.abs(wg).max(-1), 1e-8) / qmax)
+        zp = np.zeros((out_, groups), np.int64)
+    else:
+        mn, mx = np.minimum(wg.min(-1), 0), np.maximum(wg.max(-1), 0)
+        scale = bf16_round(np.maximum(mx - mn, 1e-8) / (qmax - qmin))
+        zp = np.clip(np.round(qmin - mn / scale), qmin, qmax).astype(np.int64)
+    q = np.clip(np.round(wg / scale[..., None]) + zp[..., None], qmin, qmax).astype(np.int64)
+    deq = bf16_round((q - zp[..., None]).astype(np.float32) * scale[..., None]).reshape(out_, in_)
+    offset = 1 << (bits - 1)
+    tensors = [(name[:-len(".weight")] + ".weight_packed", "I32", pack_bits(q.reshape(out_, in_) + offset, bits)),
+               (name[:-len(".weight")] + ".weight_scale", "BF16", scale),
+               (name[:-len(".weight")] + ".weight_shape", "I64", np.array([out_, in_], np.int64))]
+    if not symmetric:
+        # Zero points are packed along the rows (`packed_dim=0`): [ceil(out * bits / 32), groups].
+        tensors.append((name[:-len(".weight")] + ".weight_zero_point", "I32", pack_bits((zp + offset).T, bits).T.copy()))
+    return deq, tensors
+
+
+def quant_mxfp4(name, w):
+    """gpt-oss MXFP4 of the natural `[E, out, in]` tensor `w` (in a multiple of 32)."""
+    assert w.shape[-1] % 32 == 0
+    blocks = w.reshape(*w.shape[:-1], w.shape[-1] // 32, 32)
+    amax = np.abs(blocks).max(-1)
+    e = np.where(amax > 0, np.ceil(np.log2(np.maximum(amax, 1e-30) / 6.0)), 0).astype(np.int64)
+    e = np.clip(e, -127, 127)
+    codes = nearest_code(blocks / (2.0 ** e)[..., None], E2M1_VALUES).astype(np.uint8)
+    packed = (codes[..., 0::2] | (codes[..., 1::2] << 4)).astype(np.uint8)
+    deq = (E2M1_VALUES[codes] * (2.0 ** e)[..., None].astype(np.float32)).reshape(w.shape)
+    return bf16_round(deq), [(name + "_blocks", "U8", packed), (name + "_scales", "U8", (e + 127).astype(np.uint8))]
 
 
 B2U_MAP = None
@@ -271,6 +381,18 @@ def base(**kw):
         # the Mamba block and attention side by side (Falcon-H1); `mult` holds
         # its muP multipliers.
         ssm=None, ssm_layers=None, attn_layers=None, mlp_layers=None, parallel_ssm=False, mult=None,
+        # "gdn" (Gated DeltaNet) or "lightning" (MiniMax) linear-attention layers.
+        linear_kind="gdn",
+        # "pre" or "minimax" (h = norm(x); x = alpha * h + beta * f(h)); scales per sublayer.
+        residual_layout="pre", mm_scales=None,
+        # HunYuan applies the per-head q/k norm after the rotary embedding.
+        qk_norm_after_rope=False,
+        # (alpha, limit) of the clamped swiglu in dense MLPs (MiniMax M3).
+        dense_swiglu=None,
+        # {layer index: [(name relative to the layer, shape), ...]} of tensors the
+        # reference never reads (they must survive exports untouched).
+        extra_layer_tensors={},
+        quant=None,
         config={}, extra_config={},
     )
     d.update(kw)
@@ -404,6 +526,35 @@ spec("gpt_oss", tok="o200k", L=3, attn_bias=True, o_bias=True, sinks="self_attn.
              "head_dim": 8, "num_local_experts": 4, "num_experts_per_tok": 2, "sliding_window": 4, "layer_types": ["sliding_attention", "full_attention", "sliding_attention"],
              "rope_theta": 10000.0, "rope_scaling": {"rope_type": "yarn", "factor": 8.0, "beta_fast": 32.0, "beta_slow": 1.0, "original_max_position_embeddings": 32, "truncate": False},
              "max_position_embeddings": 128, "rms_norm_eps": 1e-5, "swiglu_limit": 7.0, "attention_bias": True, "hidden_act": "silu", "tie_word_embeddings": True})
+# Quantised variants (see "Quantised checkpoint variants" above): the qwen2
+# layout with DeepSeek-style FP8 block scales and with compressed-tensors
+# pack-quantized INT4 (asymmetric, so zero points are exercised too), and
+# gpt-oss with MXFP4 experts (hidden size 64 and expert width 64, so rows span two blocks).
+QWEN2_CONFIG = {"model_type": "qwen2", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
+                "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "silu", "max_position_embeddings": 128, "tie_word_embeddings": True,
+                "torch_dtype": "bfloat16"}
+spec("qwen2_fp8", tok="qwen2", attn_bias=True, o_bias=False, lm_head=None, quant={"kind": "fp8", "block": [16, 8]},
+     config=dict(QWEN2_CONFIG, quantization_config={"activation_scheme": "dynamic", "fmt": "e4m3", "quant_method": "fp8", "weight_block_size": [16, 8]}))
+spec("qwen2_int4", tok="qwen2", attn_bias=True, o_bias=False, lm_head=None, quant={"kind": "int", "bits": 4, "group": 16, "symmetric": False},
+     config=dict(QWEN2_CONFIG, quantization_config={
+         "config_groups": {"group_0": {"input_activations": None, "output_activations": None, "targets": ["Linear"],
+                                       "weights": {"actorder": None, "block_structure": None, "dynamic": False, "group_size": 16, "num_bits": 4,
+                                                   "observer": "minmax", "strategy": "group", "symmetric": False, "type": "int"}}},
+         "format": "pack-quantized", "global_compression_ratio": None, "ignore": ["lm_head"], "kv_cache_scheme": None,
+         "quant_method": "compressed-tensors", "quantization_status": "compressed"}))
+spec("gpt_oss_mxfp4", tok="o200k", H=64, L=3, attn_bias=True, o_bias=True, sinks="self_attn.sinks", sliding=4, sliding_layers=[1, 0, 1], lm_head=None,
+     quant={"kind": "mxfp4"},
+     scaling={"rope_type": "yarn", "factor": 8.0, "beta_fast": 32.0, "beta_slow": 1.0, "original_max_position_embeddings": 32, "truncate": False},
+     moe={"E": 4, "K": 2, "MI": 64, "shared": 0, "scoring": "softmax", "group_limited": False, "rsf": 1.0, "norm": True, "router_bias": True,
+          "layers": [0, 1, 2], "corr_bias": False, "layout": "fused_t_interleaved", "prefix": "mlp.", "router": "router.weight", "bias": True,
+          "swiglu": (1.702, 7.0)},
+     config={"model_type": "gpt_oss", "hidden_size": 64, "intermediate_size": 64, "num_hidden_layers": 3, "num_attention_heads": 4, "num_key_value_heads": 2,
+             "head_dim": 8, "num_local_experts": 4, "num_experts_per_tok": 2, "sliding_window": 4, "layer_types": ["sliding_attention", "full_attention", "sliding_attention"],
+             "rope_theta": 10000.0, "rope_scaling": {"rope_type": "yarn", "factor": 8.0, "beta_fast": 32.0, "beta_slow": 1.0, "original_max_position_embeddings": 32, "truncate": False},
+             "max_position_embeddings": 128, "rms_norm_eps": 1e-5, "swiglu_limit": 7.0, "attention_bias": True, "hidden_act": "silu", "tie_word_embeddings": True,
+             "torch_dtype": "bfloat16",
+             "quantization_config": {"modules_to_not_convert": ["model.layers.*.self_attn", "model.layers.*.mlp.router", "model.embed_tokens", "lm_head"],
+                                     "quant_method": "mxfp4"}})
 spec("minicpm", tok="spm", embed_scale=12.0, residual_mult=1.4 / np.sqrt(2), logit_scale=0.5, lm_head=None,
      config={"model_type": "minicpm", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
              "scale_emb": 12, "scale_depth": 1.4, "dim_model_base": 16, "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "silu",
@@ -484,6 +635,53 @@ spec("qwen3_next", tok="qwen2", H=32, I=32, L=4, NH=4, NKV=2, HD=8, rotary_dim=2
              "linear_num_key_heads": 2, "linear_key_head_dim": 4, "linear_num_value_heads": 4, "linear_value_head_dim": 4,
              "linear_conv_kernel_dim": 2, "full_attention_interval": 4, "partial_rotary_factor": 0.25,
              "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "silu", "max_position_embeddings": 128, "tie_word_embeddings": True})
+# Kimi Linear (KDA + MLA hybrid, DeepSeek-V3-style MoE). `kimi_linear` is the
+# original checkpoint layout (linear_attn_config, q/k/v convolutions on
+# self_attn, block_sparse_moe with w1/w3/w2 experts); `kimi_linear_hf` the
+# Hugging Face module layout (layer_types, forget_gate, fused conv1d, stacked
+# experts). Full-attention layers carry no positional encoding.
+_KIMI_MLA = {"q_lora_rank": None, "kv_lora_rank": 16, "nope": 8, "rope": 4, "v": 8}
+_KIMI_KDA = {"kind": "kda", "KH": 4, "KD": 4, "VH": 4, "VD": 4, "KC": 3}
+spec("kimi_linear", tok="deepseek3", NKV=4, HD=12, VD=8, L=4, rotary_dim=4, rope_layers=[0, 0, 0, 0], lm_head="lm_head.weight", eps=1e-5,
+     mla=_KIMI_MLA, linear=dict(_KIMI_KDA, layout="checkpoint"), linear_layers=[1, 1, 1, 0],
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "scoring": "sigmoid", "group_limited": True, "n_group": 2, "topk_group": 1, "rsf": 2.446, "norm": True,
+          "layers": [1, 2, 3], "corr_bias": True, "layout": "separate", "prefix": "block_sparse_moe.", "router": "gate.weight",
+          "expert_names": ("w1.weight", "w3.weight", "w2.weight"), "shared_name": "shared_experts."},
+     config={"model_type": "kimi_linear", "architectures": ["KimiLinearForCausalLM"], "hidden_size": 32, "intermediate_size": 32, "moe_intermediate_size": 12,
+             "num_hidden_layers": 4, "num_attention_heads": 4, "num_key_value_heads": 4, "q_lora_rank": None, "kv_lora_rank": 16,
+             "qk_nope_head_dim": 8, "qk_rope_head_dim": 4, "v_head_dim": 8, "num_experts": 4, "num_shared_experts": 1, "num_experts_per_token": 2,
+             "num_expert_group": 2, "topk_group": 1, "moe_renormalize": True, "routed_scaling_factor": 2.446, "first_k_dense_replace": 1,
+             "linear_attn_config": {"kda_layers": [1, 2, 3], "full_attn_layers": [4], "head_dim": 4, "num_heads": 4, "short_conv_kernel_size": 3},
+             "rms_norm_eps": 1e-5, "hidden_act": "silu", "model_max_length": 128, "tie_word_embeddings": False})
+spec("kimi_linear_hf", tok="deepseek3", NKV=4, HD=12, VD=8, L=4, rotary_dim=4, rope_layers=[0, 0, 0, 0], lm_head="lm_head.weight", eps=1e-5,
+     mla=_KIMI_MLA, linear=dict(_KIMI_KDA, layout="hf"), linear_layers=[1, 0, 1, 1],
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "scoring": "sigmoid", "group_limited": True, "n_group": 1, "topk_group": 1, "rsf": 2.446, "norm": True,
+          "layers": [1, 2, 3], "corr_bias": True, "layout": "fused_eih", "prefix": "mlp.", "router": "gate.weight", "shared_name": "shared_experts."},
+     config={"model_type": "kimi_linear", "architectures": ["KimiLinearForCausalLM"], "hidden_size": 32, "intermediate_size": 32, "moe_intermediate_size": 12,
+             "num_hidden_layers": 4, "num_attention_heads": 4, "num_key_value_heads": 4, "head_dim": 4, "q_lora_rank": None, "kv_lora_rank": 16,
+             "qk_nope_head_dim": 8, "qk_rope_head_dim": 4, "v_head_dim": 8, "num_local_experts": 4, "n_shared_experts": 1, "num_experts_per_tok": 2,
+             "n_group": 1, "topk_group": 1, "norm_topk_prob": True, "routed_scaling_factor": 2.446,
+             "layer_types": ["linear_attention", "full_attention", "linear_attention", "linear_attention"],
+             "mlp_layer_types": ["dense", "sparse", "sparse", "sparse"],
+             "linear_head_dim": 4, "linear_num_heads": 4, "linear_conv_kernel_dim": 3,
+             "rms_norm_eps": 1e-5, "hidden_act": "silu", "max_position_embeddings": 128, "tie_word_embeddings": False})
+# Kimi K2.5 / K2.6: the image-video wrapper around a DeepSeek V3 text config
+# (model_type kimi_k2 under text_config, language_model prefix).
+spec("kimi_k25", tok="deepseek3", NKV=4, HD=12, VD=8, L=3, prefix="language_model.model.", lm_head="language_model.lm_head.weight",
+     rope_style="gptj", rotary_dim=4,
+     mla={"q_lora_rank": 12, "kv_lora_rank": 16, "nope": 8, "rope": 4, "v": 8},
+     scaling={"type": "yarn", "factor": 32.0, "beta_fast": 1.0, "beta_slow": 1.0, "mscale": 1.0, "mscale_all_dim": 1.0, "original_max_position_embeddings": 32},
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "scoring": "sigmoid", "group_limited": True, "n_group": 1, "topk_group": 1, "rsf": 2.827, "norm": True,
+          "layers": [1, 2], "corr_bias": True, "layout": "separate", "prefix": "mlp.", "router": "gate.weight", "shared_name": "shared_experts."},
+     config={"model_type": "kimi_k25", "architectures": ["Kimi_K25ForConditionalGeneration"], "tie_word_embeddings": False,
+             "image_token_id": 200, "video_token_id": 201,
+             "vision_config": {"model_type": "kimi_k25_vision", "hidden_size": 16, "num_hidden_layers": 1, "num_attention_heads": 2, "patch_size": 14},
+             "text_config": {"model_type": "kimi_k2", "hidden_size": 32, "intermediate_size": 32, "moe_intermediate_size": 12, "num_hidden_layers": 3,
+                             "num_attention_heads": 4, "num_key_value_heads": 4, "q_lora_rank": 12, "kv_lora_rank": 16, "qk_nope_head_dim": 8, "qk_rope_head_dim": 4,
+                             "v_head_dim": 8, "n_routed_experts": 4, "n_shared_experts": 1, "num_experts_per_tok": 2, "first_k_dense_replace": 1, "moe_layer_freq": 1,
+                             "scoring_func": "sigmoid", "topk_method": "noaux_tc", "n_group": 1, "topk_group": 1, "routed_scaling_factor": 2.827,
+                             "norm_topk_prob": True, "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "max_position_embeddings": 128, "hidden_act": "silu",
+                             "tie_word_embeddings": False, "rope_interleave": True}})
 spec("qwen3_5", tok="qwen2", H=32, I=32, L=2, NH=4, NKV=2, HD=8, rotary_dim=2,
      qk_norm="head", gated_q=True,
      linear={"KH": 2, "KD": 4, "VH": 4, "VD": 4, "KC": 2, "fused": False}, linear_layers=[1, 0],
@@ -530,6 +728,76 @@ spec("glm_moe_dsa", tok="llama3", H=32, I=32, L=3, NH=4, NKV=4, HD=12, VD=8, rop
              "n_group": 1, "topk_group": 1, "routed_scaling_factor": 2.5, "norm_topk_prob": True,
              "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "rope_interleave": True, "index_topk": 2048, "hidden_act": "silu",
              "max_position_embeddings": 128, "tie_word_embeddings": True})
+MIXTRAL_EXPERTS = ("w1.weight", "w3.weight", "w2.weight")
+spec("minimax_m2", tok="o200k", L=2, rotary_dim=4, qk_norm="full", lm_head="lm_head.weight", theta=5000000.0,
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 0, "scoring": "sigmoid", "group_limited": False, "rsf": 1.0, "norm": True,
+          "layers": [0, 1], "corr_bias": True, "corr_bias_name": "block_sparse_moe.e_score_correction_bias", "layout": "separate",
+          "prefix": "block_sparse_moe.", "router": "gate.weight", "expert_names": MIXTRAL_EXPERTS},
+     config={"model_type": "minimax_m2", "hidden_size": 32, "intermediate_size": 12, "num_hidden_layers": 2, "num_attention_heads": 4,
+             "num_key_value_heads": 2, "head_dim": 8, "num_local_experts": 4, "num_experts_per_tok": 2, "rotary_dim": 4,
+             "rms_norm_eps": 1e-6, "rope_theta": 5000000.0, "hidden_act": "silu", "max_position_embeddings": 128, "tie_word_embeddings": False})
+spec("minimax", tok="llama3", L=4, rotary_dim=4, lm_head="lm_head.weight", theta=1000000.0, eps=1e-5,
+     linear_kind="lightning", linear_layers=[1, 0, 1, 0], residual_layout="minimax",
+     mm_scales={"full": (2.0, 1.0), "linear": (1.5, 1.0), "mlp": (3.0, 0.5)},
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 0, "scoring": "softmax", "group_limited": False, "rsf": 1.0, "norm": True,
+          "layers": [0, 1, 2, 3], "corr_bias": False, "layout": "separate", "prefix": "block_sparse_moe.", "router": "gate.weight",
+          "expert_names": MIXTRAL_EXPERTS},
+     config={"model_type": "minimax", "hidden_size": 32, "intermediate_size": 12, "num_hidden_layers": 4, "num_attention_heads": 4,
+             "num_key_value_heads": 2, "head_dim": 8, "num_local_experts": 4, "num_experts_per_tok": 2, "rotary_dim": 4, "block_size": 256,
+             "layer_types": ["linear_attention", "full_attention", "linear_attention", "full_attention"],
+             "full_attn_alpha_factor": 2.0, "full_attn_beta_factor": 1.0, "linear_attn_alpha_factor": 1.5, "linear_attn_beta_factor": 1.0,
+             "mlp_alpha_factor": 3.0, "mlp_beta_factor": 0.5,
+             "rms_norm_eps": 1e-5, "rope_theta": 1000000.0, "hidden_act": "silu", "max_position_embeddings": 128, "tie_word_embeddings": False})
+spec("minimax_m3", tok="o200k", L=3, I=16, rotary_dim=4, prefix="language_model.model.", lm_head="language_model.lm_head.weight", theta=5000000.0,
+     norm="rms1p", qk_norm="head", mlp="gated_fused", gate_up="mlp.gate_up_proj.weight", down="mlp.down_proj.weight", dense_swiglu=(1.702, 7.0),
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "shared_inter": 16, "shared_fused": ("gate_up_proj.weight", "down_proj.weight"),
+          "scoring": "sigmoid", "group_limited": False, "rsf": 2.0, "norm": True, "layers": [1, 2], "corr_bias": True,
+          "corr_bias_name": "block_sparse_moe.e_score_correction_bias", "layout": "separate", "prefix": "block_sparse_moe.",
+          "router": "gate.weight", "expert_names": MIXTRAL_EXPERTS, "shared_name": "shared_experts.", "swiglu": (1.702, 7.0)},
+     extra_layer_tensors={i: [("self_attn.index_q_proj.weight", (2 * 4, 32)), ("self_attn.index_k_proj.weight", (4, 32)),
+                              ("self_attn.index_q_norm.weight", (4,)), ("self_attn.index_k_norm.weight", (4,))] for i in (1, 2)},
+     config={"model_type": "minimax_m3_vl", "architectures": ["MiniMaxM3SparseForConditionalGeneration"],
+             "text_config": {"model_type": "minimax_m3_vl_text", "hidden_size": 32, "intermediate_size": 12, "dense_intermediate_size": 16,
+                             "shared_intermediate_size": 16, "num_hidden_layers": 3, "num_attention_heads": 4, "num_key_value_heads": 2,
+                             "head_dim": 8, "num_local_experts": 4, "num_experts_per_tok": 2, "routed_scaling_factor": 2.0, "rotary_dim": 4,
+                             "swiglu_alpha": 1.702, "swiglu_limit": 7.0, "mlp_layer_types": ["dense", "sparse", "sparse"],
+                             "layer_types": ["full_attention", "minimax_m3_sparse", "minimax_m3_sparse"],
+                             "index_n_heads": 2, "index_head_dim": 4, "index_block_size": 4, "index_topk_blocks": 16, "index_local_blocks": 1,
+                             "rms_norm_eps": 1e-6, "rope_theta": 5000000.0, "hidden_act": "silu", "max_position_embeddings": 128,
+                             "tie_word_embeddings": False},
+             "vision_config": {"model_type": "minimax_m3_vl_vision"}})
+spec("ernie4_5_moe", tok="spm", L=3, rope_style="gptj", lm_head="lm_head.weight", theta=500000.0, eps=1e-5,
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 2, "shared_inter": 24, "scoring": "softmax", "group_limited": False, "rsf": 1.0, "norm": True,
+          "layers": [1, 2], "corr_bias": True, "corr_bias_name": "mlp.moe_statics.e_score_correction_bias", "corr_bias_shape": (1, 4),
+          "layout": "separate", "prefix": "mlp.", "router": "gate.weight", "shared_name": "shared_experts."},
+     config={"model_type": "ernie4_5_moe", "hidden_size": 32, "intermediate_size": 32, "moe_intermediate_size": 12, "num_hidden_layers": 3,
+             "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8, "moe_num_experts": 4, "moe_k": 2, "moe_num_shared_experts": 2,
+             "moe_layer_start_index": 1, "moe_layer_end_index": -1, "moe_layer_interval": 1, "moe_norm_min": 1e-12, "use_bias": False,
+             "rms_norm_eps": 1e-5, "rope_theta": 500000.0, "hidden_act": "silu", "max_position_embeddings": 128, "tie_word_embeddings": False})
+spec("hunyuan_v1_moe", tok="gpt2", L=2, lm_head="lm_head.weight", eps=1e-5, qk_norm="head", qk_norm_after_rope=True,
+     q_norm="self_attn.query_layernorm.weight", k_norm="self_attn.key_layernorm.weight",
+     theta=10000.0 * 1000.0 ** (8 / 6),  # NTK-alpha dynamic scaling: base * alpha^(head_dim / (head_dim - 2))
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "shared_inter": 12, "scoring": "softmax", "group_limited": False, "rsf": 1.0, "norm": True,
+          "layers": [0, 1], "corr_bias": False, "layout": "separate", "prefix": "mlp.", "router": "gate.wg.weight", "shared_name": "shared_mlp."},
+     config={"model_type": "hunyuan_v1_moe", "hidden_size": 32, "intermediate_size": 12, "num_hidden_layers": 2, "num_attention_heads": 4,
+             "num_key_value_heads": 2, "head_dim": 8, "num_experts": [4, 4], "moe_topk": [2, 2], "num_shared_expert": 1, "use_mixed_mlp_moe": True,
+             "use_qk_norm": True, "attention_bias": False, "rope_scaling": {"type": "dynamic", "alpha": 1000.0},
+             "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "hidden_act": "silu", "max_position_embeddings": 128, "tie_word_embeddings": False})
+GRANITE_MOE = {"E": 4, "K": 2, "MI": 12, "shared": 0, "scoring": "topk_softmax", "group_limited": False, "rsf": 1.0, "norm": True,
+               "corr_bias": False, "layout": "fused_rows", "fused_names": ("input_linear.weight", "output_linear.weight"),
+               "prefix": "block_sparse_moe.", "router": "router.layer.weight"}
+GRANITE_CONFIG = {"hidden_size": 32, "intermediate_size": 12, "num_attention_heads": 4, "num_key_value_heads": 2, "num_local_experts": 4,
+                  "num_experts_per_tok": 2, "embedding_multiplier": 2.0, "attention_multiplier": 0.25, "residual_multiplier": 0.5,
+                  "logits_scaling": 4.0, "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "silu", "max_position_embeddings": 128,
+                  "tie_word_embeddings": True}
+spec("granitemoe", tok="starcoder", L=2, embed_scale=2.0, attn_scale=0.25, residual_mult=0.5, logit_scale=0.25, lm_head=None,
+     moe=dict(GRANITE_MOE, layers=[0, 1]),
+     config=dict(GRANITE_CONFIG, model_type="granitemoe", num_hidden_layers=2))
+spec("granitemoehybrid_attn", tok="starcoder", L=3, embed_scale=2.0, attn_scale=0.25, residual_mult=0.5, logit_scale=0.25, lm_head=None,
+     moe=dict(GRANITE_MOE, layers=[0, 1, 2], shared=1, shared_inter=16, shared_name="shared_mlp.", shared_at_layer=True,
+              shared_fused=("input_linear.weight", "output_linear.weight")),
+     config=dict(GRANITE_CONFIG, model_type="granitemoehybrid", num_hidden_layers=3, shared_intermediate_size=16, position_embedding_type="rope",
+                 layer_types=["attention", "attention", "attention"], mamba_n_heads=4, mamba_d_state=8, mamba_d_conv=4, mamba_expand=2))
 
 # Mamba families. `Infinity` in time_step_limit is what json.dump writes for
 # float("inf"), as transformers does; ditch's config reader must accept it.
@@ -589,9 +857,10 @@ GRANITE_SSM = dict(MAMBA2_SSM, prefix="mamba.", G=1)
 spec("granitemoehybrid", tok="starcoder", L=3, pos="none", embed_scale=2.0, attn_scale=0.25, residual_mult=0.5, logit_scale=0.25, lm_head=None,
      mlp="gated_fused", gate_up="shared_mlp.input_linear.weight", down="shared_mlp.output_linear.weight",
      ssm=GRANITE_SSM, ssm_layers=[1, 0, 1], attn_layers=[0, 1, 0],
-     moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "shared_inter": 16, "shared_fused": True, "scoring": "softmax", "group_limited": False,
-          "rsf": 1.0, "norm": True, "layers": [0, 1, 2], "corr_bias": False, "layout": "fused_rows", "prefix": "block_sparse_moe.",
-          "router": "router.layer.weight", "fused_names": ("input_linear.weight", "output_linear.weight"), "shared_name": "shared_mlp."},
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "shared_inter": 16, "shared_fused": ("input_linear.weight", "output_linear.weight"), "shared_at_layer": True,
+          "scoring": "softmax", "group_limited": False, "rsf": 1.0, "norm": True, "layers": [0, 1, 2], "corr_bias": False, "layout": "fused_rows",
+          "prefix": "block_sparse_moe.", "router": "router.layer.weight", "fused_names": ("input_linear.weight", "output_linear.weight"),
+          "shared_name": "shared_mlp."},
      config={"model_type": "granitemoehybrid", "hidden_size": 32, "intermediate_size": 12, "num_hidden_layers": 3, "num_attention_heads": 4,
              "num_key_value_heads": 2, "hidden_act": "silu", "rms_norm_eps": 1e-6, "max_position_embeddings": 128, "embedding_multiplier": 2.0,
              "logits_scaling": 4.0, "residual_multiplier": 0.5, "attention_multiplier": 0.25, "num_local_experts": 4, "num_experts_per_tok": 2,
@@ -621,11 +890,30 @@ def generate_generic(family, out_dir):
     V = len(vocab)
     H, I, L, NH, NKV, HD, VD = s["H"], s["I"], s["L"], s["NH"], s["NKV"], s["HD"], s["VD"]
     weights = {}
+    # Quantised storage of a weight: name -> [(tensor name, safetensors dtype, array)];
+    # `weights[name]` then holds the dequantised values the reference computes with.
+    qtensors = {}
+
+    def quantize(name, w):
+        """Re-encodes `w` in the spec's quantised format (in place) and records its storage tensors."""
+        q = s["quant"]
+        if q["kind"] == "fp8":
+            deq, tensors = quant_fp8_block(name, w, q["block"])
+        elif q["kind"] == "int":
+            deq, tensors = quant_int_packed(name, w, q["bits"], q["group"], q["symmetric"])
+        elif q["kind"] == "mxfp4":
+            deq, tensors = quant_mxfp4(name, w)
+        else:
+            raise ValueError(q["kind"])
+        w[...] = deq
+        qtensors[name] = tensors
 
     def mat(name, rows, cols, scale=0.2, register=True):
         w = bf16_round(rng.normal(0, scale, size=(rows, cols)))
         if register:
             weights[name] = w.T.copy() if s["conv1d"] and name.endswith(".weight") and "wte" not in name and "wpe" not in name and "ln" not in name else w
+            if s["quant"] and s["quant"]["kind"] in ("fp8", "int") and name.endswith("_proj.weight") and not s["conv1d"]:
+                quantize(name, w)
         return w
 
     def vec(name, n, scale=0.2):
@@ -714,7 +1002,43 @@ def generate_generic(family, out_dir):
         d["post_ff_norm"] = normw(lp + s["post_ff_norm"], H) if s["post_ff_norm"] else None
         d["mlp_norm"] = normw(lp + s["mlp_norm"], H) if s["mlp_norm"] else None
         qd, kvd = NH * HD, NKV * HD
-        if lin_layers[i]:
+        for name, shape in s["extra_layer_tensors"].get(i, []):
+            weights[lp + name] = bf16_round(rng.normal(0, 0.2, size=shape))
+        if lin_layers[i] and s["linear_kind"] == "lightning":
+            d["light_qkv"] = mat(lp + "self_attn.qkv_proj.weight", 3 * qd, H)
+            d["light_gate"] = mat(lp + "self_attn.output_gate.weight", qd, H)
+            d["light_norm"] = normw(lp + "self_attn.norm.weight", qd)[0]
+            d["o"] = mat(lp + "self_attn.out_proj.weight", H, qd)
+            d["ob"] = None
+        elif lin_layers[i] and s["linear"].get("kind") == "kda":
+            ln, ap = s["linear"], "self_attn."
+            NHl, D, KC = ln["VH"], ln["VD"], ln["KC"]
+            dim = NHl * D
+            hf = ln["layout"] == "hf"
+            fp = ap + ("forget_gate." if hf else "")
+            d["q"] = mat(lp + ap + "q_proj.weight", dim, H)
+            d["k"] = mat(lp + ap + "k_proj.weight", dim, H)
+            d["v"] = mat(lp + ap + "v_proj.weight", dim, H)
+            # nn.Conv1d weights are [channels, 1, kernel]: one fused tensor over q | k | v, or one per projection.
+            parts = [bf16_round(rng.normal(0, 0.2, size=(dim, KC))) for _ in range(3)]
+            if hf:
+                weights[lp + ap + "conv1d.weight"] = np.concatenate(parts, 0).reshape(3 * dim, 1, KC)
+            else:
+                for nm, w in zip(("q", "k", "v"), parts):
+                    weights[lp + ap + f"{nm}_conv1d.weight"] = w.reshape(dim, 1, KC)
+            d["conv"] = np.concatenate(parts, 0)
+            d["f_a"] = mat(lp + fp + "f_a_proj.weight", D, H)
+            d["f_b"] = mat(lp + fp + "f_b_proj.weight", dim, D)
+            d["dt"] = vec(lp + fp + "dt_bias", dim, 0.5)
+            d["alog"] = vec(lp + fp + "A_log", NHl, 0.5)
+            weights[lp + fp + "A_log"] = d["alog"].reshape(1, 1, NHl, 1)
+            d["b"] = mat(lp + ap + "b_proj.weight", NHl, H)
+            d["g_a"] = mat(lp + ap + "g_a_proj.weight", D, H)
+            d["g_b"] = mat(lp + ap + "g_b_proj.weight", dim, D)
+            d["lnorm"] = normw(lp + ap + "o_norm.weight", D)[0]
+            d["o"] = mat(lp + ap + "o_proj.weight", H, dim)
+            d["ob"] = None
+        elif lin_layers[i]:
             ln, ap = s["linear"], "linear_attn."
             kd_tot, vd_tot = ln["KH"] * ln["KD"], ln["VH"] * ln["VD"]
             if ln["fused"]:
@@ -777,7 +1101,12 @@ def generate_generic(family, out_dir):
             E, K, MI = moe["E"], moe["K"], moe["MI"]
             d["router"] = mat(mp + moe["router"], E, H)
             d["router_b"] = bias_for(mp + moe["router"], E, moe.get("router_bias", False))
-            d["corr_b"] = vec(mp + "gate.e_score_correction_bias", E, 0.5) if moe["corr_bias"] else None
+            d["corr_b"] = None
+            if moe["corr_bias"]:
+                cb_name = lp + moe["corr_bias_name"] if "corr_bias_name" in moe else mp + "gate.e_score_correction_bias"
+                d["corr_b"] = vec(cb_name, E, 0.5)
+                if "corr_bias_shape" in moe:
+                    weights[cb_name] = weights[cb_name].reshape(moe["corr_bias_shape"])
             experts = []
             for e in range(E):
                 ex = {"gate": bf16_round(rng.normal(0, 0.2, size=(MI, H))), "up": bf16_round(rng.normal(0, 0.2, size=(MI, H))),
@@ -795,10 +1124,21 @@ def generate_generic(family, out_dir):
                     weights[f"{mp}experts.{e}.{names[1]}"] = ex["up"]
                     weights[f"{mp}experts.{e}.{names[2]}"] = ex["down"]
             elif moe["layout"] == "fused_rows":
-                # [E, 2I, H] and [E, H, I] (Granite `input_linear` / `output_linear`).
-                gu_name, dn_name = moe.get("fused_names", ("experts.gate_up_proj", "experts.down_proj"))
-                weights[mp + gu_name] = np.stack([np.concatenate([ex["gate"], ex["up"]], 0) for ex in experts])
-                weights[mp + dn_name] = np.stack([ex["down"] for ex in experts])
+                # [E, 2I, H] / [E, H, I] (GraniteMoe input_linear / output_linear).
+                gu = np.stack([np.concatenate([ex["gate"], ex["up"]], 0) for ex in experts])
+                dn = np.stack([ex["down"] for ex in experts])
+                fn = moe.get("fused_names", ("experts.gate_up_proj", "experts.down_proj"))
+                weights[mp + fn[0]] = gu
+                weights[mp + fn[1]] = dn
+            elif moe["layout"] == "fused_eih":
+                # The Hugging Face `Experts` module layout: gate rows then up rows per expert, down as [hidden, I].
+                gu = np.zeros((E, 2 * MI, H), np.float32)
+                dn = np.zeros((E, H, MI), np.float32)
+                for e, ex in enumerate(experts):
+                    gu[e] = np.concatenate([ex["gate"], ex["up"]], 0)
+                    dn[e] = ex["down"]
+                weights[mp + "experts.gate_up_proj"] = gu
+                weights[mp + "experts.down_proj"] = dn
             else:
                 gu = np.zeros((E, H, 2 * MI), np.float32)
                 dn = np.zeros((E, MI, H), np.float32)
@@ -811,6 +1151,19 @@ def generate_generic(family, out_dir):
                     dn[e] = ex["down"].T
                 weights[mp + "experts.gate_up_proj"] = gu
                 weights[mp + "experts.down_proj"] = dn
+                if s["quant"] and s["quant"]["kind"] == "mxfp4":
+                    # Stored as blocks of the natural [E, out, in] layout; the
+                    # experts compute with the dequantised values.
+                    for key, arr in ((mp + "experts.gate_up_proj", gu), (mp + "experts.down_proj", dn)):
+                        nat = np.ascontiguousarray(arr.transpose(0, 2, 1))
+                        quantize(key, nat)
+                        arr[...] = nat.transpose(0, 2, 1)
+                    for e, ex in enumerate(experts):
+                        if moe["layout"] == "fused_t_interleaved":
+                            ex["gate"], ex["up"] = gu[e, :, 0::2].T.copy(), gu[e, :, 1::2].T.copy()
+                        else:
+                            ex["gate"], ex["up"] = gu[e, :, :MI].T.copy(), gu[e, :, MI:].T.copy()
+                        ex["down"] = dn[e].T.copy()
                 if moe.get("bias"):
                     gub = np.zeros((E, 2 * MI), np.float32)
                     dnb = np.zeros((E, H), np.float32)
@@ -820,13 +1173,14 @@ def generate_generic(family, out_dir):
                     weights[mp + "experts.down_proj_bias"] = dnb
             d["experts"] = experts
             if moe["shared"]:
-                sp = mp + moe["shared_name"]
+                sp = (lp if moe.get("shared_at_layer") else mp) + moe["shared_name"]
                 si = moe.get("shared_inter", moe["shared"] * MI)
                 if moe.get("shared_fused"):
-                    # Granite: `shared_mlp.input_linear` holds gate rows then up rows.
-                    sp = lp + moe["shared_name"]
-                    gu = mat(sp + "input_linear.weight", 2 * si, H)
-                    d["shared"] = {"gate": gu[:si], "up": gu[si:], "down": mat(sp + "output_linear.weight", H, si), "gate_vec": None}
+                    # One [2I, H] gate/up tensor (GraniteMoeShared input_linear, MiniMax M3 gate_up_proj).
+                    gu_name, dn_name = moe["shared_fused"]
+                    gu = mat(sp + gu_name, 2 * si, H, register=False)
+                    weights[sp + gu_name] = gu
+                    d["shared"] = {"gate": gu[:si], "up": gu[si:], "down": mat(sp + dn_name, H, si), "gate_vec": None}
                 elif moe.get("dense"):
                     d["shared"] = {"gate": None, "up": mat(sp + "up_proj.weight", si, H), "down": mat(sp + "down_proj.weight", H, si), "gate_vec": None}
                 else:
@@ -866,9 +1220,17 @@ def generate_generic(family, out_dir):
     json.dump(config, open(f"{out_dir}/config.json", "w"), indent=1)
     json.dump({"eos_token_id": vocab[eos], "bos_token_id": vocab[bos] if bos else None, "do_sample": False}, open(f"{out_dir}/generation_config.json", "w"))
     header, blobs, offset = {}, [], 0
+    stored = []
     for n in sorted(weights):
-        u = bf16_bits(weights[n])
-        header[n] = {"dtype": "BF16", "shape": list(u.shape), "data_offsets": [offset, offset + u.nbytes]}
+        if n in qtensors:
+            stored.extend(qtensors[n])
+        else:
+            stored.append((n, "BF16", bf16_bits(weights[n])))
+    for n, dtype, u in sorted(stored, key=lambda t: t[0]):
+        if dtype == "BF16" and u.dtype != np.uint16:
+            u = bf16_bits(u)
+        u = np.ascontiguousarray(u)
+        header[n] = {"dtype": dtype, "shape": list(u.shape), "data_offsets": [offset, offset + u.nbytes]}
         blobs.append(u.tobytes())
         offset += u.nbytes
     hb = json.dumps(header).encode()
@@ -1015,8 +1377,10 @@ def generate_generic(family, out_dir):
             ckv = ckv / np.sqrt(np.mean(ckv * ckv, -1, keepdims=True) + eps) * d["kv_a_norm"]
             kvb = (ckv @ d["kv_b"].T).reshape(T, NH, nope + vd)
             k_nope, v = kvb[..., :nope], kvb[..., nope:]
-            q = apply_rope(q, cos, sin, nope)
-            k_pe = apply_rope(k_pe.reshape(T, 1, rp), cos, sin, 0)
+            k_pe = k_pe.reshape(T, 1, rp)
+            if rope_layers[li]:
+                q = apply_rope(q, cos, sin, nope)
+                k_pe = apply_rope(k_pe, cos, sin, 0)
             k = np.concatenate([k_nope, np.repeat(k_pe, NH, axis=1)], -1)
             v = v
             groups = 1
@@ -1055,7 +1419,7 @@ def generate_generic(family, out_dir):
                 q = head_norm(q, *d["qn"])
                 k = head_norm(k, *d["kn"])
             q, k, v = q.reshape(T, NH, HD), k.reshape(T, NKV, HD), v.reshape(T, NKV, HD)
-            if qn == "head":
+            if qn == "head" and not s["qk_norm_after_rope"]:
                 q, k = head_norm(q, *d["qn"]), head_norm(k, *d["kn"])
             elif qn == "heads":
                 q = head_norm(q, d["qn"][0].reshape(NH, HD), None)
@@ -1068,6 +1432,8 @@ def generate_generic(family, out_dir):
                 p = np.arange(T, dtype=np.float32)
                 scl = np.log(np.floor((p + 1.0) / s["temp"]["floor_scale"]) + 1.0) * s["temp"]["attn_scale"] + 1.0
                 q = q * scl[:, None, None]
+            if qn == "head" and s["qk_norm_after_rope"]:
+                q, k = head_norm(q, *d["qn"]), head_norm(k, *d["kn"])
             groups = NH // NKV
         slopes = alibi_slopes(NH) if s["pos"] == "alibi" else None
         out = np.zeros((T, NH, VD), np.float32)
@@ -1100,8 +1466,69 @@ def generate_generic(family, out_dir):
                 o = o + d["ob"]
         return o
 
+    def lightning_attn(d, li, h):
+        """MiniMax lightning attention (modeling_minimax.MiniMaxLightningAttention),
+        as the per-token recurrence the blocked prefill is equivalent to."""
+        T = h.shape[0]
+        p = h @ d["light_qkv"].T
+        p = (p / (1 + np.exp(-p))).reshape(T, NH, 3 * HD)
+        q, k, v = p[:, :, :HD], p[:, :, HD:2 * HD], p[:, :, 2 * HD:]
+        base = 1 / (2 ** (8 / NH))
+        factor = 1 - li / (L - 1 + 1e-5) + 1e-5
+        rate = (base ** (np.arange(NH) + 1) * factor).astype(np.float32)
+        ratio = np.exp(-rate)
+        S = np.zeros((NH, HD, HD), np.float32)
+        out = np.zeros((T, NH, HD), np.float32)
+        for t in range(T):
+            S = ratio[:, None, None] * S + np.einsum("hi,hj->hij", k[t], v[t])
+            out[t] = np.einsum("hi,hij->hj", q[t], S)
+        o = out.reshape(T, NH * HD)
+        o = o / np.sqrt(np.mean(o * o, -1, keepdims=True) + 1e-6) * d["light_norm"]
+        o = o * (1 / (1 + np.exp(-(h @ d["light_gate"].T))))
+        return o @ d["o"].T
+
+    def kda_attn(d, h):
+        """Kimi Delta Attention (KimiLinearDeltaAttention, fused_recurrent_kda): the
+        decay is per channel of the [k_dim, v_dim] state, from a low-rank forget
+        gate; the output norm is gated by a sigmoid of a low-rank gate."""
+        ln = s["linear"]
+        NHl, D, KC = ln["VH"], ln["VD"], ln["KC"]
+        dim = NHl * D
+        T = h.shape[0]
+        mixed = np.concatenate([h @ d["q"].T, h @ d["k"].T, h @ d["v"].T], -1)
+        y = np.zeros((T, 3 * dim), np.float32)
+        for t in range(T):
+            acc = np.zeros(3 * dim, np.float32)
+            for i in range(KC):
+                if t - i >= 0:
+                    acc += d["conv"][:, KC - 1 - i] * mixed[t - i]
+            y[t] = act_fn(acc)
+        q = y[:, :dim].reshape(T, NHl, D)
+        k = y[:, dim:2 * dim].reshape(T, NHl, D)
+        v = y[:, 2 * dim:].reshape(T, NHl, D)
+        g = ((h @ d["f_a"].T) @ d["f_b"].T + d["dt"]).reshape(T, NHl, D)
+        g = -np.exp(d["alog"])[None, :, None] * np.where(g > 20.0, g, np.log1p(np.exp(np.minimum(g, 20.0))))
+        beta = 1 / (1 + np.exp(-(h @ d["b"].T)))
+        q = q / np.sqrt(np.sum(q * q, -1, keepdims=True) + 1e-6) / np.sqrt(D)
+        k = k / np.sqrt(np.sum(k * k, -1, keepdims=True) + 1e-6)
+        S = np.zeros((NHl, D, D), np.float32)
+        core = np.zeros((T, NHl, D), np.float32)
+        for t in range(T):
+            for hh in range(NHl):
+                S[hh] = S[hh] * np.exp(g[t, hh])[:, None]
+                mem = S[hh].T @ k[t, hh]
+                delta = (v[t, hh] - mem) * beta[t, hh]
+                S[hh] = S[hh] + np.outer(k[t, hh], delta)
+                core[t, hh] = S[hh].T @ q[t, hh]
+        gate = ((h @ d["g_a"].T) @ d["g_b"].T).reshape(T, NHl, D)
+        o = core / np.sqrt(np.mean(core * core, -1, keepdims=True) + eps) * d["lnorm"]
+        o = o * (1 / (1 + np.exp(-gate)))
+        return o.reshape(T, dim) @ d["o"].T
+
     def linear_attn(d, h):
         ln = s["linear"]
+        if ln.get("kind") == "kda":
+            return kda_attn(d, h)
         KH, KD, VH, VD, KC = ln["KH"], ln["KD"], ln["VH"], ln["VD"], ln["KC"]
         kd_tot, vd_tot = KH * KD, VH * VD
         T = h.shape[0]
@@ -1281,14 +1708,22 @@ def generate_generic(family, out_dir):
             logits = h @ d["router"].T
             if d["router_b"] is not None:
                 logits = logits + d["router_b"]
-            if moe["scoring"] == "softmax":
+            if moe["scoring"] in ("softmax", "topk_softmax"):
                 sc_ = np.exp(logits - logits.max(-1, keepdims=True))
                 sc_ = sc_ / sc_.sum(-1, keepdims=True)
             else:
                 sc_ = 1 / (1 + np.exp(-logits))
             out = np.zeros_like(h)
             for t in range(h.shape[0]):
-                choice = sc_[t] + (d["corr_b"] if d["corr_b"] is not None else 0)
+                if moe["scoring"] == "topk_softmax":
+                    # GraniteMoe: top-k of the logits, softmax over the selected ones.
+                    idx = np.argsort(-logits[t], kind="stable")[:K]
+                    w = np.exp(logits[t][idx] - logits[t][idx].max())
+                    w = w / w.sum()
+                    for e, we in zip(idx, w):
+                        out[t] += we * expert_out(d["experts"][e], h[t])
+                    continue
+                choice = sc_[t] + (np.squeeze(d["corr_b"]) if d["corr_b"] is not None else 0)
                 if moe["group_limited"]:
                     ng = moe["n_group"]
                     per = E // ng
@@ -1328,7 +1763,13 @@ def generate_generic(family, out_dir):
             if d["gub"] is not None:
                 gu = gu + d["gub"]
             inter = gu.shape[1] // 2
-            m = act_fn(gu[:, :inter]) * gu[:, inter:]
+            if s["dense_swiglu"]:
+                alpha, limit = s["dense_swiglu"]
+                g = np.minimum(gu[:, :inter], limit)
+                u = np.clip(gu[:, inter:], -limit, limit)
+                m = (u + 1.0) * (g / (1 + np.exp(-alpha * g)))
+            else:
+                m = act_fn(gu[:, :inter]) * gu[:, inter:]
         else:
             u = h @ d["up"].T
             if d["ub"] is not None:
@@ -1359,7 +1800,9 @@ def generate_generic(family, out_dir):
             a = None
             if has_mixer:
                 h = maybe_norm(x, d["in_norm"], s["in_norm"])
-                if lin_layers[li]:
+                if lin_layers[li] and s["linear_kind"] == "lightning":
+                    a = lightning_attn(d, li, h)
+                elif lin_layers[li]:
                     a = linear_attn(d, h)
                 elif ssm_layers[li] and attn_layers[li]:
                     a = ssm_block(d, h) * np.float32(mult["ssm_out"]) + attention(d, li, h * np.float32(mult["attn_in"]), cos, sin) * np.float32(mult["attn_out"])
@@ -1369,6 +1812,15 @@ def generate_generic(family, out_dir):
                     a = attention(d, li, h, cos, sin)
                 if d["post_attn_norm"] is not None:
                     a = norm(a, d["post_attn_norm"])
+            if s["residual_layout"] == "minimax":
+                # h = norm(x); x = alpha * h + beta * f(h) for both sublayers.
+                sa = s["mm_scales"]["linear" if lin_layers[li] else "full"]
+                x = np.float32(sa[0]) * h + np.float32(sa[1]) * a
+                h2 = norm(x, d["pre_ff_norm"])
+                sm = s["mm_scales"]["mlp"]
+                x = np.float32(sm[0]) * h2 + np.float32(sm[1]) * mlp(d, h2)
+                hidden.append(x.copy())
+                continue
             if s["parallel"]:
                 m_in = norm(x, d["mlp_norm"]) if d["mlp_norm"] is not None else h
                 m = mlp(d, m_in)

@@ -346,7 +346,8 @@ return {
   -- n_additional_trials = 20,         -- run more trials before showing results
   -- model_action = "save",            -- "save", "chat" or "exit"
   -- save_directory = "out/my-model",
-  -- export_dtype = "bf16",            -- "bf16", "f16" or "f32" (default: as source)
+  -- export_dtype = "bf16",            -- "bf16", "f16" or "f32" (default: as source;
+  --                                   -- a source dequantised on load exports as bf16)
   -- Export format: "hf" (a Hugging Face directory, the default), "gguf" (one
   -- llama.cpp model.gguf next to README.md and the manifest) or "both". A
   -- model loaded from a GGUF file defaults to "gguf".
