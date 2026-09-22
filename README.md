@@ -89,11 +89,27 @@ a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
   `qwen3_5` / `qwen3_5_moe` (Qwen3.5, Qwen3.8 dense and MoE, text configs;
   the linear recurrence runs sequentially, so long prefills are slower
   than on dense models)
+* Mamba (selective state-space) families: `mamba2` (Mamba-Codestral,
+  `state-spaces/mamba2-*-hf`), `nemotron_h` (Nemotron-H and Nemotron 3 Nano:
+  Mamba2, attention, relu² MLP and non-gated MoE blocks laid out by
+  `hybrid_override_pattern`), `falcon_h1` (Mamba2 and attention side by side
+  in every layer, with the muP multipliers), `jamba` (Mamba1 with the
+  RMS-normalised dt/B/C path, attention and MoE layers by period) and
+  `granitemoehybrid` (Granite 4.0 H: Mamba2, attention, fused experts next
+  to the shared MLP). The selective scan runs one token at a time (heads
+  and channels in parallel) and its state is kept per sequence through
+  prefill and decoding like the KV cache; a Mamba block's `out_proj` is
+  abliterated like an attention output projection.
 * Kimi: `kimi_linear` (Kimi-Linear-48B-A3B: Kimi Delta Attention with
   per-channel decay, 3:1 with MLA layers without RoPE, DeepSeek-V3-style
   MoE with a shared expert; both the original checkpoint layout and the
   transformers module layout), `kimi_k25` (Kimi K2.5 / K2.6: the DeepSeek
-  V3 text config of the image-video wrapper)
+  V3 text config of the image-video wrapper), `kimi_k3` (Kimi K3: the
+  image-video wrapper around a `kimi_linear` text config with Attention
+  Residual, KDA layers with the full-rank output gate and the safe forget
+  gate, MLA layers with a sigmoid output gate, latent MoE with 896 experts,
+  SiTU activation and two shared experts; bf16 or the released
+  compressed-tensors MXFP4 experts; see "Attention Residual" below)
 * Gemma 2 / Gemma 3 (text), Gemma 3n (`gemma3n` text: AltUp residual
   streams, Laurel blocks, per-layer input embeddings, KV-shared layers),
   Gemma 4 dense (`gemma4` text: global layers with their own head size,
@@ -113,8 +129,7 @@ a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
   (top-1 routing, NoPE layers), gpt-oss (attention sinks, interleaved
   fused experts, BF16 or MXFP4 checkpoints), ERNIE 4.5 MoE
   (`ernie4_5_moe`), Hunyuan-A13B (`hunyuan_v1_moe`), GraniteMoE /
-  GraniteMoeShared (`granitemoe`) and the attention-only Granite 4 layout
-  (`granitemoehybrid` without Mamba layers)
+  GraniteMoeShared (`granitemoe`; Granite 4.0 H is `granitemoehybrid` above)
 * MiniMax: M2 (`minimax_m2`), MiniMax-Text-01 / M1 (`minimax`: lightning
   linear attention alternating with softmax attention; the recurrence runs
   sequentially) and M3 (`minimax_m3_vl` text config, also `minimax_m3`;
@@ -143,11 +158,10 @@ Implemented from the Hugging Face reference but without a fixture: Falcon
 LayerNorm), Gemma 2 logit softcapping, `dynamic` and `longrope` scaling
 beyond the original context (treated as static / short factors).
 
-Not supported: state-space and hybrid models (Mamba, Jamba, Falcon-H1,
-Nemotron-H, RWKV, Granite 4 `granitemoehybrid` checkpoints with Mamba-2
-layers), Kimi K3 (AttnRes), Kimi K2 (`kimi_k2` standalone config),
-Qwen3.8-Flash-Next (`qwen4_exp`), GLM-5.3-Flash (`glm5_next`),
-encoder-decoder models, Gemma 4 MoE (`enable_moe_block`), LFM2-MoE,
+Not supported: Mamba1-only models (`mamba`, FalconMamba) and RWKV, Kimi
+K2 (`kimi_k2` standalone config), Qwen3.8-Flash-Next (`qwen4_exp`),
+GLM-5.3-Flash (`glm5_next`), encoder-decoder models, Gemma 4 MoE
+(`enable_moe_block`), LFM2-MoE,
 MiniCPM3, HunYuan cross-layer attention (`use_cla`), OPT-350m (projection
 layers), quantisation formats other than the ones listed below (GPTQ, AWQ,
 bitsandbytes, ...), and SentencePiece-only tokenizers (Baichuan; generate
@@ -159,18 +173,49 @@ silent fallbacks. Unicode normalisers (NFKC, Precompiled) are
 approximated by the identity.
 
 Image, video and audio models (Qwen2/3-VL, Qwen3.5, GLM-4.5V, Llama 4,
-Kimi K2.5, Gemma 3n, Gemma 4, Mistral Small 4) run through their text
+Kimi K2.5, Kimi K3, Gemma 3n, Gemma 4, Mistral Small 4) run through their text
 config: the vision and audio towers are never executed, their weights pass
 through exports byte for byte, and refusal directions are measured on text
 prompts.
+
+### Attention Residual (Kimi K3)
+
+Kimi K3 has no accumulated residual stream. Every `attn_res_block_size`
+layers the running prefix is banked and restarted, and each sublayer reads
+a softmax-weighted mixture of the banked block prefixes and the running one
+(the weights come from a per-layer RMSNorm and a `[1, hidden]` score
+projection: `self_attention_res_*`, `mlp_res_*` and, for the final norm,
+`output_attn_res_*`). ditch follows the reference exactly and defines the
+residual of layer `l`, for direction extraction, as the pre-norm mixture its
+attention reads (the block input); the last entry is the mixture the final
+norm reads. That is the `aggregate_stream` value of the SGLang
+implementation, the quantity on which the layer actually operates, and the
+directions, kernel and expert ranking work on it unchanged. The bank holds
+`ceil(layers / attn_res_block_size)` copies of the hidden state per token
+in RAM for the duration of a forward call (8 for the released 93-layer
+config).
+
+Edits follow the other families: every attention output projection
+(`o_proj` of the KDA and MLA layers) and every MLP down projection. K3's
+routed experts are a *latent* MoE (`routed_expert_hidden_size`): their
+`w2` matrices write into a 3584-wide latent space where a residual
+direction has no meaning, so the shared `routed_expert_up_proj`, which
+writes the summed expert output into the residual, takes the edit that the
+routed experts would have received (with the kernel weight in broad mode,
+`weight × strength` when expert selection is on; there is nothing to rank),
+while `shared_experts.down_proj` and the dense `mlp.down_proj` are edited
+as usual. The Attention Residual scorers, `routed_expert_down_proj` and
+`routed_expert_norm` are never touched and pass through exports byte for
+byte.
 
 Weights are read from safetensors (F32/F16/BF16, or the quantised formats
 below) or GGUF (llama, Mistral, Mixtral, Qwen2/3, Qwen MoE and Gemma 2/3
 families; the registry carries the llama.cpp architecture name of every
 family for the GGUF writer). Abliteration edits each family's attention
-output projection and MLP down projection (per expert on MoE layers) and
-exports preserve every tensor name and layout, including GPT-2's Conv1D
-transposes and fused expert tensors.
+output projection (the `out_proj` of a Mamba block) and MLP down
+projection (per expert on MoE layers) and exports preserve every tensor
+name and layout, including GPT-2's Conv1D transposes and fused expert
+tensors.
 
 ### Quantised checkpoints
 
@@ -191,6 +236,11 @@ model:
   llm-compressor INT4/INT8 models): `weight_packed` with `num_bits`-wide
   fields, per-group `weight_scale`, optional `weight_zero_point` and
   `weight_shape` from `quantization_config`.
+* **compressed-tensors mxfp4-pack-quantized** (Kimi K3 as released: the
+  routed experts only): `weight_packed` U8 holding E2M1 nibble pairs in the
+  natural `[out, in]` layout and `weight_scale` U8 E8M0 exponents per 32
+  elements; a different packing from gpt-oss's `*_blocks` / `*_scales`,
+  decoded row by row.
 
 Values are decoded to bf16, which is what the Hugging Face integrations
 produce. With `--max-ram` (streamed weights) a tensor is decoded row-chunk
@@ -281,8 +331,8 @@ the metadata); `--export-format gguf` writes one with llama.cpp's tensor
 names, metadata and permutations. Untouched tensors are copied byte for
 byte; edited tensors are re-quantised to the source type.
 
-A quantised safetensors source (FP8, MXFP4, pack-quantized INT4; see
-"Quantised checkpoints") is exported as a plain bf16 checkpoint: every
+A quantised safetensors source (FP8, MXFP4, pack-quantized INT4, packed
+MXFP4; see "Quantised checkpoints") is exported as a plain bf16 checkpoint: every
 tensor, edited or not, is written in bf16 (or `--export-dtype`) under its
 model name, the storage tensors (`*_blocks`, `*_scales`, `weight_scale_inv`,
 `weight_packed`, ...) are dropped and `quantization_config` is removed from

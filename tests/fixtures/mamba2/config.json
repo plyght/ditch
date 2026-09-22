@@ -1,0 +1,22 @@
+{
+ "model_type": "mamba2",
+ "hidden_size": 32,
+ "num_hidden_layers": 3,
+ "num_heads": 4,
+ "head_dim": 16,
+ "state_size": 8,
+ "n_groups": 2,
+ "expand": 2,
+ "conv_kernel": 4,
+ "use_bias": false,
+ "use_conv_bias": true,
+ "hidden_act": "silu",
+ "layer_norm_epsilon": 1e-05,
+ "time_step_limit": [
+  0.0,
+  Infinity
+ ],
+ "chunk_size": 256,
+ "tie_word_embeddings": false,
+ "vocab_size": 275
+}
