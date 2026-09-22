@@ -739,11 +739,22 @@ const Sgemm = *const fn (
 
 var sgemm_fn: ?Sgemm = null;
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
 /// Resolves `cblas_sgemm` from Accelerate. Called once at startup before any
 /// kernel runs (the pointer is then only read), and returns whether the
 /// Accelerate path is live.
 pub fn initAccelerate() bool {
     if (!have_accelerate) return false;
+    // ditch already spreads a matmul over its own workers, each handing
+    // `cblas_sgemm` one tile. Left multithreaded, Accelerate starts its own
+    // pool inside every one of those calls: on the three-core macOS CI runner
+    // that oversubscription made prefill 11% slower than the Zig kernel, and
+    // Accelerate's threads, still spinning afterwards, halved kernels that
+    // never call it (silu 28.9 -> 13.9 GFLOP/s). vecLib reads this when the
+    // framework loads, so it must be set before the dlopen; overwrite 0 keeps
+    // a value the user set themselves.
+    if (std.c.getenv("VECLIB_MAXIMUM_THREADS") == null) _ = setenv("VECLIB_MAXIMUM_THREADS", "1", 0);
     const handle = std.c.dlopen("/System/Library/Frameworks/Accelerate.framework/Accelerate", .{ .LAZY = true }) orelse return false;
     const sym = std.c.dlsym(handle, "cblas_sgemm") orelse return false;
     sgemm_fn = @ptrCast(@alignCast(sym));
