@@ -75,6 +75,24 @@ pub const QkNorm = enum {
 
 pub const RouterScoring = enum { softmax, sigmoid };
 
+/// Which recurrence a `linear_attention` layer runs.
+pub const LinearKind = enum {
+    /// Gated DeltaNet (Qwen hybrids).
+    gdn,
+    /// MiniMax lightning attention: `S = exp(-s_h) S + kᵀv`, `o = q S` per head,
+    /// with a silu on the fused qkv projection, an RMSNorm and a sigmoid output gate.
+    lightning,
+};
+
+/// Where the residual stream is normalised.
+pub const ResidualLayout = enum {
+    /// `x += f(norm(x))` (pre-norm; parallel or sequential).
+    pre,
+    /// MiniMax-01: `h = norm(x); x = α h + β f(h)` for both sublayers, so the
+    /// residual stream itself is renormalised twice per layer.
+    minimax,
+};
+
 pub const TopkMethod = enum {
     /// Plain top-k over the scores.
     greedy,
@@ -172,6 +190,13 @@ pub const Names = struct {
     lin_a_log: ?[]const u8 = null,
     lin_norm: ?[]const u8 = null,
     lin_out: ?[]const u8 = null,
+    /// MiniMax lightning attention: fused `[heads][q | k | v]` projection,
+    /// sigmoid output gate, RMSNorm over `heads * head_dim` and the output
+    /// projection (loaded into `Layer.o`).
+    light_qkv: ?[]const u8 = null,
+    light_gate: ?[]const u8 = null,
+    light_norm: ?[]const u8 = null,
+    light_out: ?[]const u8 = null,
     // MLA
     q_a: ?[]const u8 = null,
     q_a_norm: ?[]const u8 = null,
@@ -192,9 +217,16 @@ pub const Names = struct {
     expert_down: []const u8 = "down_proj.weight",
     fused_gate_up: []const []const u8 = &.{ "mlp.experts.gate_up_proj", "mlp.experts.gate_up_proj.weight" },
     fused_down: []const []const u8 = &.{ "mlp.experts.down_proj", "mlp.experts.down_proj.weight" },
-    /// Shared expert prefix (its projections use the expert_* names).
+    /// Shared expert prefix (its projections use the expert_* names unless
+    /// `shared_gate_up` / `shared_down` override them).
     shared_expert: ?[]const u8 = null,
     shared_expert_gate: ?[]const u8 = null,
+    /// Fused `[2I][H]` gate/up tensor of the shared expert (GraniteMoeShared
+    /// `input_linear`, MiniMax M3 `gate_up_proj`), relative to `shared_expert`.
+    shared_gate_up: ?[]const u8 = null,
+    /// Down projection of the shared expert, relative to `shared_expert`
+    /// (default: `expert_down`).
+    shared_down: ?[]const u8 = null,
 };
 
 /// One architecture family.
@@ -224,6 +256,8 @@ pub const Arch = struct {
     tie_word_embeddings: bool = false,
     embed_scale_sqrt: bool = false,
     qk_norm: QkNorm = .none,
+    /// What a `linear_attention` layer of this family computes.
+    linear_kind: LinearKind = .gdn,
     /// Family-specific config keys.
     extra: ?*const fn (*Config, Allocator, std.json.ObjectMap) anyerror!void = null,
 };
@@ -256,6 +290,7 @@ pub const Config = struct {
     linear_layers: []bool,
     /// Any linear-attention layer present.
     has_linear: bool,
+    linear_kind: LinearKind,
     linear_k_heads: usize,
     linear_k_dim: usize,
     linear_v_heads: usize,
@@ -285,6 +320,12 @@ pub const Config = struct {
     qk_norm: QkNorm,
     /// Apply the q/k norm only on layers with RoPE (Llama 4).
     qk_norm_rope_only: bool,
+    /// Apply the q/k norm after the rotary embedding (HunYuan).
+    qk_norm_after_rope: bool,
+    residual_layout: ResidualLayout,
+    /// MiniMax-01 residual scales `[full attention, linear attention, mlp]`
+    /// as `[α (residual), β (sublayer output)]`.
+    minimax_scales: [3][2]f32,
     clip_qkv: ?f32,
     /// Scale on every sublayer output before the residual add (Granite, MiniCPM).
     residual_multiplier: f32,
@@ -502,7 +543,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
     var kv_heads = getIntAny(obj, &.{ "num_key_value_heads", "num_kv_heads", "n_head_kv", "multi_query_group_num" }, heads);
     if (attn_cfg.get("kv_n_heads") != null) kv_heads = getInt(attn_cfg, "kv_n_heads", heads);
     if (getBool(obj, "multi_query", false)) kv_heads = 1;
-    var head_dim = getIntAny(obj, &.{ "head_dim", "kv_channels" }, hidden / heads);
+    var head_dim = getIntAny(obj, &.{ "head_dim", "attention_head_dim", "kv_channels" }, hidden / heads);
     var v_head_dim = head_dim;
 
     var mla: ?Mla = null;
@@ -533,6 +574,8 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
     var rotary_dim = head_dim;
     if (getNum(obj, "partial_rotary_factor")) |f| rotary_dim = @intFromFloat(@as(f64, @floatFromInt(head_dim)) * f);
     if (getNum(obj, "rotary_pct")) |f| rotary_dim = @intFromFloat(@as(f64, @floatFromInt(head_dim)) * f);
+    // MiniMax checkpoints express partial rotary as an absolute `rotary_dim`.
+    if (getNum(obj, "rotary_dim") != null) rotary_dim = @min(getInt(obj, "rotary_dim", head_dim), head_dim);
     if (mla) |m| rotary_dim = m.qk_rope_head_dim;
     rotary_dim -= rotary_dim % 2;
 
@@ -627,11 +670,20 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
                     } else if (std.mem.eql(u8, t, "linear_attention")) {
                         linear_layers[i] = true;
                         has_linear = true;
-                    } else if (std.mem.eql(u8, t, "full_attention")) {} else if (std.mem.eql(u8, t, "deepseek_sparse_attention")) {
+                    } else if (std.mem.eql(u8, t, "full_attention") or std.mem.eql(u8, t, "attention")) {} else if (std.mem.eql(u8, t, "deepseek_sparse_attention")) {
                         // Zhipu's sparse indexer selects a top-k over the keys; for
                         // the short calibration contexts ditch scores, the top-k
                         // covers the whole context, so dense attention is exact.
                         std.log.warn("deepseek_sparse_attention runs as dense attention (exact for short contexts)", .{});
+                    } else if (std.mem.eql(u8, t, "minimax_m3_sparse")) {
+                        // MiniMax Sparse Attention selects the top-k key blocks per
+                        // query (plus the local blocks); with fewer blocks than the
+                        // top-k in the context every block is selected and the
+                        // layer is plain causal attention (see extraMiniMaxM3).
+                        const prev = if (i > 0 and lt.array.items[i - 1] == .string) lt.array.items[i - 1].string else "";
+                        if (!std.mem.eql(u8, prev, "minimax_m3_sparse")) {
+                            std.log.warn("minimax_m3_sparse runs as dense attention (exact while the context fits index_topk_blocks blocks)", .{});
+                        }
                     } else {
                         std.log.err("unsupported layer type '{s}' (only full/sliding/linear attention are implemented)", .{t});
                         return error.UnsupportedArchitecture;
@@ -689,7 +741,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
     const linear_v_heads = getInt(obj, "linear_num_value_heads", 0);
     const linear_v_dim = getInt(obj, "linear_value_head_dim", 0);
     const linear_conv_kernel = getInt(obj, "linear_conv_kernel_dim", 0);
-    if (has_linear and (linear_k_heads == 0 or linear_k_dim == 0 or linear_v_heads == 0 or linear_v_dim == 0 or linear_conv_kernel == 0)) {
+    if (has_linear and arch.linear_kind == .gdn and arch.names.lin_conv != null and (linear_k_heads == 0 or linear_k_dim == 0 or linear_v_heads == 0 or linear_v_dim == 0 or linear_conv_kernel == 0)) {
         std.log.err("linear_attention layers need linear_num_key_heads/key_head_dim/num_value_heads/value_head_dim/conv_kernel_dim", .{});
         return error.InvalidConfig;
     }
@@ -725,6 +777,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         .positional = arch.positional,
         .linear_layers = linear_layers,
         .has_linear = has_linear,
+        .linear_kind = arch.linear_kind,
         .linear_k_heads = linear_k_heads,
         .linear_k_dim = linear_k_dim,
         .linear_v_heads = linear_v_heads,
@@ -749,6 +802,9 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         .mlp = arch.mlp,
         .qk_norm = arch.qk_norm,
         .qk_norm_rope_only = false,
+        .qk_norm_after_rope = false,
+        .residual_layout = .pre,
+        .minimax_scales = .{ .{ 1, 1 }, .{ 1, 1 }, .{ 1, 1 } },
         .clip_qkv = null,
         .residual_multiplier = 1.0,
         .logit_scale = 1.0,
@@ -1051,6 +1107,202 @@ fn extraGlmMoeDsa(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
     c.moe.routed_scaling_factor = getF32(obj, "routed_scaling_factor", 1.0);
     if (getNum(obj, "index_topk") != null) {
         std.log.warn("sparse indexer runs as dense attention (exact for short contexts)", .{});
+    }
+}
+
+/// First element of an integer array config value (or the scalar), requiring
+/// every element to agree: ditch has one value per model, not per layer.
+fn uniformInt(obj: std.json.ObjectMap, key: []const u8, default: usize) !usize {
+    const v = obj.get(key) orelse return default;
+    switch (v) {
+        .integer, .float => return getInt(obj, key, default),
+        .array => |a| {
+            if (a.items.len == 0) return default;
+            var first: ?i64 = null;
+            for (a.items) |item| {
+                if (item != .integer) return error.InvalidConfig;
+                if (first == null) first = item.integer;
+                if (item.integer != first.?) {
+                    std.log.err("per-layer values of '{s}' differ; only uniform values are supported", .{key});
+                    return error.UnsupportedArchitecture;
+                }
+            }
+            if (first.? < 0) return error.InvalidConfig;
+            return @intCast(first.?);
+        },
+        else => return default,
+    }
+}
+
+fn extraMiniMaxM2(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
+    // Sigmoid routing, top-k on the biased scores, renormalised routing weights.
+    c.moe.scoring = .sigmoid;
+    c.norm_topk_prob = true;
+    c.num_experts_per_tok = getInt(obj, "num_experts_per_tok", 8);
+    if (getNum(obj, "rope_theta") == null) c.rope_theta = 5000000.0;
+    if (c.num_experts > 0) @memset(c.moe_layers, true);
+}
+
+fn extraMiniMax(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
+    // MiniMax-01 / M1: lightning (linear) attention on every layer but each
+    // `full_attention` one, a renormalised residual stream with per-sublayer
+    // α/β scales, softmax top-k routing renormalised over the selected experts.
+    c.residual_layout = .minimax;
+    c.norm_topk_prob = true;
+    if (getNum(obj, "rope_theta") == null) c.rope_theta = 1000000.0;
+    if (obj.get("layer_types") == null) {
+        // Remote-code checkpoints carry `attn_type_list` (0 = lightning, 1 =
+        // softmax attention); the Hugging Face default alternates, starting linear.
+        if (obj.get("attn_type_list")) |al| {
+            if (al == .array) for (al.array.items, 0..) |v, i| {
+                if (i < c.num_layers) c.linear_layers[i] = (v == .integer and v.integer == 0);
+            };
+        } else {
+            for (c.linear_layers, 0..) |*l, i| l.* = ((i + 1) % 2 != 0);
+        }
+        c.has_linear = false;
+        for (c.linear_layers) |l| c.has_linear = c.has_linear or l;
+    }
+    const keys = [3][2][2][]const u8{
+        .{ .{ "full_attn_alpha_factor", "layernorm_full_attention_alpha" }, .{ "full_attn_beta_factor", "layernorm_full_attention_beta" } },
+        .{ .{ "linear_attn_alpha_factor", "layernorm_linear_attention_alpha" }, .{ "linear_attn_beta_factor", "layernorm_linear_attention_beta" } },
+        .{ .{ "mlp_alpha_factor", "layernorm_mlp_alpha" }, .{ "mlp_beta_factor", "layernorm_mlp_beta" } },
+    };
+    for (&c.minimax_scales, keys) |*s, k| {
+        s[0] = getF32Any(obj, &k[0], 1.0);
+        s[1] = getF32Any(obj, &k[1], 1.0);
+    }
+    if (getBool(obj, "postnorm", false)) {
+        std.log.err("unsupported model: MiniMax 'postnorm' residual layout", .{});
+        return error.UnsupportedArchitecture;
+    }
+    if (c.num_experts > 0) @memset(c.moe_layers, true);
+}
+
+fn extraMiniMaxM3(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
+    // MiniMax M3 (transformers `minimax_m3_vl_text`): Gemma-style (1 + w)
+    // norms everywhere, per-head q/k norm before a partial rotary, sigmoid
+    // routing with a correction bias and a routed scaling factor, a shared
+    // expert and the clamped gpt-oss swiglu in every MLP. Attention on
+    // `minimax_m3_sparse` layers is MiniMax Sparse Attention: every query
+    // scores the key blocks of `index_block_size` tokens with a small indexer
+    // and attends to the best `index_topk_blocks` plus `index_local_blocks`
+    // (the top-k always includes every block once the context is shorter
+    // than `index_topk_blocks * index_block_size` tokens, 2048 with the
+    // released config), so ditch runs those layers as dense causal attention
+    // and never reads the indexer weights; longer prompts diverge from the
+    // reference and are rejected below.
+    c.moe.scoring = .sigmoid;
+    c.norm_topk_prob = true;
+    c.moe.routed_scaling_factor = getF32(obj, "routed_scaling_factor", 2.0);
+    c.moe.swiglu = .{ .alpha = getF32(obj, "swiglu_alpha", 1.702), .limit = getF32(obj, "swiglu_limit", 7.0) };
+    c.num_experts_per_tok = getInt(obj, "num_experts_per_tok", 4);
+    if (getNum(obj, "rope_theta") == null) c.rope_theta = 5000000.0;
+    if (getNum(obj, "rotary_dim") == null and getNum(obj, "partial_rotary_factor") == null) c.rotary_dim = @min(64, c.head_dim);
+    // Experts use `intermediate_size`; dense layers `dense_intermediate_size`.
+    c.moe_intermediate_size = c.intermediate_size;
+    c.intermediate_size = getInt(obj, "dense_intermediate_size", c.intermediate_size);
+    if (c.num_experts > 0) {
+        @memset(c.moe_layers, true);
+        if (obj.get("mlp_layer_types")) |ml| {
+            if (ml == .array) for (ml.array.items, 0..) |v, i| {
+                if (i < c.num_layers and v == .string) c.moe_layers[i] = !std.mem.eql(u8, v.string, "dense");
+            };
+        } else if (obj.get("moe_layer_freq")) |mf| {
+            if (mf == .array) for (mf.array.items, 0..) |v, i| {
+                if (i < c.num_layers) c.moe_layers[i] = !(v == .integer and v.integer == 0);
+            };
+        }
+    }
+    var block: usize = getInt(obj, "index_block_size", 128);
+    var topk: usize = getInt(obj, "index_topk_blocks", 16);
+    if (getObj(obj, "sparse_attention_config")) |sc| {
+        block = getInt(sc, "sparse_block_size", block);
+        topk = getInt(sc, "sparse_topk_blocks", topk);
+    }
+    var any_sparse = false;
+    if (obj.get("layer_types")) |lt| {
+        if (lt == .array) for (lt.array.items) |v| {
+            if (v == .string and std.mem.eql(u8, v.string, "minimax_m3_sparse")) any_sparse = true;
+        };
+    } else if (getObj(obj, "sparse_attention_config")) |sc| {
+        if (sc.get("sparse_attention_freq")) |f| {
+            if (f == .array) for (f.array.items) |v| {
+                if (v == .integer and v.integer != 0) any_sparse = true;
+            };
+        }
+    }
+    if (any_sparse) {
+        // Dense attention is exact only while every key block is selected.
+        std.log.warn("minimax_m3: sparse attention runs as dense attention, exact for prompts up to {d} tokens (index_block_size * index_topk_blocks)", .{block * topk});
+    }
+}
+
+fn extraErnieMoe(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
+    // Softmax routing; the correction bias steers the choice only; the
+    // selected probabilities are renormalised (clamped at moe_norm_min).
+    c.norm_topk_prob = true;
+    c.attention_bias = getBool(obj, "use_bias", false);
+    if (getNum(obj, "rope_theta") == null) c.rope_theta = 500000.0;
+    c.num_experts = getInt(obj, "moe_num_experts", c.num_experts);
+    c.num_experts_per_tok = getInt(obj, "moe_k", getInt(obj, "num_experts_per_tok", 6));
+    @memset(c.moe_layers, false);
+    if (c.num_experts > 0) {
+        const start = getInt(obj, "moe_layer_start_index", 1);
+        var end = c.num_layers - 1;
+        if (getNum(obj, "moe_layer_end_index")) |e| {
+            if (e >= 0) end = @intFromFloat(e);
+        }
+        const interval = @max(getInt(obj, "moe_layer_interval", 1), 1);
+        for (c.moe_layers, 0..) |*m, i| m.* = ((i + 1) % interval == 0) and i >= start and i <= end;
+    }
+}
+
+fn extraHunyuanMoe(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
+    // Softmax top-k renormalised; per-head q/k RMSNorm applied after RoPE;
+    // NTK-alpha "dynamic" rope scaling folded into the base.
+    c.norm_topk_prob = true;
+    c.qk_norm_after_rope = true;
+    c.attention_bias = getBool(obj, "attention_bias", false);
+    if (getBool(obj, "use_cla", false)) {
+        std.log.err("unsupported model: HunYuan cross-layer attention (use_cla)", .{});
+        return error.UnsupportedArchitecture;
+    }
+    c.num_experts = try uniformInt(obj, "num_experts", c.num_experts);
+    c.num_experts_per_tok = try uniformInt(obj, "moe_topk", getInt(obj, "num_experts_per_tok", 1));
+    c.moe_intermediate_size = try uniformInt(obj, "moe_intermediate_size", c.intermediate_size);
+    @memset(c.moe_layers, c.num_experts > 0);
+    const rs = getObj(obj, "rope_scaling") orelse getObj(obj, "rope_parameters");
+    if (rs) |r| {
+        const t = getStr(r, "rope_type") orelse getStr(r, "type") orelse "";
+        if (std.mem.eql(u8, t, "dynamic")) {
+            if (getNum(r, "alpha")) |alpha| {
+                const d: f64 = @floatFromInt(c.head_dim);
+                c.rope_theta = @floatCast(@as(f64, c.rope_theta) * std.math.pow(f64, alpha, d / (d - 2.0)));
+            }
+        }
+    }
+}
+
+fn extraGraniteMoe(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
+    try extraGranite(c, arena, obj);
+    // Top-k over the router logits, softmax over the selected ones (equal
+    // to a renormalised softmax over every expert).
+    c.norm_topk_prob = true;
+    if (c.num_experts > 0) @memset(c.moe_layers, true);
+}
+
+fn extraGraniteHybrid(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
+    try extraGraniteMoe(c, arena, obj);
+    // `linear_attention` (or `mamba`) layers are Mamba-2 blocks here.
+    if (c.has_linear) {
+        std.log.err("unsupported model: GraniteMoeHybrid with Mamba-2 layers (only attention-only configurations run)", .{});
+        return error.UnsupportedArchitecture;
+    }
+    if (getStr(obj, "position_embedding_type")) |t| {
+        if (!std.mem.eql(u8, t, "rope")) c.positional = .none;
+    } else if (obj.get("position_embedding_type")) |v| {
+        if (v == .null) c.positional = .none;
     }
 }
 
@@ -1414,7 +1666,7 @@ pub const registry = [_]Arch{
         .llama_cpp = "granite",
         .chat = "granite",
         .verified = true,
-        .notes = "fixture: embedding, attention and residual multipliers, logits scaling. Granite 3.x dense (GraniteMoE is unsupported).",
+        .notes = "fixture: embedding, attention and residual multipliers, logits scaling. Granite 3.x dense (GraniteMoE has its own entry).",
         .extra = extraGranite,
     },
     .{
@@ -1794,6 +2046,147 @@ pub const registry = [_]Arch{
         .notes = "fixture: MLA with a sparse indexer (run as dense attention: exact for short contexts), sigmoid MoE with correction bias and shared experts.",
         .extra = extraGlmMoeDsa,
     },
+    .{
+        .model_type = "minimax_m2",
+        .llama_cpp = "minimax-m2",
+        .verified = true,
+        .qk_norm = .full,
+        .names = .{
+            .q_norm = "self_attn.q_norm.weight",
+            .k_norm = "self_attn.k_norm.weight",
+            .router = "block_sparse_moe.gate.weight",
+            .router_correction_bias = "block_sparse_moe.e_score_correction_bias",
+            .expert = "block_sparse_moe.experts.{e}.",
+            .expert_gate = "w1.weight",
+            .expert_up = "w3.weight",
+            .expert_down = "w2.weight",
+            .fused_gate_up = &.{},
+            .fused_down = &.{},
+        },
+        .notes = "fixture: q/k RMSNorm over the whole projection, partial rotary (rotary_dim), sigmoid routing with e_score_correction_bias and renormalised top-k, Mixtral-style expert tensors.",
+        .extra = extraMiniMaxM2,
+    },
+    .{
+        .model_type = "minimax",
+        .aliases = &.{ "minimax_text_01", "minimax_m1", "MiniMaxText01", "MiniMaxM1" },
+        .llama_cpp = "minimax-01",
+        .verified = true,
+        .linear_kind = .lightning,
+        .names = .{
+            .light_qkv = "self_attn.qkv_proj.weight",
+            .light_gate = "self_attn.output_gate.weight",
+            .light_norm = "self_attn.norm.weight",
+            .light_out = "self_attn.out_proj.weight",
+            .router = "block_sparse_moe.gate.weight",
+            .expert = "block_sparse_moe.experts.{e}.",
+            .expert_gate = "w1.weight",
+            .expert_up = "w3.weight",
+            .expert_down = "w2.weight",
+            .fused_gate_up = &.{},
+            .fused_down = &.{},
+        },
+        .notes = "fixture: lightning attention layers (silu qkv, per-head decay recurrence, RMSNorm, sigmoid output gate) alternating with softmax attention with partial rotary, the renormalised residual layout with α/β scales, softmax top-k MoE. MiniMax-Text-01 / M1 (`layer_types` or `attn_type_list`). The recurrence runs sequentially.",
+        .extra = extraMiniMax,
+    },
+    .{
+        .model_type = "minimax_m3_vl_text",
+        .aliases = &.{ "minimax_m3_vl", "minimax_m3" },
+        .llama_cpp = "minimax-m3",
+        .verified = true,
+        .norm = .rms_gemma,
+        .qk_norm = .head,
+        .mlp = .gated_fused,
+        .names = .{
+            .q_norm = "self_attn.q_norm.weight",
+            .k_norm = "self_attn.k_norm.weight",
+            .gate = null,
+            .up = null,
+            .gate_up = "mlp.gate_up_proj.weight",
+            .down = "mlp.down_proj.weight",
+            .router = "block_sparse_moe.gate.weight",
+            .router_correction_bias = "block_sparse_moe.e_score_correction_bias",
+            .expert = "block_sparse_moe.experts.{e}.",
+            .expert_gate = "w1.weight",
+            .expert_up = "w3.weight",
+            .expert_down = "w2.weight",
+            .fused_gate_up = &.{},
+            .fused_down = &.{},
+            .shared_expert = "block_sparse_moe.shared_experts.",
+            .shared_gate_up = "gate_up_proj.weight",
+            .shared_down = "down_proj.weight",
+        },
+        .notes = "fixture: (1 + w) norms, per-head (1 + w) q/k norm, partial rotary, dense layers (mlp_layer_types) with a fused gate_up and the clamped swiglu, sigmoid MoE with correction bias, routed scaling and a fused-gate_up shared expert, minimax_m3_sparse layers run as dense attention (exact while the context fits index_topk_blocks blocks); the indexer weights pass through exports untouched. The image tower of the VL wrapper is never executed.",
+        .extra = extraMiniMaxM3,
+    },
+    .{
+        .model_type = "ernie4_5_moe",
+        .llama_cpp = "ernie4_5-moe",
+        .verified = true,
+        .rope_style = .gptj,
+        .names = .{
+            .router_correction_bias = "mlp.moe_statics.e_score_correction_bias",
+            .shared_expert = "mlp.shared_experts.",
+        },
+        .notes = "fixture: interleaved rotary, softmax routing with the moe_statics correction bias and renormalised top-k, shared experts, moe_layer_start_index / interval, use_bias. ERNIE 4.5 MoE (PT checkpoints).",
+        .extra = extraErnieMoe,
+    },
+    .{
+        .model_type = "hunyuan_v1_moe",
+        .aliases = &.{"hunyuan"},
+        .llama_cpp = "hunyuan-moe",
+        .verified = true,
+        .qk_norm = .head,
+        .names = .{
+            .q_norm = "self_attn.query_layernorm.weight",
+            .k_norm = "self_attn.key_layernorm.weight",
+            .router = "mlp.gate.wg.weight",
+            .shared_expert = "mlp.shared_mlp.",
+        },
+        .notes = "fixture: per-head q/k RMSNorm after RoPE, NTK-alpha dynamic rope base, softmax top-k renormalised, shared MLP, per-layer (uniform) expert counts. Hunyuan-A13B.",
+        .extra = extraHunyuanMoe,
+    },
+    .{
+        .model_type = "granitemoe",
+        .aliases = &.{"granitemoeshared"},
+        .llama_cpp = "granitemoe",
+        .chat = "granite",
+        .verified = true,
+        .names = .{
+            .router = "block_sparse_moe.router.layer.weight",
+            .expert = "block_sparse_moe.experts.{e}.",
+            .expert_down = "output_linear.weight",
+            .fused_gate_up = &.{"block_sparse_moe.input_linear.weight"},
+            .fused_down = &.{"block_sparse_moe.output_linear.weight"},
+            .shared_expert = "shared_mlp.",
+            .shared_gate_up = "input_linear.weight",
+            .shared_down = "output_linear.weight",
+        },
+        .notes = "fixture: Granite multipliers, fused [E, 2I, H] / [E, H, I] expert tensors (input_linear / output_linear), top-k softmax routing. GraniteMoeShared adds the fused shared_mlp (implemented, covered by the granitemoehybrid fixture).",
+        .extra = extraGraniteMoe,
+    },
+    .{
+        .model_type = "granitemoehybrid",
+        .llama_cpp = "granitehybrid",
+        .chat = "granite",
+        .verified = true,
+        .mlp = .gated_fused,
+        .names = .{
+            .gate = null,
+            .up = null,
+            .gate_up = "shared_mlp.input_linear.weight",
+            .down = "shared_mlp.output_linear.weight",
+            .router = "block_sparse_moe.router.layer.weight",
+            .expert = "block_sparse_moe.experts.{e}.",
+            .expert_down = "output_linear.weight",
+            .fused_gate_up = &.{"block_sparse_moe.input_linear.weight"},
+            .fused_down = &.{"block_sparse_moe.output_linear.weight"},
+            .shared_expert = "shared_mlp.",
+            .shared_gate_up = "input_linear.weight",
+            .shared_down = "output_linear.weight",
+        },
+        .notes = "fixture: attention-only Granite 4 layout (layer_types all attention): fused routed experts plus the fused shared_mlp, or a dense shared_mlp when num_local_experts is 0, optional RoPE (position_embedding_type). Mamba-2 layers are rejected.",
+        .extra = extraGraniteHybrid,
+    },
 };
 
 test "registry lookup and aliases" {
@@ -1838,4 +2231,55 @@ test "parseConfig picks family knobs" {
     try std.testing.expect(ds.rope_scaling == .yarn);
     const ms = 0.1 * @log(@as(f32, 40)) + 1.0;
     try std.testing.expectApproxEqRel(ms * ms / @sqrt(@as(f32, 12)), ds.attention_scale, 1e-5);
+}
+
+test "parseConfig handles the MiniMax, HunYuan, ERNIE and Granite MoE keys" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Remote-code MiniMax-M1 keys: attn_type_list and layernorm_* scales.
+    const m1 = try parseConfig(a,
+        \\{"model_type":"minimax_m1","hidden_size":64,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":16,"num_hidden_layers":4,"vocab_size":100,"rotary_dim":8,"attn_type_list":[0,0,0,1],"layernorm_full_attention_alpha":3.5,"layernorm_linear_attention_alpha":3.5,"layernorm_mlp_alpha":3.5,"layernorm_mlp_beta":1,"num_local_experts":8,"num_experts_per_tok":2}
+    );
+    try std.testing.expectEqual(LinearKind.lightning, m1.linear_kind);
+    try std.testing.expectEqual(ResidualLayout.minimax, m1.residual_layout);
+    try std.testing.expect(m1.linear_layers[0] and m1.linear_layers[2] and !m1.linear_layers[3] and m1.has_linear);
+    try std.testing.expectEqual(@as(usize, 8), m1.rotary_dim);
+    try std.testing.expectEqual(@as(f32, 3.5), m1.minimax_scales[1][0]);
+    try std.testing.expectEqual(@as(f32, 1.0), m1.minimax_scales[2][1]);
+    try std.testing.expect(m1.norm_topk_prob and m1.moe_layers[0]);
+    // MiniMax M3: dense/sparse MLP schedule from moe_layer_freq, sparse attention accepted.
+    const m3 = try parseConfig(a,
+        \\{"model_type":"minimax_m3_vl","text_config":{"model_type":"minimax_m3_vl_text","hidden_size":64,"intermediate_size":16,"dense_intermediate_size":48,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":16,"num_hidden_layers":3,"vocab_size":100,"num_local_experts":8,"num_experts_per_tok":2,"moe_layer_freq":[0,1,1],"sparse_attention_config":{"sparse_attention_freq":[0,1,1],"sparse_block_size":64,"sparse_topk_blocks":8},"layer_types":["full_attention","minimax_m3_sparse","minimax_m3_sparse"]}}
+    );
+    try std.testing.expectEqual(NormKind.rms_gemma, m3.norm);
+    try std.testing.expect(!m3.moe_layers[0] and m3.moe_layers[1] and m3.moe_layers[2]);
+    try std.testing.expectEqual(@as(usize, 48), m3.intermediate_size);
+    try std.testing.expectEqual(@as(usize, 16), m3.moe_intermediate_size);
+    try std.testing.expectEqual(RouterScoring.sigmoid, m3.moe.scoring);
+    try std.testing.expect(m3.moe.swiglu != null);
+    // HunYuan: per-layer lists, NTK-alpha base, q/k norm after RoPE.
+    const hy = try parseConfig(a,
+        \\{"model_type":"hunyuan_v1_moe","hidden_size":64,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":16,"num_hidden_layers":2,"vocab_size":100,"intermediate_size":32,"num_experts":[8,8],"moe_topk":[3,3],"rope_theta":10000.0,"rope_scaling":{"type":"dynamic","alpha":1000.0}}
+    );
+    try std.testing.expectEqual(@as(usize, 8), hy.num_experts);
+    try std.testing.expectEqual(@as(usize, 3), hy.num_experts_per_tok);
+    try std.testing.expect(hy.qk_norm_after_rope and hy.moe_layers[1]);
+    try std.testing.expectApproxEqRel(@as(f32, 10000.0 * std.math.pow(f32, 1000.0, 16.0 / 14.0)), hy.rope_theta, 1e-5);
+    // ERNIE: moe_layer_start_index / interval schedule, interleaved rotary.
+    const er = try parseConfig(a,
+        \\{"model_type":"ernie4_5_moe","hidden_size":64,"num_attention_heads":4,"num_key_value_heads":2,"num_hidden_layers":5,"vocab_size":100,"moe_num_experts":8,"moe_k":2,"moe_layer_start_index":1,"moe_layer_end_index":3,"moe_layer_interval":2,"moe_intermediate_size":16}
+    );
+    try std.testing.expectEqual(RopeStyle.gptj, er.rope_style);
+    try std.testing.expectEqualSlices(bool, &.{ false, true, false, true, false }, er.moe_layers);
+    try std.testing.expectEqual(@as(usize, 2), er.num_experts_per_tok);
+    // Granite hybrid: attention-only dense configs run, Mamba layers are refused.
+    const gh = try parseConfig(a,
+        \\{"model_type":"granitemoehybrid","hidden_size":64,"num_attention_heads":4,"num_hidden_layers":2,"vocab_size":100,"num_local_experts":0,"shared_intermediate_size":128,"layer_types":["attention","attention"],"position_embedding_type":null,"embedding_multiplier":12.0,"logits_scaling":8.0}
+    );
+    try std.testing.expectEqual(Positional.none, gh.positional);
+    try std.testing.expect(!gh.rope_layers[0] and gh.num_experts == 0 and !gh.moe_layers[0]);
+    try std.testing.expectEqual(MlpKind.gated_fused, gh.mlp);
+    try std.testing.expectEqual(@as(f32, 12.0), gh.embed_scale);
+    try std.testing.expectEqualStrings("granitemoe", lookup("granitemoeshared").?.model_type);
 }
