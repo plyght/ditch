@@ -207,6 +207,7 @@ test "qwen3_moe -> GGUF q8_0 -> reload (stacked experts with per-expert delta)" 
 }
 
 test "GGUF input re-exported as GGUF keeps quantisation and copies untouched tensors verbatim" {
+    if (tensor.mmapDisabled()) return error.SkipZigTest; // this test is about the mapped path
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const pool = tensor.Pool.init(io, 2);

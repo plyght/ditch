@@ -24,3 +24,37 @@ jobs:
           for t in x86_64-linux-musl aarch64-linux-musl x86_64-macos aarch64-macos x86_64-windows-gnu; do
             zig build -Doptimize=ReleaseFast -Dtarget=$t --prefix "zig-out/$t"
           done
+
+  # Apple Silicon: the NEON kernel shape, the performance-core thread pool and
+  # the Accelerate path only exist on this runner, so they are tested here.
+  macos:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: CPU topology
+        run: |
+          sysctl -n machdep.cpu.brand_string
+          echo "logical CPUs:       $(sysctl -n hw.logicalcpu)"
+          echo "performance cores:  $(sysctl -n hw.perflevel0.logicalcpu)"
+          echo "efficiency cores:   $(sysctl -n hw.perflevel1.logicalcpu || echo none)"
+      - name: Format check
+        run: zig fmt --check src build.zig
+      - name: Unit tests, Accelerate built in
+        run: zig build test --summary all -Daccelerate=true
+      - name: Unit tests, Accelerate compiled out
+        run: zig build test --summary all -Daccelerate=false
+      - name: End-to-end
+        run: bash tests/e2e.sh
+      - name: Kernel throughput and the Accelerate A/B
+        # Prints both tables and fails when Accelerate and the built-in kernel
+        # disagree beyond the tolerance (bench.accelerate_tolerance).
+        run: |
+          set -euo pipefail
+          zig build -Doptimize=ReleaseFast -Daccelerate=true
+          ./zig-out/bin/ditch --version
+          ./zig-out/bin/ditch bench --kernels
+          echo "--- built-in kernels only ---"
+          ./zig-out/bin/ditch bench --kernels --no-accelerate

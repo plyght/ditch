@@ -151,7 +151,8 @@ pub const File = struct {
         defer if (header_owned) |h| gpa.free(h);
         var header: []const u8 = undefined;
         var data: []const u8 = &.{};
-        if (options.map) {
+        // `DITCH_NO_MMAP` forces the read path (see tensor.mmapDisabled).
+        if (options.map and !tensor.mmapDisabled()) {
             self.map = try Io.File.MemoryMap.create(io, file, .{
                 .len = len,
                 .protection = .{ .read = true, .write = false },
@@ -501,6 +502,7 @@ pub fn writeFile(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, sub_path: []const 
 }
 
 test "safetensors round trip" {
+    if (tensor.mmapDisabled()) return error.SkipZigTest; // this test is about the mapped path
     const gpa = std.testing.allocator;
     var threaded: Io.Threaded = .init_single_threaded;
     const io = threaded.io();

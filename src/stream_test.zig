@@ -314,6 +314,7 @@ test "time limit and disk-full stop cleanly and leave the source untouched" {
 }
 
 test "decode throughput: streamed vs mapped (measurement)" {
+    if (tensor.mmapDisabled()) return error.SkipZigTest; // this test is about the mapped path
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const pool = tensor.Pool.init(io, 2);

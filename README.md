@@ -214,6 +214,48 @@ RAM. The Pareto fronts are close.
    `ditch --help`. Expected, not measured, gains: validate with
    `--evaluate-model`.
 
+## Performance
+
+The compute kernels pick their vector width and register tile from the target
+at compile time, because the shape that is fastest on one CPU spills registers
+on another. One accumulator must fit in one vector register: sixteen f32 lanes
+are one AVX-512 register but two AVX2 ones and four NEON ones, so the 4x4
+register tile that fits AVX-512 needs about 64 vector registers on NEON, which
+has 32. `ditch --version` and `ditch bench --kernels` print what a build chose.
+
+| Target | Lanes | Tile | Prefill GFLOP/s | Decode GFLOP/s |
+| :--- | ---: | :--- | ---: | ---: |
+| AVX-512 (`-Dcpu=x86_64_v4`) | 16 | 4x4 | 69.9 | 23.0 |
+| AVX2 (`-Dcpu=x86_64_v3`) | 8 | 4x3 | 66.4 (was 37.0) | 23.0 (was 19.9) |
+| x86-64 baseline (the release binaries) | 4 | 4x3 | 30.5 (was 1.1) | 17.3 (was 1.2) |
+| NEON (Apple Silicon, `aarch64-macos`) | 4 | 4x4 | not measured | not measured |
+
+One thread, 64 x 2048 x 2048 bf16 product, on one 4-vCPU x86-64 machine; "was"
+is the previous fixed 16-lane 4x4 kernel on the same machine. The baseline
+column is the large one: the release binaries are built for plain x86-64 so
+they run anywhere, and there `@mulAdd` has no instruction and became a libc
+`fmaf` call per lane. Kernels now multiply and add separately where the target
+has no FMA, which changes the rounding of every accumulation (consistently
+within one binary, so the streamed and mapped paths still agree bit for bit)
+and is about twenty-five times faster. Building for your own CPU is still
+worth it:
+
+```sh
+zig build -Doptimize=ReleaseFast -Dcpu=native
+```
+
+On macOS, `ditch` defaults its thread pool to the performance cores
+(`hw.perflevel0.logicalcpu`) rather than every logical CPU, asks the scheduler
+for `QOS_CLASS_USER_INITIATED` on each worker so they are not parked on the
+efficiency cores, and hands batched matrix products to Apple's Accelerate
+framework (`cblas_sgemm`, which reaches the AMX/SME matrix units) once a call
+has at least eight input rows; decode-shaped calls stay on the built-in kernel,
+which reads each bf16 weight once and never materialises an f32 tile. Turn
+Accelerate off at run time with `--no-accelerate`, or out of the build with
+`-Daccelerate=false`. The NEON and Accelerate paths are verified on Apple
+Silicon by the `macos-26` CI job; the numbers in its log are the ones to trust
+for a Mac.
+
 ## Development
 
 ```sh
@@ -221,6 +263,34 @@ zig build test --summary all   # unit tests (NumPy fixtures in tests/fixtures)
 bash tests/e2e.sh              # end-to-end run of every feature on the fixtures
 zig fmt --check src build.zig
 ```
+
+The kernels are compiled per target, so correctness has to be checked per
+target too. With `qemu-user-static` installed (`apt-get install -y
+qemu-user-static`; the binary has to be reachable as `qemu-aarch64`), the suite
+runs on AArch64, which is what verifies the NEON kernels against the x86
+numbers:
+
+```sh
+DITCH_NO_MMAP=1 zig build test -Dtarget=aarch64-linux-musl -fqemu --summary all
+zig build test -Dcpu=x86_64_v3 --summary all     # AVX2, as most laptops are
+zig build test -Dcpu=x86_64_v2 --summary all     # SSE only, no FMA
+zig build -Dtarget=aarch64-macos -Doptimize=ReleaseFast   # compile check
+```
+
+`DITCH_NO_MMAP=1` reads weights instead of memory-mapping them; qemu-user
+rejects the mapping flags Zig's `MemoryMap` uses, and the nine tests that are
+themselves about the mapped path skip themselves when it is set (283 run, 0
+fail). The two paths are bit-identical by test, so this changes no numbers. The
+same variable is a way out on any filesystem whose mmap misbehaves.
+`-Dtest-filter=<substring>` runs a subset of the tests.
+
+`ditch bench --kernels` measures the kernels themselves (matmul, matvec,
+attention, activation, conversion) on synthetic data without loading a model,
+and prints the vector width, tile shape, thread count, performance/efficiency
+core split and whether Accelerate is active; `--json`, `--plain` and
+`--bench-output` work as for `ditch bench`. `-Dvector-width=N`,
+`-Dtile-inputs=N` and `-Dtile-rows=N` override the compiled-in shape when
+tuning a new machine by hand.
 
 Exit codes: 0 success (including `--dry-run` and a clean stop at
 `--time-limit`), 1 failure, 2 usage error or a memory budget too small for the

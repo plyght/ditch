@@ -1670,12 +1670,15 @@ fn checkExportRoundTrip(comptime fixture: []const u8) !void {
 }
 
 test "selective export round trip (separate experts)" {
+    if (tensor.mmapDisabled()) return error.SkipZigTest; // this test is about the mapped path
     try checkExportRoundTrip("qwen3_moe");
 }
 test "selective export round trip (fused experts)" {
+    if (tensor.mmapDisabled()) return error.SkipZigTest; // this test is about the mapped path
     try checkExportRoundTrip("qwen3_moe_fused");
 }
 test "selective export round trip (transposed fused experts)" {
+    if (tensor.mmapDisabled()) return error.SkipZigTest; // this test is about the mapped path
     try checkExportRoundTrip("qwen3_moe_fused_t");
 }
 
@@ -1754,5 +1757,6 @@ test "streamed MoE forward and edits match mapped (latent MoE, attention residua
     try checkStreamedMatchesMapped("kimi_k3_mxfp4");
 }
 test "selective export round trip (fused [E, 2I, H] experts)" {
+    if (tensor.mmapDisabled()) return error.SkipZigTest; // this test is about the mapped path
     try checkExportRoundTrip("granitemoe");
 }

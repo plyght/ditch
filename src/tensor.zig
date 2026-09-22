@@ -3,6 +3,8 @@
 //! f32; weights stay in their on-disk dtype and are converted row by row.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const build_options = @import("build_options");
 const Io = std.Io;
 const quant = @import("quant.zig");
 
@@ -127,7 +129,7 @@ pub const Pool = struct {
     scratch: ?*Scratch = null,
 
     pub fn init(io: Io, threads: ?usize) Pool {
-        const n = threads orelse (std.Thread.getCpuCount() catch 1);
+        const n = threads orelse defaultThreads();
         return .{ .io = io, .threads = @max(1, n) };
     }
 
@@ -135,6 +137,8 @@ pub const Pool = struct {
     /// works too). Falls back to the `std.Io` path if threads cannot be spawned.
     pub fn initPersistent(gpa: std.mem.Allocator, io: Io, threads: ?usize) Pool {
         var pool = init(io, threads);
+        // The calling thread works too, so it needs the same scheduling class.
+        setWorkerQos();
         if (pool.threads > 1) pool.workers = Workers.spawn(gpa, io, pool.threads - 1) catch null;
         if (gpa.create(Scratch)) |sc| {
             sc.* = .{ .gpa = gpa };
@@ -313,6 +317,7 @@ const Workers = struct {
     }
 
     fn workerMain(self: *Workers) void {
+        setWorkerQos();
         var seen = self.generation.load(.acquire);
         while (true) {
             // Wait for a new generation.
@@ -332,6 +337,67 @@ const Workers = struct {
         }
     }
 };
+
+// ---------------------------------------------------------------------------
+// Platform
+// ---------------------------------------------------------------------------
+
+/// Whether `DITCH_NO_MMAP` is set: weights are then read instead of
+/// memory-mapped (see `model.Model.loadWithOptions`). Kept here because it is
+/// a property of the process, and because the tests that can only run on the
+/// mapped path check it to skip themselves.
+pub fn mmapDisabled() bool {
+    const v = std.c.getenv("DITCH_NO_MMAP") orelse return false;
+    return v[0] != 0 and v[0] != '0';
+}
+
+/// macOS: `sysctlbyname` returning a 32-bit count, or null.
+fn sysctlU32(name: [*:0]const u8) ?u32 {
+    if (builtin.os.tag != .macos) return null;
+    var value: u32 = 0;
+    var len: usize = @sizeOf(u32);
+    if (std.c.sysctlbyname(name, &value, &len, null, 0) != 0) return null;
+    if (len != @sizeOf(u32) or value == 0) return null;
+    return value;
+}
+
+/// Logical performance cores, on a machine that distinguishes them.
+/// `hw.perflevel0` is the fastest core cluster on Apple Silicon (the P-cores);
+/// it is absent on Intel Macs and on a single-cluster machine.
+pub fn performanceCores() ?usize {
+    if (builtin.os.tag != .macos) return null;
+    const n = sysctlU32("hw.perflevel0.logicalcpu") orelse return null;
+    return @intCast(n);
+}
+
+/// Efficiency cores (`hw.perflevel1`), for reporting.
+pub fn efficiencyCores() ?usize {
+    if (builtin.os.tag != .macos) return null;
+    const n = sysctlU32("hw.perflevel1.logicalcpu") orelse return null;
+    return @intCast(n);
+}
+
+/// Threads a pool takes when none is configured. On Apple Silicon that is the
+/// number of P-cores, not every logical CPU: the E-cores are several times
+/// slower, and an equal share of a fork-join kernel handed to one of them
+/// holds up every other thread at the join.
+pub fn defaultThreads() usize {
+    if (performanceCores()) |p| return @max(1, p);
+    return std.Thread.getCpuCount() catch 1;
+}
+
+/// `QOS_CLASS_USER_INITIATED`, the class the scheduler keeps on P-cores.
+const qos_class_user_initiated: c_uint = 0x21;
+
+extern "c" fn pthread_set_qos_class_self_np(qos_class: c_uint, relative_priority: c_int) c_int;
+
+/// Asks macOS to schedule this thread as user-initiated work. Without it a
+/// thread inherits a lower class and the scheduler is free to park it on an
+/// E-core, which makes a fork-join kernel wait for its slowest chunk.
+pub fn setWorkerQos() void {
+    if (builtin.os.tag != .macos) return;
+    _ = pthread_set_qos_class_self_np(qos_class_user_initiated, 0);
+}
 
 // ---------------------------------------------------------------------------
 // Conversion
@@ -360,6 +426,12 @@ pub inline fn f32ToF16(v: f32) u16 {
     return @bitCast(h);
 }
 
+/// Lanes of the half-precision widening loops. Two vector registers' worth:
+/// the widening is a pure element-wise map (a shift for bf16, `vcvtph2ps` /
+/// `fcvtl` for f16), so a wider unroll only hides latency and never changes a
+/// result. It is deliberately independent of `VL`.
+const CVL: usize = 2 * nativeLanes();
+
 /// Converts `count` elements of raw `dtype` data starting at `bytes` into `out`.
 pub fn convertToF32(dtype: DType, bytes: []const u8, out: []f32) void {
     switch (dtype) {
@@ -369,22 +441,22 @@ pub fn convertToF32(dtype: DType, bytes: []const u8, out: []f32) void {
         },
         .bf16 => {
             const src = std.mem.bytesAsSlice(u16, bytes[0 .. out.len * 2]);
-            const V = @Vector(16, u32);
+            const V = @Vector(CVL, u32);
             var i: usize = 0;
-            while (i + 16 <= out.len) : (i += 16) {
-                const v: @Vector(16, u16) = src[i..][0..16].*;
+            while (i + CVL <= out.len) : (i += CVL) {
+                const v: @Vector(CVL, u16) = src[i..][0..CVL].*;
                 const wide: V = @as(V, @intCast(v)) << @splat(16);
-                out[i..][0..16].* = @bitCast(wide);
+                out[i..][0..CVL].* = @bitCast(wide);
             }
             while (i < out.len) : (i += 1) out[i] = bf16ToF32(src[i]);
         },
         .f16 => {
             const src = std.mem.bytesAsSlice(u16, bytes[0 .. out.len * 2]);
             var i: usize = 0;
-            while (i + 16 <= out.len) : (i += 16) {
-                const v: @Vector(16, u16) = src[i..][0..16].*;
-                const h: @Vector(16, f16) = @bitCast(v);
-                out[i..][0..16].* = @as(@Vector(16, f32), @floatCast(h));
+            while (i + CVL <= out.len) : (i += CVL) {
+                const v: @Vector(CVL, u16) = src[i..][0..CVL].*;
+                const h: @Vector(CVL, f16) = @bitCast(v);
+                out[i..][0..CVL].* = @as(@Vector(CVL, f32), @floatCast(h));
             }
             while (i < out.len) : (i += 1) out[i] = f16ToF32(src[i]);
         },
@@ -451,28 +523,27 @@ pub const Weight = struct {
 // ---------------------------------------------------------------------------
 
 /// Every dot-product kernel in this file accumulates lane-wise with fused
-/// multiply-adds over 16-wide blocks, reduces once and finishes the tail
+/// multiply-adds over `VL`-wide blocks, reduces once and finishes the tail
 /// with scalar fused multiply-adds, so an output element is bit-identical
 /// whichever kernel or thread split computes it.
 pub fn dot(a: []const f32, b: []const f32) f32 {
     var acc: VF = @splat(0);
     var i: usize = 0;
     const n = a.len;
-    while (i + VL <= n) : (i += VL) acc = @mulAdd(VF, a[i..][0..VL].*, b[i..][0..VL].*, acc);
+    while (i + VL <= n) : (i += VL) acc = fma(VF, a[i..][0..VL].*, b[i..][0..VL].*, acc);
     var s = @reduce(.Add, acc);
-    while (i < n) : (i += 1) s = @mulAdd(f32, a[i], b[i], s);
+    while (i < n) : (i += 1) s = fma(f32, a[i], b[i], s);
     return s;
 }
 
 /// `y += alpha * x`
 pub fn axpy(y: []f32, alpha: f32, x: []const f32) void {
-    const V = @Vector(16, f32);
-    const va: V = @splat(alpha);
+    const va: VF = @splat(alpha);
     var i: usize = 0;
-    while (i + 16 <= y.len) : (i += 16) {
-        const vy: V = y[i..][0..16].*;
-        const vx: V = x[i..][0..16].*;
-        y[i..][0..16].* = vy + va * vx;
+    while (i + VL <= y.len) : (i += VL) {
+        const vy: VF = y[i..][0..VL].*;
+        const vx: VF = x[i..][0..VL].*;
+        y[i..][0..VL].* = vy + va * vx;
     }
     while (i < y.len) : (i += 1) y[i] += alpha * x[i];
 }
@@ -499,15 +570,213 @@ pub const Delta = struct {
     b: []f32, // rows * rank
 };
 
-/// Vector width of the matmul kernels (one AVX-512 register, two AVX2 ones).
-pub const VL = 16;
+// ---------------------------------------------------------------------------
+// Kernel shape
+// ---------------------------------------------------------------------------
+
+/// f32 lanes in one vector register of the target CPU.
+fn nativeLanes() comptime_int {
+    return switch (builtin.cpu.arch) {
+        .x86_64, .x86 => if (std.Target.x86.featureSetHas(builtin.cpu.features, .avx512f))
+            16
+        else if (std.Target.x86.featureSetHas(builtin.cpu.features, .avx2))
+            8
+        else
+            4,
+        // NEON: 32 registers of 128 bits. SVE is not used; its length is not
+        // known at compile time and Apple Silicon implements NEON only.
+        .aarch64, .aarch64_be => 4,
+        else => 4,
+    };
+}
+
+/// Architectural vector registers available to the inner loop.
+fn vectorRegisters() comptime_int {
+    return switch (builtin.cpu.arch) {
+        .x86_64, .x86 => if (std.Target.x86.featureSetHas(builtin.cpu.features, .avx512f)) 32 else 16,
+        .aarch64, .aarch64_be => 32,
+        else => 8,
+    };
+}
+
+/// Vector width of every kernel in this file, in f32 lanes: one register on
+/// the target (see `shape`). `-Dvector-width=N` overrides it for benchmarking
+/// a machine by hand; it changes the order in which every dot product
+/// accumulates, so a binary is internally consistent but two binaries built
+/// with different widths differ in the last bits.
+pub const VL: usize = if (build_options.vector_width != 0) build_options.vector_width else shape.vl;
 pub const VF = @Vector(VL, f32);
+
+/// Register tile of the matmul kernel: `tile_inputs` input rows by
+/// `tile_rows` weight rows, so `tile_inputs * tile_rows` accumulators plus
+/// `tile_rows` weight vectors and one input vector have to fit in the register
+/// file. The tile shape changes nothing numerically (each output is still one
+/// dot product blocked by `VL`), only how many loads feed each multiply-add.
+///
+/// The width and the shape are measured, not derived: one thread, a
+/// 64 x 2048 x 2048 bf16 product, built with `-Dcpu=...` and the overrides
+/// below. Median of three runs on one 4-vCPU x86-64 machine, prefill /
+/// one-input decode GFLOP/s:
+///
+///   AVX-512  16 lanes, 4x4: 69.9 / 23.0   16 lanes, 4x6: 69.2 / 20.8
+///            16 lanes, 4x3: 67.6 / 20.3    8 lanes, 4x4: 73.6 / 21.6
+///   AVX2     16 lanes, 4x4: 37.0 / 19.9    8 lanes, 4x3: 66.4 / 23.0
+///             8 lanes, 4x4: 45.4 / 22.5    8 lanes, 4x2: 54.9 / 15.2
+///   SSE2     16 lanes, 4x4: 18.4 / 12.3    4 lanes, 4x3: 30.5 / 17.3
+///             4 lanes, 4x4: 26.6 / 17.3    4 lanes, 3x3: 25.5 / 13.7
+///
+/// A 16-lane accumulator costs two AVX2 or four NEON registers, so the 4x4
+/// tile that fits AVX-512 spills on every inner iteration everywhere else;
+/// that is what the first column of each block costs. AVX-512 is no slower
+/// than 256-bit work on this part, so the widest register wins there.
+const shape: struct { vl: usize, i: usize, k: usize } = switch (builtin.cpu.arch) {
+    .x86_64, .x86 => if (std.Target.x86.featureSetHas(builtin.cpu.features, .avx512f))
+        .{ .vl = 16, .i = 4, .k = 4 }
+    else if (std.Target.x86.featureSetHas(builtin.cpu.features, .avx2))
+        .{ .vl = 8, .i = 4, .k = 3 }
+    else
+        .{ .vl = 4, .i = 4, .k = 3 },
+    // NEON: 32 registers of 128 bits, so a four-lane accumulator leaves room
+    // for the whole 4x4 tile (16 accumulators, 4 weight and 1 input vector).
+    // Chosen from the generated assembly rather than from a timing, since the
+    // shape had to be picked without an Apple Silicon machine: in the densest
+    // 64-instruction window of `matmulWorker` compiled for aarch64-macos,
+    // 16 lanes x 4x4 spends 27 instructions on stack traffic and 8 lanes x 4x4
+    // spends 12, while every 4-lane shape spends none.
+    .aarch64, .aarch64_be => .{ .vl = 4, .i = 4, .k = 4 },
+    else => .{ .vl = 4, .i = 4, .k = 3 },
+};
+
+/// Whether the target has a hardware fused multiply-add. Without one
+/// `@mulAdd` is a call to libc `fmaf` per lane, which costs about fifty times
+/// a multiply and an add, so the kernels multiply and add separately there.
+/// The x86-64 baseline (what the release binaries are built for, so that they
+/// run everywhere) has no FMA; `-Dcpu=x86_64_v3` or a native build does.
+pub const has_fma = switch (builtin.cpu.arch) {
+    .x86_64, .x86 => std.Target.x86.featureSetHas(builtin.cpu.features, .fma),
+    else => true,
+};
+
+/// `a * b + c`, fused where the target can fuse it. Fusing changes the
+/// rounding of every accumulation, so a build either fuses everywhere or
+/// nowhere; within one binary each output is still computed identically
+/// whichever kernel or thread split produces it.
+pub inline fn fma(comptime T: type, a: T, b: T, c: T) T {
+    return if (has_fma) @mulAdd(T, a, b, c) else a * b + c;
+}
+
+pub const tile_inputs: usize = if (build_options.tile_inputs != 0) build_options.tile_inputs else shape.i;
+pub const tile_rows: usize = if (build_options.tile_rows != 0) build_options.tile_rows else shape.k;
+
 /// Weight rows converted per tile: the f32 tile (`tile * cols * 4` bytes)
 /// stays in L2 while every input row streams past it once. Prefill-sized
 /// calls take a large tile so `x` is streamed fewer times; small batches a
 /// small one so the converted tile and the inputs share L1/L2.
 fn tileRowsFor(n: usize) usize {
-    return if (n > 64) 64 else 16;
+    const big = roundTile(64);
+    const small = roundTile(16);
+    return if (n > 64) big else small;
+}
+
+/// Rounds a tile height up to a multiple of `tile_rows` so the register tile
+/// is never cut short at the end of a converted tile.
+fn roundTile(n: usize) usize {
+    return (n + tile_rows - 1) / tile_rows * tile_rows;
+}
+
+// ---------------------------------------------------------------------------
+// Accelerate (macOS)
+// ---------------------------------------------------------------------------
+
+/// Whether this build contains the Accelerate path (`-Daccelerate`, macOS
+/// only). The framework is resolved with `dlopen` rather than linked: the
+/// release binaries are cross-compiled from Linux, where no macOS SDK and so
+/// no `Accelerate.framework` exists to link against, and a `dlopen` that
+/// fails simply leaves the Zig kernels in charge.
+pub const have_accelerate = build_options.accelerate and builtin.os.tag == .macos;
+
+/// Runtime switch for the Accelerate path (`--accelerate=false`, or the
+/// `accelerate` setting). Off makes every kernel take the Zig path, which is
+/// what a reproducibility check across machines wants.
+pub var accelerate_enabled: bool = have_accelerate;
+
+/// Set once `cblas_sgemm` has been resolved (see `initAccelerate`).
+var accelerate_ready: bool = false;
+
+/// Inputs per call from which `cblas_sgemm` takes over from the register-tiled
+/// Zig kernel. Decode (one to four inputs) is a memory-bound matrix-vector
+/// product and stays on the fused half-precision path, which reads each weight
+/// byte once and never materialises an f32 tile; prefill-shaped calls hand
+/// Apple's matrix units a real GEMM. See README, "Performance".
+pub const accelerate_min_inputs: usize = 8;
+
+const cblas_row_major: c_int = 101;
+const cblas_no_trans: c_int = 111;
+const cblas_trans: c_int = 112;
+
+const Sgemm = *const fn (
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    f32,
+    [*]const f32,
+    c_int,
+    [*]const f32,
+    c_int,
+    f32,
+    [*]f32,
+    c_int,
+) callconv(.c) void;
+
+var sgemm_fn: ?Sgemm = null;
+
+/// Resolves `cblas_sgemm` from Accelerate. Called once at startup before any
+/// kernel runs (the pointer is then only read), and returns whether the
+/// Accelerate path is live.
+pub fn initAccelerate() bool {
+    if (!have_accelerate) return false;
+    const handle = std.c.dlopen("/System/Library/Frameworks/Accelerate.framework/Accelerate", .{ .LAZY = true }) orelse return false;
+    const sym = std.c.dlsym(handle, "cblas_sgemm") orelse return false;
+    sgemm_fn = @ptrCast(@alignCast(sym));
+    accelerate_ready = true;
+    return true;
+}
+
+/// Whether Accelerate is compiled in, loaded and switched on.
+pub fn accelerateActive() bool {
+    return have_accelerate and accelerate_ready and accelerate_enabled;
+}
+
+/// Whether a matmul of `n` inputs by `rows` rows of `cols` should go to BLAS:
+/// batched (prefill-shaped) calls on a matrix big enough to pay for the call.
+fn useBlas(n: usize, rows: usize, cols: usize) bool {
+    if (!have_accelerate) return false;
+    return accelerateActive() and n >= accelerate_min_inputs and rows * cols >= 1 << 14;
+}
+
+/// `out[n][nr] = x[n][cols] @ tile[nr][cols]^T`, written into a column block
+/// of `out` whose row stride is `ld_out`.
+fn blasTile(out: [*]f32, ld_out: usize, x: [*]const f32, tile: [*]const f32, n: usize, nr: usize, cols: usize) void {
+    const sgemm = sgemm_fn orelse return;
+    sgemm(
+        cblas_row_major,
+        cblas_no_trans,
+        cblas_trans,
+        @intCast(n),
+        @intCast(nr),
+        @intCast(cols),
+        1.0,
+        x,
+        @intCast(cols),
+        tile,
+        @intCast(cols),
+        0.0,
+        out,
+        @intCast(ld_out),
+    );
 }
 
 const MatmulCtx = struct {
@@ -530,36 +799,42 @@ fn matmulWorker(ctx: *const MatmulCtx, start: usize, end: usize) void {
     const rows = ctx.w.rows;
     const tile = ctx.tile;
     const buf = ctx.scratch[slot * tile * cols ..][0 .. tile * cols];
+    const blas = useBlas(n, rows, cols);
     var r = start;
     while (r < end) {
         const nr = @min(tile, end - r);
         for (0..nr) |k| ctx.w.row(r + k, buf[k * cols ..][0..cols]);
-        var i: usize = 0;
-        while (i < n) {
-            const ni = @min(4, n - i);
-            var k: usize = 0;
-            while (k < nr) {
-                const nk = @min(4, nr - k);
-                const wr = buf[k * cols ..];
-                const xr = ctx.x[i * cols ..];
-                if (nk == 4 and ni == 4) {
-                    const d = dot4x4(wr.ptr, xr.ptr, cols);
-                    inline for (0..4) |ii| {
-                        inline for (0..4) |kk| ctx.out[(i + ii) * rows + r + k + kk] = d[ii][kk];
+        if (blas) {
+            // Only reached on macOS builds with Accelerate linked in.
+            if (have_accelerate) blasTile(ctx.out.ptr + r, rows, ctx.x.ptr, buf.ptr, n, nr, cols);
+        } else {
+            var i: usize = 0;
+            while (i < n) {
+                const ni = @min(tile_inputs, n - i);
+                var k: usize = 0;
+                while (k < nr) {
+                    const nk = @min(tile_rows, nr - k);
+                    const wr = buf[k * cols ..];
+                    const xr = ctx.x[i * cols ..];
+                    if (nk == tile_rows and ni == tile_inputs) {
+                        const d = dotTile(tile_rows, tile_inputs, wr.ptr, xr.ptr, cols);
+                        inline for (0..tile_inputs) |ii| {
+                            inline for (0..tile_rows) |kk| ctx.out[(i + ii) * rows + r + k + kk] = d[ii][kk];
+                        }
+                    } else if (nk == tile_rows) {
+                        for (0..ni) |ii| {
+                            const d = dotTile(tile_rows, 1, wr.ptr, xr.ptr + ii * cols, cols);
+                            inline for (0..tile_rows) |kk| ctx.out[(i + ii) * rows + r + k + kk] = d[0][kk];
+                        }
+                    } else {
+                        for (0..ni) |ii| {
+                            for (0..nk) |kk| ctx.out[(i + ii) * rows + r + k + kk] = dot(wr[kk * cols ..][0..cols], xr[ii * cols ..][0..cols]);
+                        }
                     }
-                } else if (nk == 4) {
-                    for (0..ni) |ii| {
-                        const d = dot4(wr[0..cols], wr[cols .. 2 * cols], wr[2 * cols .. 3 * cols], wr[3 * cols .. 4 * cols], xr[ii * cols ..][0..cols]);
-                        inline for (0..4) |kk| ctx.out[(i + ii) * rows + r + k + kk] = d[kk];
-                    }
-                } else {
-                    for (0..ni) |ii| {
-                        for (0..nk) |kk| ctx.out[(i + ii) * rows + r + k + kk] = dot(wr[kk * cols ..][0..cols], xr[ii * cols ..][0..cols]);
-                    }
+                    k += nk;
                 }
-                k += nk;
+                i += ni;
             }
-            i += ni;
         }
         if (ctx.delta) |dl| {
             for (0..n) |ii| {
@@ -575,59 +850,46 @@ fn matmulWorker(ctx: *const MatmulCtx, start: usize, end: usize) void {
     }
 }
 
-/// Four dot products sharing the loads of `x`.
-inline fn dot4(a0: []const f32, a1: []const f32, a2: []const f32, a3: []const f32, x: []const f32) [4]f32 {
-    var c0: VF = @splat(0);
-    var c1: VF = @splat(0);
-    var c2: VF = @splat(0);
-    var c3: VF = @splat(0);
-    var i: usize = 0;
-    const n = x.len;
-    while (i + VL <= n) : (i += VL) {
-        const vx: VF = x[i..][0..VL].*;
-        c0 = @mulAdd(VF, a0[i..][0..VL].*, vx, c0);
-        c1 = @mulAdd(VF, a1[i..][0..VL].*, vx, c1);
-        c2 = @mulAdd(VF, a2[i..][0..VL].*, vx, c2);
-        c3 = @mulAdd(VF, a3[i..][0..VL].*, vx, c3);
+/// `NK` weight rows (`w`, stride `cols`) against `NI` input rows (`x`, stride
+/// `cols`): `out[input][row]`. `NK + NI` vector loads feed `NK * NI` fused
+/// multiply-adds, so the kernel is bound by the FMA units rather than by
+/// loads, as long as the accumulators stay in registers (see `shape`).
+inline fn dotTile(comptime NK: usize, comptime NI: usize, w: [*]const f32, x: [*]const f32, cols: usize) [NI][NK]f32 {
+    var acc: [NI][NK]VF = undefined;
+    inline for (0..NI) |ii| {
+        inline for (0..NK) |kk| acc[ii][kk] = @splat(0);
     }
-    var r = [4]f32{ @reduce(.Add, c0), @reduce(.Add, c1), @reduce(.Add, c2), @reduce(.Add, c3) };
-    while (i < n) : (i += 1) {
-        r[0] = @mulAdd(f32, a0[i], x[i], r[0]);
-        r[1] = @mulAdd(f32, a1[i], x[i], r[1]);
-        r[2] = @mulAdd(f32, a2[i], x[i], r[2]);
-        r[3] = @mulAdd(f32, a3[i], x[i], r[3]);
+    var i: usize = 0;
+    while (i + VL <= cols) : (i += VL) {
+        var wv: [NK]VF = undefined;
+        inline for (0..NK) |kk| wv[kk] = w[kk * cols + i ..][0..VL].*;
+        inline for (0..NI) |ii| {
+            const xv: VF = x[ii * cols + i ..][0..VL].*;
+            inline for (0..NK) |kk| acc[ii][kk] = fma(VF, wv[kk], xv, acc[ii][kk]);
+        }
+    }
+    var r: [NI][NK]f32 = undefined;
+    inline for (0..NI) |ii| {
+        inline for (0..NK) |kk| r[ii][kk] = @reduce(.Add, acc[ii][kk]);
+    }
+    while (i < cols) : (i += 1) {
+        inline for (0..NI) |ii| {
+            inline for (0..NK) |kk| r[ii][kk] = fma(f32, w[kk * cols + i], x[ii * cols + i], r[ii][kk]);
+        }
     }
     return r;
 }
 
-/// Sixteen dot products of four weight rows (`w`, stride `cols`) with four
-/// input rows (`x`, stride `cols`): `out[input][row]`. Eight vector loads
-/// feed sixteen fused multiply-adds, so the kernel is bound by the FMA
-/// units rather than by loads.
-inline fn dot4x4(w: [*]const f32, x: [*]const f32, cols: usize) [4][4]f32 {
-    var acc: [4][4]VF = undefined;
-    inline for (0..4) |ii| {
-        inline for (0..4) |kk| acc[ii][kk] = @splat(0);
-    }
-    var i: usize = 0;
-    while (i + VL <= cols) : (i += VL) {
-        var wv: [4]VF = undefined;
-        inline for (0..4) |kk| wv[kk] = w[kk * cols + i ..][0..VL].*;
-        inline for (0..4) |ii| {
-            const xv: VF = x[ii * cols + i ..][0..VL].*;
-            inline for (0..4) |kk| acc[ii][kk] = @mulAdd(VF, wv[kk], xv, acc[ii][kk]);
-        }
-    }
-    var r: [4][4]f32 = undefined;
-    inline for (0..4) |ii| {
-        inline for (0..4) |kk| r[ii][kk] = @reduce(.Add, acc[ii][kk]);
-    }
-    while (i < cols) : (i += 1) {
-        inline for (0..4) |ii| {
-            inline for (0..4) |kk| r[ii][kk] = @mulAdd(f32, w[kk * cols + i], x[ii * cols + i], r[ii][kk]);
-        }
-    }
-    return r;
+/// Weight rows the fused half-precision path takes at once for `NI` inputs:
+/// `NI * k` accumulators plus `k` weight vectors and one input vector, within
+/// the register file. Decode (`NI = 1`) can afford many more rows than the
+/// general tile, which is what keeps the loads flowing on a memory-bound call.
+fn fusedRowsFor(comptime NI: usize) usize {
+    const regs_per_acc = (VL + nativeLanes() - 1) / nativeLanes();
+    const budget = (vectorRegisters() - 2) / regs_per_acc;
+    var k: usize = 8;
+    while (k > 1 and NI * k + k + 1 > budget) k -= 1;
+    return k;
 }
 
 /// Inputs per call up to which the half-precision decode path is used: the
@@ -671,7 +933,7 @@ inline fn dotHalf(comptime dtype: DType, comptime NK: usize, comptime NI: usize,
         inline for (0..NK) |kk| wv[kk] = loadHalf(dtype, w + kk * cols + i);
         inline for (0..NI) |ii| {
             const xv: VF = x[ii * cols + i ..][0..VL].*;
-            inline for (0..NK) |kk| acc[ii][kk] = @mulAdd(VF, wv[kk], xv, acc[ii][kk]);
+            inline for (0..NK) |kk| acc[ii][kk] = fma(VF, wv[kk], xv, acc[ii][kk]);
         }
     }
     var r: [NI][NK]f32 = undefined;
@@ -680,7 +942,7 @@ inline fn dotHalf(comptime dtype: DType, comptime NK: usize, comptime NI: usize,
     }
     while (i < cols) : (i += 1) {
         inline for (0..NI) |ii| {
-            inline for (0..NK) |kk| r[ii][kk] = @mulAdd(f32, loadHalfScalar(dtype, w[kk * cols + i]), x[ii * cols + i], r[ii][kk]);
+            inline for (0..NK) |kk| r[ii][kk] = fma(f32, loadHalfScalar(dtype, w[kk * cols + i]), x[ii * cols + i], r[ii][kk]);
         }
     }
     return r;
@@ -690,11 +952,12 @@ fn fusedRows(comptime dtype: DType, comptime NI: usize, ctx: *const MatmulCtx, s
     const cols = ctx.w.cols;
     const rows = ctx.w.rows;
     const data: [*]align(1) const u16 = @ptrCast(ctx.w.data.ptr);
+    const nk = comptime fusedRowsFor(NI);
     var r = start;
-    while (r + 4 <= end) : (r += 4) {
-        const d = dotHalf(dtype, 4, NI, data + r * cols, ctx.x.ptr, cols);
+    while (r + nk <= end) : (r += nk) {
+        const d = dotHalf(dtype, nk, NI, data + r * cols, ctx.x.ptr, cols);
         inline for (0..NI) |ii| {
-            inline for (0..4) |kk| ctx.out[ii * rows + r + kk] = d[ii][kk];
+            inline for (0..nk) |kk| ctx.out[ii * rows + r + kk] = d[ii][kk];
         }
     }
     while (r < end) : (r += 1) {
@@ -836,14 +1099,14 @@ pub fn attentionScores(scores: []f32, q: []const f32, k: [*]const f32, stride: u
         var d: usize = 0;
         while (d < hd) : (d += VL) {
             const qv: VF = q[d..][0..VL].*;
-            inline for (0..4) |kk| a[kk] = @mulAdd(VF, k[(p + kk) * stride + d ..][0..VL].*, qv, a[kk]);
+            inline for (0..4) |kk| a[kk] = fma(VF, k[(p + kk) * stride + d ..][0..VL].*, qv, a[kk]);
         }
         inline for (0..4) |kk| scores[p + kk] = @reduce(.Add, a[kk]) * scale_;
     }
     while (p < scores.len) : (p += 1) {
         var a: VF = @splat(0);
         var d: usize = 0;
-        while (d < hd) : (d += VL) a = @mulAdd(VF, k[p * stride + d ..][0..VL].*, @as(VF, q[d..][0..VL].*), a);
+        while (d < hd) : (d += VL) a = fma(VF, k[p * stride + d ..][0..VL].*, @as(VF, q[d..][0..VL].*), a);
         scores[p] = @reduce(.Add, a) * scale_;
     }
 }
@@ -857,9 +1120,9 @@ pub fn attentionValues(out: []f32, scores: []const f32, v: [*]const f32, stride:
         var a: [4]VF = .{ @splat(0), @splat(0), @splat(0), @splat(0) };
         var p: usize = 0;
         while (p + 4 <= scores.len) : (p += 4) {
-            inline for (0..4) |kk| a[kk] = @mulAdd(VF, v[(p + kk) * stride + j ..][0..VL].*, @as(VF, @splat(scores[p + kk])), a[kk]);
+            inline for (0..4) |kk| a[kk] = fma(VF, v[(p + kk) * stride + j ..][0..VL].*, @as(VF, @splat(scores[p + kk])), a[kk]);
         }
-        while (p < scores.len) : (p += 1) a[0] = @mulAdd(VF, v[p * stride + j ..][0..VL].*, @as(VF, @splat(scores[p])), a[0]);
+        while (p < scores.len) : (p += 1) a[0] = fma(VF, v[p * stride + j ..][0..VL].*, @as(VF, @splat(scores[p])), a[0]);
         out[j..][0..VL].* = (a[0] + a[1]) + (a[2] + a[3]);
     }
 }
@@ -985,14 +1248,14 @@ pub const Activation = enum {
 pub inline fn expVec(x_in: VF) VF {
     const x = @min(@max(x_in, @as(VF, @splat(-87.3))), @as(VF, @splat(88.0)));
     const fx = @round(x * @as(VF, @splat(1.44269504088896341)));
-    const r = @mulAdd(VF, fx, @splat(2.12194440e-4), @mulAdd(VF, fx, @splat(-0.693359375), x));
+    const r = fma(VF, fx, @splat(2.12194440e-4), fma(VF, fx, @splat(-0.693359375), x));
     var y: VF = @splat(1.9875691500e-4);
-    y = @mulAdd(VF, y, r, @splat(1.3981999507e-3));
-    y = @mulAdd(VF, y, r, @splat(8.3334519073e-3));
-    y = @mulAdd(VF, y, r, @splat(4.1665795894e-2));
-    y = @mulAdd(VF, y, r, @splat(1.6666665459e-1));
-    y = @mulAdd(VF, y, r, @splat(5.0000001201e-1));
-    y = @mulAdd(VF, y, r * r, r + @as(VF, @splat(1.0)));
+    y = fma(VF, y, r, @splat(1.3981999507e-3));
+    y = fma(VF, y, r, @splat(8.3334519073e-3));
+    y = fma(VF, y, r, @splat(4.1665795894e-2));
+    y = fma(VF, y, r, @splat(1.6666665459e-1));
+    y = fma(VF, y, r, @splat(5.0000001201e-1));
+    y = fma(VF, y, r * r, r + @as(VF, @splat(1.0)));
     const e: @Vector(VL, i32) = @intFromFloat(fx);
     const bits = (e + @as(@Vector(VL, i32), @splat(127))) << @splat(23);
     return y * @as(VF, @bitCast(bits));

@@ -4,6 +4,7 @@
 //! normal run are used, so the numbers describe what a study would cost.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
@@ -340,6 +341,376 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings,
         try writeTable(&result, &buf.writer);
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = buf.written() });
         try out.print("\nBenchmark table written to {s}.\n", .{path});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-kernel microbenchmark (`ditch bench --kernels`)
+// ---------------------------------------------------------------------------
+
+/// One measured kernel. `flops` counts useful floating-point operations and
+/// `bytes` the weight traffic, so a memory-bound kernel can be read as GB/s
+/// and a compute-bound one as GFLOP/s.
+pub const KernelRow = struct {
+    name: []const u8,
+    shape: []const u8,
+    seconds: f64,
+    iterations: usize,
+    flops: f64,
+    bytes: f64,
+
+    pub fn gflops(self: *const KernelRow) f64 {
+        return self.flops * @as(f64, @floatFromInt(self.iterations)) / @max(self.seconds, 1e-9) / 1e9;
+    }
+
+    pub fn gbytes(self: *const KernelRow) f64 {
+        return self.bytes * @as(f64, @floatFromInt(self.iterations)) / @max(self.seconds, 1e-9) / 1e9;
+    }
+};
+
+/// Build and machine configuration the kernel numbers depend on.
+pub const KernelSetup = struct {
+    vector_lanes: usize,
+    tile_inputs: usize,
+    tile_rows: usize,
+    threads: usize,
+    cpus: usize,
+    performance_cores: ?usize,
+    efficiency_cores: ?usize,
+    accelerate_built: bool,
+    accelerate_active: bool,
+    cpu_arch: []const u8,
+};
+
+pub fn kernelSetup(pool: *const tensor.Pool) KernelSetup {
+    return .{
+        .vector_lanes = tensor.VL,
+        .tile_inputs = tensor.tile_inputs,
+        .tile_rows = tensor.tile_rows,
+        .threads = pool.threads,
+        .cpus = std.Thread.getCpuCount() catch 1,
+        .performance_cores = tensor.performanceCores(),
+        .efficiency_cores = tensor.efficiencyCores(),
+        .accelerate_built = tensor.have_accelerate,
+        .accelerate_active = tensor.accelerateActive(),
+        .cpu_arch = @tagName(builtin.cpu.arch),
+    };
+}
+
+/// Deterministic pseudo-random values in [-1, 1); the numbers must not depend
+/// on the machine, so the benchmark is comparable across runs.
+fn fillRandom(x: []f32, seed: u64) void {
+    var rng = std.Random.DefaultPrng.init(seed);
+    const r = rng.random();
+    for (x) |*v| v.* = r.float(f32) * 2.0 - 1.0;
+}
+
+fn fillRandomBf16(bytes: []u8, seed: u64) void {
+    var rng = std.Random.DefaultPrng.init(seed);
+    const r = rng.random();
+    const dst = std.mem.bytesAsSlice(u16, bytes);
+    for (dst) |*v| v.* = tensor.f32ToBf16(r.float(f32) * 2.0 - 1.0);
+}
+
+/// Runs `body` until at least `min_seconds` have passed (at least three
+/// times), and records the per-iteration cost.
+fn measure(io: Io, rows: *std.ArrayList(KernelRow), gpa: Allocator, name: []const u8, shape: []const u8, flops: f64, bytes: f64, ctx: anytype, comptime body: fn (@TypeOf(ctx)) anyerror!void) !void {
+    const min_seconds = 0.25;
+    try body(ctx); // warm-up: first-touch page faults and the pool's scratch
+    var iterations: usize = 0;
+    const start = Io.Timestamp.now(io, .awake);
+    var seconds: f64 = 0;
+    while (iterations < 3 or seconds < min_seconds) {
+        try body(ctx);
+        iterations += 1;
+        seconds = secondsSince(io, start);
+        if (iterations >= 1 << 20) break;
+    }
+    try rows.append(gpa, .{ .name = name, .shape = shape, .seconds = seconds, .iterations = iterations, .flops = flops, .bytes = bytes });
+}
+
+/// Measures every compute kernel on synthetic data of transformer-like
+/// shapes: prefill matmul, decode matvec, the abliteration transpose product,
+/// attention and the gated activation.
+pub fn kernelRows(gpa: Allocator, io: Io, pool: *const tensor.Pool) ![]KernelRow {
+    const cols: usize = 2048;
+    const rows_n: usize = 2048;
+    const prefill_n: usize = 64;
+
+    var out: std.ArrayList(KernelRow) = .empty;
+    errdefer out.deinit(gpa);
+
+    const wbytes = try gpa.alloc(u8, rows_n * cols * 2);
+    defer gpa.free(wbytes);
+    fillRandomBf16(wbytes, 1);
+    const w = tensor.Weight{ .data = wbytes, .dtype = .bf16, .rows = rows_n, .cols = cols };
+
+    const wf32 = try gpa.alloc(f32, rows_n * cols);
+    defer gpa.free(wf32);
+    tensor.convertToF32(.bf16, wbytes, wf32);
+    const wf = tensor.Weight{ .data = std.mem.sliceAsBytes(wf32), .dtype = .f32, .rows = rows_n, .cols = cols };
+
+    const x = try gpa.alloc(f32, prefill_n * cols);
+    defer gpa.free(x);
+    fillRandom(x, 2);
+    const y = try gpa.alloc(f32, prefill_n * rows_n);
+    defer gpa.free(y);
+    fillRandom(y, 3);
+
+    const Mm = struct {
+        gpa: Allocator,
+        pool: *const tensor.Pool,
+        out: []f32,
+        x: []const f32,
+        n: usize,
+        w: tensor.Weight,
+        fn call(c: *const @This()) anyerror!void {
+            try tensor.matmulT(c.pool, c.gpa, c.out, c.x, c.n, c.w, null);
+        }
+    };
+    const mm_prefill = Mm{ .gpa = gpa, .pool = pool, .out = y, .x = x, .n = prefill_n, .w = w };
+    try measure(io, &out, gpa, "matmul prefill (bf16 weights)", "64 x 2048 x 2048", 2.0 * @as(f64, @floatFromInt(prefill_n * rows_n * cols)), @floatFromInt(rows_n * cols * 2), &mm_prefill, Mm.call);
+
+    const mm_prefill_f32 = Mm{ .gpa = gpa, .pool = pool, .out = y, .x = x, .n = prefill_n, .w = wf };
+    try measure(io, &out, gpa, "matmul prefill (f32 weights)", "64 x 2048 x 2048", 2.0 * @as(f64, @floatFromInt(prefill_n * rows_n * cols)), @floatFromInt(rows_n * cols * 4), &mm_prefill_f32, Mm.call);
+
+    const mm_decode = Mm{ .gpa = gpa, .pool = pool, .out = y, .x = x, .n = 1, .w = w };
+    try measure(io, &out, gpa, "matvec decode (bf16 weights)", "1 x 2048 x 2048", 2.0 * @as(f64, @floatFromInt(rows_n * cols)), @floatFromInt(rows_n * cols * 2), &mm_decode, Mm.call);
+
+    const mm_batch4 = Mm{ .gpa = gpa, .pool = pool, .out = y, .x = x, .n = 4, .w = w };
+    try measure(io, &out, gpa, "matvec decode, batch 4", "4 x 2048 x 2048", 2.0 * @as(f64, @floatFromInt(4 * rows_n * cols)), @floatFromInt(rows_n * cols * 2), &mm_batch4, Mm.call);
+
+    const Mv = struct {
+        gpa: Allocator,
+        pool: *const tensor.Pool,
+        out: []f32,
+        w: tensor.Weight,
+        y: []const f32,
+        fn call(c: *const @This()) anyerror!void {
+            try tensor.matvecT(c.pool, c.gpa, c.out, c.w, c.y);
+        }
+    };
+    const mv = Mv{ .gpa = gpa, .pool = pool, .out = x, .w = w, .y = y };
+    try measure(io, &out, gpa, "matvecT (abliteration apply)", "2048 x 2048", 2.0 * @as(f64, @floatFromInt(rows_n * cols)), @floatFromInt(rows_n * cols * 2), &mv, Mv.call);
+
+    // Attention: one head of 128 dimensions over 1024 cached positions.
+    const hd: usize = 128;
+    const keys: usize = 1024;
+    const kv = try gpa.alloc(f32, keys * hd);
+    defer gpa.free(kv);
+    fillRandom(kv, 4);
+    const q = try gpa.alloc(f32, hd);
+    defer gpa.free(q);
+    fillRandom(q, 5);
+    const scores = try gpa.alloc(f32, keys);
+    defer gpa.free(scores);
+    const acc = try gpa.alloc(f32, hd);
+    defer gpa.free(acc);
+
+    const At = struct {
+        q: []const f32,
+        kv: []const f32,
+        scores: []f32,
+        acc: []f32,
+        hd: usize,
+        fn scoresCall(c: *const @This()) anyerror!void {
+            tensor.attentionScores(c.scores, c.q, c.kv.ptr, c.hd, 0.08838835);
+            std.mem.doNotOptimizeAway(c.scores[0]);
+        }
+        fn valuesCall(c: *const @This()) anyerror!void {
+            tensor.attentionValues(c.acc, c.scores, c.kv.ptr, c.hd);
+            std.mem.doNotOptimizeAway(c.acc[0]);
+        }
+        fn softmaxCall(c: *const @This()) anyerror!void {
+            tensor.softmaxInPlace(c.scores);
+            std.mem.doNotOptimizeAway(c.scores[0]);
+        }
+    };
+    const at = At{ .q = q, .kv = kv, .scores = scores, .acc = acc, .hd = hd };
+    try measure(io, &out, gpa, "attention scores", "1024 keys x 128", 2.0 * @as(f64, @floatFromInt(keys * hd)), @floatFromInt(keys * hd * 4), &at, At.scoresCall);
+    try measure(io, &out, gpa, "attention values", "1024 keys x 128", 2.0 * @as(f64, @floatFromInt(keys * hd)), @floatFromInt(keys * hd * 4), &at, At.valuesCall);
+    try measure(io, &out, gpa, "softmax", "1024", @floatFromInt(keys), @floatFromInt(keys * 4), &at, At.softmaxCall);
+
+    // Gated activation over a transformer-sized MLP block.
+    const act_rows: usize = 32;
+    const act_len: usize = 8192;
+    const gate = try gpa.alloc(f32, act_rows * act_len);
+    defer gpa.free(gate);
+    fillRandom(gate, 6);
+    const up = try gpa.alloc(f32, act_rows * act_len);
+    defer gpa.free(up);
+    fillRandom(up, 7);
+    const act_out = try gpa.alloc(f32, act_rows * act_len);
+    defer gpa.free(act_out);
+    const Ac = struct {
+        pool: *const tensor.Pool,
+        out: []f32,
+        gate: []const f32,
+        up: []const f32,
+        rows: usize,
+        len: usize,
+        fn call(c: *const @This()) anyerror!void {
+            tensor.gatedActivation(c.pool, .silu, c.out, c.gate, c.up, c.rows, c.len, c.len, c.len);
+            std.mem.doNotOptimizeAway(c.out[0]);
+        }
+    };
+    const ac = Ac{ .pool = pool, .out = act_out, .gate = gate, .up = up, .rows = act_rows, .len = act_len };
+    // A silu plus the up-projection product is about ten operations per element.
+    try measure(io, &out, gpa, "gated activation (silu)", "32 x 8192", 10.0 * @as(f64, @floatFromInt(act_rows * act_len)), @floatFromInt(act_rows * act_len * 12), &ac, Ac.call);
+
+    // Weight conversion, the path every f32 tile goes through.
+    const Cv = struct {
+        src: []const u8,
+        dst: []f32,
+        fn call(c: *const @This()) anyerror!void {
+            tensor.convertToF32(.bf16, c.src, c.dst);
+            std.mem.doNotOptimizeAway(c.dst[0]);
+        }
+    };
+    const cv = Cv{ .src = wbytes, .dst = wf32 };
+    try measure(io, &out, gpa, "bf16 to f32 conversion", "2048 x 2048", @floatFromInt(rows_n * cols), @floatFromInt(rows_n * cols * 6), &cv, Cv.call);
+
+    return out.toOwnedSlice(gpa);
+}
+
+/// Writes the kernel table (Markdown, or `key: value` lines with --plain, or
+/// one JSON object with --json).
+pub fn writeKernels(setup: *const KernelSetup, rows: []const KernelRow, w: *Io.Writer, mode: enum { table, plain, json }) !void {
+    switch (mode) {
+        .json => {
+            var js: std.json.Stringify = .{ .writer = w };
+            try js.beginObject();
+            inline for (std.meta.fields(KernelSetup)) |f| {
+                try js.objectField(f.name);
+                try js.write(@field(setup, f.name));
+            }
+            try js.objectField("kernels");
+            try js.beginArray();
+            for (rows) |r| {
+                try js.beginObject();
+                try js.objectField("name");
+                try js.write(r.name);
+                try js.objectField("shape");
+                try js.write(r.shape);
+                try js.objectField("gflops");
+                try js.write(r.gflops());
+                try js.objectField("gbytes_per_second");
+                try js.write(r.gbytes());
+                try js.objectField("iterations");
+                try js.write(r.iterations);
+                try js.endObject();
+            }
+            try js.endArray();
+            try js.endObject();
+            try w.writeAll("\n");
+        },
+        .plain => {
+            try w.print("cpu_arch: {s}\nvector_lanes: {d}\ntile: {d}x{d}\nthreads: {d}\ncpus: {d}\nperformance_cores: {?d}\nefficiency_cores: {?d}\naccelerate_built: {}\naccelerate_active: {}\n", .{
+                setup.cpu_arch, setup.vector_lanes,      setup.tile_inputs,      setup.tile_rows,        setup.threads,
+                setup.cpus,     setup.performance_cores, setup.efficiency_cores, setup.accelerate_built, setup.accelerate_active,
+            });
+            for (rows) |r| try w.print("kernel {s} ({s}): {d:.2} GFLOP/s, {d:.2} GB/s\n", .{ r.name, r.shape, r.gflops(), r.gbytes() });
+        },
+        .table => {
+            try w.print("| Kernel | Shape | GFLOP/s | GB/s |\n| :--- | :--- | ---: | ---: |\n", .{});
+            for (rows) |r| try w.print("| {s} | {s} | {d:.1} | {d:.1} |\n", .{ r.name, r.shape, r.gflops(), r.gbytes() });
+            try w.print("\n{d} f32 lanes per vector, {d}x{d} register tile, {d} threads of {d} CPUs", .{ setup.vector_lanes, setup.tile_inputs, setup.tile_rows, setup.threads, setup.cpus });
+            if (setup.performance_cores) |p| try w.print(", {d} performance and {?d} efficiency cores", .{ p, setup.efficiency_cores });
+            if (setup.accelerate_built) {
+                try w.print(", Accelerate {s}", .{if (setup.accelerate_active) "active" else "built in but off"});
+            }
+            try w.print(" ({s}).\n", .{setup.cpu_arch});
+        },
+    }
+}
+
+/// Runs one prefill-shaped matrix product through both the Accelerate path
+/// and the Zig kernel and returns the largest difference between them,
+/// relative to the largest output magnitude. Null when Accelerate is not
+/// active. The two sum in a different order, so they are close but not
+/// bit-identical; anything above `accelerate_tolerance` means the BLAS call
+/// is being handed the wrong shape, which must fail the build, not print.
+pub fn accelerateDifference(gpa: Allocator, pool: *const tensor.Pool) !?f64 {
+    if (!tensor.accelerateActive()) return null;
+    const cols: usize = 2048;
+    const rows: usize = 512;
+    const n: usize = 16;
+    const wbytes = try gpa.alloc(u8, rows * cols * 2);
+    defer gpa.free(wbytes);
+    fillRandomBf16(wbytes, 11);
+    const w = tensor.Weight{ .data = wbytes, .dtype = .bf16, .rows = rows, .cols = cols };
+    const x = try gpa.alloc(f32, n * cols);
+    defer gpa.free(x);
+    fillRandom(x, 12);
+    const a = try gpa.alloc(f32, n * rows);
+    defer gpa.free(a);
+    const b = try gpa.alloc(f32, n * rows);
+    defer gpa.free(b);
+
+    try tensor.matmulT(pool, gpa, a, x, n, w, null);
+    tensor.accelerate_enabled = false;
+    defer tensor.accelerate_enabled = true;
+    try tensor.matmulT(pool, gpa, b, x, n, w, null);
+
+    var worst: f64 = 0;
+    var scale: f64 = 1e-30;
+    for (a, b) |va, vb| {
+        worst = @max(worst, @abs(@as(f64, va) - @as(f64, vb)));
+        scale = @max(scale, @abs(@as(f64, va)));
+    }
+    return worst / scale;
+}
+
+/// Largest relative difference tolerated between Accelerate and the Zig
+/// kernel: the two differ only in summation order over 2048 terms.
+pub const accelerate_tolerance: f64 = 1e-4;
+
+/// `ditch bench --kernels`: per-kernel throughput, no model needed.
+pub fn runKernels(gpa: Allocator, io: Io, settings: *const config.Settings, pool: *const tensor.Pool, out: *Io.Writer, result_out: *Io.Writer) !void {
+    try out.writeAll("\nMeasuring the compute kernels...\n");
+    try out.flush();
+    const rows = try kernelRows(gpa, io, pool);
+    defer gpa.free(rows);
+    const setup = kernelSetup(pool);
+    // With Accelerate active, the same kernels are measured again with it
+    // switched off, and the two paths are compared numerically.
+    var zig_rows: []KernelRow = &.{};
+    defer if (zig_rows.len > 0) gpa.free(zig_rows);
+    var difference: ?f64 = null;
+    if (tensor.accelerateActive()) {
+        difference = try accelerateDifference(gpa, pool);
+        tensor.accelerate_enabled = false;
+        zig_rows = try kernelRows(gpa, io, pool);
+        tensor.accelerate_enabled = true;
+    }
+    if (settings.json) {
+        try writeKernels(&setup, rows, result_out, .json);
+    } else if (settings.plain) {
+        try writeKernels(&setup, rows, result_out, .plain);
+    } else {
+        try writeKernels(&setup, rows, result_out, .table);
+    }
+    try result_out.flush();
+    if (zig_rows.len > 0) {
+        var off = setup;
+        off.accelerate_active = false;
+        try result_out.writeAll("\nThe same kernels with Accelerate switched off:\n\n");
+        if (settings.plain) try writeKernels(&off, zig_rows, result_out, .plain) else try writeKernels(&off, zig_rows, result_out, .table);
+        try result_out.flush();
+    }
+    if (difference) |d| {
+        try out.print("\nAccelerate vs the built-in kernel: largest relative difference {e:.3} (tolerance {e:.3}).\n", .{ d, accelerate_tolerance });
+        try out.flush();
+        if (!(d <= accelerate_tolerance)) return error.AccelerateMismatch;
+    }
+    if (settings.bench_output) |path| {
+        var buf: Io.Writer.Allocating = .init(gpa);
+        defer buf.deinit();
+        try buf.writer.writeAll("# ditch bench --kernels\n\n");
+        try writeKernels(&setup, rows, &buf.writer, .table);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = buf.written() });
+        try out.print("\nKernel table written to {s}.\n", .{path});
+        try out.flush();
     }
 }
 

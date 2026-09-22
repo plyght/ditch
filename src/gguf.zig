@@ -344,7 +344,8 @@ pub const File = struct {
         const len: usize = @intCast(try self.file.length(io));
         self.len = len;
         if (len < 24) return error.InvalidGguf;
-        if (options.map) {
+        // `DITCH_NO_MMAP` forces the read path (see tensor.mmapDisabled).
+        if (options.map and !tensor.mmapDisabled()) {
             self.map = try Io.File.MemoryMap.create(io, self.file, .{
                 .len = len,
                 .protection = .{ .read = true, .write = false },
@@ -711,6 +712,7 @@ pub fn writeFile(gpa: Allocator, io: Io, dir: Io.Dir, sub_path: []const u8, w: *
 // ---------------------------------------------------------------------------
 
 test "gguf header and metadata round trip" {
+    if (tensor.mmapDisabled()) return error.SkipZigTest; // this test is about the mapped path
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

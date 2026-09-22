@@ -811,7 +811,15 @@ pub const Model = struct {
 
     /// Loads a model with an explicit weight store mode and optional memory budget.
     /// `gpa` is used for metadata; runtime buffers use `opts.budget` when given.
-    pub fn loadWithOptions(gpa: Allocator, io: Io, pool: *const tensor.Pool, dir_path: []const u8, opts: LoadOptions) !*Model {
+    pub fn loadWithOptions(gpa: Allocator, io: Io, pool: *const tensor.Pool, dir_path: []const u8, options: LoadOptions) !*Model {
+        var opts = options;
+        // `DITCH_NO_MMAP=1` reads the weights instead of memory-mapping them.
+        // The two paths produce bit-identical results (see the streamed
+        // versus mapped test in stream_test.zig), so this only trades memory
+        // for a syscall; it exists for environments whose mmap cannot serve
+        // the mapping, such as qemu-user, which rejects the
+        // `MAP_SHARED_VALIDATE` that Zig's `MemoryMap` asks for.
+        if (tensor.mmapDisabled()) opts.store = .streamed;
         const self = try gpa.create(Model);
         errdefer gpa.destroy(self);
         self.* = undefined;

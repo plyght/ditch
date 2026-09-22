@@ -1362,7 +1362,17 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     const bold_out = con.tty_out and con.color;
 
     if (settings.version) {
-        try con.result.print("ditch {s} (zig {s}, {s}-{s}, {s})\n", .{ config.version, builtin.zig_version_string, @tagName(builtin.cpu.arch), @tagName(builtin.os.tag), @tagName(builtin.mode) });
+        try con.result.print("ditch {s} (zig {s}, {s}-{s}, {s}, {d}-lane {d}x{d} kernels{s})\n", .{
+            config.version,
+            builtin.zig_version_string,
+            @tagName(builtin.cpu.arch),
+            @tagName(builtin.os.tag),
+            @tagName(builtin.mode),
+            tensor.VL,
+            tensor.tile_inputs,
+            tensor.tile_rows,
+            if (tensor.have_accelerate) ", Accelerate" else "",
+        });
         return;
     }
     if (settings.help) {
@@ -1389,6 +1399,21 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         try out.print("{s}  v{s}  ditch censorship.  https://github.com/plyght/ditch\n", .{ banner, config.version });
         try out.writeAll("  Built on Heretic: https://github.com/p-e-w/heretic\n\n");
     }
+    // Accelerate (macOS): resolved once, before any kernel runs.
+    tensor.accelerate_enabled = settings.accelerate;
+    if (tensor.have_accelerate and settings.accelerate) {
+        if (!tensor.initAccelerate()) try out.writeAll("Accelerate could not be loaded; using the built-in kernels.\n");
+    }
+
+    // `ditch bench --kernels`: the compute kernels on synthetic data, no model.
+    if (settings.bench and settings.bench_kernels) {
+        const kpool = try arena.create(tensor.Pool);
+        kpool.* = tensor.Pool.initPersistent(gpa, io, settings.threads);
+        defer kpool.deinit();
+        try bench.runKernels(gpa, io, settings, kpool, out, con.result);
+        return;
+    }
+
     // A reproducibility manifest replaces the recorded settings (model, seed, datasets, ...).
     var manifest: ?reproduce.Manifest = null;
     if (settings.reproduce) |path| {
@@ -1417,7 +1442,13 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     const pool = try arena.create(tensor.Pool);
     pool.* = tensor.Pool.initPersistent(gpa, io, settings.threads);
     defer pool.deinit();
-    try out.print("Using {d} threads ({d} CPUs available)\n", .{ pool.threads, cpu_count });
+    if (tensor.performanceCores()) |p| {
+        // Apple Silicon: the default is the performance cores only (see tensor.defaultThreads).
+        try out.print("Using {d} threads ({d} CPUs available, {d} performance cores)\n", .{ pool.threads, cpu_count, p });
+    } else {
+        try out.print("Using {d} threads ({d} CPUs available)\n", .{ pool.threads, cpu_count });
+    }
+    if (tensor.accelerateActive()) try out.writeAll("Matrix products above the batch threshold use Accelerate.\n");
     try out.flush();
     installSigint();
 

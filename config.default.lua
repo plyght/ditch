@@ -19,8 +19,16 @@ return {
   -- Pin the model to a specific revision (commit SHA, branch or tag) on the Hub.
   -- model_commit = "main",
 
-  -- Number of worker threads for matrix kernels (default: number of CPUs).
+  -- Number of worker threads for matrix kernels (default: the number of CPUs,
+  -- or on Apple Silicon the number of performance cores, since an equal share
+  -- of a fork-join kernel on an efficiency core holds up every other thread).
   -- threads = 8,
+
+  -- Use Apple's Accelerate framework (cblas_sgemm) for batched matrix
+  -- products on macOS; ignored on other platforms and in builds made with
+  -- -Daccelerate=false. Turn it off to compare against the built-in kernels
+  -- or to keep results bit-for-bit equal to another machine's.
+  -- accelerate = true,
 
   -- Directory for downloaded models and dataset rows
   -- (default: $DITCH_CACHE, else $XDG_CACHE_HOME/ditch, else ~/.cache/ditch).
@@ -372,4 +380,6 @@ return {
   -- bench_prompts = 16,               -- prompts in the throughput batch
   -- bench_tokens = 32,                -- tokens decoded per prompt
   -- bench_output = "bench.md",        -- also write the table to this file
+  -- bench_kernels = false,            -- `ditch bench --kernels`: per-kernel
+                                       -- throughput only, no model needed
 }

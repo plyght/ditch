@@ -279,6 +279,7 @@ fn saveModelInner(gpa: Allocator, io: Io, model: *const Model, dir: Io.Dir, opts
 }
 
 test "export round trip merges deltas" {
+    if (tensor.mmapDisabled()) return error.SkipZigTest; // this test is about the mapped path
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var threaded: Io.Threaded = .init_single_threaded;
