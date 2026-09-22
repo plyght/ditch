@@ -9,6 +9,7 @@ const std = @import("std");
 const Io = std.Io;
 const tensor = @import("tensor.zig");
 const remote = @import("remote.zig");
+const dequant = @import("dequant.zig");
 const DType = tensor.DType;
 
 pub const TensorInfo = struct {
@@ -44,6 +45,24 @@ pub const TensorInfo = struct {
     }
 };
 
+/// A tensor whose dtype is not a floating-point type ditch computes with
+/// (quantised codes, scales, shapes: U8, I32, I64, F8_E4M3, ...). Kept in
+/// `File.raw` so dequant.zig can turn groups of them into virtual bf16 tensors.
+pub const RawInfo = struct {
+    name: []const u8,
+    /// The safetensors dtype string.
+    dtype: []const u8,
+    shape: []const usize,
+    offset: u64,
+    byte_len: usize,
+
+    pub fn numel(self: RawInfo) usize {
+        var n: usize = 1;
+        for (self.shape) |s| n *= s;
+        return n;
+    }
+};
+
 pub const OpenOptions = struct {
     /// Memory-map the whole file. When false only the header is read and
     /// `TensorInfo.data` is empty; tensor bytes must be read positionally.
@@ -69,6 +88,8 @@ pub const Overlay = struct {
         /// Rows `[rows][row_bytes]` at `src_offset`, stored in llama.cpp's
         /// permuted order and read back in Hugging Face order (streamed mode).
         permuted_rows: struct { src_offset: u64, rows: usize, row_bytes: usize, n_head: usize },
+        /// A bf16 tensor decoded on read from quantised source tensors (see dequant.zig).
+        dequant: *dequant.Dequant,
     },
 };
 
@@ -89,10 +110,16 @@ pub const File = struct {
     /// Total file length in bytes.
     len: u64,
     tensors: std.StringArrayHashMapUnmanaged(TensorInfo),
+    /// Tensors of non-floating-point dtypes (see `RawInfo`); consumed by dequant.zig.
+    raw: std.StringArrayHashMapUnmanaged(RawInfo) = .{},
     arena: std.heap.ArenaAllocator,
+    /// Allocator of this struct, its dequantisers and their resident buffers.
+    gpa: std.mem.Allocator,
     /// Synthetic data (see `Overlay`), addressed above `len`.
     overlays: std.ArrayList(Overlay) = .empty,
     next_virtual: u64 = 0,
+    /// Virtual tensors registered with `addDequant` (owned).
+    dequants: std.ArrayList(*dequant.Dequant) = .empty,
 
     pub fn open(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, sub_path: []const u8) !*File {
         return openOptions(gpa, io, dir, sub_path, .{});
@@ -109,6 +136,7 @@ pub const File = struct {
             .len = 0,
             .tensors = .{},
             .arena = std.heap.ArenaAllocator.init(gpa),
+            .gpa = gpa,
         };
         errdefer self.arena.deinit();
         const arena = self.arena.allocator();
@@ -167,6 +195,7 @@ pub const File = struct {
             .len = 0,
             .tensors = .{},
             .arena = std.heap.ArenaAllocator.init(gpa),
+            .gpa = gpa,
         };
         errdefer self.arena.deinit();
         self.path = try self.arena.allocator().dupe(u8, rf.name);
@@ -200,10 +229,6 @@ pub const File = struct {
             const obj = entry.value_ptr.*;
             if (obj != .object) return error.InvalidSafetensors;
             const dtype_str = (obj.object.get("dtype") orelse return error.InvalidSafetensors).string;
-            const dtype = DType.fromSafetensors(dtype_str) orelse {
-                std.log.warn("skipping tensor {s} with unsupported dtype {s}", .{ name, dtype_str });
-                continue;
-            };
             const shape_val = (obj.object.get("shape") orelse return error.InvalidSafetensors).array;
             const shape = try arena.alloc(usize, shape_val.items.len);
             for (shape_val.items, 0..) |v, i| shape[i] = @intCast(v.integer);
@@ -211,6 +236,17 @@ pub const File = struct {
             const start: usize = @intCast(offs.items[0].integer);
             const end: usize = @intCast(offs.items[1].integer);
             if (end > data_len or start > end) return error.InvalidSafetensors;
+            const dtype = DType.fromSafetensors(dtype_str) orelse {
+                // Quantised codes, scales and shapes: dequant.zig decides what to do with them.
+                try self.raw.put(arena, try arena.dupe(u8, name), .{
+                    .name = try arena.dupe(u8, name),
+                    .dtype = try arena.dupe(u8, dtype_str),
+                    .shape = shape,
+                    .offset = data_start + start,
+                    .byte_len = end - start,
+                });
+                continue;
+            };
             try self.tensors.put(arena, try arena.dupe(u8, name), .{
                 .name = try arena.dupe(u8, name),
                 .dtype = dtype,
@@ -236,6 +272,7 @@ pub const File = struct {
             .len = 0,
             .tensors = .{},
             .arena = std.heap.ArenaAllocator.init(gpa),
+            .gpa = gpa,
         };
         errdefer self.arena.deinit();
         self.path = try self.arena.allocator().dupe(u8, sub_path);
@@ -259,10 +296,36 @@ pub const File = struct {
         try self.tensors.put(self.arena.allocator(), info.name, info);
     }
 
+    /// First free virtual offset: overlays live above the file's bytes.
+    fn virtualBase(self: *File) u64 {
+        if (self.next_virtual == 0) self.next_virtual = (self.len + 63) / 64 * 64;
+        return self.next_virtual;
+    }
+
+    /// Registers a dequantiser as the bf16 tensor `dq.name` of `shape`
+    /// (`data` is its decoded bytes when the file is mapped, else empty). The
+    /// file owns `dq` from now on.
+    pub fn addDequant(self: *File, dq: *dequant.Dequant, shape: []const usize, data: []const u8) !void {
+        const arena = self.arena.allocator();
+        const off = self.virtualBase();
+        const byte_len = dq.byteLen();
+        try self.overlays.append(arena, .{ .offset = off, .byte_len = byte_len, .kind = .{ .dequant = dq } });
+        self.next_virtual += (byte_len + 63) / 64 * 64;
+        try self.dequants.append(arena, dq);
+        try self.tensors.put(arena, dq.name, .{
+            .name = dq.name,
+            .dtype = .bf16,
+            .shape = shape,
+            .data = data,
+            .offset = off,
+            .byte_len = byte_len,
+        });
+    }
+
     /// Registers in-memory bytes (owned by the caller for the file's lifetime)
     /// and returns the virtual offset under which they are read.
     pub fn addOverlayBytes(self: *File, bytes: []const u8) !u64 {
-        const off = self.next_virtual;
+        const off = self.virtualBase();
         try self.overlays.append(self.arena.allocator(), .{ .offset = off, .byte_len = bytes.len, .kind = .{ .bytes = bytes } });
         self.next_virtual += (bytes.len + 63) / 64 * 64;
         return off;
@@ -270,7 +333,7 @@ pub const File = struct {
 
     /// Registers a permuted-row view over the file range at `src_offset`.
     pub fn addOverlayPermuted(self: *File, src_offset: u64, rows: usize, row_bytes: usize, n_head: usize) !u64 {
-        const off = self.next_virtual;
+        const off = self.virtualBase();
         const byte_len = rows * row_bytes;
         try self.overlays.append(self.arena.allocator(), .{ .offset = off, .byte_len = byte_len, .kind = .{ .permuted_rows = .{ .src_offset = src_offset, .rows = rows, .row_bytes = row_bytes, .n_head = n_head } } });
         self.next_virtual += (byte_len + 63) / 64 * 64;
@@ -278,8 +341,17 @@ pub const File = struct {
     }
 
     fn overlayAt(self: *const File, offset: u64) ?*const Overlay {
-        for (self.overlays.items) |*o| {
-            if (offset >= o.offset and offset < o.offset + o.byte_len) return o;
+        // Overlays are registered in increasing offset order.
+        var lo: usize = 0;
+        var hi: usize = self.overlays.items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const o = &self.overlays.items[mid];
+            if (offset < o.offset) {
+                hi = mid;
+            } else if (offset >= o.offset + o.byte_len) {
+                lo = mid + 1;
+            } else return o;
         }
         return null;
     }
@@ -292,10 +364,12 @@ pub const File = struct {
         return switch (o.kind) {
             .bytes => |b| b[rel..][0..len],
             .permuted_rows => unreachable, // only registered for unmapped files
+            .dequant => |dq| dq.materialized.?[rel..][0..len], // decoded at registration for mapped files
         };
     }
 
     pub fn close(self: *File, gpa: std.mem.Allocator, io: Io) void {
+        for (self.dequants.items) |dq| dq.deinit(self.gpa);
         if (self.map) |*m| m.destroy(io);
         switch (self.source) {
             .local => |f| f.close(io),
@@ -330,6 +404,7 @@ pub const File = struct {
             if (rel + out.len > o.byte_len) return error.UnexpectedEndOfFile;
             switch (o.kind) {
                 .bytes => |b| @memcpy(out, b[rel..][0..out.len]),
+                .dequant => |dq| try dq.readRange(io, rel, out),
                 .permuted_rows => |p| {
                     // Whole rows only: the store reads row slices.
                     if (rel % p.row_bytes != 0 or out.len % p.row_bytes != 0) return error.UnexpectedEndOfFile;

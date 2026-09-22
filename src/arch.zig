@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const tensor = @import("tensor.zig");
+const dequant = @import("dequant.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -295,6 +296,8 @@ pub const Config = struct {
     /// Any linear-attention layer present.
     has_linear: bool,
     linear_kind: LinearKind,
+    /// The checkpoint's `quantization_config` (dequantised on load, see dequant.zig).
+    quant: dequant.QuantConfig = .{},
     linear_k_heads: usize,
     linear_k_dim: usize,
     linear_v_heads: usize,
@@ -451,8 +454,8 @@ pub fn lookup(model_type: []const u8) ?*const Arch {
 
 fn rejectKnownHybrid(model_type: []const u8) !void {
     const table = .{
-        .{ "kimi_k3", "Kimi K3 (its weights format and AttnRes are not implemented yet)" },
-        .{ "kimi_k2", "Kimi K2 (FP8 E4M3 block-quantised weights)" },
+        .{ "kimi_k3", "Kimi K3 (AttnRes is not implemented yet)" },
+        .{ "kimi_k2", "Kimi K2 (use the kimi_k25 wrapper config or a deepseek_v3 config; the standalone kimi_k2 model_type is untested)" },
         .{ "qwen4_exp", "Qwen3.8-Flash-Next hybrid (linear attention with sparse indexer and hyper-connections)" },
         .{ "qwen4_exp_text", "Qwen3.8-Flash-Next hybrid (linear attention with sparse indexer and hyper-connections)" },
         .{ "glm5_next", "GLM-5.3-Flash hybrid (linear attention with sparse indexer and hyper-connections)" },
@@ -469,22 +472,14 @@ fn rejectKnownHybrid(model_type: []const u8) !void {
     }
 }
 
-fn rejectUnsupportedMath(top: std.json.ObjectMap, obj: std.json.ObjectMap) !void {
-    if (getObj(top, "quantization_config")) |qc| {
-        const method = getStr(qc, "quant_method") orelse "";
-        const fmt = getStr(qc, "format") orelse getStr(qc, "fmt") orelse "";
-        if (std.mem.eql(u8, method, "compressed-tensors") or std.mem.indexOf(u8, fmt, "mxfp4") != null or std.mem.indexOf(u8, fmt, "pack-quantized") != null) {
-            std.log.err("unsupported model: compressed/MXFP4 quantised weights cannot be dequantised", .{});
-            return error.UnsupportedArchitecture;
-        }
-        if (std.mem.eql(u8, method, "fp8")) {
-            std.log.err("unsupported model: FP8 block-quantised weights cannot be dequantised yet", .{});
-            return error.UnsupportedArchitecture;
-        }
-    }
+/// Rejects what no family can run, whatever its `model_type`: quantisation
+/// formats ditch cannot decode (the supported ones become `Config.quant`),
+/// expert storage dtypes it cannot read, and unimplemented layer maths.
+fn rejectUnsupportedMath(top: std.json.ObjectMap, obj: std.json.ObjectMap) !dequant.QuantConfig {
+    const quant = try dequant.parseQuantConfig(getObj(top, "quantization_config") orelse getObj(obj, "quantization_config"));
     if (getStr(obj, "expert_dtype")) |dt| {
-        if (!std.mem.eql(u8, dt, "bfloat16") and !std.mem.eql(u8, dt, "float32")) {
-            std.log.err("unsupported model: '{s}' expert dtype cannot be dequantised yet", .{dt});
+        if (!dequant.expertDtypeSupported(dt)) {
+            std.log.err("unsupported model: '{s}' expert dtype cannot be dequantised (bf16/f16/f32, fp8, mxfp4 and pack-quantized int4 are supported)", .{dt});
             return error.UnsupportedArchitecture;
         }
     }
@@ -503,6 +498,7 @@ fn rejectUnsupportedMath(top: std.json.ObjectMap, obj: std.json.ObjectMap) !void
         std.log.err("unsupported model: 'situ' activation is not implemented", .{});
         return error.UnsupportedArchitecture;
     }
+    return quant;
 }
 
 pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
@@ -520,7 +516,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
     const arch = lookup(model_type) orelse lookup(top_type) orelse {
         try rejectKnownHybrid(model_type);
         try rejectKnownHybrid(top_type);
-        try rejectUnsupportedMath(parsed.value.object, obj);
+        _ = try rejectUnsupportedMath(parsed.value.object, obj);
         var names: std.Io.Writer.Allocating = .init(arena);
         for (&registry, 0..) |*a, i| {
             if (i > 0) try names.writer.writeAll(", ");
@@ -529,6 +525,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         std.log.err("unsupported model_type: {s} (supported: {s})", .{ model_type, names.written() });
         return error.UnsupportedArchitecture;
     };
+    const quant = try rejectUnsupportedMath(parsed.value.object, obj);
     // Nested attention config (MPT).
     const attn_cfg: std.json.ObjectMap = getObj(obj, "attn_config") orelse obj;
 
@@ -739,6 +736,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
 
     var c = Config{
         .arch = arch,
+        .quant = quant,
         .model_type = try arena.dupe(u8, model_type),
         .hidden_size = hidden,
         .intermediate_size = if (intermediate_size > 0) intermediate_size else 4 * hidden,
@@ -1561,7 +1559,7 @@ pub const registry = [_]Arch{
         .chat = "deepseek",
         .verified = true,
         .names = deepseek_v3_names,
-        .notes = "fixture: MLA with q_lora_rank (q_a/q_b) and without, softmax routing with group-limited top-k, shared experts, first_k_dense_replace, yarn with mscale. Checkpoints must be BF16/F16 (no FP8).",
+        .notes = "fixture: MLA with q_lora_rank (q_a/q_b) and without, softmax routing with group-limited top-k, shared experts, first_k_dense_replace, yarn with mscale. BF16/F16 and FP8 block-quantised checkpoints.",
         .extra = extraDeepseek,
     },
     .{
@@ -1570,7 +1568,7 @@ pub const registry = [_]Arch{
         .chat = "deepseek",
         .verified = true,
         .names = deepseek_v3_names,
-        .notes = "fixture: MLA, sigmoid routing with e_score_correction_bias, group-limited (noaux_tc) top-k, routed_scaling_factor, shared experts. Checkpoints must be BF16/F16 (no FP8).",
+        .notes = "fixture: MLA, sigmoid routing with e_score_correction_bias, group-limited (noaux_tc) top-k, routed_scaling_factor, shared experts. BF16/F16 and FP8 block-quantised checkpoints (dequantised on load).",
         .extra = extraDeepseek,
     },
     .{
@@ -1605,7 +1603,7 @@ pub const registry = [_]Arch{
             .fused_gate_up = &.{"mlp.experts.gate_up_proj"},
             .fused_down = &.{"mlp.experts.down_proj"},
         },
-        .notes = "fixture: attention sinks, alternating sliding layers, yarn, router bias with top-k softmax, interleaved fused experts with biases and the clamped swiglu. BF16 checkpoints only (MXFP4 must be dequantised first).",
+        .notes = "fixture: attention sinks, alternating sliding layers, yarn, router bias with top-k softmax, interleaved fused experts with biases and the clamped swiglu. BF16 and MXFP4 checkpoints (experts dequantised on load).",
         .extra = extraGptOss,
     },
     .{
@@ -1953,7 +1951,7 @@ pub const registry = [_]Arch{
         .chat = "kimi",
         .verified = true,
         .names = deepseek_v3_names,
-        .notes = "fixture: the Kimi K2.5 / K2.6 image-video wrapper (Kimi_K25ForConditionalGeneration) around a DeepSeek V3 text config (model_type kimi_k2 or deepseek_v3 under text_config): MLA, sigmoid routing with correction bias and group-limited top-k, shared experts, language_model prefix. The vision tower and projector pass through exports untouched. Needs BF16 weights (compressed-tensors INT4 must be dequantised first).",
+        .notes = "fixture: the Kimi K2.5 / K2.6 image-video wrapper (Kimi_K25ForConditionalGeneration) around a DeepSeek V3 text config (model_type kimi_k2 or deepseek_v3 under text_config): MLA, sigmoid routing with correction bias and group-limited top-k, shared experts, language_model prefix. The vision tower and projector pass through exports untouched..",
         .extra = extraDeepseek,
     },
 };

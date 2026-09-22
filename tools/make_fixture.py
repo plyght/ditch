@@ -5,7 +5,8 @@ forward pass, used to validate ditch's inference against known-good numbers.
 Usage: make_fixture.py <family> [<out_dir>] [--gguf]
     family: llama | qwen2 | qwen3 | gemma3 | qwen3_moe | qwen3_moe_fused | qwen3_moe_fused_t
             or any family of the registry-driven generator (`SPECS` below:
-            phi3, phi, gpt_neox, gpt2, falcon, ... , gpt_oss, deepseek_v3, kimi_linear)
+            phi3, phi, gpt_neox, gpt2, falcon, ... , gpt_oss, deepseek_v3, kimi_linear,
+            and the quantised variants qwen2_fp8, qwen2_int4, gpt_oss_mxfp4)
             | qwen3_moe_big
     --gguf: additionally write <out_dir>_gguf/model.gguf, the same model as a
             llama.cpp GGUF file (f16 attention and embedding matrices, Q8_0
@@ -63,6 +64,115 @@ def bf16_bits(a):
     a = np.ascontiguousarray(a, dtype=np.float32)
     u = a.view(np.uint32)
     return ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16)
+
+
+# ---------------------------------------------------------------------------
+# Quantised checkpoint variants. A spec with `quant` stores its linear weights
+# (or, for MXFP4, its fused expert tensors) in one of the quantised safetensors
+# layouts ditch dequantises on load; the reference forward pass runs on the
+# dequantised (bf16-rounded) values, exactly what the loader must produce.
+#   fp8:   DeepSeek V3 / Kimi K2 style `weight` F8_E4M3 + `weight_scale_inv` F32
+#          with block scales (`weight_block_size` in quantization_config).
+#   int:   compressed-tensors pack-quantized: `weight_packed` I32 (num_bits-wide
+#          fields packed densely, little end first), `weight_scale` BF16 per
+#          group, `weight_zero_point` (asymmetric, packed along the rows) and
+#          `weight_shape` I64.
+#   mxfp4: gpt-oss `*_blocks` U8 (E2M1 nibble pairs, low nibble first) and
+#          `*_scales` U8 (E8M0, bias 127) per 32 elements of the natural
+#          [E, out, in] layout; the bf16 tensor is its [E, in, out] transpose.
+# ---------------------------------------------------------------------------
+
+E2M1_VALUES = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], np.float32)
+
+
+def fp8_e4m3_table():
+    """Value of every F8_E4M3 code (OCP fn variant: no infinities, 0x7f/0xff are NaN)."""
+    codes = np.arange(256, dtype=np.uint32)
+    sign, exp, man = codes >> 7, (codes >> 3) & 0xF, (codes & 7).astype(np.float64)
+    val = np.where(exp == 0, man / 8 * 2.0 ** -6, (1 + man / 8) * 2.0 ** (exp.astype(np.float64) - 7))
+    val = np.where((exp == 15) & (man == 7), np.nan, val)
+    return np.where(sign == 1, -val, val).astype(np.float32)
+
+
+def nearest_code(x, table):
+    """Index of the table entry nearest to every element of `x` (NaN entries never match)."""
+    t = np.where(np.isnan(table), np.inf, table)
+    return np.abs(np.asarray(x, np.float32)[..., None] - t).argmin(-1)
+
+
+def quant_fp8_block(name, w, block):
+    """DeepSeek-style FP8: one f32 scale per `block` (rows, cols) tile, `w = code * scale`."""
+    table = fp8_e4m3_table()
+    br, bc = block
+    out_, in_ = w.shape
+    nb0, nb1 = -(-out_ // br), -(-in_ // bc)
+    scale = np.zeros((nb0, nb1), np.float32)
+    codes = np.zeros(w.shape, np.uint8)
+    deq = np.zeros(w.shape, np.float32)
+    for i in range(nb0):
+        for j in range(nb1):
+            blk = w[i * br:(i + 1) * br, j * bc:(j + 1) * bc]
+            s = np.float32(max(float(np.abs(blk).max()), 1e-12) / 448.0)
+            scale[i, j] = s
+            c = nearest_code(blk / s, table)
+            codes[i * br:(i + 1) * br, j * bc:(j + 1) * bc] = c
+            deq[i * br:(i + 1) * br, j * bc:(j + 1) * bc] = table[c] * s
+    return bf16_round(deq), [(name, "F8_E4M3", codes), (name + "_scale_inv", "F32", scale)]
+
+
+def pack_bits(vals, bits):
+    """compressed-tensors `pack_to_int32` along the last axis: element i occupies bits
+    [i * bits, (i + 1) * bits) of the little-endian word stream of its row."""
+    vals = np.asarray(vals, np.int64)
+    rows, n = vals.shape
+    words = -(-n * bits // 32)
+    out = np.zeros((rows, words), np.uint64)
+    for i in range(n):
+        start = i * bits
+        w, off = start // 32, start % 32
+        out[:, w] |= (vals[:, i].astype(np.uint64) << np.uint64(off)) & np.uint64(0xFFFFFFFF)
+        if off + bits > 32:
+            out[:, w + 1] |= vals[:, i].astype(np.uint64) >> np.uint64(32 - off)
+    return out.astype(np.uint32).view(np.int32)
+
+
+def quant_int_packed(name, w, bits, group, symmetric):
+    """compressed-tensors pack-quantized INT weights with per-group scales."""
+    out_, in_ = w.shape
+    assert in_ % group == 0
+    groups = in_ // group
+    wg = w.reshape(out_, groups, group)
+    qmin, qmax = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+    if symmetric:
+        scale = bf16_round(np.maximum(np.abs(wg).max(-1), 1e-8) / qmax)
+        zp = np.zeros((out_, groups), np.int64)
+    else:
+        mn, mx = np.minimum(wg.min(-1), 0), np.maximum(wg.max(-1), 0)
+        scale = bf16_round(np.maximum(mx - mn, 1e-8) / (qmax - qmin))
+        zp = np.clip(np.round(qmin - mn / scale), qmin, qmax).astype(np.int64)
+    q = np.clip(np.round(wg / scale[..., None]) + zp[..., None], qmin, qmax).astype(np.int64)
+    deq = bf16_round((q - zp[..., None]).astype(np.float32) * scale[..., None]).reshape(out_, in_)
+    offset = 1 << (bits - 1)
+    tensors = [(name[:-len(".weight")] + ".weight_packed", "I32", pack_bits(q.reshape(out_, in_) + offset, bits)),
+               (name[:-len(".weight")] + ".weight_scale", "BF16", scale),
+               (name[:-len(".weight")] + ".weight_shape", "I64", np.array([out_, in_], np.int64))]
+    if not symmetric:
+        # Zero points are packed along the rows (`packed_dim=0`): [ceil(out * bits / 32), groups].
+        tensors.append((name[:-len(".weight")] + ".weight_zero_point", "I32", pack_bits((zp + offset).T, bits).T.copy()))
+    return deq, tensors
+
+
+def quant_mxfp4(name, w):
+    """gpt-oss MXFP4 of the natural `[E, out, in]` tensor `w` (in a multiple of 32)."""
+    assert w.shape[-1] % 32 == 0
+    blocks = w.reshape(*w.shape[:-1], w.shape[-1] // 32, 32)
+    amax = np.abs(blocks).max(-1)
+    e = np.where(amax > 0, np.ceil(np.log2(np.maximum(amax, 1e-30) / 6.0)), 0).astype(np.int64)
+    e = np.clip(e, -127, 127)
+    codes = nearest_code(blocks / (2.0 ** e)[..., None], E2M1_VALUES).astype(np.uint8)
+    packed = (codes[..., 0::2] | (codes[..., 1::2] << 4)).astype(np.uint8)
+    deq = (E2M1_VALUES[codes] * (2.0 ** e)[..., None].astype(np.float32)).reshape(w.shape)
+    return bf16_round(deq), [(name + "_blocks", "U8", packed), (name + "_scales", "U8", (e + 127).astype(np.uint8))]
 
 
 B2U_MAP = None
@@ -263,6 +373,7 @@ def base(**kw):
         residual_mult=1.0, logit_scale=1.0, embed_scale=1.0, lm_bias=False, sinks=None, temp=None, pos_offset=0,
         sliding=None, sliding_layers=None, mla=None, moe=None, linear=None, linear_layers=None, full_interval=0,
         gated_q=False, gate_swish=False,
+        quant=None,
         config={}, extra_config={},
     )
     d.update(kw)
@@ -393,6 +504,35 @@ spec("gpt_oss", tok="o200k", L=3, attn_bias=True, o_bias=True, sinks="self_attn.
              "head_dim": 8, "num_local_experts": 4, "num_experts_per_tok": 2, "sliding_window": 4, "layer_types": ["sliding_attention", "full_attention", "sliding_attention"],
              "rope_theta": 10000.0, "rope_scaling": {"rope_type": "yarn", "factor": 8.0, "beta_fast": 32.0, "beta_slow": 1.0, "original_max_position_embeddings": 32, "truncate": False},
              "max_position_embeddings": 128, "rms_norm_eps": 1e-5, "swiglu_limit": 7.0, "attention_bias": True, "hidden_act": "silu", "tie_word_embeddings": True})
+# Quantised variants (see "Quantised checkpoint variants" above): the qwen2
+# layout with DeepSeek-style FP8 block scales and with compressed-tensors
+# pack-quantized INT4 (asymmetric, so zero points are exercised too), and
+# gpt-oss with MXFP4 experts (hidden size 64 and expert width 64, so rows span two blocks).
+QWEN2_CONFIG = {"model_type": "qwen2", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
+                "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "silu", "max_position_embeddings": 128, "tie_word_embeddings": True,
+                "torch_dtype": "bfloat16"}
+spec("qwen2_fp8", tok="qwen2", attn_bias=True, o_bias=False, lm_head=None, quant={"kind": "fp8", "block": [16, 8]},
+     config=dict(QWEN2_CONFIG, quantization_config={"activation_scheme": "dynamic", "fmt": "e4m3", "quant_method": "fp8", "weight_block_size": [16, 8]}))
+spec("qwen2_int4", tok="qwen2", attn_bias=True, o_bias=False, lm_head=None, quant={"kind": "int", "bits": 4, "group": 16, "symmetric": False},
+     config=dict(QWEN2_CONFIG, quantization_config={
+         "config_groups": {"group_0": {"input_activations": None, "output_activations": None, "targets": ["Linear"],
+                                       "weights": {"actorder": None, "block_structure": None, "dynamic": False, "group_size": 16, "num_bits": 4,
+                                                   "observer": "minmax", "strategy": "group", "symmetric": False, "type": "int"}}},
+         "format": "pack-quantized", "global_compression_ratio": None, "ignore": ["lm_head"], "kv_cache_scheme": None,
+         "quant_method": "compressed-tensors", "quantization_status": "compressed"}))
+spec("gpt_oss_mxfp4", tok="o200k", H=64, L=3, attn_bias=True, o_bias=True, sinks="self_attn.sinks", sliding=4, sliding_layers=[1, 0, 1], lm_head=None,
+     quant={"kind": "mxfp4"},
+     scaling={"rope_type": "yarn", "factor": 8.0, "beta_fast": 32.0, "beta_slow": 1.0, "original_max_position_embeddings": 32, "truncate": False},
+     moe={"E": 4, "K": 2, "MI": 64, "shared": 0, "scoring": "softmax", "group_limited": False, "rsf": 1.0, "norm": True, "router_bias": True,
+          "layers": [0, 1, 2], "corr_bias": False, "layout": "fused_t_interleaved", "prefix": "mlp.", "router": "router.weight", "bias": True,
+          "swiglu": (1.702, 7.0)},
+     config={"model_type": "gpt_oss", "hidden_size": 64, "intermediate_size": 64, "num_hidden_layers": 3, "num_attention_heads": 4, "num_key_value_heads": 2,
+             "head_dim": 8, "num_local_experts": 4, "num_experts_per_tok": 2, "sliding_window": 4, "layer_types": ["sliding_attention", "full_attention", "sliding_attention"],
+             "rope_theta": 10000.0, "rope_scaling": {"rope_type": "yarn", "factor": 8.0, "beta_fast": 32.0, "beta_slow": 1.0, "original_max_position_embeddings": 32, "truncate": False},
+             "max_position_embeddings": 128, "rms_norm_eps": 1e-5, "swiglu_limit": 7.0, "attention_bias": True, "hidden_act": "silu", "tie_word_embeddings": True,
+             "torch_dtype": "bfloat16",
+             "quantization_config": {"modules_to_not_convert": ["model.layers.*.self_attn", "model.layers.*.mlp.router", "model.embed_tokens", "lm_head"],
+                                     "quant_method": "mxfp4"}})
 spec("minicpm", tok="spm", embed_scale=12.0, residual_mult=1.4 / np.sqrt(2), logit_scale=0.5, lm_head=None,
      config={"model_type": "minicpm", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
              "scale_emb": 12, "scale_depth": 1.4, "dim_model_base": 16, "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "silu",
@@ -578,11 +718,30 @@ def generate_generic(family, out_dir):
     V = len(vocab)
     H, I, L, NH, NKV, HD, VD = s["H"], s["I"], s["L"], s["NH"], s["NKV"], s["HD"], s["VD"]
     weights = {}
+    # Quantised storage of a weight: name -> [(tensor name, safetensors dtype, array)];
+    # `weights[name]` then holds the dequantised values the reference computes with.
+    qtensors = {}
+
+    def quantize(name, w):
+        """Re-encodes `w` in the spec's quantised format (in place) and records its storage tensors."""
+        q = s["quant"]
+        if q["kind"] == "fp8":
+            deq, tensors = quant_fp8_block(name, w, q["block"])
+        elif q["kind"] == "int":
+            deq, tensors = quant_int_packed(name, w, q["bits"], q["group"], q["symmetric"])
+        elif q["kind"] == "mxfp4":
+            deq, tensors = quant_mxfp4(name, w)
+        else:
+            raise ValueError(q["kind"])
+        w[...] = deq
+        qtensors[name] = tensors
 
     def mat(name, rows, cols, scale=0.2, register=True):
         w = bf16_round(rng.normal(0, scale, size=(rows, cols)))
         if register:
             weights[name] = w.T.copy() if s["conv1d"] and name.endswith(".weight") and "wte" not in name and "wpe" not in name and "ln" not in name else w
+            if s["quant"] and s["quant"]["kind"] in ("fp8", "int") and name.endswith("_proj.weight") and not s["conv1d"]:
+                quantize(name, w)
         return w
 
     def vec(name, n, scale=0.2):
@@ -749,6 +908,19 @@ def generate_generic(family, out_dir):
                     dn[e] = ex["down"].T
                 weights[mp + "experts.gate_up_proj"] = gu
                 weights[mp + "experts.down_proj"] = dn
+                if s["quant"] and s["quant"]["kind"] == "mxfp4":
+                    # Stored as blocks of the natural [E, out, in] layout; the
+                    # experts compute with the dequantised values.
+                    for key, arr in ((mp + "experts.gate_up_proj", gu), (mp + "experts.down_proj", dn)):
+                        nat = np.ascontiguousarray(arr.transpose(0, 2, 1))
+                        quantize(key, nat)
+                        arr[...] = nat.transpose(0, 2, 1)
+                    for e, ex in enumerate(experts):
+                        if moe["layout"] == "fused_t_interleaved":
+                            ex["gate"], ex["up"] = gu[e, :, 0::2].T.copy(), gu[e, :, 1::2].T.copy()
+                        else:
+                            ex["gate"], ex["up"] = gu[e, :, :MI].T.copy(), gu[e, :, MI:].T.copy()
+                        ex["down"] = dn[e].T.copy()
                 if moe.get("bias"):
                     gub = np.zeros((E, 2 * MI), np.float32)
                     dnb = np.zeros((E, H), np.float32)
@@ -794,9 +966,17 @@ def generate_generic(family, out_dir):
     json.dump(config, open(f"{out_dir}/config.json", "w"), indent=1)
     json.dump({"eos_token_id": vocab[eos], "bos_token_id": vocab[bos] if bos else None, "do_sample": False}, open(f"{out_dir}/generation_config.json", "w"))
     header, blobs, offset = {}, [], 0
+    stored = []
     for n in sorted(weights):
-        u = bf16_bits(weights[n])
-        header[n] = {"dtype": "BF16", "shape": list(u.shape), "data_offsets": [offset, offset + u.nbytes]}
+        if n in qtensors:
+            stored.extend(qtensors[n])
+        else:
+            stored.append((n, "BF16", bf16_bits(weights[n])))
+    for n, dtype, u in sorted(stored, key=lambda t: t[0]):
+        if dtype == "BF16" and u.dtype != np.uint16:
+            u = bf16_bits(u)
+        u = np.ascontiguousarray(u)
+        header[n] = {"dtype": dtype, "shape": list(u.shape), "data_offsets": [offset, offset + u.nbytes]}
         blobs.append(u.tobytes())
         offset += u.nbytes
     hb = json.dumps(header).encode()

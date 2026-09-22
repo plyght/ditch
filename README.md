@@ -23,7 +23,8 @@ What ditch adds:
   Heretic's edit-every-expert as a candidate.
 * **A cheaper search.** Early stopping of dominated trials, warm starts from
   earlier studies, optional multi-direction ablation.
-* **GGUF in and out**, including quantised weights.
+* **GGUF in and out**, including quantised weights, and quantised
+  safetensors (FP8, MXFP4, INT4) dequantised on load.
 * **Reproducible exports** (a Lua manifest with content hashes) and a
   benchmark harness.
 
@@ -101,8 +102,7 @@ a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
 * Mixture of experts: Mixtral, Qwen2/3-MoE (separate and fused expert
   layouts), DeepSeek V2 / V3 (MLA, group-limited and sigmoid routing, shared
   experts), Llama 4 text (top-1 routing, NoPE layers), gpt-oss (attention
-  sinks, interleaved fused experts; BF16 checkpoints only, MXFP4 must be
-  dequantised first)
+  sinks, interleaved fused experts, BF16 or MXFP4 checkpoints)
 
 Implemented from the Hugging Face reference but without a fixture: Falcon
 40B/180B (grouped qkv, `ln_attn`/`ln_mlp`) and Falcon ALiBi, Baichuan 13B
@@ -111,12 +111,13 @@ LayerNorm), Gemma 2 logit softcapping, `dynamic` and `longrope` scaling
 beyond the original context (treated as static / short factors).
 
 Not supported: state-space and hybrid models (Mamba, Jamba, Falcon-H1,
-Nemotron-H, RWKV), Kimi K3 (its weights format and AttnRes), Kimi K2 (FP8
-weights), Qwen3.8-Flash-Next (`qwen4_exp`), GLM-5.3-Flash (`glm5_next`) and
-DeepSeek V4 (sparse indexers with hyper-connections and hash layers, FP4/FP8
-weights), encoder-decoder models, Gemma 3n (per-layer inputs), MiniCPM3,
-GraniteMoE, OPT-350m (projection layers), FP8 checkpoints, and
-SentencePiece-only tokenizers (Baichuan; generate a `tokenizer.json` with
+Nemotron-H, RWKV), Kimi K3 (AttnRes), Kimi K2 (`kimi_k2` standalone
+config), Qwen3.8-Flash-Next (`qwen4_exp`), GLM-5.3-Flash (`glm5_next`) and
+DeepSeek V4 (sparse indexers with hyper-connections and hash layers),
+encoder-decoder models, Gemma 3n (per-layer inputs), MiniCPM3, GraniteMoE,
+OPT-350m (projection layers), quantisation formats other than the ones
+listed below (GPTQ, AWQ, bitsandbytes, ...), and SentencePiece-only
+tokenizers (Baichuan; generate a `tokenizer.json` with
 `AutoTokenizer.from_pretrained(...).save_pretrained(...)` and place it
 next to the model). ditch names the missing piece instead of guessing:
 unknown layer types, quantisation formats and activations are errors, not
@@ -128,13 +129,41 @@ through their text config: the vision tower is never executed, its
 weights pass through exports byte for byte, and refusal directions are
 measured on text prompts.
 
-Weights are read from safetensors (F32/F16/BF16) or GGUF (llama, Mistral,
-Mixtral, Qwen2/3, Qwen MoE and Gemma 2/3 families; the registry carries the
-llama.cpp architecture name of every family for the GGUF writer).
-Abliteration edits each family's attention output projection and MLP down
-projection (per expert on MoE layers) and exports preserve every tensor
-name and layout, including GPT-2's Conv1D transposes and fused expert
-tensors.
+Weights are read from safetensors (F32/F16/BF16, or the quantised formats
+below) or GGUF (llama, Mistral, Mixtral, Qwen2/3, Qwen MoE and Gemma 2/3
+families; the registry carries the llama.cpp architecture name of every
+family for the GGUF writer). Abliteration edits each family's attention
+output projection and MLP down projection (per expert on MoE layers) and
+exports preserve every tensor name and layout, including GPT-2's Conv1D
+transposes and fused expert tensors.
+
+### Quantised checkpoints
+
+Quantised safetensors checkpoints are dequantised as they are read
+(`src/dequant.zig`), so the loader, the kernels and the exporter see a bf16
+model:
+
+* **FP8** (`quant_method = "fp8"`: DeepSeek V3 / R1, Kimi K2 and the
+  Qwen3 FP8 releases; also `fbgemm_fp8` and compressed-tensors
+  `float-quantized`): `weight` in F8_E4M3 or F8_E5M2 with a
+  `weight_scale_inv` / `weight_scale` tensor holding one scale per
+  `weight_block_size` tile, per row or per tensor.
+* **MXFP4** (`quant_method = "mxfp4"`: gpt-oss as shipped): `*_blocks`
+  (E2M1 nibble pairs) and `*_scales` (E8M0 exponents) per 32 elements; the
+  experts are presented in the `[E, hidden, 2I]` / `[E, I, hidden]` layout
+  of the bf16 gpt-oss checkpoints.
+* **compressed-tensors pack-quantized** (Kimi K2.5 and other
+  llm-compressor INT4/INT8 models): `weight_packed` with `num_bits`-wide
+  fields, per-group `weight_scale`, optional `weight_zero_point` and
+  `weight_shape` from `quantization_config`.
+
+Values are decoded to bf16, which is what the Hugging Face integrations
+produce. With `--max-ram` (streamed weights) a tensor is decoded row-chunk
+by row-chunk as it is read, so a quantised MoE never holds more than one
+expert of decoded weights; without a budget the decoded tensors stay
+resident, so a quantised checkpoint then needs the memory of its bf16
+equivalent. `expert_dtype` values naming one of these formats are accepted.
+Any other `quantization_config` is an error naming the format.
 
 Tokenizers are read from `tokenizer.json` (Hugging Face fast tokenizers:
 byte-level and SentencePiece-style BPE), or, when a model ships none, from
@@ -216,6 +245,17 @@ scoring batch many tokens per read and suffer far less. Measure with
 the metadata); `--export-format gguf` writes one with llama.cpp's tensor
 names, metadata and permutations. Untouched tensors are copied byte for
 byte; edited tensors are re-quantised to the source type.
+
+A quantised safetensors source (FP8, MXFP4, pack-quantized INT4; see
+"Quantised checkpoints") is exported as a plain bf16 checkpoint: every
+tensor, edited or not, is written in bf16 (or `--export-dtype`) under its
+model name, the storage tensors (`*_blocks`, `*_scales`, `weight_scale_inv`,
+`weight_packed`, ...) are dropped and `quantization_config` is removed from
+the exported `config.json`, so the result loads as an ordinary bf16 model in
+transformers and in ditch. Quantised tensors are never passed through byte
+for byte, because a file mixing bf16 edits with the source encoding would
+not match any `quantization_config`. For a smaller file, export GGUF with
+`--gguf-dtype q8_0` (or another quantised type).
 
 | ggml type | read | written |
 | :--- | :---: | :---: |
