@@ -3105,8 +3105,11 @@ fn normRowsInPlace(c: *const Config, buf: []f32, n: usize, hidden: usize, nm: No
 /// Normalises a query/key vector in place: RMS or LayerNorm per the family
 /// (weightless RMS when `w` is empty, e.g. the Llama 4 L2 norm).
 fn normVecInPlace(c: *const Config, x: []f32, w: []const f32, b: ?[]const f32) void {
-    var tmp: [1024]f32 = undefined;
-    const out = tmp[0..x.len];
+    // The kernels take their statistics before writing, element by element,
+    // so they run in place. (A fixed stack buffer here once capped the vector
+    // at 1024 floats; OLMo 2 / OLMoE normalise the whole q projection,
+    // 2048–4096 of them.)
+    const out = x;
     if (w.len == 0) {
         var ss: f32 = 0;
         for (x) |v| ss += v * v;
@@ -3119,7 +3122,6 @@ fn normVecInPlace(c: *const Config, x: []f32, w: []const f32, b: ?[]const f32) v
         .rms_gemma => compute.rmsnorm(out, x, w, c.rms_norm_eps, true),
         .layer, .layer_1p => compute.layernorm(out, x, w, b, c.rms_norm_eps, false),
     }
-    @memcpy(x, out);
 }
 
 /// Applies the q/k norm to head `h` of a projection row (`.head`, `.heads`, `.l2`).

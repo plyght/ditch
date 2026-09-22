@@ -603,6 +603,14 @@ pub const Arch = struct {
     notes: []const u8 = "",
     names: Names = .{},
     norm: NormKind = .rms,
+    /// The norm epsilon when config.json gives none: the family's transformers
+    /// config-class default (OLMoE and others ship without the key). Null: 1e-6
+    /// for RMSNorm families, 1e-5 otherwise.
+    default_norm_eps: ?f32 = null,
+    /// The RoPE base when config.json gives none (neither `rope_theta` nor
+    /// `rope_parameters`): the family's transformers config-class default.
+    /// Null: 10000.
+    default_rope_theta: ?f32 = null,
     parallel_residual: bool = false,
     positional: Positional = .rope,
     rope_style: RopeStyle = .neox,
@@ -1173,7 +1181,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         } else rope_params = rp;
     }
     const rs_obj: ?std.json.ObjectMap = getObj(obj, "rope_scaling") orelse rope_params;
-    var rope_theta = getF32Any(obj, &.{ "rope_theta", "rotary_emb_base", "rope_base" }, 10000.0);
+    var rope_theta = getF32Any(obj, &.{ "rope_theta", "rotary_emb_base", "rope_base" }, arch.default_rope_theta orelse 10000.0);
     if (getNum(obj, "rope_theta") == null) if (rope_params) |rp| {
         rope_theta = getF32(rp, "rope_theta", rope_theta);
     };
@@ -1409,7 +1417,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         .head_dim = head_dim,
         .v_head_dim = v_head_dim,
         .vocab_size = getIntAny(obj, &.{ "vocab_size", "padded_vocab_size" }, 0),
-        .rms_norm_eps = getF32Any(obj, &.{ "rms_norm_eps", "layer_norm_eps", "layer_norm_epsilon", "layernorm_epsilon", "norm_eps", "norm_epsilon" }, if (arch.norm == .rms or arch.norm == .rms_gemma) 1e-6 else 1e-5),
+        .rms_norm_eps = getF32Any(obj, &.{ "rms_norm_eps", "layer_norm_eps", "layer_norm_epsilon", "layernorm_epsilon", "norm_eps", "norm_epsilon" }, arch.default_norm_eps orelse if (arch.norm == .rms or arch.norm == .rms_gemma) 1e-6 else 1e-5),
         .rope_theta = rope_theta,
         .rope_scaling = rope_scaling,
         .rotary_dim = rotary_dim,
@@ -3748,6 +3756,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "lfm2",
+        .default_norm_eps = 1e-05,
         .llama_cpp = "lfm2",
         .chat = "chatml",
         .verified = true,
@@ -3809,6 +3818,8 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "mixtral",
+        .default_rope_theta = 1000000.0,
+        .default_norm_eps = 1e-05,
         .llama_cpp = "llama",
         .chat = "mistral",
         .names = .{
@@ -3826,6 +3837,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "phi3",
+        .default_norm_eps = 1e-05,
         .aliases = &.{"phi4"},
         .llama_cpp = "phi3",
         .chat = "phi3",
@@ -3968,6 +3980,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "olmo2",
+        .default_norm_eps = 1e-05,
         .aliases = &.{"olmo3"},
         .llama_cpp = "olmo2",
         .chat = "olmo",
@@ -3994,6 +4007,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "cohere",
+        .default_rope_theta = 500000.0,
         .aliases = &.{"cohere2"},
         .llama_cpp = "command-r",
         .chat = "cohere",
@@ -4010,6 +4024,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "glm4",
+        .default_norm_eps = 1.5625e-07,
         .aliases = &.{ "glm", "glm4v", "glm4v_text" },
         .llama_cpp = "glm4",
         .chat = "glm4",
@@ -4085,6 +4100,8 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "llama4",
+        .default_rope_theta = 500000.0,
+        .default_norm_eps = 1e-05,
         .aliases = &.{"llama4_text"},
         .llama_cpp = "llama4",
         .chat = "llama4",
@@ -4105,6 +4122,8 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "gpt_oss",
+        .default_rope_theta = 150000.0,
+        .default_norm_eps = 1e-05,
         .llama_cpp = "gpt-oss",
         .chat = "harmony",
         .verified = true,
@@ -4151,6 +4170,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "exaone4",
+        .default_norm_eps = 1e-05,
         .llama_cpp = "exaone4",
         .chat = "exaone4",
         .verified = true,
@@ -4179,6 +4199,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "smollm3",
+        .default_rope_theta = 2000000.0,
         .llama_cpp = "smollm3",
         .chat = "smollm3",
         .verified = true,
@@ -4427,6 +4448,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "glm4_moe",
+        .default_norm_eps = 1e-05,
         .aliases = &.{"glm4v_moe_text"},
         .llama_cpp = null,
         .chat = "glm4",
@@ -4444,6 +4466,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "glm_moe_dsa",
+        .default_norm_eps = 1e-05,
         .llama_cpp = null,
         .chat = "glm4",
         .verified = true,
@@ -4462,6 +4485,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "glm4_moe_lite",
+        .default_norm_eps = 1e-05,
         .aliases = &.{"glm_moe_lite"},
         .llama_cpp = null,
         .chat = "glm4",
@@ -4481,6 +4505,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "mamba2",
+        .default_norm_eps = 1e-05,
         .llama_cpp = "mamba2",
         .verified = true,
         .positional = .none,
@@ -4499,6 +4524,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "nemotron_h",
+        .default_norm_eps = 1e-05,
         .llama_cpp = "nemotron_h",
         .verified = true,
         .positional = .none,
@@ -4532,6 +4558,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "falcon_h1",
+        .default_norm_eps = 1e-05,
         .llama_cpp = "falcon-h1",
         .chat = "chatml",
         .verified = true,
@@ -4595,6 +4622,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "minimax",
+        .default_norm_eps = 1e-05,
         .aliases = &.{ "minimax_text_01", "minimax_m1", "MiniMaxText01", "MiniMaxM1" },
         .llama_cpp = "minimax-01",
         .verified = true,
@@ -4652,6 +4680,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "ernie4_5_moe",
+        .default_norm_eps = 1e-05,
         .llama_cpp = "ernie4_5-moe",
         .verified = true,
         .rope_style = .gptj,
@@ -4664,6 +4693,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "hunyuan_v1_moe",
+        .default_norm_eps = 1e-05,
         .chat = "hunyuan_moe",
         .aliases = &.{"hunyuan"},
         .llama_cpp = "hunyuan-moe",
@@ -4726,6 +4756,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "kimi_linear",
+        .default_norm_eps = 1e-05,
         .llama_cpp = "kimi-linear",
         .verified = true,
         .linear = .kda,
@@ -4735,6 +4766,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "glm5_next",
+        .default_norm_eps = 1e-05,
         .aliases = &.{"glm5_next_text"},
         .llama_cpp = null,
         .chat = "glm4",
@@ -4793,6 +4825,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "mimo_v2_flash",
+        .default_norm_eps = 1e-05,
         .aliases = &.{"mimo_v2"},
         .llama_cpp = "mimo2",
         .chat = "mimo",
@@ -4830,6 +4863,7 @@ pub const registry = [_]Arch{
     // ---- llama-layout dense families -------------------------------------
     .{
         .model_type = "arcee",
+        .default_norm_eps = 1e-05,
         .llama_cpp = "arcee",
         .chat = "llama3",
         .verified = true,
@@ -4841,6 +4875,8 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "apertus",
+        .default_rope_theta = 12000000.0,
+        .default_norm_eps = 1e-05,
         .llama_cpp = null,
         .chat = "apertus",
         .verified = true,
@@ -4859,6 +4895,8 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "bitnet",
+        .default_rope_theta = 500000.0,
+        .default_norm_eps = 1e-05,
         .llama_cpp = "bitnet-25",
         .chat = "chatml",
         .verified = true,
@@ -4871,6 +4909,8 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "helium",
+        .default_rope_theta = 100000.0,
+        .default_norm_eps = 1e-08,
         .llama_cpp = null,
         .chat = "chatml",
         .verified = true,
@@ -4879,6 +4919,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "hunyuan_v1_dense",
+        .default_norm_eps = 1e-05,
         .chat = "hunyuan",
         .aliases = &.{ "hunyuan_vl_text", "hunyuan_vl" },
         .llama_cpp = "hunyuan-dense",
@@ -4906,6 +4947,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "nanochat",
+        .default_norm_eps = 1e-06,
         .llama_cpp = null,
         .chat = "nanochat",
         .verified = true,
@@ -5054,6 +5096,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "biogpt",
+        .default_norm_eps = 1e-12,
         .llama_cpp = null,
         .verified = true,
         .norm = .layer,
@@ -5078,6 +5121,8 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "ernie4_5",
+        .default_rope_theta = 500000.0,
+        .default_norm_eps = 1e-05,
         .chat = "ernie",
         .aliases = &.{"paddleocr_vl_text"},
         .llama_cpp = "ernie4_5",
@@ -5088,6 +5133,8 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "ministral3",
+        .default_rope_theta = 1000000.0,
+        .default_norm_eps = 1e-05,
         .llama_cpp = "llama",
         .chat = "mistral_v7",
         .verified = true,
@@ -5096,6 +5143,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "granite_swa",
+        .default_norm_eps = 1e-05,
         .llama_cpp = "granite",
         .chat = "granite",
         .verified = true,
@@ -5106,6 +5154,7 @@ pub const registry = [_]Arch{
     // ---- mixture-of-experts families --------------------------------------
     .{
         .model_type = "olmoe",
+        .default_norm_eps = 1e-05,
         .llama_cpp = "olmoe",
         .chat = "olmo",
         .verified = true,
@@ -5116,6 +5165,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "flex_olmo",
+        .default_rope_theta = 500000.0,
         .llama_cpp = "olmoe",
         .chat = "olmo",
         .verified = true,
@@ -5147,6 +5197,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "exaone_moe",
+        .default_norm_eps = 1e-05,
         .llama_cpp = "exaone4",
         .chat = "k_exaone",
         .verified = true,
@@ -5161,6 +5212,8 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "solar_open",
+        .default_rope_theta = 1000000.0,
+        .default_norm_eps = 1e-05,
         .llama_cpp = null,
         .chat = "solar_open",
         .verified = true,
@@ -5173,6 +5226,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "afmoe",
+        .default_norm_eps = 1e-05,
         .llama_cpp = null,
         .chat = "chatml",
         .verified = true,
@@ -5192,6 +5246,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "mellum",
+        .default_rope_theta = 500000.0,
         .llama_cpp = null,
         .chat = "chatml",
         .verified = true,
@@ -5201,6 +5256,7 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "laguna",
+        .default_rope_theta = 500000.0,
         .llama_cpp = null,
         .chat = "laguna",
         .verified = true,
@@ -5217,6 +5273,8 @@ pub const registry = [_]Arch{
     },
     .{
         .model_type = "hy_v3",
+        .default_rope_theta = 11158840.0,
+        .default_norm_eps = 1e-05,
         .llama_cpp = "hunyuan-moe",
         .verified = true,
         .names = .{
@@ -5453,6 +5511,18 @@ test "parseConfig handles the swept families' keys" {
     try std.testing.expectEqual(AttnGate.softplus, lag.attn_gate);
     try std.testing.expectEqual(@as(?f32, 5.0), lag.moe.router_softcap);
     try std.testing.expectEqualSlices(usize, &.{ 4, 4 }, lag.layer_heads);
+    // A config that leaves out the norm epsilon or the RoPE base gets the
+    // family's transformers default (allenai/OLMoE-1B-7B-0924 has no
+    // rms_norm_eps: 1e-5, not the generic RMSNorm 1e-6).
+    const oe = try parseConfig(a,
+        \\{"model_type":"olmoe","hidden_size":32,"num_attention_heads":4,"num_hidden_layers":2,"vocab_size":100,"num_experts":4,"num_experts_per_tok":2,"intermediate_size":16}
+    );
+    try std.testing.expectEqual(@as(f32, 1e-5), oe.rms_norm_eps);
+    const mx = try parseConfig(a,
+        \\{"model_type":"mixtral","hidden_size":32,"num_attention_heads":4,"num_hidden_layers":2,"vocab_size":100,"num_local_experts":4,"num_experts_per_tok":2,"intermediate_size":16}
+    );
+    try std.testing.expectEqual(@as(f32, 1e6), mx.rope_theta);
+    try std.testing.expectEqual(@as(f32, 1e-5), mx.rms_norm_eps);
     // nanochat: logits softcapped at 15 even when the config does not say so,
     // and the rotation runs backwards.
     const nc = try parseConfig(a,

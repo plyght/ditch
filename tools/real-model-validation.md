@@ -1856,6 +1856,8 @@ layers by range requests. Same comparison as everywhere else, float32.
 | --- | --- | :---: | :---: | ---: |
 | mistralai/Ministral-3-3B-Base-2512, N = 4 | `ministral3` | match (raw); template after bug 35 | all 5 agree | 2.02e-06 |
 | swiss-ai/Apertus-8B-Instruct-2509, N = 3 | `apertus` | match (raw); template after bug 36 | all 4 agree | 6.29e-07 |
+| arcee-ai/AFM-4.5B, N = 3 | `arcee` | match (raw); template ids match | all 4 agree | 6.14e-07 |
+| allenai/OLMoE-1B-7B-0924-Instruct, N = 2 | `olmoe` | match (raw); template ids match | all 3 agree (after bugs 54, 55) | 1.36e-06 |
 
 Ministral 3 covers yarn rope scaling and tied embeddings inside the
 `mistral3` multimodal wrapper; the tokenizer (tekken, as `tokenizer.json`)
@@ -2169,6 +2171,60 @@ family in the registry that has a public instruct release — now reports
 differences for all of its tokenizers (Qwen 3.5, K-EXAONE and Nemotron-Mini
 added). Unit tests hold transformers' own rendering of a system/user prompt for
 20 families and of a four-turn conversation for 6.
+
+
+## Bug 54 — a full-width q/k norm overran a 1024-float stack buffer (fixed)
+
+**Symptom.** `ditch probe` on the first two layers of
+`allenai/OLMoE-1B-7B-0924-Instruct` segfaulted (ReleaseFast); the Debug build
+panicked with `index out of bounds: index 2048, len 1024` in
+`normVecInPlace`.
+
+**Cause.** the q/k norm helper copied its input into `var tmp: [1024]f32`.
+Per-head norms fit, but OLMo 2 and OLMoE normalise the *whole* q and k
+projection — 16 × 128 = 2048 floats here, 4096 on OLMo-2-1124-7B — so every
+such model wrote past the buffer. In ReleaseFast that is silent stack
+corruption; the families' fixtures are small enough to fit, and the only
+real OLMo 2 run so far was the 1B.
+
+**Fix.** the norm kernels take their statistics before writing, element by
+element, so they now run in place and the buffer is gone.
+
+## Bug 55 — a config without a norm epsilon got the generic default, not the family's (fixed)
+
+**Symptom.** with bug 54 fixed, OLMoE ran — 89% wrong at its first layer.
+Zeroing the attention output left the error, zeroing the experts left it too;
+what both sublayers share is their RMSNorm.
+
+**Cause.** OLMoE's released `config.json` has no `rms_norm_eps`. transformers
+then uses `OlmoeConfig`'s default, 1e-5; ditch used its generic default for
+RMSNorm families, 1e-6. With OLMoE's small embedding activations that is
+enough to change the first layer's output by a factor. An audit of every
+registry family against its transformers config class found 35 whose default
+differs from ditch's — 1e-5 for most, 1.5625e-7 for GLM-4, 1e-8 for Helium,
+1e-12 for BioGPT, 1e-6 for NanoChat — so any release that omits the key would
+have run with the wrong epsilon.
+
+**Fix.** a `default_norm_eps` field on the registry entry, filled from each
+family's transformers config class; the generic default stays for families
+that have none.
+
+## Bug 56 — the same for the RoPE base (fixed)
+
+The same audit over `rope_theta`: fifteen families whose transformers default
+is not ditch's 10,000 — Mixtral and Ministral 3 1e6, Llama 4, Cohere, ERNIE
+4.5, Mellum, Laguna, FlexOlmo and BitNet 500,000, gpt-oss 150,000, Helium
+100,000, SmolLM3 2e6, Apertus 1.2e7, Solar Open 1e6, HunYuan V3 11,158,840.
+A `default_rope_theta` field, used when the config has neither `rope_theta`
+nor `rope_parameters`.
+
+**Verification (54–56).** OLMoE's first two layers on its unmodified
+config, float32: all 3 residuals agree, logits to 1.36e-06 (table above). The
+audit — a throwaway test running ditch's own `parseConfig` on a minimal
+config for every registered type, against `CONFIG_MAPPING[type]()` — now
+reports no difference in the norm epsilon or the RoPE base for any of the 78
+families that have a transformers config class. A unit test covers OLMoE's
+epsilon and Mixtral's base.
 
 ---
 
