@@ -233,9 +233,10 @@ pub fn buildState(arena: Allocator, ng: arch.NgramPle) !NgramState {
 // Cache
 // ---------------------------------------------------------------------------
 
-/// Per batch slot: the last `ngram_size - 1` token ids and the distance to
-/// the previous end-of-sequence token; per (PLE layer, batch slot): the
-/// dilated convolution's history. Slots reset when a sequence restarts at
+/// Per (PLE layer, batch slot): the last `ngram_size - 1` token ids, the
+/// distance to the previous end-of-sequence token and the dilated
+/// convolution's history. Every PLE layer walks the sequence on its own, so
+/// each keeps its own cursor. Slots reset when a sequence restarts at
 /// position 0; any other gap in the positions is an error.
 pub const NgramCache = struct {
     gpa: Allocator,
@@ -245,7 +246,7 @@ pub const NgramCache = struct {
     n: usize,
     ctx: usize,
     conv_len: usize,
-    /// `[batch][ctx]` (-1 = nothing there) and `[batch]` counters.
+    /// `[n][batch][ctx]` (-1 = nothing there) and `[n][batch]` counters.
     hist: []i64,
     since_eos: []usize,
     next_pos: []usize,
@@ -261,11 +262,11 @@ pub const NgramCache = struct {
         const n = ng.layer_ids.len;
         const ctx = ng.ngram_size - 1;
         const conv_len = (ng.conv_kernel - 1) * ng.ngram_size * c.hc_mult * c.hidden_size;
-        const hist = try gpa.alloc(i64, batch * ctx);
+        const hist = try gpa.alloc(i64, n * batch * ctx);
         errdefer gpa.free(hist);
-        const since_eos = try gpa.alloc(usize, batch);
+        const since_eos = try gpa.alloc(usize, n * batch);
         errdefer gpa.free(since_eos);
-        const next_pos = try gpa.alloc(usize, batch);
+        const next_pos = try gpa.alloc(usize, n * batch);
         errdefer gpa.free(next_pos);
         const conv = try gpa.alloc(f32, n * batch * conv_len);
         @memset(hist, -1);
@@ -297,11 +298,19 @@ pub const NgramCache = struct {
     pub fn bytesFor(c: *const arch.Config, batch: usize) u64 {
         const ng = c.ngram_ple orelse return 0;
         const conv_len: u64 = (ng.conv_kernel - 1) * ng.ngram_size * c.hc_mult * c.hidden_size;
-        return @as(u64, ng.layer_ids.len) * batch * conv_len * 4 + @as(u64, batch) * (ng.ngram_size * 8 + 16);
+        return @as(u64, ng.layer_ids.len) * batch * (conv_len * 4 + ng.ngram_size * 8 + 16);
+    }
+
+    fn slot(self: *const NgramCache, ci: usize, b: usize) usize {
+        return ci * self.batch + b;
+    }
+
+    fn histOf(self: *NgramCache, ci: usize, b: usize) []i64 {
+        return self.hist[self.slot(ci, b) * self.ctx ..][0..self.ctx];
     }
 
     fn convOf(self: *NgramCache, ci: usize, b: usize) []f32 {
-        return self.conv[(ci * self.batch + b) * self.conv_len ..][0..self.conv_len];
+        return self.conv[self.slot(ci, b) * self.conv_len ..][0..self.conv_len];
     }
 };
 
@@ -343,18 +352,19 @@ pub fn pleApply(model: *const Model, w: *const NgramWeights, cache: *KvCache, x:
     for (0..n) |t| {
         const b = rows[t].b;
         const pos = rows[t].pos;
-        const hist = nc.hist[b * ctx ..][0..ctx];
+        const slot = nc.slot(w.index, b);
+        const hist = nc.histOf(w.index, b);
         if (pos == 0) {
             @memset(hist, -1);
-            nc.since_eos[b] = 0;
-            nc.next_pos[b] = 0;
+            nc.since_eos[slot] = 0;
+            nc.next_pos[slot] = 0;
         }
-        if (pos != nc.next_pos[b]) return error.NonContiguousRows;
-        nc.next_pos[b] = pos + 1;
+        if (pos != nc.next_pos[slot]) return error.NonContiguousRows;
+        nc.next_pos[slot] = pos + 1;
         const tid = tokens[t];
         // Shift `s` reads the token `s` back, or the EOS id once the shift
         // would cross the previous end-of-sequence token.
-        const seg = nc.since_eos[b];
+        const seg = nc.since_eos[slot];
         for (0..st.ngram_size) |s| {
             gram[s] = if (s == 0)
                 @intCast(tid)
@@ -367,7 +377,7 @@ pub fn pleApply(model: *const Model, w: *const NgramWeights, cache: *KvCache, x:
             if (k + 1 < ctx) hist[k] = hist[k + 1];
         }
         if (ctx > 0) hist[ctx - 1] = @intCast(tid);
-        nc.since_eos[b] = if (tid == st.eos_id) 0 else seg + 1;
+        nc.since_eos[slot] = if (tid == st.eos_id) 0 else seg + 1;
         // 2..ngram_size-grams: the running XOR of the multiplied ids,
         // reduced modulo each head's prime and offset into the table.
         var rolling: u64 = @bitCast(gram[0] *% mult[0]);

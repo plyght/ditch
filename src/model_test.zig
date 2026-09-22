@@ -36,6 +36,9 @@ pub fn checkFixture(comptime family: []const u8) !void {
     if (c.dsv4 != null) {
         cache.compress = try model_mod.dsv4.CompressCache.init(gpa, c, ref.value.cases.len, 64);
     }
+    if (c.ngram_ple != null) {
+        cache.ngram = try model_mod.qwen4.NgramCache.init(gpa, c, ref.value.cases.len);
+    }
 
     var prompts = std.ArrayList([]const u32).empty;
     defer {
@@ -215,6 +218,15 @@ test "glm4_moe fixture" {
 }
 test "glm_moe_dsa fixture" {
     try checkFixture("glm_moe_dsa");
+}
+test "glm4_moe_lite fixture (GLM-4.7-Flash)" {
+    try checkFixture("glm4_moe_lite");
+}
+test "glm5_next fixture (GLM-5.3-Flash)" {
+    try checkFixture("glm5_next");
+}
+test "qwen4_exp fixture (Qwen3.8-Flash-Next)" {
+    try checkFixture("qwen4_exp");
 }
 test "seed_oss fixture" {
     try checkFixture("seed_oss");
@@ -553,6 +565,15 @@ test "glm4_moe edit, export and streamed reload (per-head q/k norms, sigmoid MoE
 }
 test "glm_moe_dsa edit, export and streamed reload (MLA sparse indexer as dense)" {
     try checkEditExportStream("glm_moe_dsa");
+}
+test "glm4_moe_lite edit, export and streamed reload (stacked experts, group-limited sigmoid MoE)" {
+    try checkEditExportStream("glm4_moe_lite");
+}
+test "glm5_next edit, export and streamed reload (mHC streams, KDA, NoPE MLA behind the indexer)" {
+    try checkEditExportStream("glm5_next");
+}
+test "qwen4_exp edit, export and streamed reload (gated streams, sharded n-gram tables)" {
+    try checkEditExportStream("qwen4_exp");
 }
 test "mamba2 edit, export and streamed reload (Mamba out_proj as the attention output)" {
     try checkEditExportStream("mamba2");
