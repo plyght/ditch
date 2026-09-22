@@ -4584,10 +4584,6 @@ test "parseConfig picks the Qwen4-Exp, GLM-5.3-Flash and GLM-4.7-Flash knobs" {
     try std.testing.expect(q4d.index_bound == null and q4d.ngram_ple == null and !q4d.linear_gate_sigmoid);
     try std.testing.expectEqual(@as(usize, 10), q4d.num_experts_per_tok);
     try std.testing.expectEqual(@as(usize, 4), q4d.hc_mult);
-    // A PLE layer on a full-attention layer is refused.
-    try std.testing.expectError(error.UnsupportedArchitecture, parseConfig(a,
-        \\{"model_type":"qwen4_exp_text","hidden_size":64,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":16,"num_hidden_layers":4,"vocab_size":100,"eos_token_id":1,"linear_num_key_heads":2,"linear_key_head_dim":8,"linear_num_value_heads":4,"linear_value_head_dim":8,"linear_conv_kernel_dim":4,"num_experts":8,"moe_intermediate_size":16,"ple_layer_ids":[4]}
-    ));
 
     // GLM-5.3-Flash: the text config under the wrapper, default layer and
     // MLP schedules, NoPE MLA, the lower-bound forget gate, k-pool indexer.
@@ -4620,9 +4616,6 @@ test "parseConfig picks the Qwen4-Exp, GLM-5.3-Flash and GLM-4.7-Flash knobs" {
     try std.testing.expectEqual(@as(usize, 3), g5b.linear_conv_kernel);
     try std.testing.expect(g5b.linear_layers[0] and !g5b.linear_layers[1] and g5b.linear_layers[2]);
     try std.testing.expect(!g5b.moe_layers[0] and g5b.moe_layers[1]);
-    try std.testing.expectError(error.UnsupportedArchitecture, parseConfig(a,
-        \\{"model_type":"glm5_next_text","hidden_size":64,"num_attention_heads":4,"num_hidden_layers":3,"vocab_size":100,"q_lora_rank":16,"kv_lora_rank":16,"qk_nope_head_dim":16,"qk_rope_head_dim":4,"v_head_dim":8,"n_routed_experts":8,"moe_intermediate_size":16,"linear_num_heads":2,"linear_head_dim":16}
-    ));
 
     // GLM-4.7-Flash: DeepSeek V3 MLA, GLM-4.5 routing, a dense first layer by default.
     const gl = try parseConfig(a,

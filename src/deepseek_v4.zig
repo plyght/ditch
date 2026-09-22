@@ -2,16 +2,10 @@
 //! these families add on top of the generic forward pass of model.zig.
 //!
 //! * Manifold-constrained hyper-connections (mHC): the residual is `hc_mult`
-//!   parallel streams. Around every attention and MLP block a learned mix
-//!   (one projection of the RMS-normalised, flattened streams) yields the
-//!   collapse weights `pre`, the expansion weights `post` and a stream mixing
-//!   matrix `comb` projected onto the doubly-stochastic manifold by
-//!   Sinkhorn-Knopp. V4 collapses with the `pre` of the same site, V4.1
-//!   (single pass) with the `pre` computed by the previous site. For
-//!   direction extraction ditch defines "the residual at layer L" as the
-//!   collapsed input of layer L's attention block (the single vector the
-//!   block reads, before its input norm); entry `num_layers` is the final
-//!   collapse that enters the last norm. The weight edits stay on the
+//!   parallel streams, mixed around every block by hyper.zig (which also
+//!   serves GLM-5.3-Flash and Qwen4-Exp). V4's sites use their own collapse
+//!   weights and its `hc_head` collapses at the end; V4.1 is single-pass and
+//!   collapses with the previous site's weights. The weight edits stay on the
 //!   attention output projection (`o_b_proj`, which writes into the streams)
 //!   and the expert down projections.
 //! * Shared-KV sliding-window attention: a low-rank query (`q_a`/`q_b`), one
@@ -57,16 +51,6 @@ const Config = arch.Config;
 // Weights
 // ---------------------------------------------------------------------------
 
-/// One hyper-connection site (`attn_hc` / `ffn_hc`).
-pub const HyperSite = struct {
-    /// `[(2 + hc) * hc][hc * hidden]` mix projection.
-    fn_w: Weight,
-    /// `[(2 + hc) * hc]` biases: pre, post, then comb rows.
-    base: []const f32,
-    /// `[3]` scales of pre, post and comb.
-    scale: []const f32,
-};
-
 /// The compressor of a layer that owns a compressed-KV branch.
 pub const Compressor = struct {
     /// `[width][hidden]`: `width = 2 * head_dim` for V4 CSA, `head_dim` otherwise.
@@ -100,18 +84,8 @@ pub const LayerWeights = struct {
     kv_norm: []const f32,
     /// `[o_groups * o_lora_rank][heads * head_dim / o_groups]` block-diagonal projection.
     o_a: Weight,
-    attn_hc: HyperSite,
-    ffn_hc: HyperSite,
     compressor: ?Compressor,
     engram: ?EngramWeights,
-};
-
-/// V4's final stream collapse (`hc_head`).
-pub const HyperHead = struct {
-    /// `[hc][hc * hidden]`
-    fn_w: []const f32,
-    base: []const f32,
-    scale: f32,
 };
 
 /// Tokenizer- and config-derived engram hash state (V4.1).
@@ -131,46 +105,15 @@ pub const EngramState = struct {
     multipliers: []const i64,
 };
 
+inline fn sigmoid(x: f32) f32 {
+    return 1.0 / (1.0 + @exp(-x));
+}
+
+const loadMatChecked = model_mod.loadMatChecked;
+const loadVecChecked = model_mod.loadVecChecked;
+
 fn cat(arena: Allocator, a: []const u8, b: []const u8) ![]const u8 {
     return std.fmt.allocPrint(arena, "{s}{s}", .{ a, b });
-}
-
-fn loadMatChecked(model: *Model, layer: *Layer, slot: model_mod.Slot, name: []const u8, rows: usize, cols: usize) !Weight {
-    const r = try model.ref(name);
-    if (!r.dtype.isFloat()) {
-        std.log.err("{s} is stored as {s}; ditch reads F32/F16/BF16 weights (dequantise the checkpoint first)", .{ name, r.dtype.safetensorsName() });
-        return error.UnsupportedArchitecture;
-    }
-    if (r.rows != rows or r.cols != cols) {
-        std.log.err("{s} is [{d}][{d}], expected [{d}][{d}]", .{ name, r.rows, r.cols, rows, cols });
-        return error.InvalidConfig;
-    }
-    layer.refs.add(slot, r, false);
-    return model.loadMat(name);
-}
-
-fn loadVecChecked(model: *Model, name: []const u8, len: usize) ![]const f32 {
-    const v = model.loadVecOpt(name) orelse {
-        std.log.err("missing tensor: {s}", .{name});
-        return error.MissingWeights;
-    };
-    if (v.len != len) {
-        std.log.err("{s} has {d} elements, expected {d}", .{ name, v.len, len });
-        return error.InvalidConfig;
-    }
-    return v;
-}
-
-fn loadSite(model: *Model, layer: *Layer, arena: Allocator, lp: []const u8, site: []const u8, slot: model_mod.Slot) !HyperSite {
-    const c = &model.config;
-    const hc = c.hc_mult;
-    const mix = (2 + hc) * hc;
-    const p = try cat(arena, lp, site);
-    return .{
-        .fn_w = try loadMatChecked(model, layer, slot, try cat(arena, p, ".fn"), mix, hc * c.hidden_size),
-        .base = try loadVecChecked(model, try cat(arena, p, ".base"), mix),
-        .scale = try loadVecChecked(model, try cat(arena, p, ".scale"), 3),
-    };
 }
 
 /// Loads the family-specific tensors of layer `li` (prefix `lp`) into
@@ -189,8 +132,6 @@ pub fn loadLayer(model: *Model, layer: *Layer, arena: Allocator, li: usize, lp: 
     w.kv_norm = try loadVecChecked(model, try cat(arena, lp, "self_attn.kv_norm.weight"), hd);
     w.o_a = try loadMatChecked(model, layer, .d_o_a, try cat(arena, lp, "self_attn.o_a_proj.weight"), d.o_groups * d.o_lora_rank, nh * hd / d.o_groups);
     layer.o = try loadMatChecked(model, layer, .o, try cat(arena, lp, c.arch.names.o), hidden, d.o_groups * d.o_lora_rank);
-    w.attn_hc = try loadSite(model, layer, arena, lp, "attn_hc", .d_hc_attn);
-    w.ffn_hc = try loadSite(model, layer, arena, lp, "ffn_hc", .d_hc_ffn);
     w.compressor = null;
     if (d.branch[li] != .none and d.kv_source[li] == li) {
         const ratio = d.compress_ratio[li];
@@ -246,18 +187,7 @@ pub fn loadModel(model: *Model, arena: Allocator) !void {
         std.log.err("embedding or lm_head stored as {s}; ditch reads F32/F16/BF16 weights", .{model.embed_ref.dtype.safetensorsName()});
         return error.UnsupportedArchitecture;
     }
-    const hc = c.hc_mult;
-    model.dsv4_head = null;
     model.engram = null;
-    if (!d.v41) {
-        const p = try std.fmt.allocPrint(arena, "{s}hc_head.", .{model.prefix});
-        const scale = try loadVecChecked(model, try cat(arena, p, "hc_scale"), 1);
-        model.dsv4_head = .{
-            .fn_w = try loadVecChecked(model, try cat(arena, p, "hc_fn"), hc * hc * c.hidden_size),
-            .base = try loadVecChecked(model, try cat(arena, p, "hc_base"), hc),
-            .scale = scale[0],
-        };
-    }
     if (d.engram) |eg| model.engram = try buildEngramState(arena, model.tokenizer, eg);
 }
 
@@ -433,189 +363,6 @@ pub const CompressCache = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Hyper-connections
-// ---------------------------------------------------------------------------
-
-/// Mix weights of one site for `n` rows: `pre[n][hc]`, `post[n][hc]`,
-/// `comb[n][hc][hc]` (Sinkhorn-projected).
-const Mix = struct {
-    pre: []f32,
-    post: []f32,
-    comb: []f32,
-};
-
-/// Computes the site's mix weights from the streams `x[n][hc * hidden]`.
-fn siteMix(model: *const Model, site: *const HyperSite, x: []const f32, n: usize, out: Mix, tmp: []f32) !void {
-    const c = &model.config;
-    const d = c.dsv4.?;
-    const gpa = model.gpa;
-    const hc = c.hc_mult;
-    const sw = hc * c.hidden_size;
-    const mix = (2 + hc) * hc;
-    // Unweighted RMSNorm over the whole flattened stream, then the projection.
-    for (0..n) |t| {
-        const src = x[t * sw ..][0..sw];
-        const dst = tmp[t * sw ..][0..sw];
-        var ss: f32 = 0;
-        for (src) |v| ss += v * v;
-        const inv = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(sw)) + c.rms_norm_eps);
-        for (dst, 0..) |*o, i| o.* = src[i] * inv;
-    }
-    const proj = try gpa.alloc(f32, n * mix);
-    defer gpa.free(proj);
-    try tensor.matmulT(model.pool, gpa, proj, tmp, n, site.fn_w, null);
-    const eps = d.hc_eps;
-    for (0..n) |t| {
-        const p = proj[t * mix ..][0..mix];
-        const pre = out.pre[t * hc ..][0..hc];
-        const post = out.post[t * hc ..][0..hc];
-        const comb = out.comb[t * hc * hc ..][0 .. hc * hc];
-        for (0..hc) |j| {
-            pre[j] = sigmoid(p[j] * site.scale[0] + site.base[j]) + eps;
-            post[j] = 2.0 * sigmoid(p[hc + j] * site.scale[1] + site.base[hc + j]);
-        }
-        for (0..hc) |j| {
-            const row = comb[j * hc ..][0..hc];
-            for (0..hc) |k| row[k] = p[2 * hc + j * hc + k] * site.scale[2] + site.base[2 * hc + j * hc + k];
-            tensor.softmaxInPlace(row);
-            for (row) |*v| v.* += eps;
-        }
-        sinkhorn(comb, hc, d.hc_sinkhorn_iters, eps);
-    }
-}
-
-/// Projects `m[hc][hc]` onto the doubly-stochastic manifold: columns first,
-/// then `iters - 1` rounds of rows then columns (each sum floored by `eps`).
-fn sinkhorn(m: []f32, hc: usize, iters: usize, eps: f32) void {
-    normColumns(m, hc, eps);
-    var i: usize = 1;
-    while (i < iters) : (i += 1) {
-        for (0..hc) |j| {
-            const row = m[j * hc ..][0..hc];
-            var s: f32 = 0;
-            for (row) |v| s += v;
-            const inv = 1.0 / (s + eps);
-            for (row) |*v| v.* *= inv;
-        }
-        normColumns(m, hc, eps);
-    }
-}
-
-fn normColumns(m: []f32, hc: usize, eps: f32) void {
-    for (0..hc) |k| {
-        var s: f32 = 0;
-        for (0..hc) |j| s += m[j * hc + k];
-        const inv = 1.0 / (s + eps);
-        for (0..hc) |j| m[j * hc + k] *= inv;
-    }
-}
-
-inline fn sigmoid(x: f32) f32 {
-    return 1.0 / (1.0 + @exp(-x));
-}
-
-/// `out[n][hidden] = sum_j pre[j] * x[j]` per row.
-fn collapse(x: []const f32, pre: []const f32, n: usize, hc: usize, hidden: usize, out: []f32) void {
-    for (0..n) |t| {
-        const dst = out[t * hidden ..][0..hidden];
-        @memset(dst, 0);
-        for (0..hc) |j| tensor.axpy(dst, pre[t * hc + j], x[t * hc * hidden + j * hidden ..][0..hidden]);
-    }
-}
-
-/// `x[k] = post[k] * y + sum_j comb[j][k] * x[j]` per row, in place (`tmp` holds one row of streams).
-fn expand(x: []f32, y: []const f32, mix: Mix, n: usize, hc: usize, hidden: usize, tmp: []f32) void {
-    const sw = hc * hidden;
-    for (0..n) |t| {
-        const row = x[t * sw ..][0..sw];
-        @memcpy(tmp[0..sw], row);
-        const post = mix.post[t * hc ..][0..hc];
-        const comb = mix.comb[t * hc * hc ..][0 .. hc * hc];
-        const yt = y[t * hidden ..][0..hidden];
-        for (0..hc) |k| {
-            const dst = row[k * hidden ..][0..hidden];
-            for (dst, 0..) |*v, i| v.* = post[k] * yt[i];
-            for (0..hc) |j| tensor.axpy(dst, comb[j * hc + k], tmp[j * hidden ..][0..hidden]);
-        }
-    }
-}
-
-/// One layer applied in place to the residual streams `x[n][hc * hidden]`.
-/// `pre_mix[n][hc]` (V4.1 only) carries the collapse weights from the
-/// previous site and receives this layer's last ones. When `capture` is
-/// given, the collapsed attention input (this layer's residual) is written
-/// to it (`[n][hidden]`).
-pub fn layerBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace, cache: *KvCache, x: []f32, rows: []const Row, tokens: []const u32, pre_mix: ?[]f32, capture: ?[]f32) !void {
-    const c = &model.config;
-    const d = c.dsv4.?;
-    const gpa = model.gpa;
-    const n = rows.len;
-    const hidden = c.hidden_size;
-    const hc = c.hc_mult;
-    const sw = hc * hidden;
-    const w = &layer.dsv4.?;
-    const cc = &(cache.compress orelse return error.MissingCompressCache);
-
-    if (w.engram) |*eg| try engramApply(model, eg, cc, x, rows, tokens);
-
-    const tmp = try gpa.alloc(f32, n * sw);
-    defer gpa.free(tmp);
-    const pre = try gpa.alloc(f32, n * hc);
-    defer gpa.free(pre);
-    const post = try gpa.alloc(f32, n * hc);
-    defer gpa.free(post);
-    const comb = try gpa.alloc(f32, n * hc * hc);
-    defer gpa.free(comb);
-    const mix = Mix{ .pre = pre, .post = post, .comb = comb };
-    const collapsed = try gpa.alloc(f32, n * hidden);
-    defer gpa.free(collapsed);
-    const h = ws.h[0 .. n * hidden];
-
-    // Attention site.
-    try siteMix(model, &w.attn_hc, x, n, mix, tmp);
-    collapse(x, if (d.v41) pre_mix.? else pre, n, hc, hidden, collapsed);
-    if (capture) |cap| @memcpy(cap[0 .. n * hidden], collapsed);
-    for (0..n) |t| tensor.rmsnorm(h[t * hidden ..][0..hidden], collapsed[t * hidden ..][0..hidden], layer.input_norm.?.w, c.rms_norm_eps, false);
-    try attention(model, layer, li, ws, cache, h, rows);
-    expand(x, ws.o[0 .. n * hidden], mix, n, hc, hidden, tmp);
-    if (d.v41) @memcpy(pre_mix.?[0 .. n * hc], pre);
-
-    // MLP site.
-    try siteMix(model, &w.ffn_hc, x, n, mix, tmp);
-    collapse(x, if (d.v41) pre_mix.? else pre, n, hc, hidden, collapsed);
-    for (0..n) |t| tensor.rmsnorm(h[t * hidden ..][0..hidden], collapsed[t * hidden ..][0..hidden], layer.pre_ff_norm.?.w, c.rms_norm_eps, false);
-    try model_mod.mlpBlock(model, layer, li, ws, h, n, tokens);
-    expand(x, ws.m[0 .. n * hidden], mix, n, hc, hidden, tmp);
-    if (d.v41) @memcpy(pre_mix.?[0 .. n * hc], pre);
-}
-
-/// Collapses one row of streams `x[hc * hidden]` into `out[hidden]`: V4
-/// through `hc_head`, V4.1 with the last site's `pre_mix[hc]`.
-pub fn finalCollapse(model: *const Model, x: []const f32, pre_mix: ?[]const f32, out: []f32) void {
-    const c = &model.config;
-    const d = c.dsv4.?;
-    const hc = c.hc_mult;
-    const hidden = c.hidden_size;
-    @memset(out, 0);
-    if (d.v41) {
-        for (0..hc) |j| tensor.axpy(out, pre_mix.?[j], x[j * hidden ..][0..hidden]);
-        return;
-    }
-    const head = model.dsv4_head.?;
-    const sw = hc * hidden;
-    var ss: f32 = 0;
-    for (x) |v| ss += v * v;
-    const inv = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(sw)) + c.rms_norm_eps);
-    for (0..hc) |j| {
-        var acc: f32 = 0;
-        const wr = head.fn_w[j * sw ..][0..sw];
-        for (x, 0..) |v, i| acc += v * inv * wr[i];
-        const p = sigmoid(acc * head.scale + head.base[j]) + d.hc_eps;
-        tensor.axpy(out, p, x[j * hidden ..][0..hidden]);
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Attention
 // ---------------------------------------------------------------------------
 
@@ -704,7 +451,7 @@ fn softmaxWithSink(x: []f32, sink: f32) void {
 /// Attention sublayer of layer `li`: reads the normalised block input `h`,
 /// writes `ws.o`. Updates the sliding-window KV cache and, for a layer that
 /// owns a compressor, its compressed entries before attending.
-fn attention(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace, cache: *KvCache, h: []const f32, rows: []const Row) !void {
+pub fn attention(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace, cache: *KvCache, h: []const f32, rows: []const Row) !void {
     const c = &model.config;
     const d = c.dsv4.?;
     const w = &layer.dsv4.?;
@@ -1060,7 +807,7 @@ pub fn fakeQuantFp4(x: []f32, block: usize, e4m3_scales: bool) void {
 // ---------------------------------------------------------------------------
 
 /// Adds the n-gram memory of `eg` to the streams `x[n][hc * hidden]` of `rows`.
-fn engramApply(model: *const Model, eg: *const EngramWeights, cc: *CompressCache, x: []f32, rows: []const Row, tokens: []const u32) !void {
+pub fn engramApply(model: *const Model, eg: *const EngramWeights, cc: *CompressCache, x: []f32, rows: []const Row, tokens: []const u32) !void {
     const c = &model.config;
     const es = model.engram orelse return error.MissingEngramState;
     const gpa = model.gpa;
@@ -1521,19 +1268,4 @@ test "fp8 and fp4 fake quantisation" {
     try std.testing.expectEqual(@as(f32, -1.0), w[1]);
     try std.testing.expectEqual(@as(f32, 0.25), w[2]);
     try std.testing.expectEqual(@as(f32, 0.75), w[3]);
-}
-
-test "sinkhorn produces a doubly stochastic matrix" {
-    var m = [_]f32{ 0.7, 0.2, 0.1, 0.1, 0.8, 0.1, 0.4, 0.4, 0.2 };
-    sinkhorn(&m, 3, 20, 1e-6);
-    for (0..3) |j| {
-        var rs: f32 = 0;
-        var cs: f32 = 0;
-        for (0..3) |k| {
-            rs += m[j * 3 + k];
-            cs += m[k * 3 + j];
-        }
-        try std.testing.expectApproxEqAbs(@as(f32, 1.0), rs, 1e-4);
-        try std.testing.expectApproxEqAbs(@as(f32, 1.0), cs, 1e-4);
-    }
 }
