@@ -1465,7 +1465,7 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         try selftest.run(gpa, settings, pool, out, con.result);
         return;
     }
-    const device_note = compute.selectInto(gpa, device_kind, .{ .memory_budget = settings.gpu_memory }) catch {
+    const device_note = compute.selectInto(gpa, device_kind, .{ .memory_budget = settings.gpu_memory, .io = pool.io }) catch {
         std.log.err("device {s} is not available on this build or machine (build with -Dmetal on Apple silicon, or use --device auto)", .{settings.device});
         std.process.exit(2);
     };

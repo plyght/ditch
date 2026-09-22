@@ -92,10 +92,13 @@ pub const Backend = struct {
     gpa: Allocator,
     ctx: *Ctx,
     name: []u8,
-    lock: std.Thread.Mutex = .{},
+    io: std.Io,
+    /// Held across a whole dispatch, including the wait for the GPU, so a
+    /// contending thread must sleep rather than spin.
+    lock: std.Io.Mutex = .init,
     residency: compute.Residency,
     /// Reused staging buffers for inputs, outputs and small tables.
-    scratch: [5]Scratch = .{.{}} ** 5,
+    scratch: [5]Scratch = [_]Scratch{.{}} ** 5,
     /// Weight tiles that are neither resident nor wrapped are staged here.
     weight_scratch: Scratch = .{},
 
@@ -244,8 +247,8 @@ fn matmulT(ctx: *anyopaque, out: []f32, x: []const f32, n: usize, w: Weight) Err
     if (w.cols == 0 or w.rows == 0 or n == 0) return error.Unsupported;
     var name_buf: [64]u8 = undefined;
     const name = try kernelName(&name_buf, "matmul", w.dtype);
-    self.lock.lock();
-    defer self.lock.unlock();
+    self.lock.lockUncancelable(self.io);
+    defer self.lock.unlock(self.io);
     const pipe = try self.pipeline(name.ptr);
     const xb = try self.upload(0, x[0 .. n * w.cols]);
     const ob = try self.slot(1, n * w.rows * 4);
@@ -261,8 +264,8 @@ fn matvecTMulti(ctx: *anyopaque, out: []f32, w: Weight, y: []const f32, q: usize
     if (w.cols == 0 or w.rows == 0 or q == 0) return error.Unsupported;
     var name_buf: [64]u8 = undefined;
     const name = try kernelName(&name_buf, "matvec", w.dtype);
-    self.lock.lock();
-    defer self.lock.unlock();
+    self.lock.lockUncancelable(self.io);
+    defer self.lock.unlock(self.io);
     const pipe = try self.pipeline(name.ptr);
     const yb = try self.upload(0, y[0 .. q * w.rows]);
     const ob = try self.slot(1, q * w.cols * 4);
@@ -278,8 +281,8 @@ fn rowNorms(ctx: *anyopaque, out: []f32, w: Weight) Error!void {
     if (w.cols == 0 or w.rows == 0) return error.Unsupported;
     var name_buf: [64]u8 = undefined;
     const name = try kernelName(&name_buf, "row_norms", w.dtype);
-    self.lock.lock();
-    defer self.lock.unlock();
+    self.lock.lockUncancelable(self.io);
+    defer self.lock.unlock(self.io);
     const pipe = try self.pipeline(name.ptr);
     const ob = try self.slot(1, w.rows * 4);
     const wb = try self.weightBuffer(w.data[0 .. w.rows * w.dtype.rowBytes(w.cols)]);
@@ -292,8 +295,8 @@ fn rowNorms(ctx: *anyopaque, out: []f32, w: Weight) Error!void {
 fn attentionScores(ctx: *anyopaque, scores: []f32, q: []const f32, k: []const f32, stride: usize, scale: f32) Error!void {
     const self: *Backend = @ptrCast(@alignCast(ctx));
     if (scores.len == 0 or q.len == 0) return error.Unsupported;
-    self.lock.lock();
-    defer self.lock.unlock();
+    self.lock.lockUncancelable(self.io);
+    defer self.lock.unlock(self.io);
     const pipe = try self.pipeline("attn_scores");
     const qb = try self.upload(0, q);
     const kb = try self.upload(2, k);
@@ -306,8 +309,8 @@ fn attentionScores(ctx: *anyopaque, scores: []f32, q: []const f32, k: []const f3
 fn attentionValues(ctx: *anyopaque, out: []f32, scores: []const f32, v: []const f32, stride: usize) Error!void {
     const self: *Backend = @ptrCast(@alignCast(ctx));
     if (out.len == 0 or scores.len == 0) return error.Unsupported;
-    self.lock.lock();
-    defer self.lock.unlock();
+    self.lock.lockUncancelable(self.io);
+    defer self.lock.unlock(self.io);
     const pipe = try self.pipeline("attn_values");
     const sb = try self.upload(0, scores);
     const vb = try self.upload(2, v);
@@ -320,8 +323,8 @@ fn attentionValues(ctx: *anyopaque, out: []f32, scores: []const f32, v: []const 
 fn gatedActivation(ctx: *anyopaque, act: compute.ActivationCode, out: []f32, gate: []const f32, up: ?[]const f32, n: usize, len: usize, in_stride: usize, out_stride: usize) Error!void {
     const self: *Backend = @ptrCast(@alignCast(ctx));
     if (n == 0 or len == 0) return error.Unsupported;
-    self.lock.lock();
-    defer self.lock.unlock();
+    self.lock.lockUncancelable(self.io);
+    defer self.lock.unlock(self.io);
     const pipe = try self.pipeline("gated");
     const gb = try self.upload(0, gate[0 .. (n - 1) * in_stride + len]);
     const ub = if (up) |u| try self.upload(2, u[0 .. (n - 1) * in_stride + len]) else gb;
@@ -349,8 +352,8 @@ fn normFlags(weight: []const f32, one_plus: bool, bias: ?[]const f32) u32 {
 fn rmsnormRows(ctx: *anyopaque, out: []f32, x: []const f32, weight: []const f32, n: usize, len: usize, eps: f32, gemma_style: bool) Error!void {
     const self: *Backend = @ptrCast(@alignCast(ctx));
     if (n == 0 or len == 0) return error.Unsupported;
-    self.lock.lock();
-    defer self.lock.unlock();
+    self.lock.lockUncancelable(self.io);
+    defer self.lock.unlock(self.io);
     const pipe = try self.pipeline("rmsnorm_rows");
     const xb = try self.upload(0, x[0 .. n * len]);
     const wb = try self.upload(2, weight);
@@ -363,8 +366,8 @@ fn rmsnormRows(ctx: *anyopaque, out: []f32, x: []const f32, weight: []const f32,
 fn layernormRows(ctx: *anyopaque, out: []f32, x: []const f32, weight: []const f32, bias: ?[]const f32, n: usize, len: usize, eps: f32, one_plus: bool) Error!void {
     const self: *Backend = @ptrCast(@alignCast(ctx));
     if (n == 0 or len == 0) return error.Unsupported;
-    self.lock.lock();
-    defer self.lock.unlock();
+    self.lock.lockUncancelable(self.io);
+    defer self.lock.unlock(self.io);
     const pipe = try self.pipeline("layernorm_rows");
     const xb = try self.upload(0, x[0 .. n * len]);
     const wb = try self.upload(2, weight);
@@ -378,8 +381,8 @@ fn layernormRows(ctx: *anyopaque, out: []f32, x: []const f32, weight: []const f3
 fn softmaxRows(ctx: *anyopaque, x: []f32, n: usize, len: usize) Error!void {
     const self: *Backend = @ptrCast(@alignCast(ctx));
     if (n == 0 or len == 0) return error.Unsupported;
-    self.lock.lock();
-    defer self.lock.unlock();
+    self.lock.lockUncancelable(self.io);
+    defer self.lock.unlock(self.io);
     const pipe = try self.pipeline("softmax_rows");
     const xb = try self.upload(0, x[0 .. n * len]);
     const p = SoftmaxParams{ .n = @intCast(n), .len = @intCast(len) };
@@ -390,8 +393,8 @@ fn softmaxRows(ctx: *anyopaque, x: []f32, n: usize, len: usize) Error!void {
 fn ropeRows(ctx: *anyopaque, x: []f32, n: usize, dim: usize, cos: []const f32, sin: []const f32, half: usize, pos: []const u32, style: compute.RopeStyle) Error!void {
     const self: *Backend = @ptrCast(@alignCast(ctx));
     if (n == 0 or half == 0) return error.Unsupported;
-    self.lock.lock();
-    defer self.lock.unlock();
+    self.lock.lockUncancelable(self.io);
+    defer self.lock.unlock(self.io);
     const pipe = try self.pipeline("rope_rows");
     const xb = try self.upload(0, x[0 .. n * dim]);
     const cb = try self.upload(1, cos);
@@ -436,7 +439,7 @@ fn releaseBuffer(_: *anyopaque, handle: *anyopaque) void {
 
 /// Opens the default Metal device and compiles the shaders. `memory_budget` is
 /// the device memory the residency cache may hold (0 = upload, compute, drop).
-pub fn open(gpa: Allocator, memory_budget: u64) !compute.Device {
+pub fn open(gpa: Allocator, io: std.Io, memory_budget: u64) !compute.Device {
     var err_buf: [512]u8 = undefined;
     err_buf[0] = 0;
     const ctx = ditch_mtl_open(shaders, &err_buf, err_buf.len) orelse {
@@ -449,6 +452,7 @@ pub fn open(gpa: Allocator, memory_budget: u64) !compute.Device {
     const self = try gpa.create(Backend);
     self.* = .{
         .gpa = gpa,
+        .io = io,
         .ctx = ctx,
         .name = name,
         .residency = undefined,

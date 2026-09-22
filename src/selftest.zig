@@ -428,7 +428,7 @@ pub fn run(gpa: Allocator, settings: *config.Settings, pool: *const Pool, out: *
         std.log.err("unknown device: {s} (expected {s})", .{ settings.device, compute.Kind.names });
         std.process.exit(2);
     };
-    var selected = compute.select(gpa, kind, .{ .memory_budget = settings.gpu_memory }) catch {
+    var selected = compute.select(gpa, kind, .{ .memory_budget = settings.gpu_memory, .io = pool.io }) catch {
         std.log.err("device {s} is not available on this build or machine", .{settings.device});
         std.process.exit(2);
     };

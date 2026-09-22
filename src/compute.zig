@@ -175,6 +175,10 @@ fn deviceWorthIt(dev: *const Device, n: usize, rows: usize, cols: usize) bool {
 pub const SelectOptions = struct {
     /// Device memory the backend may keep resident for hot weights.
     memory_budget: u64 = 0,
+    /// Lets a backend put waiting threads to sleep (`std.Io.Mutex`). A GPU
+    /// backend needs it; without one it reports itself unavailable, which
+    /// `auto` turns into the CPU.
+    io: ?std.Io = null,
 };
 
 pub const SelectResult = struct {
@@ -214,7 +218,8 @@ pub fn select(gpa: Allocator, kind: Kind, opts: SelectOptions) !SelectResult {
 fn openMetal(gpa: Allocator, opts: SelectOptions) !Device {
     if (!metal_supported) return error.DeviceUnavailable;
     const metal = @import("metal/backend.zig");
-    return metal.open(gpa, opts.memory_budget);
+    const io = opts.io orelse return error.DeviceUnavailable;
+    return metal.open(gpa, io, opts.memory_budget);
 }
 
 /// Selects `kind` into `active`. Returns the note, if any, for stderr.
