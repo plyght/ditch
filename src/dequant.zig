@@ -24,6 +24,12 @@
 //!   U8 `[..., R, C/2]` holding E2M1 nibble pairs (low nibble first, in the
 //!   natural `[out][in]` layout) and `weight_scale` U8 `[..., R, C/32]` E8M0
 //!   exponents (bias 127). `w = code * 2^(scale - 127)`.
+//! * MXFP4 `store_dtype` (MiMo V2.6, `quant_method = "fp8"` with
+//!   `store_dtype = "mxfp4"`): the routed experts sit next to the fp8 dense
+//!   weights as `weight` U8 `[..., R, C/2]` (E2M1 nibble pairs, low nibble
+//!   first, natural `[out][in]` layout) and `weight_scale` U8 `[..., R, C/32]`
+//!   E8M0 exponents (bias 127) — the bytes of `mxfp4-pack-quantized` under the
+//!   plain tensor names, `w = code * 2^(scale - 127)`.
 //! * compressed-tensors `pack-quantized` (Kimi K2.5): `weight_packed` I32 with
 //!   `num_bits`-wide fields packed densely from the low end, `weight_scale`
 //!   per group of `group_size` columns (or per row / per tensor),
@@ -48,7 +54,7 @@ pub const chunk_bytes: usize = 4 << 20;
 // Config
 // ---------------------------------------------------------------------------
 
-pub const Method = enum { none, fp8, mxfp4, mxfp4_packed, int_packed };
+pub const Method = enum { none, fp8, mxfp4, mxfp4_packed, mxfp4_store, int_packed };
 
 /// The `quantization_config` of a config.json, reduced to what the decoders need.
 pub const QuantConfig = struct {
@@ -57,6 +63,7 @@ pub const QuantConfig = struct {
     block_rows: usize = 0,
     block_cols: usize = 0,
     /// pack-quantized: field width and columns per scale (0 = from the scale shape).
+    /// mxfp4 store_dtype: `mxfp4_block_size`, the columns per E8M0 scale.
     num_bits: u8 = 4,
     group_size: usize = 0,
     /// Human-readable format name for messages.
@@ -90,6 +97,24 @@ pub fn parseQuantConfig(qc: ?std.json.ObjectMap) !QuantConfig {
             if (bs == .array and bs.array.items.len == 2 and bs.array.items[0] == .integer and bs.array.items[1] == .integer) {
                 out.block_rows = @intCast(bs.array.items[0].integer);
                 out.block_cols = @intCast(bs.array.items[1].integer);
+            }
+        }
+        // MiMo V2.6: the dense weights are fp8 as above, but the routed
+        // experts are stored as MXFP4, which `store_dtype` declares (the
+        // mixed-checkpoint spelling `routed_experts_quant_method` says the
+        // same thing). `mxfp4_block_size` is the columns per E8M0 scale.
+        if (objStr(obj, "store_dtype") orelse objStr(obj, "routed_experts_quant_method")) |sd| {
+            if (std.ascii.eqlIgnoreCase(sd, "mxfp4")) {
+                out.method = .mxfp4_store;
+                out.label = "fp8 with mxfp4 experts (store_dtype)";
+                out.group_size = objInt(obj, "mxfp4_block_size") orelse 32;
+                if (out.group_size != 32) {
+                    std.log.err("unsupported model: mxfp4 experts in groups of {d} (32 is the MXFP4 block size)", .{out.group_size});
+                    return error.UnsupportedArchitecture;
+                }
+            } else if (!storeFloatDtype(sd)) {
+                std.log.err("unsupported model: experts stored as '{s}' (store_dtype) cannot be dequantised (mxfp4, fp8 and the plain float dtypes are supported)", .{sd});
+                return error.UnsupportedArchitecture;
             }
         }
         return out;
@@ -155,6 +180,14 @@ pub fn parseQuantConfig(qc: ?std.json.ObjectMap) !QuantConfig {
     const shown = if (method.len > 0) method else if (format.len > 0) format else "unknown";
     std.log.err("unsupported model: '{s}' quantised weights cannot be dequantised (fp8, mxfp4 and compressed-tensors pack-quantized/mxfp4-pack-quantized/float-quantized are supported)", .{shown});
     return error.UnsupportedArchitecture;
+}
+
+/// Whether a `store_dtype` names a dtype the experts are stored in as they
+/// are (no unpacking beyond what the fp8 and float readers already do).
+pub fn storeFloatDtype(dt: []const u8) bool {
+    const known = [_][]const u8{ "bfloat16", "bf16", "float16", "fp16", "float32", "fp32", "fp8", "float8", "fp8_e4m3", "float8_e4m3fn", "e4m3" };
+    for (known) |k| if (std.ascii.eqlIgnoreCase(dt, k)) return true;
+    return false;
 }
 
 /// Whether an `expert_dtype` config value names a storage format ditch reads.
@@ -325,7 +358,7 @@ pub const Dequant = struct {
             .fp8 => try self.readFp8(io, slab, a, n, out),
             .int_packed => try self.readPacked(io, slab, a, n, out),
             .mxfp4 => try self.readMxfp4(io, slab, a, n, out),
-            .mxfp4_packed => try self.readMxfp4Packed(io, slab, a, n, out),
+            .mxfp4_packed, .mxfp4_store => try self.readMxfp4Packed(io, slab, a, n, out),
             .none => unreachable,
         }
     }
@@ -478,9 +511,10 @@ pub const Dequant = struct {
         }
     }
 
-    /// compressed-tensors `mxfp4-pack-quantized`: the natural `[rows][cols]`
-    /// layout, a nibble pair per byte and one E8M0 scale per 32 columns, so a
-    /// row range decodes just its rows.
+    /// compressed-tensors `mxfp4-pack-quantized` and the `store_dtype = mxfp4`
+    /// experts of MiMo V2.6 (the same bytes under different names): the natural
+    /// `[rows][cols]` layout, a nibble pair per byte and one E8M0 scale per 32
+    /// columns, so a row range decodes just its rows.
     fn readMxfp4Packed(self: *Dequant, io: Io, slab: usize, a: usize, n: usize, out: []u8) !void {
         const pa = std.heap.page_allocator;
         const src_rb = self.cols / 2;
@@ -611,6 +645,18 @@ pub fn register(gpa: Allocator, io: Io, files: []const *safetensors.File, cfg: Q
             if (try registerMxfp4(gpa, io, files, found)) out.mxfp4 += 1;
         } else if (std.mem.eql(u8, dt, "I32") and std.mem.endsWith(u8, name, ".weight_packed")) {
             if (try registerPacked(gpa, io, files, found, cfg)) out.int_packed += 1;
+        } else if (std.mem.eql(u8, dt, "U8") and std.mem.endsWith(u8, name, ".weight")) {
+            // MXFP4 experts stored under the plain names (`store_dtype`):
+            // recognised by the U8 `weight_scale` next to a U8 `weight`.
+            const scale_name = try withPrefix(gpa, name, "_scale");
+            defer gpa.free(scale_name);
+            const sc = findRaw(files, scale_name) orelse continue;
+            if (!std.mem.eql(u8, sc.info.dtype, "U8")) continue;
+            if (cfg.method != .mxfp4_store) {
+                std.log.err("{s}: U8 weight/weight_scale tensors need a quantization_config with store_dtype mxfp4 (found: {s})", .{ name, cfg.label });
+                return error.UnsupportedArchitecture;
+            }
+            if (try registerMxfp4Store(gpa, io, files, found, sc)) out.mxfp4 += 1;
         } else if (std.mem.eql(u8, dt, "U8") and std.mem.endsWith(u8, name, ".weight_packed")) {
             if (cfg.method != .mxfp4_packed) {
                 std.log.err("{s}: U8 weight_packed tensors need a compressed-tensors mxfp4-pack-quantized quantization_config (found: {s})", .{ name, cfg.label });
@@ -774,6 +820,45 @@ fn registerMxfp4Packed(gpa: Allocator, io: Io, files: []const *safetensors.File,
     removeRaw(files, scale_name);
     try dropModuleAux(gpa, files, module);
     try install(gpa, io, p.file, dq, shape);
+    return true;
+}
+
+/// MiMo V2.6's `store_dtype = mxfp4` experts: `weight` U8 `[..., R, C/2]` and
+/// `weight_scale` U8 `[..., R, C/32]`, the `mxfp4-pack-quantized` bytes under
+/// the plain tensor names, so the same row-chunked decoder reads them.
+fn registerMxfp4Store(gpa: Allocator, io: Io, files: []const *safetensors.File, w: FoundRaw, sc: FoundRaw) !bool {
+    const name = w.info.name;
+    const ws = w.info.shape;
+    if (ws.len < 2) return false;
+    const rows = ws[ws.len - 2];
+    const cols = ws[ws.len - 1] * 2;
+    const slabs = leading(ws, 2);
+    if (cols % 32 != 0 or sc.info.numel() != slabs * rows * (cols / 32)) {
+        std.log.err("{s}: unexpected mxfp4 store_dtype layout (weight {any}, scales {any})", .{ name, ws, sc.info.shape });
+        return error.InvalidConfig;
+    }
+    const dq = try gpa.create(Dequant);
+    errdefer gpa.destroy(dq);
+    dq.* = .{
+        .name = try w.file.arena.allocator().dupe(u8, name),
+        .method = .mxfp4_store,
+        .slabs = slabs,
+        .rows = rows,
+        .cols = cols,
+        .src_rows = rows,
+        .src_cols = cols,
+        .data = piece(w.file, w.info.offset, w.info.byte_len, .f32),
+        .scale = piece(sc.file, sc.info.offset, sc.info.byte_len, .f32),
+    };
+    const shape = try w.file.arena.allocator().alloc(usize, ws.len);
+    @memcpy(shape[0 .. ws.len - 1], ws[0 .. ws.len - 1]);
+    shape[ws.len - 1] = cols;
+    const scale_name = try withPrefix(gpa, name, "_scale");
+    defer gpa.free(scale_name);
+    removeRaw(files, name);
+    removeRaw(files, scale_name);
+    try dropModuleAux(gpa, files, name[0 .. name.len - ".weight".len]);
+    try install(gpa, io, w.file, dq, shape);
     return true;
 }
 
@@ -1023,5 +1108,16 @@ test "quant config parsing" {
     var s = try std.json.parseFromSlice(std.json.Value, gpa, "{\"quant_method\": \"compressed-tensors\", \"format\": \"mxfp4-pack-quantized\", \"config_groups\": {\"group_0\": {\"weights\": {\"num_bits\": 4, \"group_size\": 32, \"type\": \"float\", \"scale_dtype\": \"torch.uint8\"}}}}", .{});
     defer s.deinit();
     try std.testing.expectEqual(Method.mxfp4_packed, (try parseQuantConfig(s.value.object)).method);
+    // MiMo V2.6: fp8 dense weights with MXFP4 routed experts.
+    var m = try std.json.parseFromSlice(std.json.Value, gpa, "{\"activation_scheme\": \"dynamic\", \"fmt\": \"e4m3\", \"mxfp4_block_size\": 32, \"quant_method\": \"fp8\", \"store_dtype\": \"mxfp4\", \"weight_block_size\": [128, 128]}", .{});
+    defer m.deinit();
+    const mimo = try parseQuantConfig(m.value.object);
+    try std.testing.expectEqual(Method.mxfp4_store, mimo.method);
+    try std.testing.expectEqual(@as(usize, 32), mimo.group_size);
+    try std.testing.expectEqual(@as(usize, 128), mimo.block_cols);
+    // An fp8 checkpoint that stores its experts as fp8 too is plain fp8.
+    var f = try std.json.parseFromSlice(std.json.Value, gpa, "{\"quant_method\": \"fp8\", \"store_dtype\": \"float8_e4m3fn\"}", .{});
+    defer f.deinit();
+    try std.testing.expectEqual(Method.fp8, (try parseQuantConfig(f.value.object)).method);
     try std.testing.expectEqual(Method.none, (try parseQuantConfig(null)).method);
 }

@@ -291,6 +291,9 @@ test "gpt_oss_mxfp4 fixture (MXFP4 expert blocks and scales)" {
 test "kimi_k3_mxfp4 fixture (compressed-tensors mxfp4-pack-quantized experts)" {
     try checkFixture("kimi_k3_mxfp4");
 }
+test "mimo_v2_mxfp4 fixture (MiMo V2.6 store_dtype mxfp4 experts, bf16 MoE router)" {
+    try checkFixture("mimo_v2_mxfp4");
+}
 
 // Mamba families (selective state-space blocks with a per-sequence recurrent state).
 test "mamba2 fixture" {
@@ -595,6 +598,9 @@ test "mimo_v2_flash edit, export and streamed reload (sinks on sliding layers, d
 }
 test "mimo_v2 edit, export and streamed reload (chunked qkv_proj, per-expert tensors, omni tensors pass-through)" {
     try checkEditExportStream("mimo_v2");
+}
+test "mimo_v2_mxfp4 edit, export and streamed reload (store_dtype mxfp4 experts export as bf16)" {
+    try checkEditExportStream("mimo_v2_mxfp4");
 }
 test "deepseek_v4 edit, export and streamed reload (hyper-connections, hash routing, MTP pass-through)" {
     try checkEditExportStream("deepseek_v4");

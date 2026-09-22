@@ -150,13 +150,15 @@ a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
   Pro layout's fused `qkv_proj` chunked per kv head). The V2.5 / V2.6 omni
   checkpoints run through their text layers: the vision and audio encoders,
   `speech_embeddings` and the MTP layers (`model.mtp.*`) pass through
-  exports untouched. The released V2.6 checkpoints store the experts as
-  MXFP4 (`store_dtype`), which ditch refuses until they are dequantised to
-  bf16; the FP8 V2.5 checkpoints are dequantised on load. What is verified
-  is the transcription: the fixtures follow the transformers module and the
-  vLLM / llama.cpp loaders, not a released checkpoint, and MiMo-V2.6's own
-  `config.json` was not reachable to confirm that it adds nothing beyond
-  `store_dtype` and `moe_router_dtype`
+  exports untouched. The released V2.6 checkpoints (`quant_method = "fp8"`
+  with `store_dtype = "mxfp4"` and a bf16 router) are dequantised on load
+  like the FP8 V2.5 ones: the dense weights from their block scales, the
+  routed experts from the packed MXFP4 `weight` / `weight_scale` pairs (see
+  Quantised checkpoints below). What is verified is the transcription: the
+  fixtures follow the transformers module and the vLLM / SGLang / llama.cpp
+  loaders, not a released checkpoint; MiMo-V2.6's `config.json` and the
+  dtypes and shapes of its expert tensors were read from a published census
+  of `MiMo-V2.6-Flash-RL`, but no released checkpoint was decoded
 * DeepSeek V4 (`deepseek_v4`) and V4.1-Flash (`deepseek_v41`, text config):
   manifold-constrained hyper-connections, shared-KV sliding attention with
   sinks and grouped output projection, compressed-KV branches (V4 CSA/HCA,
@@ -261,6 +263,15 @@ model:
   natural `[out, in]` layout and `weight_scale` U8 E8M0 exponents per 32
   elements; a different packing from gpt-oss's `*_blocks` / `*_scales`,
   decoded row by row.
+* **MXFP4 `store_dtype`** (MiMo-V2.6 Pro / Flash as released): a mixed
+  checkpoint, `quant_method = "fp8"` (block scales for the dense weights,
+  `ignored_layers` left in bf16) with `store_dtype = "mxfp4"` for the routed
+  experts, which are stored per projection as `weight` U8 `[out, in / 2]`
+  and `weight_scale` U8 `[out, in / 32]` — the same bytes as
+  mxfp4-pack-quantized (E2M1 nibble pairs, low nibble first; `w = code *
+  2^(scale - 127)`) under the plain tensor names, `mxfp4_block_size` giving
+  the 32-element group. Decoded row by row like the other packed layout, and
+  the bf16 MoE router (`moe_router_dtype`) is read as it is.
 
 Values are decoded to bf16, which is what the Hugging Face integrations
 produce. With `--max-ram` (streamed weights) a tensor is decoded row-chunk

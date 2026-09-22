@@ -2386,9 +2386,21 @@ fn extraMiMoV2(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
     const n = c.num_layers;
     const hf_spelling = std.mem.eql(u8, c.model_type, "mimo_v2_flash") or obj.get("layer_types") != null or obj.get("rope_parameters") != null or obj.get("mlp_layer_types") != null;
     if (getNum(obj, "rms_norm_eps") == null) c.rms_norm_eps = getF32(obj, "layernorm_epsilon", 1e-5);
+    // `store_dtype` names the expert storage format. MiMo V2.6 carries it in
+    // `quantization_config` (parsed by dequant.zig, which decodes the MXFP4
+    // experts on read); a copy at the config level says the same thing.
     if (getStr(obj, "store_dtype")) |sd| {
-        if (!dequant.expertDtypeSupported(sd) or std.mem.eql(u8, sd, "mxfp4")) {
+        if (!dequant.expertDtypeSupported(sd)) {
             std.log.err("unsupported model: MiMo experts stored as '{s}' (store_dtype) cannot be dequantised; convert the experts to bf16 first", .{sd});
+            return error.UnsupportedArchitecture;
+        }
+    }
+    // The router runs in f32 on the bf16 gate weights whatever
+    // `moe_router_dtype` says (MiMo V2.6: bfloat16, the earlier ones float32);
+    // a quantised router would need a reader of its own.
+    if (getStr(obj, "moe_router_dtype")) |rd| {
+        if (!dequant.storeFloatDtype(rd)) {
+            std.log.err("unsupported model: MiMo MoE router in '{s}' (moe_router_dtype)", .{rd});
             return error.UnsupportedArchitecture;
         }
     }
@@ -3912,7 +3924,7 @@ pub const registry = [_]Arch{
             .qkv = "self_attn.qkv_proj.weight",
             .router_correction_bias = "mlp.gate.e_score_correction_bias",
         },
-        .notes = "fixtures: hybrid full / sliding-window attention (window 128 in the released configs) with attention sinks and doubled kv heads on the sliding layers, v_head_dim < head_dim with attention_value_scale, partial rotary with one base per layer type (rope_parameters, or rope_theta / swa_rope_theta), a dense first layer (mlp_layer_types / moe_layer_freq) then sigmoid MoE with correction bias and group-limited top-k, no shared experts; both the transformers spelling (layer_types, stacked experts, sinks) and the hub checkpoint spelling of MiMo-V2-Flash / V2.5 / V2.6 (model_type mimo_v2: hybrid_layer_pattern, swa_*, attention_sink_bias, per-expert tensors, the Pro layout's fused qkv_proj chunked per kv head). MTP (model.mtp.*), vision and audio encoder tensors of the V2.5 / V2.6 omni checkpoints pass through exports untouched. MXFP4 experts (store_dtype) are refused until dequantised.",
+        .notes = "fixtures: hybrid full / sliding-window attention (window 128 in the released configs) with attention sinks and doubled kv heads on the sliding layers, v_head_dim < head_dim with attention_value_scale, partial rotary with one base per layer type (rope_parameters, or rope_theta / swa_rope_theta), a dense first layer (mlp_layer_types / moe_layer_freq) then sigmoid MoE with correction bias and group-limited top-k, no shared experts; both the transformers spelling (layer_types, stacked experts, sinks) and the hub checkpoint spelling of MiMo-V2-Flash / V2.5 / V2.6 (model_type mimo_v2: hybrid_layer_pattern, swa_*, attention_sink_bias, per-expert tensors, the Pro layout's fused qkv_proj chunked per kv head). MTP (model.mtp.*), vision and audio encoder tensors of the V2.5 / V2.6 omni checkpoints pass through exports untouched. The V2.6 checkpoints' MXFP4 experts (quant_method fp8 with store_dtype mxfp4: U8 weight/weight_scale next to the fp8 dense weights) and their bf16 MoE router (moe_router_dtype) are read as they are.",
         .extra = extraMiMoV2,
     },
     .{
