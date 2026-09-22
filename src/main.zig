@@ -876,9 +876,12 @@ const App = struct {
         const c = &model.config;
         const max_new: usize = 1024;
 
-        const text = try chat.render(gpa, self.template, messages);
+        const body = try chat.render(gpa, self.template, messages);
+        defer gpa.free(body);
+        // The same BOS rules as the study's prompts (see `Engine`).
+        const text = try std.mem.concat(gpa, u8, &.{ self.engine.bos_prefix, body });
         defer gpa.free(text);
-        const ids = try model.tokenizer.encode(gpa, text, true);
+        const ids = try model.tokenizer.encode(gpa, text, self.engine.add_special);
         defer gpa.free(ids);
         const max_len = ids.len + max_new + 1;
         const kv_bytes = model_mod.KvCache.bytesFor(c.num_layers, 1, max_len, c.kvDim());

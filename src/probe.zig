@@ -77,7 +77,7 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings,
     for (settings.probe_prompts) |user| {
         const text = if (settings.probe_raw) try gpa.dupe(u8, user) else try engine.formatPrompt(gpa, .{ .system = settings.system_prompt, .user = user });
         defer gpa.free(text);
-        const ids = try model.tokenizer.encode(gpa, text, !settings.probe_raw);
+        const ids = try model.tokenizer.encode(gpa, text, !settings.probe_raw and engine.add_special);
         defer gpa.free(ids);
         const prompts = [_][]u32{ids};
         const generated = try engine.generateBatch(gpa, &prompts, @max(settings.max_response_length, 1));

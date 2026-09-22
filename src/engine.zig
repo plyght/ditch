@@ -71,6 +71,11 @@ pub const Engine = struct {
     /// BOS text the model's own template puts before the first turn but the
     /// rendered family and the tokenizer do not add (see `chat.templateBos`).
     bos_prefix: []const u8 = "",
+    /// Whether a rendered chat prompt is encoded with the tokenizer's own
+    /// special tokens (its BOS). transformers' `apply_chat_template` encodes
+    /// without them, so a BOS appears only where the template writes one;
+    /// see `chatAddsSpecial`.
+    add_special: bool = true,
     ws: ?model_mod.Workspace = null,
     ws_rows: usize = 0,
 
@@ -82,7 +87,22 @@ pub const Engine = struct {
             .template = template,
             .batch_size = @max(settings.batch_size, 1),
             .bos_prefix = bosPrefix(model, template),
+            .add_special = chatAddsSpecial(model),
         };
+    }
+
+    /// False when the tokenizer would prepend a BOS but the model's template
+    /// never writes one (arcee-ai/AFM-4.5B, MiniCPM4): transformers, vLLM
+    /// and the model's own training render those prompts without a BOS.
+    /// Templates that mention `bos_token` or the BOS text keep the
+    /// tokenizer's, since ditch cannot tell where in the Jinja it lands.
+    fn chatAddsSpecial(model: *Model) bool {
+        const tok = model.tokenizer;
+        if (!tok.add_bos) return true;
+        const t = model.chat_template orelse return true;
+        const bos_id = tok.bos_id orelse return true;
+        const bos = tok.id_to_token[bos_id];
+        return std.mem.indexOf(u8, t, "bos_token") != null or (bos.len > 0 and std.mem.indexOf(u8, t, bos) != null);
     }
 
     /// The BOS the rendered prompt must carry itself: the model's template
@@ -144,7 +164,7 @@ pub const Engine = struct {
     pub fn encodePrompt(self: *Engine, gpa: Allocator, prompt: Prompt) ![]u32 {
         const text = try self.formatPrompt(gpa, prompt);
         defer gpa.free(text);
-        return self.model.tokenizer.encode(gpa, text, true);
+        return self.model.tokenizer.encode(gpa, text, self.add_special);
     }
 
     fn encodeBatch(self: *Engine, gpa: Allocator, prompts: []const Prompt) ![][]u32 {

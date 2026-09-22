@@ -75,6 +75,17 @@ const RegexKind = enum {
     trailing_ws,
     /// CJK runs `[一-龥ࠀ-一가-퟿]+`
     cjk,
+    /// AFMoE's digit handling, three `Split`s in a row: decimal-digit runs cut
+    /// into right-aligned chunks of 510 (`\p{Nd}{1,510}(?=(?>\p{Nd}{510})*(?:\P{Nd}|$))|\G\p{Nd}{510}`),
+    /// the leading 1–2 digits of an all-digit piece whose length is not a
+    /// multiple of three (`\A\p{Nd}{1,2}(?=\p{Nd}{3}+\z)`), then groups of
+    /// three from the start (`\A\p{Nd}{3}|\G\p{Nd}{3}`): `1234567` -> `1 234 567`.
+    nd_chunks510,
+    nd_lead,
+    nd_groups3,
+    /// AFMoE's script runs: CJK / kana, Thai, Lao, Khmer, Myanmar and Hangul,
+    /// each a run of its own class.
+    script_runs,
 };
 
 /// One pre-tokenisation step of a `Sequence`.
@@ -724,13 +735,33 @@ pub const Tokenizer = struct {
         }
     }
 
-    fn classifyRegex(r: []const u8) RegexKind {
+    fn classifyRegex(raw: []const u8) RegexKind {
+        // Some tokenizer.json files (StableLM 2) carry the line breaks of a
+        // character class as literal CR/LF rather than as `\r` / `\n`
+        // escapes; the patterns below are written with the escapes.
+        var buf: [2048]u8 = undefined;
+        var n: usize = 0;
+        const r = for (raw) |ch| {
+            if (n + 2 > buf.len) break raw;
+            if (ch == '\r' or ch == '\n') {
+                buf[n] = '\\';
+                buf[n + 1] = if (ch == '\r') 'r' else 'n';
+                n += 2;
+            } else {
+                buf[n] = ch;
+                n += 1;
+            }
+        } else buf[0..n];
         const has = struct {
             fn f(hay: []const u8, needle: []const u8) bool {
                 return std.mem.indexOf(u8, hay, needle) != null;
             }
         }.f;
         if (std.mem.eql(u8, r, "\\p{N}{1,3}")) return .digits3;
+        if (std.mem.eql(u8, r, "\\p{Nd}{1,510}(?=(?>\\p{Nd}{510})*(?:\\P{Nd}|$))|\\G\\p{Nd}{510}")) return .nd_chunks510;
+        if (std.mem.eql(u8, r, "\\A\\p{Nd}{1,2}(?=\\p{Nd}{3}+\\z)")) return .nd_lead;
+        if (std.mem.eql(u8, r, "\\A\\p{Nd}{3}|\\G\\p{Nd}{3}")) return .nd_groups3;
+        if (std.mem.eql(u8, r, "(?:[\\u4E00-\\u9FFF\\u3040-\\u309F\\u30A0-\\u30FF\\u3400-\\u4DBF\\uf900-\\uFAFF\\uFF65-\\uFF9F\\u2F00-\\u2FDF]+|[\\u0E00-\\u0E7F]+|[\\u0E80-\\u0EFF]+|[\\u1780-\\u17FF]+|[\\u1000-\\u109F\\uAA60-\\uAA7F\\uA9E0-\\uA9FF]+|[\\uAC00-\\uD7AF\\u1100-\\u11FF]+)")) return .script_runs;
         if (std.mem.eql(u8, r, "[\\r\\n]")) return .newlines;
         if (std.mem.eql(u8, r, "\\s+$")) return .trailing_ws;
         if (std.mem.startsWith(u8, r, "\\s?[A-Za-z")) return .ds2_letters;
@@ -796,7 +827,7 @@ pub const Tokenizer = struct {
                 .nanochat => "llama-bpe",
                 .o200k => "gpt-4o",
                 .kimi => "kimi-k2",
-                .deepseek3, .digits3 => "deepseek-v3",
+                .deepseek3, .digits3, .nd_chunks510, .nd_lead, .nd_groups3, .script_runs => "deepseek-v3",
                 .ds2_letters, .newlines, .ds2_punct, .trailing_ws, .cjk => "deepseek-llm",
                 .gpt2 => "gpt-2",
             };
@@ -1510,6 +1541,8 @@ const RegexSplitter = struct {
     text: []const u8,
     kind: RegexKind,
     pos: usize = 0,
+    /// End of the previous match (`\G`); a pattern may match there contiguously.
+    g: usize = 0,
 
     fn cpAt(self: *const RegexSplitter, i: usize) ?Cp {
         if (i >= self.text.len) return null;
@@ -1534,12 +1567,48 @@ const RegexSplitter = struct {
                     return self.text[start..i];
                 }
                 self.pos = end;
+                self.g = end;
                 return self.text[start..end];
             }
             i += self.cpAt(i).?.len;
         }
         self.pos = self.text.len;
         return self.text[start..];
+    }
+
+    /// Decimal digits (`\p{Nd}`) from `i`: how many, and where they end.
+    fn ndRun(self: *const RegexSplitter, i: usize) struct { count: usize, end: usize } {
+        var j = i;
+        var count: usize = 0;
+        while (self.cpAt(j)) |n| {
+            if (!inRanges(n.cp, &uni.decimal_digits)) break;
+            j += n.len;
+            count += 1;
+        }
+        return .{ .count = count, .end = j };
+    }
+
+    fn skipCps(self: *const RegexSplitter, i: usize, count: usize) usize {
+        var j = i;
+        for (0..count) |_| j += self.cpAt(j).?.len;
+        return j;
+    }
+
+    /// The `script_runs` class of `cp` (0: none).
+    fn scriptClass(cp: u21) u8 {
+        const in = struct {
+            fn f(c: u21, lo: u21, hi: u21) bool {
+                return c >= lo and c <= hi;
+            }
+        }.f;
+        if (in(cp, 0x4E00, 0x9FFF) or in(cp, 0x3040, 0x309F) or in(cp, 0x30A0, 0x30FF) or in(cp, 0x3400, 0x4DBF) or
+            in(cp, 0xF900, 0xFAFF) or in(cp, 0xFF65, 0xFF9F) or in(cp, 0x2F00, 0x2FDF)) return 1;
+        if (in(cp, 0x0E00, 0x0E7F)) return 2;
+        if (in(cp, 0x0E80, 0x0EFF)) return 3;
+        if (in(cp, 0x1780, 0x17FF)) return 4;
+        if (in(cp, 0x1000, 0x109F) or in(cp, 0xAA60, 0xAA7F) or in(cp, 0xA9E0, 0xA9FF)) return 5;
+        if (in(cp, 0xAC00, 0xD7AF) or in(cp, 0x1100, 0x11FF)) return 6;
+        return 0;
     }
 
     fn isUpperAscii(cp: u21) bool {
@@ -1578,6 +1647,34 @@ const RegexSplitter = struct {
                 return i;
             },
             .newlines => return if (isNewline(first.cp)) start + first.len else start,
+            .nd_chunks510 => {
+                // Greedy 1..510 digits such that what is left of the run is a
+                // whole number of 510-digit chunks.
+                const run = self.ndRun(start);
+                if (run.count == 0) return start;
+                return self.skipCps(start, (run.count - 1) % 510 + 1);
+            },
+            .nd_lead => {
+                if (start != 0) return start;
+                const run = self.ndRun(0);
+                if (run.end != self.text.len or run.count % 3 == 0) return start;
+                return self.skipCps(0, run.count % 3);
+            },
+            .nd_groups3 => {
+                if (start != 0 and start != self.g) return start;
+                if (self.ndRun(start).count < 3) return start;
+                return self.skipCps(start, 3);
+            },
+            .script_runs => {
+                const class = scriptClass(first.cp);
+                if (class == 0) return start;
+                var i = start;
+                while (self.cpAt(i)) |n| {
+                    if (scriptClass(n.cp) != class) break;
+                    i += n.len;
+                }
+                return i;
+            },
             .ds2_letters, .ds2_punct => {
                 var i = start;
                 var c = first;
@@ -1685,7 +1782,7 @@ const RegexSplitter = struct {
                 }
                 return self.matchWhitespace(start);
             },
-            .o200k, .kimi, .deepseek3, .digits3, .newlines, .ds2_letters, .ds2_punct, .trailing_ws, .cjk => unreachable,
+            .o200k, .kimi, .deepseek3, .digits3, .newlines, .ds2_letters, .ds2_punct, .trailing_ws, .cjk, .nd_chunks510, .nd_lead, .nd_groups3, .script_runs => unreachable,
             .qwen2, .llama3, .nanochat => {
                 // '[^\r\n\p{L}\p{N}]?\p{L}+'
                 var i = start;
@@ -1927,6 +2024,10 @@ const RegexSplitter = struct {
 
     /// DeepSeek V3: `[ascii punct][A-Za-z]+ | [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+ | ?[\p{P}\p{S}]+[\r\n]* |
     /// \s*[\r\n]+ | \s+(?!\S) | \s+` (symbols approximated as "neither letter, number nor whitespace").
+    /// DeepSeek V3's main pattern (AFMoE's too):
+    /// `[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+ | [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+ |
+    /// ?[\p{P}\p{S}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+`. Words run over letters *and*
+    /// combining marks; punctuation is exactly `P` and `S`.
     fn matchDeepseek3(self: *const RegexSplitter, start: usize, first: Cp) usize {
         var i = start;
         var c = first;
@@ -1942,17 +2043,17 @@ const RegexSplitter = struct {
                 }
             }
         }
-        if (!isNewline(c.cp) and !isLetter(c.cp) and !isPunctOrSymbol(c.cp)) {
+        if (!isLetterOrMark(c.cp) and !isNewline(c.cp) and !isPunctSymbol(c.cp)) {
             if (self.cpAt(i + c.len)) |n| {
-                if (isLetter(n.cp)) {
+                if (isLetterOrMark(n.cp)) {
                     i += c.len;
                     c = n;
                 }
             }
         }
-        if (isLetter(c.cp)) {
+        if (isLetterOrMark(c.cp)) {
             while (self.cpAt(i)) |n| {
-                if (!isLetter(n.cp)) break;
+                if (!isLetterOrMark(n.cp)) break;
                 i += n.len;
             }
             return i;
@@ -1961,15 +2062,15 @@ const RegexSplitter = struct {
         c = first;
         if (c.cp == ' ') {
             if (self.cpAt(i + 1)) |n| {
-                if (isPunctOrSymbol(n.cp)) {
+                if (isPunctSymbol(n.cp)) {
                     i += 1;
                     c = n;
                 }
             }
         }
-        if (isPunctOrSymbol(c.cp)) {
+        if (isPunctSymbol(c.cp)) {
             while (self.cpAt(i)) |n| {
-                if (!isPunctOrSymbol(n.cp)) break;
+                if (!isPunctSymbol(n.cp)) break;
                 i += n.len;
             }
             while (self.cpAt(i)) |n| {
@@ -1979,6 +2080,14 @@ const RegexSplitter = struct {
             return i;
         }
         return self.matchNewlinesOrWhitespace(start);
+    }
+
+    fn isLetterOrMark(cp: u21) bool {
+        return isLetter(cp) or inRanges(cp, &uni.marks);
+    }
+
+    fn isPunctSymbol(cp: u21) bool {
+        return inRanges(cp, &uni.punct_symbols);
     }
 
     /// `\s*[\r\n]+ | \s+(?!\S) | \s+`
@@ -1996,10 +2105,6 @@ const RegexSplitter = struct {
         }
         if (saw_nl) return i;
         return self.matchWhitespace(start);
-    }
-
-    fn isPunctOrSymbol(cp: u21) bool {
-        return !isWhitespace(cp) and !isLetter(cp) and !isNumber(cp) and !isNewline(cp);
     }
 
     fn isDs2Punct(cp: u21) bool {
@@ -2128,6 +2233,36 @@ test "a line-break split merged with the next piece (Laguna)" {
     const want = [_][]const u8{ "f", "(x", "):", "\r\n\n", " ", " y", "\r", "z", "\n" };
     try std.testing.expectEqual(want.len, pieces.items.len);
     for (want, pieces.items) |w, got| try std.testing.expectEqualStrings(w, got);
+}
+
+test "a regex with literal line breaks is still recognised (StableLM 2)" {
+    try std.testing.expectEqual(RegexKind.qwen2, Tokenizer.classifyRegex("(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+"));
+}
+
+test "AFMoE digit groups and script runs, and DeepSeek V3 words with marks" {
+    // Pieces from `tokenizers`' pre_tokenize_str on arcee-ai/Trinity-Nano-Preview.
+    const Case = struct { kind: RegexKind, text: []const u8, want: []const []const u8 };
+    const cases = [_]Case{
+        .{ .kind = .nd_lead, .text = "1234567", .want = &.{ "1", "234567" } },
+        .{ .kind = .nd_lead, .text = "123456", .want = &.{"123456"} },
+        .{ .kind = .nd_lead, .text = "12a", .want = &.{"12a"} },
+        .{ .kind = .nd_groups3, .text = "234567", .want = &.{ "234", "567" } },
+        .{ .kind = .nd_groups3, .text = "2345", .want = &.{ "234", "5" } },
+        .{ .kind = .script_runs, .text = "ab\u{0e20}\u{0e32}\u{1780}\u{17d2}\u{d55c}x", .want = &.{ "ab", "\u{0e20}\u{0e32}", "\u{1780}\u{17d2}", "\u{d55c}", "x" } },
+        .{ .kind = .deepseek3, .text = "\u{1781}\u{17d2}\u{1798}\u{17c2}\u{179a} cafe\u{301}!", .want = &.{ "\u{1781}\u{17d2}\u{1798}\u{17c2}\u{179a}", " cafe\u{301}", "!" } },
+    };
+    for (cases) |c| {
+        var it = RegexSplitter{ .text = c.text, .kind = c.kind };
+        for (c.want) |w| try std.testing.expectEqualStrings(w, it.next().?);
+        try std.testing.expect(it.next() == null);
+    }
+    var long: [1100]u8 = undefined;
+    @memset(&long, '9');
+    var it = RegexSplitter{ .text = &long, .kind = .nd_chunks510 };
+    try std.testing.expectEqual(@as(usize, 80), it.next().?.len);
+    try std.testing.expectEqual(@as(usize, 510), it.next().?.len);
+    try std.testing.expectEqual(@as(usize, 510), it.next().?.len);
+    try std.testing.expect(it.next() == null);
 }
 
 test "byte-level bpe round trip" {

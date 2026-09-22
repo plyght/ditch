@@ -1890,6 +1890,104 @@ Token for token against `apply_chat_template` on two system/user pairs, and a
 unit test covers a multi-turn conversation. The forward pass itself (xIELU,
 per-head q/k norm) was already exact on the real weights: all 4 residuals of
 the first 3 layers, logits to 6.3e-07; tokenizer 15 of 15.
+
+## A template and tokenizer sweep over one release per family
+
+The forward passes are exact almost everywhere now; what a real study also
+depends on is the prompt: the chat template and the tokenization of the
+rendered text. To check those for every family without downloading weights,
+the sweep takes each release's tokenizer and template alone and puts them on
+a tiny random Llama with the same vocabulary. ditch then renders and
+tokenizes exactly as it would for the real model (its forward pass is
+meaningless and ignored), and the prompt ids are compared with
+`apply_chat_template(..., tokenize=True)` for two system/user pairs, one of
+them with surrounding whitespace, a trailing newline in the system prompt and
+a code block. A second pass runs 20 harder strings — combining marks, Hebrew
+points, Arabic harakat, Devanagari, Khmer, Myanmar, digit runs, symbols —
+through each tokenizer against the `tokenizers` package.
+
+The findings split into tokenizer bugs (37–40, below), template-family bugs
+(the next sections), and whitespace differences.
+
+## Bug 37 — a pre-tokenizer regex with literal line breaks fell back to GPT-2's (fixed)
+
+**Symptom.** `stabilityai/stablelm-2-1_6b-chat`: identical rendered text, but
+`.\n`, `:\n\n` and `)\n` each one token in transformers and two or three in
+ditch — silently, no warning.
+
+**Cause.** its `Split` regex is Qwen 2's, but the `tokenizer.json` spells the
+line breaks inside its character classes as literal CR / LF characters, not as
+`\r` / `\n` escapes. `classifyRegex` matches patterns by substring, found no
+known one, and — because the contraction alternative `'s|'t|'re` is there —
+chose GPT-2's pattern without warning.
+
+**Fix.** literal CR / LF are turned back into their escapes before
+classifying. A unit test uses StableLM 2's exact pattern.
+
+## Bug 38 — a BOS the chat template never writes was prepended (fixed)
+
+**Symptom.** `arcee-ai/AFM-4.5B` and `openbmb/MiniCPM4-0.5B`: ditch's prompt
+ids start with a BOS (`1` / `128000`) that transformers' do not.
+
+**Cause.** both tokenizers add a BOS by default, but their chat templates
+never emit one, and `apply_chat_template` — like vLLM's chat path — encodes
+the rendered prompt *without* the tokenizer's special tokens. ditch encoded
+every chat prompt with them.
+
+**Fix.** a chat prompt is encoded without the tokenizer's automatic BOS when
+the model has a chat template that mentions neither `bos_token` nor the BOS
+text; a template that does mention it keeps the old behaviour, since ditch
+cannot tell where in the Jinja it lands. The interactive chat now uses the
+same rules as the study (it also missed `bos_prefix` before).
+
+## Bug 39 — AFMoE's pre-tokenizer ran GPT-2 splits (fixed)
+
+**Symptom.** `arcee-ai/Trinity-Nano-Preview` loads with four
+`pre-tokenizer regex is not recognised; using the GPT-2 pattern` warnings, and
+10 of 20 strings tokenize differently.
+
+**Cause.** AFMoE's `Sequence` has three anchored digit splits — digit runs in
+right-aligned chunks of 510, then the leading one or two digits of an
+all-digit piece, then groups of three from the start (together: `1234567` →
+`1`, `234`, `567`) — and a split isolating runs of CJK / kana, Thai, Lao,
+Khmer, Myanmar and Hangul, before DeepSeek V3's main regex. ditch knew only
+the last.
+
+**Fix.** four regex kinds implementing them exactly, with `\A` as the start of
+the piece and `\G` as the end of the previous match, over `\p{Nd}` (a new
+decimal-digit table in `tools/gen_unicode.py`, not `\p{N}`).
+
+## Bug 40 — DeepSeek V3's word pattern split at combining marks (fixed)
+
+**Symptom.** after bug 39, Trinity still differed on Khmer and Myanmar; the
+pre-tokens were the same but the tokens were not — the word had been cut
+further before BPE.
+
+**Cause.** DeepSeek V3's main pattern (which AFMoE reuses) is
+`[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|…`: a word runs
+over letters *and* combining marks, and punctuation is exactly `P` and `S`.
+ditch's matcher ran over letters only, so a virama, a vowel sign, an Arabic
+haraka or a decomposed accent ended the word, and it treated everything that
+is not a letter, number or space as punctuation. This affects DeepSeek V3 /
+V3.1 / V3.2 themselves on any script written with combining marks.
+
+**Fix.** words over `L` and `M`, punctuation over a new exact `P` / `S` table.
+
+**Verification (37–40).** 20 hard strings per tokenizer against `tokenizers`,
+before and after:
+
+| tokenizer | before | after |
+| --- | ---: | ---: |
+| arcee-ai/Trinity-Nano-Preview (`afmoe`) | 10 differ | 0 |
+| ByteDance-Seed/Seed-OSS-36B-Instruct | 10 | 2 |
+| deepseek-ai/DeepSeek-V3.1 | 5 | 4 |
+| stabilityai/stablelm-2-1_6b-chat (8 strings) | 3 | 0 |
+| 13 more (SmolLM3, EXAONE 4, Granite 3.3, GLM 4.5, Hunyuan-A13B, Solar Open, MiniMax-M2, MiMo V2, Phi-4-mini, Nemotron Nano 9B v2, gpt-oss, dots1, Falcon-H1) | unchanged | unchanged |
+
+and the prompt ids of StableLM 2, AFM-4.5B, MiniCPM4 and Trinity-Nano now
+equal `apply_chat_template`'s. The remaining differences are the next
+subject.
+
 ---
 
 # Frontier pass: the arithmetic of the frontier families on their real weights
