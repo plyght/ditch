@@ -15,6 +15,11 @@
 # Usage: bash tests/metal_e2e.sh
 
 set -euo pipefail
+# Model output from the tiny random fixtures is arbitrary bytes, often
+# invalid UTF-8. BSD grep (macOS) refuses to match a line with an illegal byte
+# sequence under a UTF-8 locale, where GNU grep matches it anyway, so pin the
+# C locale and let every grep treat the output as the bytes it is.
+export LC_ALL=C
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
