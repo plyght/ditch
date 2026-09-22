@@ -268,8 +268,7 @@ pub const MoeLayer = struct {
         const names = self.names;
         if (self.shared != null) {
             if (names.shared_expert) |sp| {
-                const down = names.shared_down orelse names.expert_down;
-                if (std.mem.startsWith(u8, suffix, sp) and std.mem.eql(u8, suffix[sp.len..], down)) return .{ .expert = self.experts.len };
+                if (std.mem.startsWith(u8, suffix, sp) and std.mem.eql(u8, suffix[sp.len..], names.shared_down orelse names.expert_down)) return .{ .expert = self.experts.len };
             }
         }
         // `mlp.experts.{e}.` → prefix before `{e}` and the text after it.
@@ -491,12 +490,17 @@ fn deinterleave(arena: Allocator, v: []const f32) ![2][]f32 {
 /// Loads the MoE block of layer `li` with tensor prefix `lp` (e.g. "model.layers.3.").
 pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !MoeLayer {
     const c = &model.config;
-    const names = &c.arch.names;
+    var names: *const arch.Names = &c.arch.names;
     const hidden = c.hidden_size;
     const inter = c.moe_intermediate_size;
     const n_experts = c.num_experts;
     const mapped = !model.streamed();
 
+    // Checkpoints that predate the family's Hugging Face module layout keep
+    // the MoE under other names (Kimi Linear's `block_sparse_moe`).
+    if (names.moe_alt) |alt| {
+        if (model.store.lookup(try cat(arena, &.{ lp, names.router })) == null and model.store.lookup(try cat(arena, &.{ lp, alt.router })) != null) names = alt;
+    }
     const router_name = try cat(arena, &.{ lp, names.router });
     const router_ref = model.store.lookup(router_name) orelse {
         std.log.err("missing router tensor {s}", .{router_name});
@@ -693,8 +697,8 @@ pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !Mo
                     sh.up = sh.up_ref.shapeOnly();
                 }
             } else {
-                const gate_name = try cat(arena, &.{ sp, names.expert_gate });
-                const up_name = try cat(arena, &.{ sp, names.expert_up });
+                const gate_name = try cat(arena, &.{ sp, names.shared_gate orelse names.expert_gate });
+                const up_name = try cat(arena, &.{ sp, names.shared_up orelse names.expert_up });
                 sh.gate = try model.loadMat(gate_name);
                 sh.up = try model.loadMat(up_name);
                 sh.gate_ref = .{ .ref = try model.ref(gate_name) };
@@ -803,8 +807,8 @@ pub fn forward(model: *const Model, m: *const MoeLayer, li: usize, out: []f32, h
             const per_group = n_experts / n_group;
             for (0..n_group) |g| {
                 const gs = choice[g * per_group ..][0..per_group];
-                if (m.correction_bias != null) {
-                    // Sum of the two best selection scores of the group (DeepSeek V3).
+                if (m.correction_bias != null or r.group_score_top2) {
+                    // Sum of the two best selection scores of the group (DeepSeek V3, Kimi Linear).
                     var b1: f32 = -std.math.inf(f32);
                     var b2: f32 = -std.math.inf(f32);
                     for (gs) |s| {

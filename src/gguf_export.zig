@@ -567,7 +567,7 @@ fn saveInner(gpa: Allocator, io: Io, model: *const Model, dir: Io.Dir, opts: Opt
     if (opts.name.len > 0) try w.addString("general.name", opts.name);
     try addVocab(&w, a, model);
     // Copies of the Hugging Face configuration files, for an exact HF re-export.
-    try w.addString(gguf_model.key_hf_config, model.config_json);
+    try w.addString(gguf_model.key_hf_config, model.export_config_json);
     try w.addString(gguf_model.key_hf_tokenizer, model.tokenizer_json);
     if (model.tokenizer_config_json) |t| try w.addString(gguf_model.key_hf_tokenizer_config, t);
     if (model.generation_config_json) |g| try w.addString(gguf_model.key_hf_generation_config, g);
