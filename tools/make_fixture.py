@@ -380,6 +380,21 @@ def base(**kw):
         residual_layout="pre", mm_scales=None,
         # HunYuan applies the per-head q/k norm after the rotary embedding.
         qk_norm_after_rope=False,
+        # Sub-layer norms on the attention output and the MLP intermediate (BitNet).
+        attn_sub_norm=None, ffn_sub_norm=None,
+        # Gate on the attention output from a separate projection (AFMoE, Laguna):
+        # (tensor name, "sigmoid" | "softplus", per-head?).
+        attn_gate=None,
+        # xIELU activation (Apertus): (alpha_p, alpha_n) after softplus; the
+        # tensors store the pre-softplus values.
+        xielu=None,
+        # Tensor-parallel blocks of a fused [q | v | k] projection (CodeGen).
+        qkv_mp=0,
+        # (theta, scaling) of the sliding layers' own rotary tables.
+        rope_local=None,
+        # Ministral 3: q *= 1 + beta * log(1 + floor(pos / floor_scale)), every layer.
+        attn_temp_always=None,
+        final_softcap=None,
         # (alpha, limit) of the clamped swiglu in dense MLPs (MiniMax M3).
         dense_swiglu=None,
         # {layer index: [(name relative to the layer, shape), ...]} of tensors the
@@ -790,6 +805,204 @@ spec("granitemoehybrid", tok="starcoder", L=3, embed_scale=2.0, attn_scale=0.25,
                  layer_types=["attention", "attention", "attention"], mamba_n_heads=4, mamba_d_state=8, mamba_d_conv=4, mamba_expand=2))
 
 
+# --- families swept from transformers' causal-LM mapping --------------------
+# Dense llama-layout variants: each differs in its MLP shape, norm placement,
+# rotary pairing or positional encoding.
+spec("arcee", tok="llama3", mlp="dense", up="mlp.up_proj.weight", act="relu2", mlp_bias=True, lm_head=None,
+     config={"model_type": "arcee", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4,
+             "num_key_value_heads": 2, "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "relu2", "mlp_bias": True,
+             "max_position_embeddings": 128, "tie_word_embeddings": True})
+spec("jais2", tok="gpt2", norm="ln", eps=1e-5, mlp="dense", up="mlp.up_proj.weight", act="relu2", mlp_bias=True,
+     attn_bias=True, o_bias=True, lm_head="lm_head.weight",
+     config={"model_type": "jais2", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4,
+             "num_key_value_heads": 2, "head_dim": 8, "layer_norm_eps": 1e-5, "rope_theta": 10000.0, "hidden_act": "relu2",
+             "attention_bias": True, "mlp_bias": True, "max_position_embeddings": 128, "tie_word_embeddings": False})
+spec("ernie4_5", tok="spm", rope_style="gptj", attn_bias=True, o_bias=True, mlp_bias=True, lm_head="lm_head.weight", eps=1e-5,
+     config={"model_type": "ernie4_5", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4,
+             "num_key_value_heads": 2, "head_dim": 8, "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "hidden_act": "silu",
+             "use_bias": True, "max_position_embeddings": 128, "tie_word_embeddings": False})
+spec("helium", tok="llama3", NKV=4, rope_style="helium", attn_bias=True, o_bias=False, mlp_bias=True,
+     lm_head="lm_head.weight", eps=1e-8,
+     config={"model_type": "helium", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4,
+             "num_key_value_heads": 4, "head_dim": 8, "rms_norm_eps": 1e-8, "rope_theta": 10000.0, "hidden_act": "silu",
+             "attention_bias": True, "mlp_bias": True, "max_position_embeddings": 128, "tie_word_embeddings": False})
+spec("hunyuan_v1_dense", tok="gpt2", qk_norm="head", qk_norm_after_rope=True, eps=1e-5, lm_head="lm_head.weight",
+     q_norm="self_attn.query_layernorm.weight", k_norm="self_attn.key_layernorm.weight",
+     theta=10000.0 * 1000.0 ** (8 / 6),
+     config={"model_type": "hunyuan_v1_dense", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2,
+             "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8, "rms_norm_eps": 1e-5, "rope_theta": 10000.0,
+             "rope_scaling": {"type": "dynamic", "alpha": 1000.0}, "hidden_act": "silu", "attention_bias": False,
+             "max_position_embeddings": 128, "tie_word_embeddings": False})
+spec("bitnet", tok="llama3", act="relu2", attn_sub_norm="self_attn.attn_sub_norm.weight", ffn_sub_norm="mlp.ffn_sub_norm.weight",
+     lm_head="lm_head.weight", eps=1e-5,
+     config={"model_type": "bitnet", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4,
+             "num_key_value_heads": 2, "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "hidden_act": "relu2",
+             "max_position_embeddings": 128, "tie_word_embeddings": False})
+spec("apertus", tok="llama3", qk_norm="head", mlp="dense", up="mlp.up_proj.weight", xielu=(0.8, 0.8), eps=1e-5,
+     in_norm="attention_layernorm.weight", pre_ff_norm="feedforward_layernorm.weight", lm_head="lm_head.weight",
+     config={"model_type": "apertus", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4,
+             "num_key_value_heads": 2, "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "hidden_act": "xielu",
+             "max_position_embeddings": 128, "tie_word_embeddings": False})
+spec("nanochat", tok="gpt2", norm="rms_none", qk_norm="weightless", qk_norm_after_rope=True, embed_norm="norm.weight",
+     mlp="dense", up="mlp.fc1.weight", down="mlp.fc2.weight", act="relu2", final_softcap=15.0, lm_head="lm_head.weight",
+     config={"model_type": "nanochat", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4,
+             "num_key_value_heads": 2, "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "relu2",
+             "final_logit_softcapping": 15.0, "max_position_embeddings": 128, "tie_word_embeddings": False})
+spec("persimmon", tok="spm", NKV=4, norm="ln", eps=1e-5, qkv="self_attn.query_key_value.weight", qkv_layout="heads",
+     o="self_attn.dense.weight", attn_bias=True, o_bias=True, final_norm="final_layernorm.weight",
+     mlp="dense", up="mlp.dense_h_to_4h.weight", down="mlp.dense_4h_to_h.weight", mlp_bias=True, act="relu2",
+     qk_norm="head", q_norm="self_attn.q_layernorm.weight", k_norm="self_attn.k_layernorm.weight", rotary_dim=4,
+     lm_head="lm_head.weight",
+     config={"model_type": "persimmon", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2,
+             "num_attention_heads": 4, "layer_norm_eps": 1e-5, "partial_rotary_factor": 0.5, "rope_theta": 10000.0,
+             "hidden_act": "relu2", "qk_layernorm": True, "max_position_embeddings": 128, "tie_word_embeddings": False})
+spec("gptj", tok="gpt2", NKV=4, I=64, prefix="transformer.", layer="h.{i}.", embed="wte.weight", final_norm="ln_f.weight",
+     norm="ln", eps=1e-5, parallel=True, pre_ff_norm=None, in_norm="ln_1.weight",
+     q="attn.q_proj.weight", k="attn.k_proj.weight", v="attn.v_proj.weight", o="attn.out_proj.weight",
+     mlp="dense", up="mlp.fc_in.weight", down="mlp.fc_out.weight", mlp_bias=True, act="gelu_new",
+     rope_style="gptj", rotary_dim=4, lm_bias=True, lm_head="lm_head.weight",
+     config={"model_type": "gptj", "n_embd": 32, "n_layer": 2, "n_head": 4, "n_positions": 128, "n_inner": 64, "rotary_dim": 4,
+             "activation_function": "gelu_new", "layer_norm_epsilon": 1e-5, "vocab_size": 0, "tie_word_embeddings": False})
+spec("codegen", tok="gpt2", NKV=4, I=64, prefix="transformer.", layer="h.{i}.", embed="wte.weight", final_norm="ln_f.weight",
+     norm="ln", eps=1e-5, parallel=True, pre_ff_norm=None, in_norm="ln_1.weight",
+     qkv="attn.qkv_proj.weight", qkv_layout="mp", qkv_mp=4, o="attn.out_proj.weight",
+     mlp="dense", up="mlp.fc_in.weight", down="mlp.fc_out.weight", mlp_bias=True, act="gelu_new",
+     rope_style="gptj", rotary_dim=4, lm_bias=True, lm_head="lm_head.weight",
+     config={"model_type": "codegen", "n_embd": 32, "n_layer": 2, "n_head": 4, "n_positions": 128, "n_ctx": 128, "n_inner": 64,
+             "rotary_dim": 4, "activation_function": "gelu_new", "layer_norm_epsilon": 1e-5, "vocab_size": 0,
+             "tie_word_embeddings": False})
+spec("gpt_neo", tok="gpt2", NKV=4, I=64, prefix="transformer.", layer="h.{i}.", embed="wte.weight", pos_embed="wpe.weight",
+     final_norm="ln_f.weight", norm="ln", eps=1e-5, in_norm="ln_1.weight", pre_ff_norm="ln_2.weight", pos="learned",
+     q="attn.attention.q_proj.weight", k="attn.attention.k_proj.weight", v="attn.attention.v_proj.weight",
+     o="attn.attention.out_proj.weight", attn_bias=False, o_bias=True, attn_scale=1.0,
+     mlp="dense", up="mlp.c_fc.weight", down="mlp.c_proj.weight", mlp_bias=True, act="gelu_new",
+     sliding=4, sliding_layers=[0, 1], lm_head=None,
+     config={"model_type": "gpt_neo", "hidden_size": 32, "num_layers": 2, "num_heads": 4, "intermediate_size": 64,
+             "max_position_embeddings": 64, "window_size": 4, "attention_types": [[["global", "local"], 1]],
+             "activation_function": "gelu_new", "layer_norm_epsilon": 1e-5, "vocab_size": 0, "tie_word_embeddings": True})
+spec("xglm", tok="spm", NKV=4, pos="sinusoidal", pos_offset=2, embed_scale=float(np.sqrt(32.0)), norm="ln", eps=1e-5,
+     in_norm="self_attn_layer_norm.weight", pre_ff_norm="final_layer_norm.weight", final_norm="layer_norm.weight",
+     o="self_attn.out_proj.weight", attn_bias=True, o_bias=True,
+     mlp="dense", up="fc1.weight", down="fc2.weight", mlp_bias=True, act="gelu", lm_head=None,
+     config={"model_type": "xglm", "d_model": 32, "ffn_dim": 32, "num_layers": 2, "attention_heads": 4,
+             "max_position_embeddings": 128, "activation_function": "gelu", "scale_embedding": True, "vocab_size": 0,
+             "tie_word_embeddings": True})
+spec("biogpt", tok="spm", NKV=4, prefix="biogpt.", pos_embed="embed_positions.weight", pos="learned", pos_offset=2,
+     embed_scale=float(np.sqrt(32.0)), norm="ln", eps=1e-5, in_norm="self_attn_layer_norm.weight",
+     pre_ff_norm="final_layer_norm.weight", final_norm="layer_norm.weight", o="self_attn.out_proj.weight",
+     attn_bias=True, o_bias=True, mlp="dense", up="fc1.weight", down="fc2.weight", mlp_bias=True, act="gelu",
+     lm_head="output_projection.weight",
+     config={"model_type": "biogpt", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2,
+             "num_attention_heads": 4, "max_position_embeddings": 64, "hidden_act": "gelu", "scale_embedding": True,
+             "vocab_size": 0, "tie_word_embeddings": False})
+spec("ministral3", tok="llama3", attn_temp_always=(4.0, 0.5), lm_head="lm_head.weight",
+     config={"model_type": "ministral3", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2,
+             "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8, "rms_norm_eps": 1e-6, "hidden_act": "silu",
+             "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0, "llama_4_scaling_beta": 0.5},
+             "max_position_embeddings": 4, "tie_word_embeddings": False})
+spec("granite_swa", tok="starcoder", L=3, embed_scale=2.0, attn_scale=0.25, residual_mult=0.5, logit_scale=0.25,
+     sinks="self_attn.sinks", sliding=4, sliding_layers=[1, 0, 1], rope_local=(50000.0, None), lm_head=None,
+     config={"model_type": "granite_swa", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 3,
+             "num_attention_heads": 4, "num_key_value_heads": 2, "rms_norm_eps": 1e-6, "rope_theta": 10000.0,
+             "layer_rope_theta": {"full_attention": 10000.0, "sliding_attention": 50000.0},
+             "layer_types": ["sliding_attention", "full_attention", "sliding_attention"], "sliding_window": 4,
+             "embedding_multiplier": 2.0, "attention_multiplier": 0.25, "residual_multiplier": 0.5, "logits_scaling": 4.0,
+             "hidden_act": "silu", "max_position_embeddings": 128, "tie_word_embeddings": True})
+
+# Mixture-of-experts families. `DS_ROUTER` is the DeepSeek-V3 router shared by
+# dots.llm1, EXAONE-MoE and Solar Open: sigmoid scores, a correction bias that
+# only steers the choice, group-limited top-k, renormalisation and a routed
+# scaling factor, plus always-on shared experts.
+DS_ROUTER = {"E": 4, "K": 2, "MI": 12, "shared": 1, "shared_inter": 16, "scoring": "sigmoid", "group_limited": True,
+             "n_group": 2, "topk_group": 1, "rsf": 2.5, "norm": True, "corr_bias": True, "layout": "separate",
+             "prefix": "mlp.", "router": "gate.weight", "shared_name": "shared_experts."}
+spec("olmoe", tok="llama3", L=2, qk_norm="full", clip=0.8, lm_head="lm_head.weight", eps=1e-5,
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 0, "scoring": "softmax", "group_limited": False, "rsf": 1.0, "norm": True,
+          "layers": [0, 1], "corr_bias": False, "layout": "separate", "prefix": "mlp.", "router": "gate.weight"},
+     config={"model_type": "olmoe", "hidden_size": 32, "intermediate_size": 12, "num_hidden_layers": 2, "num_attention_heads": 4,
+             "num_key_value_heads": 2, "num_experts": 4, "num_experts_per_tok": 2, "norm_topk_prob": True, "clip_qkv": 0.8,
+             "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "hidden_act": "silu", "max_position_embeddings": 128,
+             "tie_word_embeddings": False})
+spec("flex_olmo", tok="llama3", L=2, qk_norm="full", in_norm=None, post_attn_norm="post_attention_layernorm.weight",
+     pre_ff_norm=None, post_ff_norm="post_feedforward_layernorm.weight", lm_head="lm_head.weight",
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 0, "scoring": "softmax", "group_limited": False, "rsf": 1.0, "norm": False,
+          "layers": [0, 1], "corr_bias": False, "layout": "fused", "prefix": "mlp.", "router": "gate.weight"},
+     config={"model_type": "flex_olmo", "hidden_size": 32, "intermediate_size": 12, "num_hidden_layers": 2,
+             "num_attention_heads": 4, "num_key_value_heads": 2, "num_experts": 4, "num_experts_per_tok": 2,
+             "norm_topk_prob": False, "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "silu",
+             "max_position_embeddings": 128, "tie_word_embeddings": False})
+spec("dots1", tok="qwen2", L=3, qk_norm="head", sliding=4, sliding_layers=[1, 1, 0], lm_head="lm_head.weight",
+     moe=dict(DS_ROUTER, layers=[1, 2]),
+     config={"model_type": "dots1", "hidden_size": 32, "intermediate_size": 32, "moe_intermediate_size": 12,
+             "num_hidden_layers": 3, "num_attention_heads": 4, "num_key_value_heads": 2, "n_routed_experts": 4,
+             "n_shared_experts": 1, "num_experts_per_tok": 2, "first_k_dense_replace": 1, "n_group": 2, "topk_group": 1,
+             "routed_scaling_factor": 2.5, "norm_topk_prob": True, "sliding_window": 4,
+             "layer_types": ["sliding_attention", "sliding_attention", "full_attention"],
+             "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "silu", "max_position_embeddings": 128,
+             "tie_word_embeddings": False})
+spec("exaone_moe", tok="llama3", L=4, qk_norm="head", sliding=4, sliding_layers=[1, 1, 1, 0], lm_head="lm_head.weight",
+     moe=dict(DS_ROUTER, layers=[1, 2, 3]),
+     config={"model_type": "exaone_moe", "hidden_size": 32, "intermediate_size": 32, "moe_intermediate_size": 12,
+             "num_hidden_layers": 4, "num_attention_heads": 4, "num_key_value_heads": 2, "num_experts": 4,
+             "num_shared_experts": 1, "num_experts_per_tok": 2, "n_group": 2, "topk_group": 1, "routed_scaling_factor": 2.5,
+             "norm_topk_prob": True, "sliding_window": 4, "sliding_window_pattern": 4,
+             "mlp_layer_types": ["dense", "sparse", "sparse", "sparse"],
+             "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "hidden_act": "silu", "max_position_embeddings": 128,
+             "tie_word_embeddings": False})
+spec("solar_open", tok="llama3", L=2, rotary_dim=4, lm_head="lm_head.weight",
+     moe=dict(DS_ROUTER, layers=[0, 1], layout="fused"),
+     config={"model_type": "solar_open", "hidden_size": 32, "moe_intermediate_size": 12, "num_hidden_layers": 2,
+             "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8, "n_routed_experts": 4, "n_shared_experts": 1,
+             "num_experts_per_tok": 2, "n_group": 2, "topk_group": 1, "routed_scaling_factor": 2.5, "norm_topk_prob": True,
+             "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0,
+                                                                              "partial_rotary_factor": 0.5},
+             "hidden_act": "silu", "max_position_embeddings": 128, "tie_word_embeddings": False})
+spec("afmoe", tok="qwen2", L=3, qk_norm="head", attn_gate=("self_attn.gate_proj.weight", "sigmoid", False),
+     post_attn_norm="post_attention_layernorm.weight", pre_ff_norm="pre_mlp_layernorm.weight",
+     post_ff_norm="post_mlp_layernorm.weight", sliding=4, sliding_layers=[1, 0, 1], lm_head="lm_head.weight",
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "shared_inter": 24, "scoring": "sigmoid", "group_limited": False,
+          "rsf": 1.5, "norm": True, "layers": [1, 2], "corr_bias": True, "corr_bias_name": "mlp.expert_bias",
+          "layout": "separate", "prefix": "mlp.", "router": "router.gate.weight", "shared_name": "shared_experts."},
+     config={"model_type": "afmoe", "hidden_size": 32, "intermediate_size": 32, "moe_intermediate_size": 12,
+             "num_hidden_layers": 3, "num_dense_layers": 1, "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
+             "num_experts": 4, "num_experts_per_tok": 2, "num_shared_experts": 2, "route_scale": 1.5,
+             "global_attn_every_n_layers": 2, "sliding_window": 4,
+             "layer_types": ["sliding_attention", "full_attention", "sliding_attention"],
+             "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "hidden_act": "silu", "max_position_embeddings": 128,
+             "tie_word_embeddings": False})
+spec("mellum", tok="gpt2", L=2, qk_norm="head", lm_head="lm_head.weight",
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 0, "scoring": "softmax", "group_limited": False, "rsf": 1.0, "norm": True,
+          "layers": [0, 1], "corr_bias": False, "layout": "fused", "prefix": "mlp.", "router": "gate.weight"},
+     config={"model_type": "mellum", "hidden_size": 32, "intermediate_size": 32, "moe_intermediate_size": 12,
+             "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8, "num_experts": 4,
+             "num_experts_per_tok": 2, "norm_topk_prob": True, "mlp_layer_types": ["sparse", "sparse"],
+             "layer_types": ["full_attention", "full_attention"],
+             "rms_norm_eps": 1e-6, "rope_parameters": {"full_attention": {"rope_type": "default", "rope_theta": 10000.0}},
+             "hidden_act": "silu", "max_position_embeddings": 128, "tie_word_embeddings": False})
+spec("laguna", tok="llama3", L=3, qk_norm="head", attn_gate=("self_attn.g_proj.weight", "softplus", True),
+     sliding=4, sliding_layers=[1, 0, 1], lm_head="lm_head.weight",
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "shared_inter": 16, "scoring": "sigmoid", "group_limited": False,
+          "rsf": 2.0, "norm": True, "softcap": 5.0, "layers": [1, 2], "corr_bias": True, "layout": "separate",
+          "prefix": "mlp.", "router": "gate.weight", "shared_name": "shared_experts."},
+     config={"model_type": "laguna", "hidden_size": 32, "intermediate_size": 32, "moe_intermediate_size": 12,
+             "shared_expert_intermediate_size": 16, "num_hidden_layers": 3, "num_attention_heads": 4,
+             "num_key_value_heads": 2, "head_dim": 8, "num_experts": 4, "num_experts_per_tok": 2, "gating": "per-head",
+             "moe_routed_scaling_factor": 2.0, "moe_router_logit_softcapping": 5.0, "sliding_window": 4,
+             "layer_types": ["sliding_attention", "full_attention", "sliding_attention"],
+             "mlp_layer_types": ["dense", "sparse", "sparse"],
+             "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "silu", "max_position_embeddings": 128,
+             "tie_word_embeddings": False})
+spec("hy_v3", tok="gpt2", L=3, qk_norm="head", lm_head="lm_head.weight", eps=1e-5,
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "shared_inter": 12, "scoring": "sigmoid", "group_limited": False,
+          "rsf": 2.826, "norm": True, "layers": [1, 2], "corr_bias": True, "corr_bias_name": "mlp.expert_bias",
+          "layout": "separate", "prefix": "mlp.", "router": "router.gate.weight", "shared_name": "shared_mlp."},
+     config={"model_type": "hy_v3", "hidden_size": 32, "intermediate_size": 32, "moe_intermediate_size": 12,
+             "num_hidden_layers": 3, "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8, "num_experts": 4,
+             "num_experts_per_tok": 2, "num_shared_experts": 1, "router_scaling_factor": 2.826,
+             "mlp_layer_types": ["dense", "sparse", "sparse"],
+             "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "hidden_act": "silu", "max_position_embeddings": 128,
+             "tie_word_embeddings": False})
+
 # --- generation ------------------------------------------------------------
 
 def generate_generic(family, out_dir):
@@ -833,7 +1046,7 @@ def generate_generic(family, out_dir):
 
     def normw(name, n):
         """Norm weight (stored as w - 1 for the (1 + w) families) and, for LayerNorm families, its bias."""
-        if name is None or name == "":
+        if name is None or name == "" or s["norm"] == "rms_none":
             return None
         w = bf16_round(1.0 + rng.normal(0, 0.1, size=(n,)))
         stored = w - 1.0 if s["norm"] in ("rms1p", "ln1p") else w
@@ -957,6 +1170,22 @@ def generate_generic(family, out_dir):
                 weights[lp + s["k_norm"]] = weights[lp + s["k_norm"]].reshape(NKV, HD)
         if not lin_layers[i] and s["sinks"]:
             d["sinks"] = vec(lp + s["sinks"], NH, 1.0)
+        if s["attn_sub_norm"]:
+            d["asn"] = normw(lp + s["attn_sub_norm"], NH * VD)
+        if s["ffn_sub_norm"]:
+            d["fsn"] = normw(lp + s["ffn_sub_norm"], I)
+        if s["attn_gate"]:
+            gname, _, per_head = s["attn_gate"]
+            d["ag"] = mat(lp + gname, NH if per_head else NH * VD, H)
+        if s["xielu"]:
+            # Stored pre-softplus: alpha_p = softplus(p), alpha_n = 0.5 + softplus(n).
+            ap, an = s["xielu"]
+            stored = []
+            for nm, val in (("alpha_p", np.log(np.expm1(ap))), ("alpha_n", np.log(np.expm1(an - 0.5)))):
+                w = bf16_round(np.array([val], np.float32))
+                weights[lp + f"mlp.act_fn.{nm}"] = w
+                stored.append(float(w[0]))
+            d["xielu"] = (np.log1p(np.exp(stored[0])), 0.5 + np.log1p(np.exp(stored[1])))
         moe = s["moe"]
         if moe and i in moe["layers"]:
             mp = lp + moe["prefix"]
@@ -1100,12 +1329,14 @@ def generate_generic(family, out_dir):
     eps = s["eps"]
 
     def norm(x, nw):
+        if s["norm"] == "rms_none":
+            return x / np.sqrt(np.mean(x * x, -1, keepdims=True) + eps)
         if s["norm"] == "none":
             mu = x.mean(-1, keepdims=True)
             var = ((x - mu) ** 2).mean(-1, keepdims=True)
             return (x - mu) / np.sqrt(var + eps)
         w, b = nw
-        if s["norm"] in ("rms", "rms1p"):
+        if s["norm"] in ("rms", "rms1p", "rms_none"):
             return x / np.sqrt(np.mean(x * x, -1, keepdims=True) + eps) * w
         mu = x.mean(-1, keepdims=True)
         var = ((x - mu) ** 2).mean(-1, keepdims=True)
@@ -1116,7 +1347,7 @@ def generate_generic(family, out_dir):
         """q/k norm over the last axis of x (weightless RMS when w is None)."""
         if w is None:
             return x / np.sqrt(np.mean(x * x, -1, keepdims=True) + eps)
-        if s["norm"] in ("rms", "rms1p"):
+        if s["norm"] in ("rms", "rms1p", "rms_none"):
             return x / np.sqrt(np.mean(x * x, -1, keepdims=True) + eps) * w
         mu = x.mean(-1, keepdims=True)
         var = ((x - mu) ** 2).mean(-1, keepdims=True)
@@ -1140,9 +1371,10 @@ def generate_generic(family, out_dir):
 
     rd = s["rotary_dim"]
 
-    def inv_freq_and_factor(theta):
+    def inv_freq_and_factor(theta, sc=None):
         inv = 1.0 / (theta ** (np.arange(0, rd, 2, dtype=np.float64) / rd))
-        sc = s["scaling"]
+        if sc is None:
+            sc = s["scaling"]
         factor = 1.0
         if sc and sc.get("type", sc.get("rope_type")) == "yarn":
             f = sc["factor"]
@@ -1177,15 +1409,23 @@ def generate_generic(family, out_dir):
             factor = 1.0 if f <= 1 else np.sqrt(1 + np.log(f) / np.log(om))
         return inv, factor
 
-    def rope_tables(T):
-        inv, factor = inv_freq_and_factor(s["theta"])
+    def rope_tables(T, theta=None, sc=None):
+        inv, factor = inv_freq_and_factor(s["theta"] if theta is None else theta, sc)
         ang = np.outer(np.arange(T, dtype=np.float64), inv)
         return (np.cos(ang) * factor).astype(np.float32), (np.sin(ang) * factor).astype(np.float32)
 
     def apply_rope(x, cos, sin, off):  # x [T, nh, HD]
         rot = x[..., off:off + rd]
         c, sn = cos[:, None, :], sin[:, None, :]
-        if s["rope_style"] == "neox":
+        if s["rope_style"] == "helium":
+            # Interleaved pairs against the duplicated `[f | f]` table: coordinate
+            # j is rotated by the angle of frequency `j mod rd/2`.
+            full = np.concatenate([cos, cos], -1)[:, None, :], np.concatenate([sin, sin], -1)[:, None, :]
+            x1, x2 = rot[..., 0::2], rot[..., 1::2]
+            out = np.empty_like(rot)
+            out[..., 0::2] = x1 * full[0][..., 0::2] - x2 * full[1][..., 0::2]
+            out[..., 1::2] = x2 * full[0][..., 1::2] + x1 * full[1][..., 1::2]
+        elif s["rope_style"] == "neox":
             x1, x2 = rot[..., :rd // 2], rot[..., rd // 2:]
             out = np.concatenate([x1 * c - x2 * sn, x2 * c + x1 * sn], -1)
         else:
@@ -1250,6 +1490,14 @@ def generate_generic(family, out_dir):
                 elif s["qkv_layout"] == "heads":
                     f = f.reshape(T, NH, 3, HD)
                     q, k, v = f[:, :, 0].reshape(T, qd), f[:, :, 1].reshape(T, kvd), f[:, :, 2].reshape(T, kvd)
+                elif s["qkv_layout"] == "mp":
+                    # CodeGen: `qkv_mp` tensor-parallel blocks of [q | v | k].
+                    mp = s["qkv_mp"]
+                    local = qd // mp
+                    blocks = f.reshape(T, mp, 3 * local)
+                    q = blocks[:, :, :local].reshape(T, qd)
+                    v = blocks[:, :, local:2 * local].reshape(T, kvd)
+                    k = blocks[:, :, 2 * local:].reshape(T, kvd)
                 else:  # grouped
                     g = NH // NKV
                     f = f.reshape(T, NKV, g + 2, HD)
@@ -1273,7 +1521,9 @@ def generate_generic(family, out_dir):
                 q = head_norm(q, *d["qn"])
                 k = head_norm(k, *d["kn"])
             q, k, v = q.reshape(T, NH, HD), k.reshape(T, NKV, HD), v.reshape(T, NKV, HD)
-            if qn == "head" and not s["qk_norm_after_rope"]:
+            if qn == "weightless" and not s["qk_norm_after_rope"]:
+                q, k = head_norm(q, None, None), head_norm(k, None, None)
+            elif qn == "head" and not s["qk_norm_after_rope"]:
                 q, k = head_norm(q, *d["qn"]), head_norm(k, *d["kn"])
             elif qn == "heads":
                 q = head_norm(q, d["qn"][0].reshape(NH, HD), None)
@@ -1286,7 +1536,13 @@ def generate_generic(family, out_dir):
                 p = np.arange(T, dtype=np.float32)
                 scl = np.log(np.floor((p + 1.0) / s["temp"]["floor_scale"]) + 1.0) * s["temp"]["attn_scale"] + 1.0
                 q = q * scl[:, None, None]
-            if qn == "head" and s["qk_norm_after_rope"]:
+            if s["attn_temp_always"]:
+                floor_scale, beta = s["attn_temp_always"]
+                p = np.arange(T, dtype=np.float32)
+                q = q * (1.0 + beta * np.log(1.0 + np.floor(p / floor_scale)))[:, None, None]
+            if qn == "weightless" and s["qk_norm_after_rope"]:
+                q, k = head_norm(q, None, None), head_norm(k, None, None)
+            elif qn == "head" and s["qk_norm_after_rope"]:
                 q, k = head_norm(q, *d["qn"]), head_norm(k, *d["kn"])
             groups = NH // NKV
         slopes = alibi_slopes(NH) if s["pos"] == "alibi" else None
@@ -1308,7 +1564,16 @@ def generate_generic(family, out_dir):
             if "sinks" in d:
                 pr = pr[:, :T]
             out[:, hh, :] = pr @ v[:, kv, :]
-        o = out.reshape(T, NH * VD) @ d["o"].T
+        flat = out.reshape(T, NH * VD)
+        if s["attn_gate"]:
+            _, kind, per_head = s["attn_gate"]
+            g = h @ d["ag"].T
+            if per_head:
+                g = np.repeat(g, VD, axis=-1)
+            flat = flat * (1 / (1 + np.exp(-g)) if kind == "sigmoid" else np.log1p(np.exp(g)))
+        if s["attn_sub_norm"]:
+            flat = norm(flat, d["asn"])
+        o = flat @ d["o"].T
         if d["ob"] is not None:
             o = o + d["ob"]
         if s["gated_q"] and not s["mla"] and not s["qkv"]:
@@ -1461,6 +1726,9 @@ def generate_generic(family, out_dir):
             logits = h @ d["router"].T
             if d["router_b"] is not None:
                 logits = logits + d["router_b"]
+            if moe.get("softcap"):
+                cap = np.float32(moe["softcap"])
+                logits = cap * np.tanh(logits / cap)
             if moe["scoring"] in ("softmax", "topk_softmax"):
                 sc_ = np.exp(logits - logits.max(-1, keepdims=True))
                 sc_ = sc_ / sc_.sum(-1, keepdims=True)
@@ -1527,28 +1795,48 @@ def generate_generic(family, out_dir):
             u = h @ d["up"].T
             if d["ub"] is not None:
                 u = u + d["ub"]
-            m = act_fn(u)
+            if s["xielu"]:
+                # xIELU (Apertus): alpha_p x² + beta x for x > 0, else
+                # alpha_n (expm1(min(x, eps)) - x) + beta x, with beta = 0.5.
+                ap, an = d["xielu"]
+                m = np.where(u > 0, ap * u * u + 0.5 * u, an * (np.expm1(np.minimum(u, -1e-6)) - u) + 0.5 * u)
+            else:
+                m = act_fn(u)
+        if s["ffn_sub_norm"]:
+            m = norm(m, d["fsn"])
         y = m @ d["down"].T
         if d["db"] is not None:
             y = y + d["db"]
         return y
+
+    def sinusoidal(T):
+        """fairseq / XGLM table `[sin(p f) | cos(p f)]`, indexed at `p + offset`."""
+        half = H // 2
+        step = np.log(10000) / (half - 1)
+        freqs = np.exp(np.arange(half, dtype=np.float64) * -step)
+        ang = np.outer(np.arange(T + s["pos_offset"], dtype=np.float64), freqs)
+        return np.concatenate([np.sin(ang), np.cos(ang)], 1).astype(np.float32)
 
     def forward(tokens):
         T = len(tokens)
         x = embed[tokens] * np.float32(s["embed_scale"])
         if pos_embed is not None:
             x = x + pos_embed[s["pos_offset"] + np.arange(T)]
-        if embed_norm is not None:
+        if s["pos"] == "sinusoidal":
+            x = x + sinusoidal(T)[s["pos_offset"]:s["pos_offset"] + T]
+        if s["embed_norm"]:
             x = norm(x, embed_norm)
         hidden = [x.copy()]
         cos, sin = rope_tables(T)
+        cos_local, sin_local = (rope_tables(T, *s["rope_local"]) if s["rope_local"] else (cos, sin))
         rm = np.float32(s["residual_mult"])
         for li, d in enumerate(layers):
-            h = norm(x, d["in_norm"]) if (d["in_norm"] is not None or s["norm"] == "none") and s["in_norm"] is not None else x
+            h = norm(x, d["in_norm"]) if (d["in_norm"] is not None or s["norm"] in ("none", "rms_none")) and s["in_norm"] is not None else x
             if lin_layers[li] and s["linear_kind"] == "lightning":
                 a = lightning_attn(d, li, h)
             else:
-                a = linear_attn(d, h) if lin_layers[li] else attention(d, li, h, cos, sin)
+                local = sliding_layers[li] and s["rope_local"] is not None
+                a = linear_attn(d, h) if lin_layers[li] else attention(d, li, h, cos_local if local else cos, sin_local if local else sin)
             if d["post_attn_norm"] is not None:
                 a = norm(a, d["post_attn_norm"])
             if s["residual_layout"] == "minimax":
@@ -1568,17 +1856,19 @@ def generate_generic(family, out_dir):
                 x = x + rm * (a + m)
             else:
                 x = x + rm * a
-                h2 = norm(x, d["pre_ff_norm"]) if (d["pre_ff_norm"] is not None or s["norm"] == "none") and s["pre_ff_norm"] is not None else x
+                h2 = norm(x, d["pre_ff_norm"]) if (d["pre_ff_norm"] is not None or s["norm"] in ("none", "rms_none")) and s["pre_ff_norm"] is not None else x
                 m = mlp(d, h2)
                 if d["post_ff_norm"] is not None:
                     m = norm(m, d["post_ff_norm"])
                 x = x + rm * m
             hidden.append(x.copy())
-        hfin = norm(x, final_norm) if s["norm"] != "none" else norm(x, None)
+        hfin = norm(x, final_norm) if s["norm"] not in ("none", "rms_none") else norm(x, None)
         logits = hfin @ lm_head.T
         if lm_bias is not None:
             logits = logits + lm_bias
         logits = logits * np.float32(s["logit_scale"])
+        if s["final_softcap"]:
+            logits = np.float32(s["final_softcap"]) * np.tanh(logits / np.float32(s["final_softcap"]))
         return logits, hidden
 
     cases = []

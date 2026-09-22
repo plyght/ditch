@@ -253,6 +253,83 @@ test "kimi_k25 fixture (DeepSeek V3 text config under a multimodal wrapper)" {
     try checkFixture("kimi_k25");
 }
 
+// Families swept from transformers' MODEL_FOR_CAUSAL_LM mapping.
+test "arcee fixture (dense relu² MLP)" {
+    try checkFixture("arcee");
+}
+test "jais2 fixture (LayerNorm, dense relu² MLP with biases)" {
+    try checkFixture("jais2");
+}
+test "ernie4_5 fixture (interleaved rotary, use_bias)" {
+    try checkFixture("ernie4_5");
+}
+test "helium fixture (interleaved pairs against the duplicated rotary table)" {
+    try checkFixture("helium");
+}
+test "hunyuan_v1_dense fixture (q/k norm after rope, NTK-alpha base)" {
+    try checkFixture("hunyuan_v1_dense");
+}
+test "bitnet fixture (attention and MLP sub-norms)" {
+    try checkFixture("bitnet");
+}
+test "apertus fixture (xIELU activation, attention/feedforward norms)" {
+    try checkFixture("apertus");
+}
+test "nanochat fixture (non-parametric norms, weightless q/k norm, logit softcap)" {
+    try checkFixture("nanochat");
+}
+test "persimmon fixture (head-interleaved qkv, per-head q/k LayerNorm)" {
+    try checkFixture("persimmon");
+}
+test "gptj fixture (parallel residual, interleaved partial rotary)" {
+    try checkFixture("gptj");
+}
+test "codegen fixture (tensor-parallel [q | v | k] blocks)" {
+    try checkFixture("codegen");
+}
+test "gpt_neo fixture (learned positions, unscaled logits, local layers)" {
+    try checkFixture("gpt_neo");
+}
+test "xglm fixture (sinusoidal positions, embedding scale)" {
+    try checkFixture("xglm");
+}
+test "biogpt fixture (learned positions with offset 2, output_projection)" {
+    try checkFixture("biogpt");
+}
+test "ministral3 fixture (query scaling on every layer)" {
+    try checkFixture("ministral3");
+}
+test "granite_swa fixture (attention sinks, sliding layers with their own rope base)" {
+    try checkFixture("granite_swa");
+}
+test "olmoe fixture (full-projection q/k norm, clip_qkv, softmax routing)" {
+    try checkFixture("olmoe");
+}
+test "flex_olmo fixture (post-norms, fused experts)" {
+    try checkFixture("flex_olmo");
+}
+test "dots1 fixture (DeepSeek-V3 routing, shared experts, sliding layers)" {
+    try checkFixture("dots1");
+}
+test "exaone_moe fixture (sliding_window_pattern, mlp_layer_types)" {
+    try checkFixture("exaone_moe");
+}
+test "solar_open fixture (partial rotary, fused experts with a shared expert)" {
+    try checkFixture("solar_open");
+}
+test "afmoe fixture (sigmoid attention gate, four norms, route_scale)" {
+    try checkFixture("afmoe");
+}
+test "mellum fixture (per-layer-type rope parameters, softmax routing)" {
+    try checkFixture("mellum");
+}
+test "laguna fixture (per-head softplus gate, router logit softcapping)" {
+    try checkFixture("laguna");
+}
+test "hy_v3 fixture (checkpoint MoE names, shared_mlp)" {
+    try checkFixture("hy_v3");
+}
+
 // Quantised checkpoints (dequantised on load, see dequant.zig): the reference
 // logits were computed on the dequantised weights.
 test "qwen2_fp8 fixture (FP8 E4M3 with block scales)" {
@@ -443,6 +520,42 @@ test "kimi_linear_hf edit, export and streamed reload (fused conv1d, stacked exp
 }
 test "kimi_k25 edit, export and streamed reload (language_model prefix)" {
     try checkEditExportStream("kimi_k25");
+}
+test "bitnet edit, export and streamed reload (attention and MLP sub-norms)" {
+    try checkEditExportStream("bitnet");
+}
+test "apertus edit, export and streamed reload (xIELU parameters)" {
+    try checkEditExportStream("apertus");
+}
+test "persimmon edit, export and streamed reload (head-interleaved qkv)" {
+    try checkEditExportStream("persimmon");
+}
+test "codegen edit, export and streamed reload (tensor-parallel qkv blocks)" {
+    try checkEditExportStream("codegen");
+}
+test "gpt_neo edit, export and streamed reload (learned positions, local layers)" {
+    try checkEditExportStream("gpt_neo");
+}
+test "xglm edit, export and streamed reload (sinusoidal positions)" {
+    try checkEditExportStream("xglm");
+}
+test "granite_swa edit, export and streamed reload (sinks, per-layer-type rope)" {
+    try checkEditExportStream("granite_swa");
+}
+test "olmoe edit, export and streamed reload (separate experts, clip_qkv)" {
+    try checkEditExportStream("olmoe");
+}
+test "dots1 edit, export and streamed reload (shared experts, correction bias)" {
+    try checkEditExportStream("dots1");
+}
+test "afmoe edit, export and streamed reload (attention gate, four norms)" {
+    try checkEditExportStream("afmoe");
+}
+test "laguna edit, export and streamed reload (per-head gate, router softcap)" {
+    try checkEditExportStream("laguna");
+}
+test "hy_v3 edit, export and streamed reload (checkpoint MoE names)" {
+    try checkEditExportStream("hy_v3");
 }
 test "qwen2_fp8 edit, export and streamed reload (dequantised on load)" {
     try checkEditExportStream("qwen2_fp8");

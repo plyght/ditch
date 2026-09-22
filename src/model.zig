@@ -84,6 +84,7 @@ pub const Slot = enum {
     lin_g_b,
     light_qkv,
     light_gate,
+    attn_gate,
     // DeepSeek V4 / V4.1 (deepseek_v4.zig)
     d_q_a,
     d_q_b,
@@ -215,6 +216,14 @@ pub const Layer = struct {
     mlp_norm: ?Norm,
     q_norm: ?Norm,
     k_norm: ?Norm,
+    /// BitNet sub-layer norms: on the attention output before `o` and on the
+    /// activated MLP intermediate before `down`.
+    attn_sub_norm: ?Norm = null,
+    ffn_sub_norm: ?Norm = null,
+    /// Attention output gate projection `[heads * head_dim | heads][hidden]` (AFMoE, Laguna).
+    attn_gate: ?Weight = null,
+    /// xIELU activation parameters `(alpha_p, alpha_n)` after softplus (Apertus).
+    xielu: ?[2]f32 = null,
     /// Separate projections, or one fused `qkv`.
     q: ?Weight,
     k: ?Weight,
@@ -306,6 +315,7 @@ pub const Layer = struct {
             .lin_g_b => self.linear.?.g_b = w,
             .light_qkv => self.linear.?.light_qkv = w,
             .light_gate => self.linear.?.light_gate = w,
+            .attn_gate => self.attn_gate = w,
             .d_q_a => self.dsv4.?.q_a = w,
             .d_q_b => self.dsv4.?.q_b = w,
             .d_kv => self.dsv4.?.kv = w,
@@ -457,6 +467,8 @@ pub const Model = struct {
     lm_head_bias: ?[]const f32,
     /// Learned absolute position table (GPT-2, OPT).
     pos_embed_ref: ?WeightRef,
+    /// Sinusoidal position table `[positions][hidden]` (XGLM), computed on load.
+    sin_pos: []f32,
     /// LayerNorm on the embeddings (BLOOM).
     embed_norm: ?Norm,
     largest_layer_bytes: u64,
@@ -936,8 +948,28 @@ pub const Model = struct {
             std.log.err("missing position embedding tensor", .{});
             return error.MissingWeights;
         }
-        self.embed_norm = if (names.embed_norm) |t| try self.loadNormOpt(try self.name(t)) else null;
-        self.final_norm = if (c.norm == .none) Norm{ .w = &.{} } else try self.loadNorm(try self.name(names.final_norm));
+        self.sin_pos = &.{};
+        if (c.positional == .sinusoidal) {
+            // fairseq / XGLM: `[sin(p * f_i) | cos(p * f_i)]`, `f_i = 10000^(-i / (half - 1))`,
+            // indexed at `position + position_offset`.
+            const hidden = c.hidden_size;
+            const half = hidden / 2;
+            const rows = @min(c.max_position_embeddings, 8192) + c.position_offset;
+            self.sin_pos = try arena.alloc(f32, rows * hidden);
+            @memset(self.sin_pos, 0);
+            for (0..rows) |p| {
+                const row = self.sin_pos[p * hidden ..][0..hidden];
+                for (0..half) |i| {
+                    const freq = @exp(-@log(10000.0) * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(@max(half - 1, 1))));
+                    const ang = @as(f64, @floatFromInt(p)) * freq;
+                    row[i] = @floatCast(@sin(ang));
+                    row[half + i] = @floatCast(@cos(ang));
+                }
+            }
+        }
+        const nonparametric = c.norm == .none or c.norm == .rms_none;
+        self.embed_norm = if (names.embed_norm) |t| (if (nonparametric) Norm{ .w = &.{} } else try self.loadNormOpt(try self.name(t))) else null;
+        self.final_norm = if (nonparametric) Norm{ .w = &.{} } else try self.loadNorm(try self.name(names.final_norm));
         self.lm_head_bias = null;
         var lm: ?WeightRef = null;
         for (names.lm_head) |t| {
@@ -970,7 +1002,7 @@ pub const Model = struct {
                 .input_norm = null,
                 .post_attn_norm = try self.normSlot(lp, names.post_attn_norm, true),
                 .pre_ff_norm = try self.normSlot(lp, names.pre_ff_norm, !c.parallel_residual),
-                .post_ff_norm = try self.normSlot(lp, names.post_ff_norm, true),
+                .post_ff_norm = try self.normSlot(lp, names.post_ff_norm, !names.post_ff_norm_optional),
                 .mlp_norm = try self.normSlot(lp, names.mlp_norm, false),
                 .q_norm = if (names.q_norm) |t| try self.loadNormOpt(try cat(arena, lp, t)) else null,
                 .k_norm = if (names.k_norm) |t| try self.loadNormOpt(try cat(arena, lp, t)) else null,
@@ -995,7 +1027,16 @@ pub const Model = struct {
                 .down_bias = null,
                 .refs = .{},
             };
-            if (c.norm == .none) {
+            if (names.attn_sub_norm) |t| layer.attn_sub_norm = try self.loadNormOpt(try cat(arena, lp, t));
+            if (names.ffn_sub_norm) |t| layer.ffn_sub_norm = try self.loadNormOpt(try cat(arena, lp, t));
+            if (names.xielu_alpha_p) |ap| {
+                // Stored pre-softplus: `alpha_p = softplus(p)`, `alpha_n = beta + softplus(n)` (beta 0.5).
+                const p = try self.loadVec(try cat(arena, lp, ap));
+                const n = try self.loadVec(try cat(arena, lp, names.xielu_alpha_n orelse return error.InvalidConfig));
+                if (p.len != 1 or n.len != 1) return error.InvalidConfig;
+                layer.xielu = .{ softplus(p[0]), 0.5 + softplus(n[0]) };
+            }
+            if (nonparametric) {
                 if (names.input_norm.len > 0) layer.input_norm = Norm{ .w = &.{} };
             } else {
                 for (names.input_norm) |t| {
@@ -1098,6 +1139,16 @@ pub const Model = struct {
                 if (layer.o.rows != c.hidden_size or layer.o.cols != c.num_heads * c.v_head_dim) {
                     std.log.err("layer {d}: output projection is [{d}][{d}], expected [{d}][{d}]", .{ i, layer.o.rows, layer.o.cols, c.hidden_size, c.num_heads * c.v_head_dim });
                     return error.InvalidConfig;
+                }
+                if (c.attn_gate != .none) {
+                    const g_name = try cat(arena, lp, names.attn_gate orelse return error.InvalidConfig);
+                    layer.attn_gate = try self.loadMat(g_name);
+                    layer.refs.add(.attn_gate, try self.ref(g_name), false);
+                    const g = layer.attn_gate.?;
+                    if (g.cols != c.hidden_size or (g.rows != c.num_heads * c.v_head_dim and g.rows != c.num_heads)) {
+                        std.log.err("layer {d}: attention gate is [{d}][{d}], expected [{d} or {d}][{d}]", .{ i, g.rows, g.cols, c.num_heads * c.v_head_dim, c.num_heads, c.hidden_size });
+                        return error.InvalidConfig;
+                    }
                 }
             }
 
@@ -1458,7 +1509,7 @@ pub const Model = struct {
     /// loaded parameters (`required` decides whether absence is an error).
     fn normSlot(self: *Model, lp: []const u8, template: ?[]const u8, required: bool) !?Norm {
         const t = template orelse return null;
-        if (self.config.norm == .none) return Norm{ .w = &.{} };
+        if (self.config.norm == .none or self.config.norm == .rms_none) return Norm{ .w = &.{} };
         const name_ = try cat(self.arena.allocator(), lp, t);
         return if (required) try self.loadNorm(name_) else try self.loadNormOpt(name_);
     }
@@ -1479,14 +1530,16 @@ pub const Model = struct {
         const c = &self.config;
         const arena = self.arena.allocator();
         const half = c.rotary_dim / 2;
-        self.rope_len = @min(c.max_position_embeddings, 8192);
+        // At least 512 rows, so that a model with a tiny declared context
+        // still rotates the positions ditch scores exactly.
+        self.rope_len = @min(@max(c.max_position_embeddings, 512), 8192);
         self.rope_cos = try arena.alloc(f32, self.rope_len * half);
         self.rope_sin = try arena.alloc(f32, self.rope_len * half);
         try self.fillRope(self.rope_cos, self.rope_sin, c.rope_theta, c.rope_scaling);
-        if (c.arch.norm == .rms_gemma and std.mem.startsWith(u8, c.model_type, "gemma3")) {
+        if (c.rope_local_distinct) {
             self.rope_cos_local = try arena.alloc(f32, self.rope_len * half);
             self.rope_sin_local = try arena.alloc(f32, self.rope_len * half);
-            try self.fillRope(self.rope_cos_local, self.rope_sin_local, c.rope_local_theta, .none);
+            try self.fillRope(self.rope_cos_local, self.rope_sin_local, c.rope_local_theta, c.rope_local_scaling);
         } else {
             self.rope_cos_local = self.rope_cos;
             self.rope_sin_local = self.rope_sin;
@@ -2281,6 +2334,7 @@ fn applyNorm(c: *const Config, out: []f32, x: []const f32, nm: Norm) void {
         .layer => tensor.layernorm(out, x, nm.w, nm.b, c.rms_norm_eps, false),
         .layer_1p => tensor.layernorm(out, x, nm.w, nm.b, c.rms_norm_eps, true),
         .none => tensor.layernorm(out, x, &.{}, null, c.rms_norm_eps, false),
+        .rms_none => tensor.rmsnorm(out, x, &.{}, c.rms_norm_eps, false),
     }
 }
 
@@ -2312,7 +2366,7 @@ fn normVecInPlace(c: *const Config, x: []f32, w: []const f32, b: ?[]const f32) v
         return;
     }
     switch (c.norm) {
-        .rms, .none => tensor.rmsnorm(out, x, w, c.rms_norm_eps, false),
+        .rms, .none, .rms_none => tensor.rmsnorm(out, x, w, c.rms_norm_eps, false),
         .rms_gemma => tensor.rmsnorm(out, x, w, c.rms_norm_eps, true),
         .layer, .layer_1p => tensor.layernorm(out, x, w, b, c.rms_norm_eps, false),
     }
@@ -2336,6 +2390,18 @@ fn ropeHead(c: *const Config, x: []f32, cos_row: []const f32, sin_row: []const f
     switch (c.rope_style) {
         .neox => tensor.applyRope(x[0..d], cos_row, sin_row),
         .gptj => tensor.applyRopeInterleaved(x[0..d], cos_row, sin_row),
+        .helium => {
+            // Interleaved pairs against the `[f | f]` table: coordinate j uses
+            // the angle of frequency `j mod d/2`.
+            const half = d / 2;
+            var i: usize = 0;
+            while (i + 1 < d) : (i += 2) {
+                const x1 = x[i];
+                const x2 = x[i + 1];
+                x[i] = x1 * cos_row[i % half] - x2 * sin_row[i % half];
+                x[i + 1] = x2 * cos_row[(i + 1) % half] + x1 * sin_row[(i + 1) % half];
+            }
+        },
     }
 }
 
@@ -2377,6 +2443,18 @@ fn scatterQkv(c: *const Config, fused: []const f32, q: []f32, k: []f32, v: []f32
                 for (0..groups) |j| @memcpy(q[(g * groups + j) * hd ..][0..hd], fused[base + j * hd ..][0..hd]);
                 @memcpy(k[g * hd ..][0..hd], fused[base + groups * hd ..][0..hd]);
                 @memcpy(v[g * hd ..][0..hd], fused[base + (groups + 1) * hd ..][0..hd]);
+            }
+        },
+        .mp_blocks => {
+            // CodeGen: `qkv_mp` blocks of `[q | v | k]`, each over `heads / qkv_mp` heads.
+            std.debug.assert(nkv == nh);
+            const mp = c.qkv_mp;
+            const local = qd / mp;
+            for (0..mp) |b| {
+                const base = b * 3 * local;
+                @memcpy(q[b * local ..][0..local], fused[base..][0..local]);
+                @memcpy(v[b * local ..][0..local], fused[base + local ..][0..local]);
+                @memcpy(k[b * local ..][0..local], fused[base + 2 * local ..][0..local]);
             }
         },
     }
@@ -2936,10 +3014,11 @@ fn attentionTail(model: *const Model, layer: *const Layer, li: usize, ws: *Works
             if (layer.k_norm) |nm| normVecInPlace(c, krow, nm.w, nm.b);
         }
         var temp: ?f32 = null;
-        if (!use_rope) {
-            if (c.attn_temperature) |t| {
+        if (c.attn_temperature) |t| {
+            if (!use_rope or t.every_layer) {
                 const p: f32 = @floatFromInt(rows[i].pos);
-                temp = @log(@floor((p + 1.0) / t.floor_scale) + 1.0) * t.attn_scale + 1.0;
+                const base = if (t.from_pos) p else p + 1.0;
+                temp = @log(@floor(base / t.floor_scale) + 1.0) * t.attn_scale + 1.0;
             }
         }
         const norm_before = do_qk_norm and !c.qk_norm_after_rope;
@@ -3006,6 +3085,31 @@ fn attentionTail(model: *const Model, layer: *const Layer, li: usize, ws: *Works
             dst += vd;
         }
     }
+    const od = c.num_heads * vd;
+    if (layer.attn_gate) |gw| {
+        // Gate from the layer input: per coordinate (`[heads * head_dim]` rows) or per head.
+        const per_head = gw.rows == c.num_heads;
+        const g = try gpa.alloc(f32, n * gw.rows);
+        defer gpa.free(g);
+        try tensor.matmulT(model.pool, gpa, g, ws.h[0 .. n * hidden], n, gw, null);
+        for (0..n) |r| {
+            const a = ws.attn[r * od ..][0..od];
+            const gr = g[r * gw.rows ..][0..gw.rows];
+            for (a, 0..) |*v, j| {
+                const gv = if (per_head) gr[j / vd] else gr[j];
+                v.* *= switch (c.attn_gate) {
+                    .sigmoid => 1.0 / (1.0 + @exp(-gv)),
+                    .softplus => softplus(gv),
+                    .none => unreachable,
+                };
+            }
+        }
+    }
+    if (layer.attn_sub_norm) |nm| {
+        const tmp = try gpa.alloc(f32, n * od);
+        defer gpa.free(tmp);
+        normRowsInPlace(c, ws.attn[0 .. n * od], n, od, nm, tmp);
+    }
     try tensor.matmulT(model.pool, gpa, ws.o, ws.attn, n, layer.o, if (layer.o_delta) |*d| d else null);
     if (layer.o_bias) |b| addBias(ws.o, n, hidden, b);
 }
@@ -3036,9 +3140,22 @@ pub fn mlpBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Worksp
         .dense => {
             try tensor.matmulT(model.pool, gpa, ws.up, h_in, n, layer.up.?, null);
             if (layer.up_bias) |b| addBias(ws.up, n, inter, b);
-            tensor.gatedActivation(model.pool, c.activation, ws.up, ws.up, null, n, inter, inter, inter);
+            if (layer.xielu) |a| {
+                // xIELU (Apertus): `alpha_p x² + beta x` for x > 0, `alpha_n (expm1(min(x, eps)) - x) + beta x` otherwise.
+                for (ws.up[0 .. n * inter]) |*v| {
+                    const x = v.*;
+                    v.* = if (x > 0) a[0] * x * x + 0.5 * x else a[1] * (std.math.expm1(@min(x, -1e-6)) - x) + 0.5 * x;
+                }
+            } else {
+                tensor.gatedActivation(model.pool, c.activation, ws.up, ws.up, null, n, inter, inter, inter);
+            }
             din = ws.up;
         },
+    }
+    if (layer.ffn_sub_norm) |nm| {
+        const tmp = try gpa.alloc(f32, n * inter);
+        defer gpa.free(tmp);
+        normRowsInPlace(c, din[0 .. n * inter], n, inter, nm, tmp);
     }
     try tensor.matmulT(model.pool, gpa, ws.m, din, n, down, if (layer.down_delta) |*d| d else null);
     if (layer.down_bias) |b| addBias(ws.m, n, hidden, b);
@@ -3106,6 +3223,10 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
                 const pe = ws.h[0..hidden];
                 try model.posEmbedRow(rows[start + i].pos, pe);
                 tensor.axpy(x, 1.0, pe);
+            }
+            if (model.sin_pos.len > 0) {
+                const p = @min(rows[start + i].pos + c.position_offset, model.sin_pos.len / hidden - 1);
+                tensor.axpy(x, 1.0, model.sin_pos[p * hidden ..][0..hidden]);
             }
             if (model.embed_norm) |nm| {
                 applyNorm(c, ws.h[0..hidden], x, nm);

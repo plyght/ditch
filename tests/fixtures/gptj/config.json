@@ -1,0 +1,13 @@
+{
+ "model_type": "gptj",
+ "n_embd": 32,
+ "n_layer": 2,
+ "n_head": 4,
+ "n_positions": 128,
+ "n_inner": 64,
+ "rotary_dim": 4,
+ "activation_function": "gelu_new",
+ "layer_norm_epsilon": 1e-05,
+ "vocab_size": 275,
+ "tie_word_embeddings": false
+}

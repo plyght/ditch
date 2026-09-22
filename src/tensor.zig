@@ -873,7 +873,10 @@ pub fn rmsnorm(out: []f32, x: []const f32, weight: []const f32, eps: f32, gemma_
     var ss: f32 = 0;
     for (x) |v| ss += v * v;
     const inv = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(x.len)) + eps);
-    if (gemma_style) {
+    if (weight.len == 0) {
+        // Non-parametric (nanochat, the weightless q/k norms).
+        for (out, 0..) |*o, i| o.* = x[i] * inv;
+    } else if (gemma_style) {
         for (out, 0..) |*o, i| o.* = x[i] * inv * (1.0 + weight[i]);
     } else {
         for (out, 0..) |*o, i| o.* = x[i] * inv * weight[i];

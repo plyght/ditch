@@ -832,6 +832,7 @@ pub fn forward(model: *const Model, m: *const MoeLayer, li: usize, out: []f32, h
         const row = logits[t * n_experts ..][0..n_experts];
         if (m.router_bias) |b| tensor.axpy(row, 1.0, b[0..n_experts]);
         if (r.gate_temp != 1.0) tensor.scale(row, 1.0 / r.gate_temp);
+        if (r.router_softcap) |cap| tensor.softcap(row, cap);
         switch (r.scoring) {
             .softmax => tensor.softmaxInPlace(row),
             .sigmoid => for (row) |*v| {

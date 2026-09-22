@@ -76,12 +76,17 @@ Families are described by an architecture registry (`src/arch.zig`, one
 entry per Hugging Face `model_type`); every entry below is verified against
 a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
 
-* Llama 2/3 layout: `llama` (Yi, SOLAR, TinyLlama, SmolLM 1/2), `mistral`,
-  `mistral3` text, `smollm3`, `granite`, `minicpm`, `baichuan` (7B, RoPE),
-  `exaone`, `exaone4`, `internlm2`, `olmo`, `olmo2`, `cohere` (Command R),
-  `stablelm`, `starcoder2`, `nemotron`
-* Qwen: `qwen2` / `qwen2.5` (also the `qwen2_vl` / `qwen2_5_vl` text configs),
-  `qwen3` (also `qwen3_vl` text), `qwen2_moe`, `qwen3_moe`
+* Llama 2/3 layout: `llama` (Yi, SOLAR, TinyLlama, SmolLM 1/2, CWM, Emu3
+  text), `mistral` (also `ministral`), `mistral3` text, `ministral3`,
+  `smollm3`, `granite`, `granite_swa` (sinks, per-layer-type rope base),
+  `minicpm`, `baichuan` (7B, RoPE), `exaone`, `exaone4`, `internlm2`, `olmo`,
+  `olmo2`/`olmo3`, `cohere` (Command R), `stablelm`, `starcoder2`, `nemotron`,
+  `arcee`, `jais2`, `helium`, `bitnet` (sub-layer norms), `apertus` (xIELU),
+  `nanochat` (non-parametric norms, logit softcapping), `hunyuan_v1_dense`
+  (also HunYuan-VL text), `ernie4_5` (also PaddleOCR-VL text)
+* Qwen: `qwen2` / `qwen2.5` (also the `qwen2_vl` / `qwen2_5_vl` and
+  Qwen2.5-Omni thinker text configs), `qwen3` (also `qwen3_vl` text),
+  `qwen2_moe`, `qwen3_moe` (also `qwen3_vl_moe` and Qwen3-Omni thinker text)
 * Qwen hybrids (Gated DeltaNet linear attention + sigmoid/swish-gated full
   attention): `qwen3_next` (Qwen3-Next, Qwen3-Coder-Next),
   `qwen3_5` / `qwen3_5_moe` (Qwen3.5, Qwen3.8 dense and MoE, text configs;
@@ -98,14 +103,21 @@ a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
   indexer runs as dense attention, exact for the short contexts ditch
   scores), Phi-1/1.5/2 (`phi`), Phi-3 / 3.5 / 4 (`phi3`)
 * GPT-2, GPT-NeoX / Pythia, GPT-BigCode (StarCoder 1), Falcon (7B layout),
-  BLOOM, OPT, MPT
+  BLOOM, OPT, MPT, GPT-J (`gptj`), CodeGen (`codegen`, tensor-parallel qkv
+  blocks), GPT-Neo (`gpt_neo`, unscaled logits and local layers), Persimmon,
+  XGLM (sinusoidal positions), BioGPT
 * Mixture of experts: Mixtral, Qwen2/3-MoE (separate and fused expert
   layouts), DeepSeek V2 / V3 (MLA, group-limited and sigmoid routing, shared
   experts), Llama 4 text (top-1 routing, NoPE layers), gpt-oss (attention
   sinks, interleaved fused experts, BF16 or MXFP4 checkpoints), ERNIE 4.5
-  MoE (`ernie4_5_moe`), Hunyuan-A13B (`hunyuan_v1_moe`), GraniteMoE /
-  GraniteMoeShared (`granitemoe`) and the attention-only Granite 4 layout
-  (`granitemoehybrid` without Mamba layers)
+  MoE (`ernie4_5_moe`), Hunyuan-A13B (`hunyuan_v1_moe`), Hunyuan V3
+  (`hy_v3`), GraniteMoE / GraniteMoeShared (`granitemoe`) and the
+  attention-only Granite 4 layout (`granitemoehybrid` without Mamba layers),
+  OLMoE and FlexOlmo (`olmoe`, `flex_olmo`), dots.llm1 (`dots1`), EXAONE-MoE
+  (`exaone_moe`), Solar Open (`solar_open`), AFM MoE (`afmoe`, a sigmoid gate
+  on the attention output), Mellum, Laguna (a softplus gate and a softcapped
+  router), DeepSeek V3.2-Exp (`deepseek_v32`, whose lightning indexer runs as
+  dense attention, exact up to `index_topk` tokens)
 * MiniMax: M2 (`minimax_m2`), MiniMax-Text-01 / M1 (`minimax`: lightning
   linear attention alternating with softmax attention; the recurrence runs
   sequentially) and M3 (`minimax_m3_vl` text config, also `minimax_m3`;
@@ -131,10 +143,20 @@ a NumPy reference forward pass in the test suite (`tools/make_fixture.py`):
 Implemented from the Hugging Face reference but without a fixture: Falcon
 40B/180B (grouped qkv, `ln_attn`/`ln_mlp`) and Falcon ALiBi, Baichuan 13B
 (ALiBi), Command R7B (`cohere2`), StableLM 2 12B (parallel residual, qk
-LayerNorm), Gemma 2 logit softcapping, `dynamic` and `longrope` scaling
-beyond the original context (treated as static / short factors).
+LayerNorm), Gemma 2 logit softcapping, DeepSeek V3.2 (`deepseek_v32`, covered
+by the `deepseek_v3` fixture), `dynamic` and `longrope` scaling beyond the
+original context (treated as static / short factors).
 
-Not supported: state-space and hybrid models (Mamba, Jamba, Falcon-H1,
+Not supported, each named by its `model_type` with the reason: DBRX (stacked
+expert blocks), Phi-3.5-MoE (sparsemixer routing), JetMoE (routed attention
+heads), Zaya, LongCat-Flash, ModernBERT-decoder, BLT, HRM, DiffLlama
+(differential attention), Doge, A.X-K2 and Hunyuan V4 (hyper-connections with
+a lightning indexer), Step 3.7, Muse Glimmer, Cohere Compass, Cosmos 3 Edge,
+Aria, ERNIE 4.5 VL MoE, Llama 3.2 Vision (`mllama`, cross-attention layers),
+MiniCPM3, GPT-NeoX Japanese, CPM-Ant, CTRL, OpenAI GPT-1, Command A MoE,
+GraniteMoE SWA.
+
+Also not supported: state-space and hybrid models (Mamba, Jamba, Falcon-H1,
 Nemotron-H, RWKV, Granite 4 `granitemoehybrid` checkpoints with Mamba-2
 layers), Kimi K3 (AttnRes), Kimi K2 (`kimi_k2` standalone config),
 Qwen3.8-Flash-Next (`qwen4_exp`), GLM-5.3-Flash (`glm5_next`),
@@ -149,8 +171,10 @@ unknown layer types, quantisation formats and activations are errors, not
 silent fallbacks. Unicode normalisers (NFKC, Precompiled) are
 approximated by the identity.
 
-Image and video models (Qwen2/3-VL, Qwen3.5, GLM-4.5V, Llama 4, Kimi K2.5) run
-through their text config: the vision tower is never executed, its
+Image, video and audio models (Qwen2/3-VL, Qwen2.5-Omni, Qwen3-Omni,
+Qwen3.5, GLM-4V, GLM-4.5V, Llama 4, Kimi K2.5, HunYuan-VL, PaddleOCR-VL,
+DeepSeek-OCR2) run through their text config (the thinker's, for the Omni
+wrappers): the vision tower is never executed, its
 weights pass through exports byte for byte, and refusal directions are
 measured on text prompts.
 

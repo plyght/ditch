@@ -1,0 +1,22 @@
+{
+ "model_type": "gpt_neo",
+ "hidden_size": 32,
+ "num_layers": 2,
+ "num_heads": 4,
+ "intermediate_size": 64,
+ "max_position_embeddings": 64,
+ "window_size": 4,
+ "attention_types": [
+  [
+   [
+    "global",
+    "local"
+   ],
+   1
+  ]
+ ],
+ "activation_function": "gelu_new",
+ "layer_norm_epsilon": 1e-05,
+ "vocab_size": 275,
+ "tie_word_embeddings": true
+}

@@ -1,0 +1,12 @@
+{
+ "model_type": "xglm",
+ "d_model": 32,
+ "ffn_dim": 32,
+ "num_layers": 2,
+ "attention_heads": 4,
+ "max_position_embeddings": 128,
+ "activation_function": "gelu",
+ "scale_embedding": true,
+ "vocab_size": 374,
+ "tie_word_embeddings": true
+}
