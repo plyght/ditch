@@ -135,22 +135,36 @@ fn cat(arena: Allocator, a: []const u8, b: []const u8) ![]const u8 {
 
 const SiteSlots = struct { fn_w: model_mod.Slot, down: model_mod.Slot, up: model_mod.Slot, inject: model_mod.Slot };
 
-fn loadSite(model: *Model, layer: *Layer, arena: Allocator, lp: []const u8, site: []const u8, slots: SiteSlots) !Site {
+/// The store's spelling of an mHC site: the module one (`attn_hc.` + `fn`) or
+/// the flat one the released checkpoints use (`hc_attn_` + `fn`). Falls back to
+/// the module spelling so its name is what a "missing tensor" error names.
+fn sitePrefix(model: *Model, arena: Allocator, lp: []const u8, site: []const u8, flat: ?[]const u8) ![]const u8 {
+    const dotted = try std.fmt.allocPrint(arena, "{s}{s}.", .{ lp, site });
+    if (model.store.lookup(try cat(arena, dotted, "fn")) != null) return dotted;
+    if (flat) |f| {
+        const p = try std.fmt.allocPrint(arena, "{s}{s}", .{ lp, f });
+        if (model.store.lookup(try cat(arena, p, "fn")) != null) return p;
+    }
+    return dotted;
+}
+
+fn loadSite(model: *Model, layer: *Layer, arena: Allocator, lp: []const u8, site: []const u8, flat: ?[]const u8, slots: SiteSlots) !Site {
     const c = &model.config;
     const hy = c.hyper.?;
     const hc = c.hc_mult;
     const sw = hc * c.hidden_size;
-    const p = try cat(arena, lp, site);
     switch (hy.kind) {
         .mhc, .mhc_single_pass => {
             const mix = (2 + hc) * hc;
+            const p = try sitePrefix(model, arena, lp, site, flat);
             return .{ .mhc = .{
-                .fn_w = try model_mod.loadMatChecked(model, layer, slots.fn_w, try cat(arena, p, ".fn"), mix, sw),
-                .base = try model_mod.loadVecChecked(model, try cat(arena, p, ".base"), mix),
-                .scale = try model_mod.loadVecChecked(model, try cat(arena, p, ".scale"), 3),
+                .fn_w = try model_mod.loadMatChecked(model, layer, slots.fn_w, try cat(arena, p, "fn"), mix, sw),
+                .base = try model_mod.loadVecChecked(model, try cat(arena, p, "base"), mix),
+                .scale = try model_mod.loadVecChecked(model, try cat(arena, p, "scale"), 3),
             } };
         },
         .gated => {
+            const p = try cat(arena, lp, site);
             return .{ .gated = .{
                 .norm = try model_mod.loadVecChecked(model, try cat(arena, p, ".hc_norm.weight"), sw),
                 .down = try model_mod.loadMatChecked(model, layer, slots.down, try cat(arena, p, ".input_mix_weight_down.weight"), hy.lowrank, sw),
@@ -165,8 +179,8 @@ fn loadSite(model: *Model, layer: *Layer, arena: Allocator, lp: []const u8, site
 pub fn loadLayer(model: *Model, layer: *Layer, arena: Allocator, lp: []const u8) !void {
     const names = &model.config.arch.names;
     layer.hyper = .{
-        .attn = try loadSite(model, layer, arena, lp, names.hc_attn, .{ .fn_w = .hc_attn_fn, .down = .hc_attn_down, .up = .hc_attn_up, .inject = .hc_attn_inject }),
-        .ffn = try loadSite(model, layer, arena, lp, names.hc_ffn, .{ .fn_w = .hc_ffn_fn, .down = .hc_ffn_down, .up = .hc_ffn_up, .inject = .hc_ffn_inject }),
+        .attn = try loadSite(model, layer, arena, lp, names.hc_attn, names.hc_attn_flat, .{ .fn_w = .hc_attn_fn, .down = .hc_attn_down, .up = .hc_attn_up, .inject = .hc_attn_inject }),
+        .ffn = try loadSite(model, layer, arena, lp, names.hc_ffn, names.hc_ffn_flat, .{ .fn_w = .hc_ffn_fn, .down = .hc_ffn_down, .up = .hc_ffn_up, .inject = .hc_ffn_inject }),
     };
 }
 
@@ -179,11 +193,17 @@ pub fn loadModel(model: *Model, arena: Allocator) !Head {
     switch (hy.head) {
         .previous_pre, .mean => return .none,
         .weighted => {
-            const p = try std.fmt.allocPrint(arena, "{s}hc_head.", .{model.prefix});
-            const scale = try model_mod.loadVecChecked(model, try cat(arena, p, "hc_scale"), 1);
+            // `hc_head.hc_fn` (the module spelling) or the released
+            // checkpoints' flat `hc_head_fn`.
+            const dotted = try std.fmt.allocPrint(arena, "{s}hc_head.hc_", .{model.prefix});
+            const p = if (model.store.lookup(try cat(arena, dotted, "fn")) != null)
+                dotted
+            else
+                try std.fmt.allocPrint(arena, "{s}hc_head_", .{model.prefix});
+            const scale = try model_mod.loadVecChecked(model, try cat(arena, p, "scale"), 1);
             return .{ .weighted = .{
-                .fn_w = try model_mod.loadVecChecked(model, try cat(arena, p, "hc_fn"), hc * sw),
-                .base = try model_mod.loadVecChecked(model, try cat(arena, p, "hc_base"), hc),
+                .fn_w = try model_mod.loadVecChecked(model, try cat(arena, p, "fn"), hc * sw),
+                .base = try model_mod.loadVecChecked(model, try cat(arena, p, "base"), hc),
                 .scale = scale[0],
             } };
         },

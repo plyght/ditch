@@ -1691,9 +1691,23 @@ pub const Model = struct {
                     },
                     .gated_fused => {
                         const gu_name = try cat(arena, lp, names.gate_up orelse return error.InvalidConfig);
-                        layer.gate_up = try self.loadMat(gu_name);
-                        layer.up_bias = self.loadVecOpt(try biasName(arena, gu_name));
-                        layer.refs.add(.gate_up, try self.ref(gu_name), false);
+                        // A family whose dense MLP is fused in one checkpoint
+                        // can ship it split in another (MiniMax M3's released
+                        // weights keep `gate_proj` / `up_proj`).
+                        if (self.store.lookup(gu_name) == null and names.gate != null and names.up != null) {
+                            const gate_name = try cat(arena, lp, names.gate.?);
+                            const up_name = try cat(arena, lp, names.up.?);
+                            layer.gate = try self.loadMat(gate_name);
+                            layer.up = try self.loadMat(up_name);
+                            layer.gate_bias = self.loadVecOpt(try biasName(arena, gate_name));
+                            layer.up_bias = self.loadVecOpt(try biasName(arena, up_name));
+                            layer.refs.add(.gate, try self.ref(gate_name), false);
+                            layer.refs.add(.up, try self.ref(up_name), false);
+                        } else {
+                            layer.gate_up = try self.loadMat(gu_name);
+                            layer.up_bias = self.loadVecOpt(try biasName(arena, gu_name));
+                            layer.refs.add(.gate_up, try self.ref(gu_name), false);
+                        }
                     },
                     .dense => {
                         const up_name = try cat(arena, lp, names.up orelse return error.InvalidConfig);
@@ -1989,8 +2003,15 @@ pub const Model = struct {
             var names = std.ArrayList([]const u8).empty;
             var it = dir.iterate();
             while (try it.next(io)) |entry| {
-                if (entry.kind != .file) continue;
-                if (std.mem.endsWith(u8, entry.name, ".safetensors")) try names.append(arena, try arena.dupe(u8, entry.name));
+                // A Hugging Face hub snapshot directory is symbolic links into
+                // `blobs/`, so a link that resolves to a file counts too.
+                if (entry.kind != .file and entry.kind != .sym_link) continue;
+                if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
+                if (entry.kind == .sym_link) {
+                    const st = dir.statFile(io, entry.name, .{}) catch continue;
+                    if (st.kind != .file) continue;
+                }
+                try names.append(arena, try arena.dupe(u8, entry.name));
             }
             std.mem.sort([]const u8, names.items, {}, struct {
                 fn lt(_: void, a: []const u8, b: []const u8) bool {
@@ -4320,7 +4341,9 @@ pub fn mlpBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Worksp
     const down = layer.down.?;
     const inter = down.cols;
     var din: []f32 = ws.gate;
-    switch (c.mlp) {
+    // A `gated_fused` family whose checkpoint ships the pair split (MiniMax M3)
+    // is loaded, and run, as a plain gated MLP.
+    switch (if (c.mlp == .gated_fused and layer.gate_up == null) arch.MlpKind.gated else c.mlp) {
         .gated => {
             try compute.matmulT(model.pool, gpa, ws.gate, h_in, n, layer.gate.?, null);
             try compute.matmulT(model.pool, gpa, ws.up, h_in, n, layer.up.?, null);

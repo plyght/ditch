@@ -37,6 +37,8 @@ pub const Template = enum {
     kimi,
     /// Kimi K3 (XTML): `<|open|>message role="user"<|sep|>...<|close|>message<|sep|><|end_of_msg|>`.
     kimi_k3,
+    /// Jamba: `<|startoftext|><|bom|><|user|> ...<|eom|><|bom|><|assistant|>`.
+    jamba,
     raw,
 
     pub fn parse(name: []const u8) ?Template {
@@ -64,6 +66,7 @@ pub fn detect(chat_template: ?[]const u8, model_type: []const u8) Template {
                 return std.mem.indexOf(u8, hay, needle) != null;
             }
         }.f;
+        if (has(t, "<|bom|>")) return .jamba;
         if (has(t, "<|im_middle|>")) return .kimi;
         if (has(t, "<|end_of_msg|>")) return .kimi_k3;
         if (has(t, "<|im_start|>")) return .chatml;
@@ -92,6 +95,23 @@ pub fn detect(chat_template: ?[]const u8, model_type: []const u8) Template {
     if (std.mem.startsWith(u8, model_type, "gemma")) return .gemma;
     if (std.mem.startsWith(u8, model_type, "mistral")) return .mistral;
     return .raw;
+}
+
+/// The BOS text a model's own Jinja template emits before the first turn, or
+/// "" when it emits none. ditch's fixed families hardcode a BOS where the
+/// family always has one (llama3, gemma, llama2, mistral, cohere), but a
+/// checkpoint can add one to a family that usually has none — Falcon-H1 puts
+/// `{{bos_token}}` in front of a ChatML body — and its tokenizer does not add
+/// one either (no `add_bos_token`), so without this the prompt loses its BOS.
+pub fn templateBos(chat_template: ?[]const u8, bos_token: ?[]const u8) []const u8 {
+    const bos = bos_token orelse return "";
+    if (bos.len == 0) return "";
+    const t = chat_template orelse return "";
+    // Only what precedes the first control block counts as "before the first turn".
+    const head = t[0 .. std.mem.indexOf(u8, t, "{%") orelse t.len];
+    if (std.mem.indexOf(u8, head, "bos_token") != null) return bos;
+    if (std.mem.indexOf(u8, head, bos) != null) return bos;
+    return "";
 }
 
 fn trim(s: []const u8) []const u8 {
@@ -214,6 +234,17 @@ pub fn render(gpa: Allocator, template: Template, messages: []const Message) ![]
             for (messages) |m| try w.print("<|start|>{s}<|message|>{s}<|end|>", .{ @tagName(m.role), trim(m.content) });
             try w.writeAll("<|start|>assistant");
         },
+        .jamba => {
+            // One `<|eom|>` *between* messages (never after the last), and the
+            // role header carries a trailing space except on the generation turn.
+            try w.writeAll("<|startoftext|>");
+            for (messages, 0..) |m, i| {
+                if (i > 0) try w.writeAll("<|eom|>");
+                try w.print("<|bom|><|{s}|> {s}", .{ @tagName(m.role), m.content });
+            }
+            if (messages.len > 0) try w.writeAll("<|eom|>");
+            try w.writeAll("<|bom|><|assistant|>");
+        },
         .llama4 => {
             try w.writeAll("<|begin_of_text|>");
             for (messages) |m| try w.print("<|header_start|>{s}<|header_end|>\n\n{s}<|eot|>", .{ @tagName(m.role), trim(m.content) });
@@ -305,4 +336,16 @@ test "template detection and rendering" {
     const k3 = try renderPrompt(gpa, .kimi_k3, "Sys.", "Hi");
     defer gpa.free(k3);
     try std.testing.expectEqualStrings("<|open|>message role=\"system\"<|sep|>Sys.<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>Hi<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|>", k3);
+    // Jamba: `<|eom|>` between messages only, a space after the role header
+    // except on the generation turn. (ai21labs/Jamba-tiny-dev, verified
+    // token-for-token against transformers' apply_chat_template.)
+    try std.testing.expectEqual(Template.jamba, detect("{{- bom_str + handle_role(role) }} <|bom|>", "jamba"));
+    try std.testing.expectEqual(Template.jamba, detect(null, "jamba"));
+    const jb = try renderPrompt(gpa, .jamba, "Sys.", "Hi");
+    defer gpa.free(jb);
+    try std.testing.expectEqualStrings("<|startoftext|><|bom|><|system|> Sys.<|eom|><|bom|><|user|> Hi<|eom|><|bom|><|assistant|>", jb);
+    // A template that emits the BOS in front of a family that does not.
+    try std.testing.expectEqualStrings("<|begin_of_text|>", templateBos("{{bos_token}}\n{%- if tools %}<|im_start|>", "<|begin_of_text|>"));
+    try std.testing.expectEqualStrings("", templateBos("{% for m in messages %}<|im_start|>{{ bos_token }}", "<|begin_of_text|>"));
+    try std.testing.expectEqualStrings("", templateBos("{{bos_token}}<|im_start|>", null));
 }

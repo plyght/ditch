@@ -1,0 +1,45 @@
+{
+ "model_type": "qwen2",
+ "hidden_size": 32,
+ "intermediate_size": 32,
+ "num_hidden_layers": 2,
+ "num_attention_heads": 4,
+ "num_key_value_heads": 2,
+ "rms_norm_eps": 1e-06,
+ "rope_theta": 10000.0,
+ "hidden_act": "silu",
+ "max_position_embeddings": 128,
+ "tie_word_embeddings": true,
+ "torch_dtype": "bfloat16",
+ "quantization_config": {
+  "config_groups": {
+   "group_0": {
+    "input_activations": null,
+    "output_activations": null,
+    "targets": [
+     "Linear"
+    ],
+    "weights": {
+     "actorder": "group",
+     "block_structure": null,
+     "dynamic": false,
+     "group_size": 16,
+     "num_bits": 4,
+     "observer": "minmax",
+     "strategy": "group",
+     "symmetric": false,
+     "type": "int"
+    }
+   }
+  },
+  "format": "pack-quantized",
+  "global_compression_ratio": null,
+  "ignore": [
+   "lm_head"
+  ],
+  "kv_cache_scheme": null,
+  "quant_method": "compressed-tensors",
+  "quantization_status": "compressed"
+ },
+ "vocab_size": 275
+}

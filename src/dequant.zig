@@ -34,7 +34,8 @@
 //!   `num_bits`-wide fields packed densely from the low end, `weight_scale`
 //!   per group of `group_size` columns (or per row / per tensor),
 //!   `weight_zero_point` packed the same way along the rows (asymmetric
-//!   schemes only) and `weight_shape` I64. `w = (q - zp) * scale`.
+//!   schemes only), `weight_shape` I64 and, under `actorder`, `weight_g_idx`
+//!   I32 naming each column's scale group. `w = (q - zp) * scale`.
 //!
 //! Every value is computed in f32 and rounded to bf16, which is what the
 //! Hugging Face integrations produce when they dequantise to `bfloat16`.
@@ -293,6 +294,10 @@ pub const Dequant = struct {
     bits: u8 = 4,
     group: usize = 0,
     words_per_row: usize = 0,
+    /// pack-quantized with `actorder`: `weight_g_idx`, one I32 group index per
+    /// column, instead of the contiguous `column / group`. Read once at
+    /// registration because every decoded row needs all of it.
+    g_idx: []const u32 = &.{},
     /// Mapped mode: the whole tensor, decoded at load.
     materialized: ?[]u8 = null,
     /// Streamed mode, MXFP4: the last decoded slab, so per-row reads of a
@@ -314,6 +319,7 @@ pub const Dequant = struct {
     }
 
     pub fn deinit(self: *Dequant, gpa: Allocator) void {
+        if (self.g_idx.len > 0) gpa.free(self.g_idx);
         if (self.materialized) |m| gpa.free(m);
         if (self.cache_buf.len > 0) std.heap.page_allocator.free(self.cache_buf);
         gpa.destroy(self);
@@ -445,18 +451,32 @@ pub const Dequant = struct {
                 const row_words = words[i * self.words_per_row ..][0..self.words_per_row];
                 const srow = scales[i * groups ..][0..groups];
                 const drow = dst[i * self.cols ..][0..self.cols];
-                for (0..groups) |g| {
-                    var zp: i32 = 0;
-                    if (zwords.len > 0) {
-                        // Field `r + i` of column `g`'s word stream (row-major `[words][groups]`).
-                        const start = (r + i) * self.bits;
-                        const w = start / 32 - z0;
+                // The zero point of group `g` for this row, if the scheme has one.
+                const zeroPoint = struct {
+                    fn f(bits: u8, off0: i32, zw: []const u32, zbase: usize, ng: usize, row: usize, g: usize) i32 {
+                        if (zw.len == 0) return 0;
+                        // Field `row` of column `g`'s word stream (row-major `[words][groups]`).
+                        const start = row * bits;
+                        const w = start / 32 - zbase;
                         const off: u5 = @intCast(start % 32);
-                        const lo: u8 = @min(@as(u8, @intCast(32 - @as(u32, off))), self.bits);
-                        var v = (zwords[w * groups + g] >> off) & fieldMask(lo);
-                        if (lo < self.bits) v |= (zwords[(w + 1) * groups + g] & fieldMask(self.bits - lo)) << @intCast(lo);
-                        zp = @as(i32, @intCast(v)) - offset;
+                        const lo: u8 = @min(@as(u8, @intCast(32 - @as(u32, off))), bits);
+                        var v = (zw[w * ng + g] >> off) & fieldMask(lo);
+                        if (lo < bits) v |= (zw[(w + 1) * ng + g] & fieldMask(bits - lo)) << @intCast(lo);
+                        return @as(i32, @intCast(v)) - off0;
                     }
+                }.f;
+                if (self.g_idx.len > 0) {
+                    // `actorder`: the column's group comes from `weight_g_idx`.
+                    for (0..self.cols) |c| {
+                        const g = self.g_idx[c];
+                        const zp = zeroPoint(self.bits, offset, zwords, z0, groups, r + i, g);
+                        const q = @as(i32, @intCast(unpackField(row_words, c, self.bits))) - offset;
+                        drow[c] = tensor.f32ToBf16(@as(f32, @floatFromInt(q - zp)) * srow[g]);
+                    }
+                    continue;
+                }
+                for (0..groups) |g| {
+                    const zp = zeroPoint(self.bits, offset, zwords, z0, groups, r + i, g);
                     const s = srow[g];
                     const c0 = g * self.group;
                     const c1 = @min(self.cols, c0 + self.group);
@@ -603,7 +623,7 @@ fn withPrefix(gpa: Allocator, base: []const u8, suffix: []const u8) ![]u8 {
 }
 
 /// Names of a module's auxiliary quantisation tensors that have no place in a bf16 export.
-const module_aux = [_][]const u8{ ".weight_scale", ".weight_scale_inv", ".weight_zero_point", ".weight_shape", ".input_scale", ".input_zero_point", ".weight_global_scale", ".input_global_scale" };
+const module_aux = [_][]const u8{ ".weight_scale", ".weight_scale_inv", ".weight_zero_point", ".weight_shape", ".weight_g_idx", ".input_scale", ".input_zero_point", ".weight_global_scale", ".input_global_scale" };
 
 fn dropModuleAux(gpa: Allocator, files: []const *safetensors.File, module: []const u8) !void {
     for (module_aux) |suffix| {
@@ -926,11 +946,37 @@ fn registerPacked(gpa: Allocator, io: Io, files: []const *safetensors.File, p: F
         }
         zero = piece(z.file, z.info.offset, z.info.byte_len, .f32);
     }
+    // `actorder`: `weight_g_idx` gives each column's group instead of
+    // `column / group`. Ignoring it decodes every column with the wrong scale,
+    // which loads without complaint and silently changes the model.
+    const g_name = try withPrefix(gpa, module, ".weight_g_idx");
+    defer gpa.free(g_name);
+    var g_idx: []u32 = &.{};
+    errdefer if (g_idx.len > 0) gpa.free(g_idx);
+    if (findRaw(files, g_name)) |gi| {
+        if (!std.mem.eql(u8, gi.info.dtype, "I32") or gi.info.numel() != cols) {
+            std.log.err("{s}: {s} is {s}[{d}], expected I32[{d}]", .{ pname, g_name, gi.info.dtype, gi.info.numel(), cols });
+            return error.InvalidConfig;
+        }
+        const buf = try gpa.alloc(u8, cols * 4);
+        defer gpa.free(buf);
+        try gi.file.readRange(io, gi.info.offset, buf);
+        g_idx = try gpa.alloc(u32, cols);
+        for (g_idx, 0..) |*g, i| {
+            const v = std.mem.readInt(i32, buf[i * 4 ..][0..4], .little);
+            if (v < 0 or @as(usize, @intCast(v)) >= groups) {
+                std.log.err("{s}: {s}[{d}] is {d}, outside the {d} scale groups", .{ pname, g_name, i, v, groups });
+                return error.InvalidConfig;
+            }
+            g.* = @intCast(v);
+        }
+    }
     const dq = try gpa.create(Dequant);
     errdefer gpa.destroy(dq);
     dq.* = .{
         .name = try withPrefix(p.file.arena.allocator(), module, ".weight"),
         .method = .int_packed,
+        .g_idx = g_idx,
         .slabs = slabs,
         .rows = rows,
         .cols = cols,

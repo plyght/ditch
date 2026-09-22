@@ -29,13 +29,15 @@ pub const TensorInfo = struct {
         return n;
     }
 
+    /// A rank-0 tensor (a scalar, which real checkpoints do carry: Mistral 4's
+    /// per-tensor `weight_scale_inv`, Gemma 4's audio-tower min/max) is one
+    /// row of one column.
     pub fn rows(self: TensorInfo) usize {
-        std.debug.assert(self.shape.len >= 1);
-        return self.shape[0];
+        return if (self.shape.len == 0) 1 else self.shape[0];
     }
 
     pub fn cols(self: TensorInfo) usize {
-        return if (self.shape.len == 1) 1 else self.numel() / self.rows();
+        return if (self.shape.len <= 1) 1 else self.numel() / self.rows();
     }
 
     /// A view over the mapped bytes. Only valid for files opened with `.map = true`.
@@ -498,6 +500,34 @@ pub fn writeFile(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, sub_path: []const 
     try out.writeAll(header_bytes);
     for (tensors) |t| try out.writeAll(t.data);
     try out.flush();
+}
+
+// Real checkpoints carry rank-0 tensors: Mistral 4's per-tensor
+// `weight_scale_inv`, Gemma 4 E2B's audio-tower min/max scalars. They are one
+// row of one column, not a shape to assert on.
+test "a rank-0 tensor is one row of one column" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const scalar = [_]f32{42};
+    const mat = [_]f32{ 1, 2, 3, 4 };
+    const shape = [_]usize{ 2, 2 };
+    try writeFile(gpa, io, tmp.dir, "t.safetensors", &.{
+        .{ .name = "s", .dtype = .f32, .shape = &.{}, .data = std.mem.sliceAsBytes(&scalar) },
+        .{ .name = "w", .dtype = .f32, .shape = &shape, .data = std.mem.sliceAsBytes(&mat) },
+    }, "ditch");
+    const f = try File.open(gpa, io, tmp.dir, "t.safetensors");
+    defer f.close(gpa, io);
+    const t = f.get("s").?;
+    try std.testing.expectEqual(@as(usize, 0), t.shape.len);
+    try std.testing.expectEqual(@as(usize, 1), t.numel());
+    try std.testing.expectEqual(@as(usize, 1), t.rows());
+    try std.testing.expectEqual(@as(usize, 1), t.cols());
+    var one: [1]f32 = undefined;
+    t.asWeight().row(0, &one);
+    try std.testing.expectEqual(@as(f32, 42), one[0]);
 }
 
 test "safetensors round trip" {
