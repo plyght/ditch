@@ -454,6 +454,7 @@ pub const help_sections = [_]HelpSection{
     .{ .title = "Other", .body =
     \\  -h, --help                     Show this help (ditch help bench: the benchmark options).
     \\  --version                      Print the version, the Zig version and the target.
+    \\  Supported model families, with their caveats: docs/models.md.
     \\
     },
 };
