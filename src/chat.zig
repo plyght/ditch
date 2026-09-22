@@ -22,6 +22,10 @@ pub const Template = enum {
     glm4,
     /// Command R: `<|START_OF_TURN_TOKEN|><|USER_TOKEN|>...<|END_OF_TURN_TOKEN|>`.
     cohere,
+    /// Command R7B (cohere2): Command R's turns, but the chatbot's opens with
+    /// `<|START_RESPONSE|>` (closed by `<|END_RESPONSE|>`), and an empty
+    /// system turn stands in when the conversation has none.
+    cohere_response,
     /// DeepSeek V2/V3: `<｜User｜>...<｜Assistant｜>`.
     deepseek,
     /// gpt-oss harmony: `<|start|>user<|message|>...<|end|><|start|>assistant`.
@@ -78,7 +82,7 @@ pub fn detect(chat_template: ?[]const u8, model_type: []const u8) Template {
         if (has(t, "<|start_header_id|>")) return .llama3;
         if (has(t, "<|header_start|>")) return .llama4;
         if (has(t, "<start_of_turn>")) return .gemma;
-        if (has(t, "<|START_OF_TURN_TOKEN|>")) return .cohere;
+        if (has(t, "<|START_OF_TURN_TOKEN|>")) return if (has(t, "<|START_RESPONSE|>")) .cohere_response else .cohere;
         if (has(t, "<|start|>") and has(t, "<|message|>")) return .harmony;
         if (has(t, "<|start_of_role|>")) return .granite;
         if (has(t, "[|user|]")) return .exaone;
@@ -225,6 +229,20 @@ pub fn render(gpa: Allocator, template: Template, messages: []const Message) ![]
                 try w.print("<|START_OF_TURN_TOKEN|>{s}{s}<|END_OF_TURN_TOKEN|>", .{ role, trim(m.content) });
             }
             try w.writeAll("<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>");
+        },
+        .cohere_response => {
+            // CohereLabs/c4ai-command-r7b-12-2024's plain-chat branch (no tools or
+            // documents): the system message is not trimmed, the turns are.
+            try w.writeAll("<BOS_TOKEN>");
+            if (messages.len == 0 or messages[0].role != .system) try w.writeAll("<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|><|END_OF_TURN_TOKEN|>");
+            for (messages) |m| {
+                switch (m.role) {
+                    .system => try w.print("<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>{s}<|END_OF_TURN_TOKEN|>", .{m.content}),
+                    .user => try w.print("<|START_OF_TURN_TOKEN|><|USER_TOKEN|>{s}<|END_OF_TURN_TOKEN|>", .{trim(m.content)}),
+                    .assistant => try w.print("<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|><|START_RESPONSE|>{s}<|END_RESPONSE|><|END_OF_TURN_TOKEN|>", .{trim(m.content)}),
+                }
+            }
+            try w.writeAll("<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|><|START_RESPONSE|>");
         },
         .deepseek => {
             try w.writeAll("<\xef\xbd\x9cbegin\xe2\x96\x81of\xe2\x96\x81sentence\xef\xbd\x9c>");
@@ -379,6 +397,13 @@ test "template detection and rendering" {
     const lg_no_sys = try render(gpa, .laguna, &.{ .{ .role = .user, .content = "Hi" }, .{ .role = .assistant, .content = " Yo " }, .{ .role = .user, .content = "Bye" } });
     defer gpa.free(lg_no_sys);
     try std.testing.expectEqualStrings("\xe3\x80\x88|EOS|\xe3\x80\x89<system>\n\n" ++ laguna_default_system ++ "\n</system>\n<user>\nHi\n</user>\n<assistant>\n</think>\nYo\n</assistant>\n<user>\nBye\n</user>\n<assistant>\n</think>", lg_no_sys);
+    // Command R7B (estrogen/c4ai-command-r7b-12-2024, a copy of the gated
+    // CohereLabs release; token-for-token against apply_chat_template).
+    try std.testing.expectEqual(Template.cohere_response, detect("<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|><|START_RESPONSE|>", "cohere2"));
+    try std.testing.expectEqual(Template.cohere, detect("<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>", "cohere"));
+    const r7 = try render(gpa, .cohere_response, &.{ .{ .role = .user, .content = " Hi " }, .{ .role = .assistant, .content = "Yo" }, .{ .role = .user, .content = "Bye" } });
+    defer gpa.free(r7);
+    try std.testing.expectEqualStrings("<BOS_TOKEN><|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|><|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>Hi<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|><|START_RESPONSE|>Yo<|END_RESPONSE|><|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>Bye<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|><|START_RESPONSE|>", r7);
     // A template that emits the BOS in front of a family that does not.
     try std.testing.expectEqualStrings("<|begin_of_text|>", templateBos("{{bos_token}}\n{%- if tools %}<|im_start|>", "<|begin_of_text|>"));
     try std.testing.expectEqualStrings("", templateBos("{% for m in messages %}<|im_start|>{{ bos_token }}", "<|begin_of_text|>"));

@@ -3967,10 +3967,13 @@ pub const registry = [_]Arch{
         .chat = "cohere",
         .verified = true,
         .norm = .layer,
+        // `CohereRotaryEmbedding` repeat-interleaves the frequencies and
+        // `rotate_half` pairs adjacent coordinates: GPT-J pairs, not NeoX halves.
+        .rope_style = .gptj,
         .parallel_residual = true,
         .tie_word_embeddings = true,
         .names = .{ .pre_ff_norm = null, .q_norm = "self_attn.q_norm.weight", .k_norm = "self_attn.k_norm.weight" },
-        .notes = "fixture: LayerNorm without bias, parallel residual, logit_scale, tied embeddings, per-head q/k LayerNorm (use_qk_norm). cohere2 (Command R7B: sliding layers with RoPE, global layers without) is unverified.",
+        .notes = "fixture: LayerNorm without bias, parallel residual, interleaved rotary, logit_scale, tied embeddings, per-head q/k LayerNorm (use_qk_norm). cohere2 (Command R7B: sliding layers with RoPE, global layers without) is verified on the first four layers of the real checkpoint.",
         .extra = extraCohere,
     },
     .{

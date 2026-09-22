@@ -544,6 +544,7 @@ spec("olmo", norm="none", eps=1e-5, in_norm="", pre_ff_norm="", final_norm="", c
      config={"model_type": "olmo", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
              "clip_qkv": 0.6, "rope_theta": 10000.0, "hidden_act": "silu", "max_position_embeddings": 128, "tie_word_embeddings": True})
 spec("cohere", norm="ln", eps=1e-5, ln_bias=False, parallel=True, pre_ff_norm=None, qk_norm="heads", logit_scale=0.5, lm_head=None,
+     rope_style="gptj",
      config={"model_type": "cohere", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
              "layer_norm_eps": 1e-5, "logit_scale": 0.5, "use_qk_norm": True, "rope_theta": 10000.0, "hidden_act": "silu",
              "max_position_embeddings": 128, "tie_word_embeddings": True})

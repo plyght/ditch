@@ -1490,3 +1490,60 @@ so the routing (softmax, the bias on the selection only, renormalised top-k)
 and the `moe_layer_start_index = 0` placement are right. None of the other
 three open stubs (`cohere`, `minimax`, `nanochat`) has a constant router; the
 only constant tensors there are norm weights of 1.
+
+## Bug 25 — Cohere's rotary embedding used NeoX halves (fixed)
+
+**Symptom.** handoff item 3: `hf-tiny-v2/tiny-random-CohereForCausalLM`
+diverged at the first layer (4.8e-03). Setting `hidden_act` to silu changed
+nothing; zeroing every `o_proj` on both sides made it exact and zeroing the
+MLPs did not, so the error was in attention.
+
+**Cause.** `CohereRotaryEmbedding` builds `emb = repeat_interleave(freqs, 2)`
+("diff from Llama: we interleave() instead of cat()") and Cohere's
+`rotate_half` is `stack([-x[1::2], x[0::2]]).flatten(-2)`: coordinates `2i`
+and `2i + 1` are rotated together by frequency `i` — GPT-J pairs. The
+registry entry did not set `rope_style`, so it got the default NeoX pairing
+(`i` with `i + head_dim / 2`). `cohere2` (Command R7B) is an alias of the
+same entry and uses the same functions. The fixture generator's `cohere`
+spec had the same default, so the fixture agreed with the code.
+
+**Fix.** `.rope_style = .gptj` on the entry; the generator's spec says so too
+and the fixture is regenerated. (GGUF export is unaffected: command-r is not
+one of the architectures whose q/k llama.cpp permutes.)
+
+**Verification.** No Cohere checkpoint is public (every `CohereLabs/*` repo
+is gated), and an 8B float32 reference does not fit in 15 GiB anyway. Two
+ungated copies of released weights were cut down instead:
+`tools`-style range requests fetch the safetensors header of each shard and
+then only the embedding, final norm and the first *N* layers' tensors, and a
+checkpoint with `num_hidden_layers = N` is written from them (3.4–3.8 GB).
+Both against transformers in float32, with each model's own chat template:
+
+| Checkpoint (first N layers) | family | tokens | residuals | first-token logits |
+| --- | --- | :---: | :---: | ---: |
+| hf-tiny-v2/tiny-random-CohereForCausalLM | `cohere` | match (raw) | all 3 agree | 1.66e-07 (was 2.10e-03) |
+| Cossale/aya-expanse-8b-formal, N = 3 (Aya Expanse 8B fine-tune) | `cohere` | match | all 4 agree | 3.74e-07 |
+| estrogen/c4ai-command-r7b-12-2024, N = 4 (Command R7B copy) | `cohere2` | match (after bug 26) | all 5 agree | 2.48e-06 |
+
+The Command R7B cut includes layer 3, its first global layer, which has no
+rotary embedding at all, so both of `cohere2`'s layer kinds are covered; it
+was the first real check of `cohere2`, which the registry listed as
+unverified. Aya Expanse's tokenizer: 0 of 15 test strings differ.
+
+## Bug 26 — Command R7B's chat template lost `<|START_RESPONSE|>` (fixed)
+
+**Symptom.** on the Command R7B cut the forward pass agreed, but the prompt
+was one token short: transformers ends it with `<|START_RESPONSE|>` (id
+255021) after `<|CHATBOT_TOKEN|>`.
+
+**Cause.** ditch detected the template as Command R's (`cohere`), and R7B's
+plain-chat branch differs: every chatbot turn opens with
+`<|START_RESPONSE|>` and a completed one ends with `<|END_RESPONSE|>` before
+`<|END_OF_TURN_TOKEN|>`, and a conversation without a system message gets an
+empty system turn.
+
+**Fix.** a `cohere_response` template family, detected by
+`<|START_RESPONSE|>` in the model's template; Command R templates without it
+keep `cohere`. Verified token for token against `apply_chat_template` on
+two prompts (one with surrounding whitespace, which the template strips),
+and a unit test covers a multi-turn conversation without a system message.
