@@ -115,7 +115,7 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings,
                 try js.objectField("id");
                 try js.write(t.id);
                 try js.objectField("token");
-                try js.write(model.tokenizer.id_to_token[t.id]);
+                try js.write(tokenText(model, t.id));
                 try js.objectField("logit");
                 try js.write(t.logit);
                 try js.endObject();
@@ -139,7 +139,7 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings,
             try result_out.print("\nPrompt: {s}\nRendered ({d} tokens): {s}\nIds:", .{ user, ids.len, text });
             for (ids) |id| try result_out.print(" {d}", .{id});
             try result_out.writeAll("\nTop first-token logits:\n");
-            for (top) |t| try result_out.print("  {d:>8}  {d:>10.4}  {s}\n", .{ t.id, t.logit, model.tokenizer.id_to_token[t.id] });
+            for (top) |t| try result_out.print("  {d:>8}  {d:>10.4}  {s}\n", .{ t.id, t.logit, tokenText(model, t.id) });
             try result_out.print("Greedy ({d} tokens): {s}\n", .{ generated[0].len, response });
             if (residuals) |r| {
                 try result_out.writeAll("Residual norm per layer (last token):\n");
@@ -159,6 +159,14 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings,
         try result_out.writeAll("\n");
     }
     try result_out.flush();
+}
+
+/// The vocabulary entry for `id`, or "" for the padding rows many checkpoints
+/// add past the tokenizer's vocabulary (LFM2: 65536 rows, 64400 tokens), which
+/// an edited or random model can rank highest.
+fn tokenText(model: *const Model, id: u32) []const u8 {
+    const table = model.tokenizer.id_to_token;
+    return if (id < table.len) table[id] else "";
 }
 
 test "topK keeps the largest logits in order" {

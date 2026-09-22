@@ -1988,6 +1988,65 @@ and the prompt ids of StableLM 2, AFM-4.5B, MiniCPM4 and Trinity-Nano now
 equal `apply_chat_template`'s. The remaining differences are the next
 subject.
 
+
+## Bugs 41–47 — the rest of the tokenizer sweep (fixed)
+
+After bugs 37–40, eight of the eighteen swept tokenizers still differed from
+`tokenizers` on some of the 20 hard strings, and one crashed ditch. Each is a
+separate misreading of a pre-tokenizer or normalizer:
+
+* **41 — o200k split words at combining marks.** o200k's word classes
+  (gpt-oss, Phi-4-mini, Nemotron Nano 9B v2) are
+  `[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+`; ditch's
+  matcher ran over letters only and treated every non-ASCII letter as both
+  cases. It now shares Kimi's matcher, which already had the exact classes
+  and the regex's backtracking, without Kimi's Han exclusion and with `/`
+  allowed after punctuation. (Devanagari, Arabic with harakat, Thai.)
+* **42 — `NFC` was the identity.** MiMo V2, Seed-OSS, MiniMax-M2, dots1 and
+  the Qwen family declare an NFC normalizer; `cafe` + U+0301 is `café` to
+  them. NFC now uses bug 33's machinery with its own table (1,120 singletons
+  and composition exclusions) before canonical composition.
+* **43 — Seed-OSS's punctuation takes no line breaks.** Its pattern is Qwen
+  2's with ` ?[^\s\p{L}\p{N}\r\n]+` where Qwen 2 has
+  ` ?[^\s\p{L}\p{N}]+[\r\n]*`, so `):\n` is two pieces, not one. A
+  `qwen2_bare_punct` kind.
+* **44 — the `Punctuation` pre-tokenizer included symbols, and Falcon-H1's
+  digits are single.** `tokenizers`' `is_punc` is ASCII punctuation or
+  Unicode `P*`; ditch's hand-written ranges also took `©`, `®`, `×`, `÷`
+  and more. It now uses a generated `P` table. Falcon-H1's main pattern is
+  o200k's with `\p{N}` for `\p{N}{1,3}` (`o200k_digit1`).
+* **45 — DeepSeek V3's CJK split was DeepSeek V2's.** V3 isolates
+  `[一-龥぀-ゟ゠-ヿ]+` (CJK and kana); ditch used V2's `[一-龥ࠀ-一가-퟿]+`, whose
+  middle range U+0800–U+4E00 also covers the em dash, Devanagari, Thai and
+  much else. A `cjk_kana` kind.
+* **46 — DeepSeek V2's letter class was "any letter".** Its
+  `\s?[A-Za-zµÀ-Ö…]+` split lists 2,729 code points: a hand-picked subset of
+  the cased letters (Armenian lowercase, for one, is left out) that no Unicode
+  property reproduces. The class is now read from the pattern itself when the
+  tokenizer loads.
+* **47 — `ditch probe` crashed on padded vocabulary rows.** Many checkpoints
+  have more embedding rows than tokens (LFM2: 65,536 rows, 64,400 tokens;
+  Qwen pads to 151,936). `probe` looked up the token text of every top-k id
+  unchecked, so a model that ranks a padding row highest — as an edited or
+  random one can — segfaulted (ReleaseFast) or panicked (Debug). Padding rows
+  now print as empty text.
+
+**Verification.** unit tests take their expected pieces from
+`tokenizers`' `pre_tokenize_str` on the release's own tokenizer, and the
+sweep, 20 hard strings per tokenizer:
+
+| tokenizer | before 37–47 | after |
+| --- | ---: | ---: |
+| ByteDance-Seed/Seed-OSS-36B-Instruct | 10 differ | 0 |
+| arcee-ai/Trinity-Nano-Preview | 10 | 0 |
+| deepseek-ai/DeepSeek-V3.1 | 5 | 0 |
+| openai/gpt-oss-20b, microsoft/Phi-4-mini-instruct, nvidia/NVIDIA-Nemotron-Nano-9B-v2 | 3 each | 0 |
+| MiniMaxAI/MiniMax-M2 | 2 | 0 |
+| XiaomiMiMo/MiMo-V2-Flash, rednote-hilab/dots.llm1.inst, tiiuae/Falcon-H1-0.5B-Instruct | 1 each | 0 |
+| deepseek-ai/DeepSeek-V2-Lite-Chat | 1, and 2 crashes | 0 |
+| LiquidAI/LFM2-350M | 2 crashes | 0 |
+| SmolLM3, EXAONE 4, Granite 3.3, Hunyuan-A13B, Solar Open, GLM 4.5 | 0 | 0 |
+
 ---
 
 # Frontier pass: the arithmetic of the frontier families on their real weights

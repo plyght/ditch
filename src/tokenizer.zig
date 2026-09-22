@@ -5,9 +5,9 @@
 //! regex pre-tokenisers (plus the `Digits`, `Punctuation`, `Whitespace` and
 //! `ByteLevel(add_prefix_space)` steps some families chain in a `Sequence`),
 //! and SentencePiece-derived BPE with Metaspace handling and byte fallback.
-//! NFKC is applied (per code point, then canonical composition; only the
-//! reordering of several combining marks is left out); NFC and the rest of SentencePiece's `Precompiled` map are
-//! approximated by the identity.
+//! NFKC and NFC are applied (per code point, then canonical composition;
+//! only the reordering of several combining marks is left out); the rest of
+//! SentencePiece's `Precompiled` map is approximated by the identity.
 //!
 //! Models without a `tokenizer.json` that ship a tiktoken rank file instead
 //! (Moonshot Kimi's `tiktoken.model`, Meta's Llama 3 `tokenizer.model`) are
@@ -52,6 +52,9 @@ pub const AddedToken = struct {
 const RegexKind = enum {
     gpt2,
     qwen2,
+    /// Seed-OSS: Qwen 2's pattern whose punctuation run takes no line breaks
+    /// after it (` ?[^\s\p{L}\p{N}\r\n]+` for ` ?[^\s\p{L}\p{N}]+[\r\n]*`).
+    qwen2_bare_punct,
     llama3,
     /// nanochat's GPT-4-style split: Llama 3's with digit runs of at most two
     /// (`\p{N}{1,2}`). Its possessive quantifiers and single-`[\r\n]` line
@@ -59,6 +62,8 @@ const RegexKind = enum {
     nanochat,
     /// tiktoken o200k (gpt-oss): words split at lower→upper case changes, contractions as suffixes.
     o200k,
+    /// o200k with single digits (`\p{N}` for `\p{N}{1,3}`; Falcon-H1).
+    o200k_digit1,
     /// Kimi (`tokenization_kimi.py`): Han runs first, then o200k-style words excluding Han characters.
     kimi,
     /// DeepSeek V3 main pattern (`[\p{P}\p{S}]` classes; digits are split by an earlier `\p{N}{1,3}` step).
@@ -73,8 +78,10 @@ const RegexKind = enum {
     ds2_punct,
     /// `\s+$`
     trailing_ws,
-    /// CJK runs `[一-龥ࠀ-一가-퟿]+`
+    /// CJK runs `[一-龥ࠀ-一가-퟿]+` (DeepSeek V2)
     cjk,
+    /// CJK and kana runs `[一-龥぀-ゟ゠-ヿ]+` (DeepSeek V3)
+    cjk_kana,
     /// AFMoE's digit handling, three `Split`s in a row: decimal-digit runs cut
     /// into right-aligned chunks of 510 (`\p{Nd}{1,510}(?=(?>\p{Nd}{510})*(?:\P{Nd}|$))|\G\p{Nd}{510}`),
     /// the leading 1–2 digits of an all-digit piece whose length is not a
@@ -137,8 +144,12 @@ pub const Tokenizer = struct {
     prepend: ?[]const u8,
     replace_space: ?[]const u8, // replacement for " " (typically "▁")
     lowercase: bool,
-    /// `NFKC` normalizer: each code point is replaced by its own NFKC.
-    nfkc: bool,
+    /// `NFKC` / `NFC` normalizer (see `normalizeUnicode`); null: neither.
+    unicode_form: ?UnicodeForm,
+    /// The letter class of DeepSeek V2's `\s?[A-Za-z…]+` split, read from the
+    /// pattern itself: a hand-picked subset of the cased letters that no
+    /// Unicode property reproduces.
+    ds2_letter_class: []const uni.Range = &.{},
     /// Pre-tokenisation steps applied in order to every segment.
     steps: []const Step,
     /// SentencePiece's `Precompiled` charsmap: only its whitespace rules are
@@ -190,7 +201,7 @@ pub const Tokenizer = struct {
             .prepend = null,
             .replace_space = null,
             .lowercase = false,
-            .nfkc = false,
+            .unicode_form = null,
             .steps = &.{},
             .sp_whitespace = false,
             .byte_level = false,
@@ -677,9 +688,11 @@ pub const Tokenizer = struct {
         } else if (std.mem.eql(u8, t, "Lowercase")) {
             self.lowercase = true;
         } else if (std.mem.eql(u8, t, "NFKC")) {
-            self.nfkc = true;
-        } else if (std.mem.eql(u8, t, "Strip") or std.mem.eql(u8, t, "NFC")) {
-            // Whitespace stripping of the whole input and NFC are identities for the prompts ditch builds.
+            self.unicode_form = .nfkc;
+        } else if (std.mem.eql(u8, t, "NFC")) {
+            self.unicode_form = .nfc;
+        } else if (std.mem.eql(u8, t, "Strip")) {
+            // Whitespace stripping of the whole input is the identity for the prompts ditch builds.
         } else if (std.mem.eql(u8, t, "Precompiled")) {
             // The charsmap is a compiled trie; ditch applies the part of it
             // that ordinary text actually hits (see `sp_whitespace`) and
@@ -706,7 +719,9 @@ pub const Tokenizer = struct {
                     try steps.append(arena, .newline_runs);
                     return;
                 }
-                try steps.append(arena, .{ .regex = classifyRegex(r.string) });
+                const kind = classifyRegex(r.string);
+                if (kind == .ds2_letters) self.ds2_letter_class = try parseCharClass(arena, r.string);
+                try steps.append(arena, .{ .regex = kind });
             } else if (pattern.get("String")) |str| {
                 try steps.append(arena, .{ .split_string = .{ .pattern = try arena.dupe(u8, str.string), .removed = std.ascii.eqlIgnoreCase(behavior, "removed") } });
             }
@@ -733,6 +748,48 @@ pub const Tokenizer = struct {
         } else {
             std.log.warn("ignoring unsupported pre-tokenizer: {s}", .{t});
         }
+    }
+
+    /// The ranges of the first bracketed class of `pattern` (`[A-Za-zµÀ-Ö…]`):
+    /// single code points and `a-b` ranges, `\x` escaping `x`; sorted and merged.
+    fn parseCharClass(arena: Allocator, pattern: []const u8) ![]const uni.Range {
+        const open = std.mem.indexOfScalar(u8, pattern, '[') orelse return error.InvalidTokenizer;
+        var cps = std.ArrayList(u21).empty;
+        var it = (try std.unicode.Utf8View.init(pattern[open + 1 ..])).iterator();
+        var escaped = false;
+        while (it.nextCodepoint()) |cp| {
+            if (!escaped and cp == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (!escaped and cp == ']') break;
+            escaped = false;
+            try cps.append(arena, cp);
+        }
+        var ranges = std.ArrayList(uni.Range).empty;
+        var i: usize = 0;
+        while (i < cps.items.len) {
+            if (i + 2 < cps.items.len and cps.items[i + 1] == '-') {
+                try ranges.append(arena, .{ .lo = cps.items[i], .hi = cps.items[i + 2] });
+                i += 3;
+            } else {
+                try ranges.append(arena, .{ .lo = cps.items[i], .hi = cps.items[i] });
+                i += 1;
+            }
+        }
+        std.mem.sort(uni.Range, ranges.items, {}, struct {
+            fn lt(_: void, x: uni.Range, y: uni.Range) bool {
+                return x.lo < y.lo;
+            }
+        }.lt);
+        var merged = std.ArrayList(uni.Range).empty;
+        for (ranges.items) |r| {
+            if (merged.items.len > 0 and r.lo <= merged.items[merged.items.len - 1].hi + 1) {
+                const last = &merged.items[merged.items.len - 1];
+                last.hi = @max(last.hi, r.hi);
+            } else try merged.append(arena, r);
+        }
+        return merged.items;
     }
 
     fn classifyRegex(raw: []const u8) RegexKind {
@@ -766,12 +823,14 @@ pub const Tokenizer = struct {
         if (std.mem.eql(u8, r, "\\s+$")) return .trailing_ws;
         if (std.mem.startsWith(u8, r, "\\s?[A-Za-z")) return .ds2_letters;
         if (std.mem.startsWith(u8, r, "\\s?[!-/")) return .ds2_punct;
+        if (std.mem.eql(u8, r, "[\u{4e00}-\u{9fa5}\u{3040}-\u{309f}\u{30a0}-\u{30ff}]+")) return .cjk_kana;
         if (std.mem.startsWith(u8, r, "[\xe4\xb8\x80-")) return .cjk;
         if (has(r, "\\p{Han}")) return .kimi;
-        if (has(r, "\\p{Lu}")) return .o200k;
+        if (has(r, "\\p{Lu}")) return if (has(r, "|\\p{N}|")) .o200k_digit1 else .o200k;
         if (has(r, "\\p{P}\\p{S}")) return .deepseek3;
         if (has(r, "\\p{N}{1,2}") and has(r, "\\p{L}+")) return .nanochat;
         if (has(r, "{1,3}")) return .llama3;
+        if (has(r, "[^\\r\\n\\p{L}\\p{N}]?\\p{L}+") and has(r, " ?[^\\s\\p{L}\\p{N}\\r\\n]+|")) return .qwen2_bare_punct;
         if (has(r, "[^\\r\\n\\p{L}\\p{N}]?\\p{L}+")) return .qwen2;
         if (!has(r, "'s|'t|'re")) std.log.warn("pre-tokenizer regex is not recognised; using the GPT-2 pattern: {s}", .{r});
         return .gpt2;
@@ -820,15 +879,16 @@ pub const Tokenizer = struct {
         if (!self.byte_level) return null;
         for (self.steps) |st| {
             if (st == .regex) return switch (st.regex) {
-                .qwen2 => "qwen2",
+                .qwen2, .qwen2_bare_punct => "qwen2",
                 .llama3 => "llama-bpe",
                 // No llama.cpp pre-tokenizer splits digits in pairs; the nearest
                 // one (nanochat has no llama.cpp architecture to export to anyway).
                 .nanochat => "llama-bpe",
-                .o200k => "gpt-4o",
+                .o200k, .o200k_digit1 => "gpt-4o",
                 .kimi => "kimi-k2",
                 .deepseek3, .digits3, .nd_chunks510, .nd_lead, .nd_groups3, .script_runs => "deepseek-v3",
                 .ds2_letters, .newlines, .ds2_punct, .trailing_ws, .cjk => "deepseek-llm",
+                .cjk_kana => "deepseek-v3",
                 .gpt2 => "gpt-2",
             };
         }
@@ -894,7 +954,7 @@ pub const Tokenizer = struct {
         // Normalise. The prepended text goes through the replacement too: a
         // `Prepend " "` in front of a `Replace " " -> "▁"` (Helium) means the
         // prefix is a metaspace, not a literal space.
-        const folded = if (self.nfkc) try nfkcCodePoints(a, raw) else raw;
+        const folded = if (self.unicode_form) |f| try normalizeUnicode(a, raw, f) else raw;
         const text = if (self.sp_whitespace) try spWhitespace(a, folded) else folded;
         var norm = std.ArrayList(u8).empty;
         for ([_][]const u8{ self.prepend orelse "", text }) |part| {
@@ -931,7 +991,7 @@ pub const Tokenizer = struct {
     fn applyStep(self: *Tokenizer, a: Allocator, step: Step, piece: []const u8, out: *std.ArrayList([]const u8)) !void {
         switch (step) {
             .regex => |kind| {
-                var it = RegexSplitter{ .text = piece, .kind = kind };
+                var it = RegexSplitter{ .text = piece, .kind = kind, .class = self.ds2_letter_class };
                 while (it.next()) |w| try out.append(a, w);
             },
             .split_string => |sp| {
@@ -1027,14 +1087,20 @@ pub const Tokenizer = struct {
         }
     }
 
-    /// NFKC (EXAONE): every code point is replaced by its own NFKC —
-    /// no-break and thin spaces, full-width letters, ligatures, superscripts —
-    /// and the result is canonically composed, so a letter followed by a
-    /// combining accent, or half-width katakana followed by a voiced mark,
-    /// becomes the precomposed character. The one step of full NFKC left out
-    /// is canonical reordering of several combining marks. Bytes that are
-    /// not UTF-8 are copied and block composition.
-    fn nfkcCodePoints(a: Allocator, s: []const u8) ![]const u8 {
+    /// NFKC (EXAONE) or NFC (Qwen, MiMo, Seed-OSS, MiniMax-M2, dots1): every
+    /// code point is replaced by its own NFKC / NFC — for NFKC no-break and
+    /// thin spaces, full-width letters, ligatures, superscripts; for NFC only
+    /// singletons such as U+212B and composition exclusions — and the result
+    /// is canonically composed, so a letter followed by a combining accent,
+    /// or half-width katakana followed by a voiced mark, becomes the
+    /// precomposed character. The one step of full NFKC / NFC left out is
+    /// canonical reordering of several combining marks. Bytes that are not
+    /// UTF-8 are copied and block composition.
+    fn normalizeUnicode(a: Allocator, s: []const u8, form: UnicodeForm) ![]const u8 {
+        const table: []const uni.FoldMulti = switch (form) {
+            .nfkc => &uni.nfkc_map,
+            .nfc => &uni.nfc_map,
+        };
         // Code points, or `raw_byte | b` for a byte that does not decode.
         const raw_byte: u32 = 1 << 31;
         var cps = std.ArrayList(u32).empty;
@@ -1043,7 +1109,7 @@ pub const Tokenizer = struct {
             const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 0;
             const cp = if (len > 0 and i + len <= s.len) (std.unicode.utf8Decode(s[i .. i + len]) catch null) else null;
             if (cp) |c| {
-                if (nfkcOf(c)) |m| {
+                if (mapOf(table, c)) |m| {
                     var it = std.unicode.Utf8View.initUnchecked(m).iterator();
                     while (it.nextCodepoint()) |mc| try cps.append(a, mc);
                 } else try cps.append(a, c);
@@ -1119,8 +1185,7 @@ pub const Tokenizer = struct {
         return null;
     }
 
-    fn nfkcOf(cp: u21) ?[]const u8 {
-        const table = &uni.nfkc_map;
+    fn mapOf(table: []const uni.FoldMulti, cp: u21) ?[]const u8 {
         var lo: usize = 0;
         var hi: usize = table.len;
         while (lo < hi) {
@@ -1483,17 +1548,12 @@ pub fn isWhitespace(cp: u21) bool {
 
 /// Unicode punctuation (approximated: ASCII punctuation, Latin-1 symbols and
 /// the general / CJK / full-width punctuation blocks).
+/// The `Punctuation` pre-tokenizer's test (`tokenizers`' `is_punc`): ASCII
+/// punctuation, which includes `$+<=>^`|~`, or Unicode `P*` — not the other
+/// symbols (`©`, `€`, `×`).
 pub fn isPunctuation(cp: u21) bool {
     if (cp < 128) return std.ascii.isPunctuation(@intCast(cp));
-    if (cp >= 0xA1 and cp <= 0xBF) return true;
-    if (cp == 0xD7 or cp == 0xF7) return true;
-    if (cp >= 0x2000 and cp <= 0x206F) return true;
-    if (cp >= 0x3000 and cp <= 0x303F) return true;
-    if (cp >= 0xFF00 and cp <= 0xFF0F) return true;
-    if (cp >= 0xFF1A and cp <= 0xFF20) return true;
-    if (cp >= 0xFF3B and cp <= 0xFF40) return true;
-    if (cp >= 0xFF5B and cp <= 0xFF65) return true;
-    return false;
+    return inRanges(cp, &uni.punctuation);
 }
 
 fn isWordChar(cp: u21) bool {
@@ -1537,12 +1597,16 @@ fn splitClass(a: Allocator, piece: []const u8, comptime pred: fn (u21) bool, ind
     }
 }
 
+const UnicodeForm = enum { nfkc, nfc };
+
 const RegexSplitter = struct {
     text: []const u8,
     kind: RegexKind,
     pos: usize = 0,
     /// End of the previous match (`\G`); a pattern may match there contiguously.
     g: usize = 0,
+    /// Character class of `ds2_letters` (see `Tokenizer.ds2_letter_class`).
+    class: []const uni.Range = &.{},
 
     fn cpAt(self: *const RegexSplitter, i: usize) ?Cp {
         if (i >= self.text.len) return null;
@@ -1631,8 +1695,8 @@ const RegexSplitter = struct {
     fn matchOne(self: *const RegexSplitter, start: usize) usize {
         const first = self.cpAt(start).?;
         switch (self.kind) {
-            .gpt2, .qwen2, .llama3, .nanochat => {},
-            .o200k => return self.matchO200k(start, first),
+            .gpt2, .qwen2, .qwen2_bare_punct, .llama3, .nanochat => {},
+            .o200k, .o200k_digit1 => return self.matchO200k(start, first),
             .kimi => return self.matchKimi(start, first),
             .deepseek3 => return self.matchDeepseek3(start, first),
             .digits3 => {
@@ -1684,9 +1748,9 @@ const RegexSplitter = struct {
                     c = n;
                 }
                 const letters = self.kind == .ds2_letters;
-                if (!(if (letters) isLetter(c.cp) else isDs2Punct(c.cp))) return start;
+                if (!(if (letters) inRanges(c.cp, self.class) else isDs2Punct(c.cp))) return start;
                 while (self.cpAt(i)) |n| {
-                    if (!(if (letters) isLetter(n.cp) else isDs2Punct(n.cp))) break;
+                    if (!(if (letters) inRanges(n.cp, self.class) else isDs2Punct(n.cp))) break;
                     i += n.len;
                 }
                 return i;
@@ -1696,6 +1760,20 @@ const RegexSplitter = struct {
                 var i = start;
                 while (self.cpAt(i)) |n| {
                     if (!isWhitespace(n.cp)) return start;
+                    i += n.len;
+                }
+                return i;
+            },
+            .cjk_kana => {
+                const in = struct {
+                    fn f(cp: u21) bool {
+                        return (cp >= 0x4E00 and cp <= 0x9FA5) or (cp >= 0x3040 and cp <= 0x30FF);
+                    }
+                }.f;
+                if (!in(first.cp)) return start;
+                var i = start;
+                while (self.cpAt(i)) |n| {
+                    if (!in(n.cp)) break;
                     i += n.len;
                 }
                 return i;
@@ -1782,8 +1860,8 @@ const RegexSplitter = struct {
                 }
                 return self.matchWhitespace(start);
             },
-            .o200k, .kimi, .deepseek3, .digits3, .newlines, .ds2_letters, .ds2_punct, .trailing_ws, .cjk, .nd_chunks510, .nd_lead, .nd_groups3, .script_runs => unreachable,
-            .qwen2, .llama3, .nanochat => {
+            .o200k, .o200k_digit1, .kimi, .deepseek3, .digits3, .newlines, .ds2_letters, .ds2_punct, .trailing_ws, .cjk, .cjk_kana, .nd_chunks510, .nd_lead, .nd_groups3, .script_runs => unreachable,
+            .qwen2, .qwen2_bare_punct, .llama3, .nanochat => {
                 // '[^\r\n\p{L}\p{N}]?\p{L}+'
                 var i = start;
                 var c = first;
@@ -1834,6 +1912,7 @@ const RegexSplitter = struct {
                         if (isWhitespace(n.cp) or isLetter(n.cp) or isNumber(n.cp)) break;
                         i += n.len;
                     }
+                    if (self.kind == .qwen2_bare_punct) return i;
                     while (self.cpAt(i)) |n| {
                         if (!isNewline(n.cp)) break;
                         i += n.len;
@@ -1858,65 +1937,12 @@ const RegexSplitter = struct {
         }
     }
 
-    /// o200k: `[^\r\n\p{L}\p{N}]?[Upper]*[Lower]+contraction? | [^\r\n\p{L}\p{N}]?[Upper]+[Lower]*contraction? |
-    /// \p{N}{1,3} | ?[^\s\p{L}\p{N}]+[\r\n/]* | \s*[\r\n]+ | \s+(?!\S) | \s+`. Non-ASCII letters count as
-    /// both cases (the pattern's Lm/Lo classes), so only ASCII case changes split a word.
+    /// o200k (gpt-oss, Phi-4, Nemotron Nano): `[^\r\n\p{L}\p{N}]?U*L+c? | [^\r\n\p{L}\p{N}]?U+L*c? |
+    /// \p{N}{1,3} | ?[^\s\p{L}\p{N}]+[\r\n/]* | \s*[\r\n]+ | \s+(?!\S) | \s+` with
+    /// `U` = `[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]` and `L` = `[\p{Ll}\p{Lm}\p{Lo}\p{M}]`: Kimi's pattern
+    /// without its Han alternative, and `/` may follow punctuation.
     fn matchO200k(self: *const RegexSplitter, start: usize, first: Cp) usize {
-        var i = start;
-        var c = first;
-        if (!isNewline(c.cp) and !isLetter(c.cp) and !isNumber(c.cp)) {
-            if (self.cpAt(i + c.len)) |n| {
-                if (isLetter(n.cp)) {
-                    i += c.len;
-                    c = n;
-                }
-            }
-        }
-        if (isLetter(c.cp)) {
-            // Upper run (ASCII capitals or case-less letters), then lower run (everything but ASCII capitals).
-            while (self.cpAt(i)) |n| {
-                if (!isLetter(n.cp) or (n.cp < 128 and !isUpperAscii(n.cp))) break;
-                i += n.len;
-            }
-            while (self.cpAt(i)) |n| {
-                if (!isLetter(n.cp) or isUpperAscii(n.cp)) break;
-                i += n.len;
-            }
-            return self.contractionAt(i);
-        }
-        if (isNumber(first.cp)) {
-            i = start;
-            var count: usize = 0;
-            while (self.cpAt(i)) |n| {
-                if (!isNumber(n.cp) or count == 3) break;
-                i += n.len;
-                count += 1;
-            }
-            return i;
-        }
-        // ` ?[^\s\p{L}\p{N}]+[\r\n/]*`
-        i = start;
-        c = first;
-        if (c.cp == ' ') {
-            if (self.cpAt(i + 1)) |n| {
-                if (!isWhitespace(n.cp) and !isLetter(n.cp) and !isNumber(n.cp)) {
-                    i += 1;
-                    c = n;
-                }
-            }
-        }
-        if (!isWhitespace(c.cp) and !isLetter(c.cp) and !isNumber(c.cp)) {
-            while (self.cpAt(i)) |n| {
-                if (isWhitespace(n.cp) or isLetter(n.cp) or isNumber(n.cp)) break;
-                i += n.len;
-            }
-            while (self.cpAt(i)) |n| {
-                if (!isNewline(n.cp) and n.cp != '/') break;
-                i += n.len;
-            }
-            return i;
-        }
-        return self.matchNewlinesOrWhitespace(start);
+        return self.matchCased(start, first);
     }
 
     /// Kimi: `[\p{Han}]+ | [^\r\n\p{L}\p{N}]?U*L+c? | [^\r\n\p{L}\p{N}]?U+L*c? | \p{N}{1,3} |
@@ -1932,6 +1958,11 @@ const RegexSplitter = struct {
             }
             return i;
         }
+        return self.matchCased(start, first);
+    }
+
+    /// The cased-word pattern shared by Kimi and o200k (see both).
+    fn matchCased(self: *const RegexSplitter, start: usize, first: Cp) usize {
         const lead = !isNewline(first.cp) and !isLetter(first.cp) and !isNumber(first.cp);
         const after_lead = start + first.len;
         if (lead) if (self.kimiWord(after_lead, true)) |e| return self.contractionAt(e);
@@ -1942,7 +1973,7 @@ const RegexSplitter = struct {
             var i = start;
             var count: usize = 0;
             while (self.cpAt(i)) |n| {
-                if (!isNumber(n.cp) or count == 3) break;
+                if (!isNumber(n.cp) or count == @as(usize, if (self.kind == .o200k_digit1) 1 else 3)) break;
                 i += n.len;
                 count += 1;
             }
@@ -1965,7 +1996,7 @@ const RegexSplitter = struct {
                 i += n.len;
             }
             while (self.cpAt(i)) |n| {
-                if (!isNewline(n.cp)) break;
+                if (!isNewline(n.cp) and !((self.kind == .o200k or self.kind == .o200k_digit1) and n.cp == '/')) break;
                 i += n.len;
             }
             return i;
@@ -1979,7 +2010,7 @@ const RegexSplitter = struct {
     fn kimiWord(self: *const RegexSplitter, i: usize, need_lower: bool) ?usize {
         var k = i;
         while (self.cpAt(k)) |n| {
-            if (!isKimiUpper(n.cp)) break;
+            if (!self.isCasedUpper(n.cp)) break;
             k += n.len;
         }
         if (!need_lower) {
@@ -1989,7 +2020,7 @@ const RegexSplitter = struct {
         var s = k;
         while (true) {
             if (self.cpAt(s)) |n| {
-                if (isKimiLower(n.cp)) return self.kimiLowerRun(s);
+                if (self.isCasedLower(n.cp)) return self.kimiLowerRun(s);
             }
             if (s == i) return null;
             s -= 1;
@@ -2000,7 +2031,7 @@ const RegexSplitter = struct {
     fn kimiLowerRun(self: *const RegexSplitter, start: usize) usize {
         var i = start;
         while (self.cpAt(i)) |n| {
-            if (!isKimiLower(n.cp)) break;
+            if (!self.isCasedLower(n.cp)) break;
             i += n.len;
         }
         return i;
@@ -2011,14 +2042,14 @@ const RegexSplitter = struct {
     }
 
     /// `[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]`
-    fn isKimiUpper(cp: u21) bool {
-        if (isHan(cp)) return false;
+    fn isCasedUpper(self: *const RegexSplitter, cp: u21) bool {
+        if (self.kind == .kimi and isHan(cp)) return false;
         return (isLetter(cp) and !inRanges(cp, &uni.lower)) or inRanges(cp, &uni.marks);
     }
 
     /// `[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]`
-    fn isKimiLower(cp: u21) bool {
-        if (isHan(cp)) return false;
+    fn isCasedLower(self: *const RegexSplitter, cp: u21) bool {
+        if (self.kind == .kimi and isHan(cp)) return false;
         return (isLetter(cp) and !inRanges(cp, &uni.upper)) or inRanges(cp, &uni.marks);
     }
 
@@ -2205,7 +2236,9 @@ test "NFKC: compatibility forms, then canonical composition" {
         .{ "o\u{308}\u{304}", "\u{22b}" },
         .{ "\xff\u{301}", "\xff\u{301}" },
     };
-    for (cases) |c| try std.testing.expectEqualStrings(c[1], try Tokenizer.nfkcCodePoints(a, c[0]));
+    for (cases) |c| try std.testing.expectEqualStrings(c[1], try Tokenizer.normalizeUnicode(a, c[0], .nfkc));
+    // NFC composes but keeps compatibility forms.
+    try std.testing.expectEqualStrings("caf\u{e9} \u{fb01} \u{c5}", try Tokenizer.normalizeUnicode(a, "cafe\u{301} \u{fb01} \u{212b}", .nfc));
 }
 
 test "a line-break split merged with the next piece (Laguna)" {
@@ -2263,6 +2296,40 @@ test "AFMoE digit groups and script runs, and DeepSeek V3 words with marks" {
     try std.testing.expectEqual(@as(usize, 510), it.next().?.len);
     try std.testing.expectEqual(@as(usize, 510), it.next().?.len);
     try std.testing.expect(it.next() == null);
+}
+
+test "pre-tokenizer variants found by the tokenizer sweep" {
+    // Pieces from `tokenizers`' pre_tokenize_str on each release's tokenizer.
+    const Case = struct { kind: RegexKind, text: []const u8, want: []const []const u8 };
+    const cases = [_]Case{
+        // o200k (openai/gpt-oss-20b): marks belong to words.
+        .{ .kind = .o200k, .text = "\u{939}\u{93f}\u{928}\u{94d}\u{926}\u{940} \u{92e}\u{947}\u{902}", .want = &.{ "\u{939}\u{93f}\u{928}\u{94d}\u{926}\u{940}", " \u{92e}\u{947}\u{902}" } },
+        // Falcon-H1: single digits.
+        .{ .kind = .o200k_digit1, .text = "x123", .want = &.{ "x", "1", "2", "3" } },
+        .{ .kind = .o200k, .text = "x123", .want = &.{ "x", "123" } },
+        // Seed-OSS: no line breaks after punctuation.
+        .{ .kind = .qwen2_bare_punct, .text = "):\n x", .want = &.{ "):", "\n", " x" } },
+        .{ .kind = .qwen2, .text = "):\n x", .want = &.{ "):\n", " x" } },
+        // DeepSeek V3's CJK and kana split does not take the em dash.
+        .{ .kind = .cjk_kana, .text = "\u{65e5}\u{672c}\u{3042}\u{2014}x", .want = &.{ "\u{65e5}\u{672c}\u{3042}", "\u{2014}x" } },
+    };
+    for (cases) |c| {
+        var it = RegexSplitter{ .text = c.text, .kind = c.kind };
+        for (c.want) |w| try std.testing.expectEqualStrings(w, it.next().?);
+        try std.testing.expect(it.next() == null);
+    }
+    try std.testing.expectEqual(RegexKind.o200k_digit1, Tokenizer.classifyRegex("[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"));
+    try std.testing.expectEqual(RegexKind.qwen2_bare_punct, Tokenizer.classifyRegex("(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1}| ?[^\\s\\p{L}\\p{N}\r\n]+|\\s*[\r\n]+|\\s+(?!\\S)|\\s+"));
+    try std.testing.expectEqual(RegexKind.cjk_kana, Tokenizer.classifyRegex("[\u{4e00}-\u{9fa5}\u{3040}-\u{309f}\u{30a0}-\u{30ff}]+"));
+    // Punctuation is ASCII punctuation or Unicode P, not the other symbols.
+    try std.testing.expect(isPunctuation('$') and isPunctuation(0xAB) and isPunctuation(0x2014));
+    try std.testing.expect(!isPunctuation(0xA9) and !isPunctuation(0x20AC) and !isPunctuation(0xD7));
+    // DeepSeek V2's letter class comes from the pattern itself.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const class = try Tokenizer.parseCharClass(arena.allocator(), "\\s?[A-Za-z\u{b5}\u{c0}-\u{d6}\\-]+");
+    try std.testing.expect(inRanges('q', class) and inRanges(0xB5, class) and inRanges(0xC3, class) and inRanges('-', class));
+    try std.testing.expect(!inRanges(0xD7, class) and !inRanges(0x939, class) and !inRanges('[', class));
 }
 
 test "byte-level bpe round trip" {
