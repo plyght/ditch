@@ -2472,7 +2472,7 @@ pub const KvCache = struct {
         const kvd = c.kvDim();
         var use_scratch = model.spill_always;
         if (model.budget) |b| {
-            const need = bytesFor(c.num_layers, batch, max_len, kvd) + LinearCache.bytesFor(c, batch) + model.residentWeightNeed();
+            const need = bytesFor(c.num_layers, batch, max_len, kvd) + LinearCache.bytesFor(c, batch) + qwen4.NgramCache.bytesFor(c, batch) + model.residentWeightNeed();
             if (b.limited() and b.available() + model.expertCacheEvictable() < need) use_scratch = true;
         }
         var cache: KvCache = undefined;
