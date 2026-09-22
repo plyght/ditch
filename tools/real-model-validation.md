@@ -1729,7 +1729,9 @@ The last three:
   `.scale` FP8 siblings). transformers loads it through a 40-rule rename table
   in `conversion_mapping.py`. Supporting it means that table plus its inverse
   for exports; the stub would be the way to verify it, but no release could be
-  run here even then (FP4), so it stays a recorded gap.
+  run here even then (FP4), so it stays a recorded gap. (Superseded: the frontier
+  pass below added DeepSeek's own names, ue8m0 FP8 scales and FP4 experts, and
+  runs the released V4.)
 * **`hf-tiny-v2/tiny-random-Gemma4Model`** — a Gemma 4 MoE block, the
   documented limitation.
 
@@ -1859,6 +1861,14 @@ layers by range requests. Same comparison as everywhere else, float32.
 | arcee-ai/AFM-4.5B, N = 3 | `arcee` | match (raw); template ids match | all 4 agree | 6.14e-07 |
 | allenai/OLMoE-1B-7B-0924-Instruct, N = 2 | `olmoe` | match (raw); template ids match | all 3 agree (after bugs 54, 55) | 1.36e-06 |
 | arcee-ai/Trinity-Nano-Preview, N = 4 (3 sliding + 1 NoPE full, dense then MoE) | `afmoe` | match (raw); template ids match | all 5 agree (after bug 57) | 7.02e-06 |
+| JetBrains/Mellum2-12B-A2.5B-Instruct, N = 4 (3 sliding + 1 full), experts 0–15 of 64 | `mellum` | match (raw); template ids match | all 5 agree | 1.32e-06 |
+
+The Mellum cut keeps 16 of each layer's 64 experts, and the matching 16 router
+rows, with `num_experts: 16` in its config: in float32 the full four layers need
+more than this machine's 15 GiB on the transformers side. Both sides then run
+the same smaller model, which still exercises every part of the arithmetic —
+the per-layer-type rope, the sliding and full layers, the softmax top-8 routing
+renormalised over fused experts.
 
 Ministral 3 covers yarn rope scaling and tied embeddings inside the
 `mistral3` multimodal wrapper; the tokenizer (tekken, as `tokenizer.json`)
