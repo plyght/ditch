@@ -82,10 +82,11 @@ pub const Http = struct {
         self.io.sleep(Io.Duration.fromSeconds(@intCast(attempt * 2)), .awake) catch {};
     }
 
-    fn curlTimeoutArgs(self: *Http, buf: []u8) ![]const []const u8 {
-        // Connect timeout, and abort a transfer that stalls (< 1 B/s) for that long.
+    /// Appends curl's connect timeout and the stall abort (< 1 B/s for that
+    /// long) to `argv`. `buf` must outlive `argv`: the arguments point into it.
+    fn appendCurlTimeoutArgs(self: *Http, argv: *std.ArrayList([]const u8), buf: []u8) !void {
         const t = try std.fmt.bufPrint(buf, "{d}", .{@max(self.timeout_seconds, 1)});
-        return &.{ "--connect-timeout", t, "--speed-time", t, "--speed-limit", "1" };
+        try argv.appendSlice(self.gpa, &.{ "--connect-timeout", t, "--speed-time", t, "--speed-limit", "1" });
     }
 
     pub fn deinit(self: *Http) void {
@@ -187,7 +188,7 @@ pub const Http = struct {
         defer argv.deinit(self.gpa);
         try argv.appendSlice(self.gpa, &.{ "curl", "-L", "-sS", "--fail-with-body", "-w", "\n%{http_code}" });
         var tbuf: [32]u8 = undefined;
-        try argv.appendSlice(self.gpa, try self.curlTimeoutArgs(&tbuf));
+        try self.appendCurlTimeoutArgs(&argv, &tbuf);
         var range_buf: [64]u8 = undefined;
         if (range) |r| {
             try argv.append(self.gpa, "-r");
@@ -299,7 +300,7 @@ pub const Http = struct {
         defer argv.deinit(self.gpa);
         try argv.appendSlice(self.gpa, &.{ "curl", "-L", "-sS", "--fail", "-o", full });
         var tbuf: [32]u8 = undefined;
-        try argv.appendSlice(self.gpa, try self.curlTimeoutArgs(&tbuf));
+        try self.appendCurlTimeoutArgs(&argv, &tbuf);
         if (continue_partial) try argv.appendSlice(self.gpa, &.{ "-C", "-" });
         var auth_buf: [512]u8 = undefined;
         var auth_line: ?[]u8 = null;

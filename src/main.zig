@@ -29,6 +29,7 @@ const budget_mod = @import("budget.zig");
 const stream = @import("stream.zig");
 const reproduce = @import("reproduce.zig");
 const bench = @import("bench.zig");
+const probe = @import("probe.zig");
 const directions = @import("directions.zig");
 const remote = @import("remote.zig");
 
@@ -1444,6 +1445,10 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     const cache_root = try hf.cacheDir(arena, settings, init.environ_map);
     if (settings.bench) {
         try bench.run(gpa, arena, io, settings, &http, cache_root, pool, out, con.result);
+        return;
+    }
+    if (settings.probe) {
+        try probe.run(gpa, arena, io, settings, &http, cache_root, pool, out, con.result);
         return;
     }
     try out.print("\nLoading model {s}...\n", .{settings.model});

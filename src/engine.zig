@@ -91,7 +91,7 @@ pub const Engine = struct {
         return stream.workspaceRows(self.model, wanted, logit_rows, kv_bytes);
     }
 
-    fn ensureWorkspace(self: *Engine, rows: usize, logit_rows: usize, kv_bytes: u64) !*model_mod.Workspace {
+    pub fn ensureWorkspace(self: *Engine, rows: usize, logit_rows: usize, kv_bytes: u64) !*model_mod.Workspace {
         if (self.ws) |*w| {
             if (w.max_rows >= rows and w.max_logit_rows >= logit_rows) return w;
             w.deinit();
