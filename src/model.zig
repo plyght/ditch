@@ -1037,12 +1037,10 @@ pub const Model = struct {
         self.config = try parseConfig(arena, self.config_json);
         self.generation_config_json = dir.readFileAlloc(io, "generation_config.json", arena, .unlimited) catch null;
         self.tokenizer_config_json = dir.readFileAlloc(io, "tokenizer_config.json", arena, .unlimited) catch null;
-        const tok_json = dir.readFileAlloc(io, "tokenizer.json", arena, .unlimited) catch {
-            std.log.err("tokenizer.json not found in {s} (only fast tokenizers are supported)", .{dir_path});
-            return error.MissingTokenizer;
-        };
-        self.tokenizer_json = tok_json;
-        self.tokenizer = try Tokenizer.parse(gpa, tok_json, self.tokenizer_config_json);
+        // tokenizer.json, else a tiktoken vocabulary (tiktoken.model / tokenizer.model).
+        const loaded = try Tokenizer.loadDir(gpa, io, arena, dir, dir_path, self.tokenizer_config_json);
+        self.tokenizer_json = loaded.json;
+        self.tokenizer = loaded.tokenizer;
         errdefer self.tokenizer.deinit();
         self.chat_template = null;
         if (self.tokenizer_config_json) |tc| {

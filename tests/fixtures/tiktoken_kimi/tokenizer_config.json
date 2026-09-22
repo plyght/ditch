@@ -1,0 +1,121 @@
+{
+ "added_tokens_decoder": {
+  "657": {
+   "content": "[BOS]",
+   "lstrip": false,
+   "normalized": false,
+   "rstrip": false,
+   "single_word": false,
+   "special": true
+  },
+  "658": {
+   "content": "[EOS]",
+   "lstrip": false,
+   "normalized": false,
+   "rstrip": false,
+   "single_word": false,
+   "special": true
+  },
+  "659": {
+   "content": "<|im_end|>",
+   "lstrip": false,
+   "normalized": false,
+   "rstrip": false,
+   "single_word": false,
+   "special": true
+  },
+  "660": {
+   "content": "<|im_user|>",
+   "lstrip": false,
+   "normalized": false,
+   "rstrip": false,
+   "single_word": false,
+   "special": true
+  },
+  "661": {
+   "content": "<|im_assistant|>",
+   "lstrip": false,
+   "normalized": false,
+   "rstrip": false,
+   "single_word": false,
+   "special": true
+  },
+  "663": {
+   "content": "<|start_header_id|>",
+   "lstrip": false,
+   "normalized": false,
+   "rstrip": false,
+   "single_word": false,
+   "special": true
+  },
+  "664": {
+   "content": "<|end_header_id|>",
+   "lstrip": false,
+   "normalized": false,
+   "rstrip": false,
+   "single_word": false,
+   "special": true
+  },
+  "666": {
+   "content": "[EOT]",
+   "lstrip": false,
+   "normalized": false,
+   "rstrip": false,
+   "single_word": false,
+   "special": true
+  },
+  "667": {
+   "content": "<|im_system|>",
+   "lstrip": false,
+   "normalized": false,
+   "rstrip": false,
+   "single_word": false,
+   "special": true
+  },
+  "668": {
+   "content": "<|tool_calls_section_begin|>",
+   "lstrip": false,
+   "normalized": false,
+   "rstrip": false,
+   "single_word": false,
+   "special": false
+  },
+  "674": {
+   "content": "<|im_middle|>",
+   "lstrip": false,
+   "normalized": false,
+   "rstrip": false,
+   "single_word": false,
+   "special": true
+  },
+  "911": {
+   "content": "[UNK]",
+   "lstrip": false,
+   "normalized": false,
+   "rstrip": false,
+   "single_word": false,
+   "special": true
+  },
+  "912": {
+   "content": "[PAD]",
+   "lstrip": false,
+   "normalized": false,
+   "rstrip": false,
+   "single_word": false,
+   "special": true
+  }
+ },
+ "bos_token": "[BOS]",
+ "eos_token": "[EOS]",
+ "pad_token": "[PAD]",
+ "unk_token": "[UNK]",
+ "clean_up_tokenization_spaces": false,
+ "tokenizer_class": "TikTokenTokenizer",
+ "auto_map": {
+  "AutoTokenizer": [
+   "tokenization_kimi.TikTokenTokenizer",
+   null
+  ]
+ },
+ "chat_template": "{%- for message in messages -%}{%- if message['role'] == 'system' -%}{{ '<|im_system|>system<|im_middle|>' }}{%- elif message['role'] == 'user' -%}{{ '<|im_user|>user<|im_middle|>' }}{%- elif message['role'] == 'assistant' -%}{{ '<|im_assistant|>assistant<|im_middle|>' }}{%- endif -%}{{ message['content'] + '<|im_end|>' }}{%- endfor -%}{%- if add_generation_prompt -%}{{ '<|im_assistant|>assistant<|im_middle|>' }}{%- endif -%}"
+}
