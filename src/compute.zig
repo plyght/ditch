@@ -163,6 +163,16 @@ pub fn setWeightsStable(stable: bool) void {
 /// dispatch plus the tile upload costs more than the arithmetic saves.
 pub const min_device_macs: u64 = 1 << 20;
 
+/// Weight-tile operations the active device actually served (it neither
+/// declined them nor fell below `min_macs`). Lets a run report, and a test
+/// assert, that the GPU did the work rather than silently leaving it all to the
+/// CPU.
+pub var served: std.atomic.Value(u64) = .init(0);
+
+fn noteServed() void {
+    _ = served.fetchAdd(1, .monotonic);
+}
+
 fn deviceWorthIt(dev: *const Device, n: usize, rows: usize, cols: usize) bool {
     const macs = @as(u64, n) * @as(u64, rows) * @as(u64, cols);
     return macs >= dev.min_macs;
@@ -179,6 +189,8 @@ pub const SelectOptions = struct {
     /// backend needs it; without one it reports itself unavailable, which
     /// `auto` turns into the CPU.
     io: ?std.Io = null,
+    /// Overrides `Device.min_macs` (see `Settings.device_min_macs`).
+    min_macs: ?u64 = null,
 };
 
 pub const SelectResult = struct {
@@ -191,6 +203,12 @@ pub const SelectResult = struct {
 /// Opens `kind`, or returns an error for an explicitly requested backend that
 /// is not available. `auto` never fails: it falls back to the CPU with a note.
 pub fn select(gpa: Allocator, kind: Kind, opts: SelectOptions) !SelectResult {
+    var r = try selectDevice(gpa, kind, opts);
+    if (opts.min_macs) |m| r.device.min_macs = m;
+    return r;
+}
+
+fn selectDevice(gpa: Allocator, kind: Kind, opts: SelectOptions) !SelectResult {
     switch (kind) {
         .cpu => return .{ .device = cpu_device },
         .metal => {
@@ -247,6 +265,7 @@ pub fn matmulTOn(dev: *const Device, pool: *const Pool, gpa: Allocator, out: []f
     if (dev.vtable.matmulT) |f| {
         if (n > 0 and w.rows > 0 and deviceWorthIt(dev, n, w.rows, w.cols)) {
             if (f(dev.ctx.?, out, x, n, w)) |_| {
+                noteServed();
                 if (delta) |d| try applyDelta(gpa, out, x, n, w, d);
                 return;
             } else |err| switch (err) {
@@ -286,6 +305,7 @@ pub fn matvecTMultiOn(dev: *const Device, pool: *const Pool, gpa: Allocator, out
     if (dev.vtable.matvecTMulti) |f| {
         if (q > 0 and w.rows > 0 and deviceWorthIt(dev, q, w.rows, w.cols)) {
             if (f(dev.ctx.?, out, w, y, q)) |_| {
+                noteServed();
                 return;
             } else |err| switch (err) {
                 error.Unsupported => {},
@@ -310,6 +330,7 @@ pub fn rowNormsOn(dev: *const Device, pool: *const Pool, gpa: Allocator, out: []
     if (dev.vtable.rowNorms) |f| {
         if (w.rows > 0 and deviceWorthIt(dev, 1, w.rows, w.cols)) {
             if (f(dev.ctx.?, out, w)) |_| {
+                noteServed();
                 return;
             } else |err| switch (err) {
                 error.Unsupported => {},
@@ -677,6 +698,19 @@ test "selecting cpu and auto never fails and metal is refused off-Apple" {
     if (!metal_supported) {
         try testing.expectError(error.DeviceUnavailable, select(gpa, .metal, .{}));
     }
+}
+
+test "select applies a min_macs override, and a device serves only what crosses it" {
+    const gpa = testing.allocator;
+    const r = try select(gpa, .cpu, .{ .min_macs = 0 });
+    try testing.expectEqual(@as(u64, 0), r.device.min_macs);
+    const d = try select(gpa, .cpu, .{});
+    try testing.expectEqual(min_device_macs, d.device.min_macs);
+    // A 2x2x2 product is 8 MACs: below the default threshold, above zero.
+    var dev = d.device;
+    try testing.expect(!deviceWorthIt(&dev, 2, 2, 2));
+    dev.min_macs = 0;
+    try testing.expect(deviceWorthIt(&dev, 2, 2, 2));
 }
 
 test "residency keeps hot tiles and evicts the least recently used" {

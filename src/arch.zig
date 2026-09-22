@@ -1182,7 +1182,16 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
     const rope_scaling: RopeScaling = if (rs_obj) |rs| try parseRopeScaling(arena, obj, rs, rotary_dim, max_pos) else .none;
     // The sliding layers' own table (the Gemma 3 family sets its own in its
     // hook); its scaling is always the unscaled one of the released configs.
-    const rope_local: ?LocalRope = if (local_theta) |t| .{ .theta = t, .rotary_dim = rotary_dim, .freq_dim = rotary_dim } else null;
+    // A per-layer-type `rope_parameters` table can give the local layers their
+    // own `partial_rotary_factor` as well as their own base (Laguna rotates
+    // half the head on its full-attention layers and all of it on the sliding
+    // ones), so the local rotary width is read from the local entry.
+    var local_rotary_dim = rotary_dim;
+    if (rp_local) |l| if (getNum(l, "partial_rotary_factor")) |f| {
+        local_rotary_dim = @intFromFloat(@as(f64, @floatFromInt(head_dim)) * f);
+        local_rotary_dim -= local_rotary_dim % 2;
+    };
+    const rope_local: ?LocalRope = if (local_theta) |t| .{ .theta = t, .rotary_dim = local_rotary_dim, .freq_dim = local_rotary_dim } else null;
 
     const sliding_window: ?usize = blk: {
         const v = obj.get("sliding_window") orelse break :blk null;
@@ -3134,6 +3143,9 @@ fn extraAfmoe(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
         const every = @max(1, getInt(obj, "global_attn_every_n_layers", 4));
         for (c.sliding_layers, 0..) |*s, i| s.* = ((i + 1) % every != 0);
     }
+    // Only the local layers are roped; the full-attention ones are NoPE
+    // (`AfmoeAttention` applies the rotary under `if self.is_local_attention`).
+    for (c.rope_layers, 0..) |*r, i| r.* = c.sliding_layers[i];
 }
 
 /// Mellum: a plain softmax top-k router (renormalised) over fused experts.

@@ -110,7 +110,7 @@ returning a table keyed like the flags; every option is documented in
 [`config.default.lua`](config.default.lua), and Heretic `config.toml` files are
 accepted. Precedence, highest first: flags, `DITCH_*` environment variables
 (`DITCH_THREADS`, `DITCH_MAX_RAM`, `DITCH_CACHE`, `DITCH_DEVICE`,
-`DITCH_NO_COLOR`),
+`DITCH_REMOTE_CACHE_SIZE`, `DITCH_NO_COLOR`),
 `./config.lua`, then `$XDG_CONFIG_HOME/ditch/config.lua`. Messages go to stderr
 and results to stdout (`--json` for one JSON document, `--plain` for
 grep-friendly lines); `--no-input` turns every prompt into an error naming the
