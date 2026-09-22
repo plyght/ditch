@@ -1513,10 +1513,11 @@ one of the architectures whose q/k llama.cpp permutes.)
 
 **Verification.** No Cohere checkpoint is public (every `CohereLabs/*` repo
 is gated), and an 8B float32 reference does not fit in 15 GiB anyway. Two
-ungated copies of released weights were cut down instead:
-`tools`-style range requests fetch the safetensors header of each shard and
-then only the embedding, final norm and the first *N* layers' tensors, and a
-checkpoint with `num_hidden_layers = N` is written from them (3.4–3.8 GB).
+ungated copies of released weights were cut down instead with
+`tools/truncate_checkpoint.py REPO N` (new): HTTP range requests fetch each
+shard's safetensors header and then only the embedding, final norm and the
+first *N* layers' tensors, and a checkpoint with `num_hidden_layers = N` is
+written from them (3.4–3.8 GB, no full shard ever downloaded).
 Both against transformers in float32, with each model's own chat template:
 
 | Checkpoint (first N layers) | family | tokens | residuals | first-token logits |
