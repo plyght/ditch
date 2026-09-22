@@ -240,6 +240,9 @@ pub const Settings = struct {
     probe_prompts: []const []const u8 = &.{},
     /// Feed `--prompt` texts verbatim (no chat template, no BOS).
     probe_raw: bool = false,
+    /// Also report the last token's residual at every layer (`--residuals`),
+    /// so a reference implementation can be compared layer by layer.
+    probe_residuals: bool = false,
     help: bool = false,
     version: bool = false,
     /// Print only trial results, scores, menus and errors: no banner and no progress lines.
@@ -431,10 +434,12 @@ pub const help_sections = [_]HelpSection{
     \\  --bench-prompts <n>            Prompts per benchmark batch (default: 16).
     \\  --bench-tokens <n>             Tokens decoded per prompt in the benchmark (default: 32).
     \\  --bench-output <file.md>       Also write the benchmark table to this file.
-    \\  ditch probe <model> --prompt TEXT [--prompt TEXT ...] [--raw]
+    \\  ditch probe <model> --prompt TEXT [--prompt TEXT ...] [--raw] [--residuals]
     \\                                 Print the rendered prompt, token ids, the top first-token
     \\                                 logits and the greedy reply (--json: the full logit vector),
-    \\                                 for checking against tools/probe_reference.py.
+    \\                                 for checking against tools/probe_reference.py. --residuals
+    \\                                 adds the last token's residual at every layer (its norm in
+    \\                                 text mode), which locates the layer a forward pass diverges at.
     \\  ditch selftest [--device D]    Check every kernel of a compute backend against the CPU
     \\                                 reference on random inputs and a sweep of shapes, printing
     \\                                 the largest absolute and relative error per kernel (--json
@@ -822,7 +827,7 @@ fn normalizeKey(a: Allocator, name: []const u8) ![]u8 {
 }
 
 fn isBoolKey(key: []const u8) bool {
-    const bools = [_][]const u8{ "print_debug_information", "print_residual_geometry", "orthogonalize_direction", "keyword_rate_print_responses", "ignore_mismatches", "early_stop", "no_early_stop", "visited_experts_only", "remote_weights", "hotlist", "no_hotlist", "ablate_inputs", "fast_search", "selftest", "raw", "help", "version", "quiet", "dry_run", "no_input", "interactive", "force", "json", "plain", "no_color", "debug", "token" };
+    const bools = [_][]const u8{ "print_debug_information", "print_residual_geometry", "orthogonalize_direction", "keyword_rate_print_responses", "ignore_mismatches", "early_stop", "no_early_stop", "visited_experts_only", "remote_weights", "hotlist", "no_hotlist", "ablate_inputs", "fast_search", "selftest", "raw", "residuals", "help", "version", "quiet", "dry_run", "no_input", "interactive", "force", "json", "plain", "no_color", "debug", "token" };
     for (bools) |b| if (std.mem.eql(u8, b, key)) return true;
     return false;
 }
@@ -909,7 +914,7 @@ fn applyOption(a: Allocator, s: *Settings, key: []const u8, value: []const u8) !
         @memcpy(list[0..s.probe_prompts.len], s.probe_prompts);
         list[s.probe_prompts.len] = try a.dupe(u8, value);
         s.probe_prompts = list;
-    } else if (eql(u8, key, "raw")) s.probe_raw = try parseBool(value) else if (eql(u8, key, "help")) s.help = try parseBool(value) else if (eql(u8, key, "version")) s.version = try parseBool(value) else if (eql(u8, key, "quiet")) s.quiet = try parseBool(value) else if (eql(u8, key, "json_log")) s.json_log = try a.dupe(u8, value) else if (eql(u8, key, "dry_run")) s.dry_run = try parseBool(value) else if (eql(u8, key, "no_input")) s.no_input = try parseBool(value) else if (eql(u8, key, "interactive")) s.interactive = try parseBool(value) else if (eql(u8, key, "force")) s.force = try parseBool(value) else if (eql(u8, key, "json")) s.json = try parseBool(value) else if (eql(u8, key, "plain")) s.plain = try parseBool(value) else if (eql(u8, key, "no_color")) s.no_color = try parseBool(value) else if (eql(u8, key, "debug")) s.print_debug_information = try parseBool(value) else if (eql(u8, key, "output")) s.save_directory = try a.dupe(u8, value) else if (eql(u8, key, "token_file")) s.token_file = try a.dupe(u8, value) else if (eql(u8, key, "http_timeout")) s.http_timeout_seconds = try parseDuration(value) else if (eql(u8, key, "token")) return error.TokenAsFlag else if (eql(u8, key, "keyword_rate_print_responses")) s.keyword_rate.print_responses = try parseBool(value) else if (eql(u8, key, "keyword_rate_score_name")) s.keyword_rate.score_name = try a.dupe(u8, value) else if (std.mem.startsWith(u8, key, "good_prompts_")) try applyDatasetOption(a, &s.good_prompts, key["good_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "bad_prompts_")) try applyDatasetOption(a, &s.bad_prompts, key["bad_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "keyword_rate_prompts_")) try applyDatasetOption(a, &s.keyword_rate.prompts, key["keyword_rate_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "kl_divergence_prompts_")) try applyDatasetOption(a, &s.kl_divergence.prompts, key["kl_divergence_prompts_".len..], value) else return error.UnknownOption;
+    } else if (eql(u8, key, "raw")) s.probe_raw = try parseBool(value) else if (eql(u8, key, "residuals")) s.probe_residuals = try parseBool(value) else if (eql(u8, key, "help")) s.help = try parseBool(value) else if (eql(u8, key, "version")) s.version = try parseBool(value) else if (eql(u8, key, "quiet")) s.quiet = try parseBool(value) else if (eql(u8, key, "json_log")) s.json_log = try a.dupe(u8, value) else if (eql(u8, key, "dry_run")) s.dry_run = try parseBool(value) else if (eql(u8, key, "no_input")) s.no_input = try parseBool(value) else if (eql(u8, key, "interactive")) s.interactive = try parseBool(value) else if (eql(u8, key, "force")) s.force = try parseBool(value) else if (eql(u8, key, "json")) s.json = try parseBool(value) else if (eql(u8, key, "plain")) s.plain = try parseBool(value) else if (eql(u8, key, "no_color")) s.no_color = try parseBool(value) else if (eql(u8, key, "debug")) s.print_debug_information = try parseBool(value) else if (eql(u8, key, "output")) s.save_directory = try a.dupe(u8, value) else if (eql(u8, key, "token_file")) s.token_file = try a.dupe(u8, value) else if (eql(u8, key, "http_timeout")) s.http_timeout_seconds = try parseDuration(value) else if (eql(u8, key, "token")) return error.TokenAsFlag else if (eql(u8, key, "keyword_rate_print_responses")) s.keyword_rate.print_responses = try parseBool(value) else if (eql(u8, key, "keyword_rate_score_name")) s.keyword_rate.score_name = try a.dupe(u8, value) else if (std.mem.startsWith(u8, key, "good_prompts_")) try applyDatasetOption(a, &s.good_prompts, key["good_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "bad_prompts_")) try applyDatasetOption(a, &s.bad_prompts, key["bad_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "keyword_rate_prompts_")) try applyDatasetOption(a, &s.keyword_rate.prompts, key["keyword_rate_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "kl_divergence_prompts_")) try applyDatasetOption(a, &s.kl_divergence.prompts, key["kl_divergence_prompts_".len..], value) else return error.UnknownOption;
 }
 
 fn tomlString(a: Allocator, v: toml.Value) ![]const u8 {

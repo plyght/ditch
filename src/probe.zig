@@ -3,7 +3,10 @@
 //! can be checked against a reference implementation (see
 //! tools/probe_reference.py). Prints the rendered prompt, its token ids,
 //! the highest first-token logits and the greedy continuation; `--json`
-//! also includes the full first-token logit vector.
+//! also includes the full first-token logit vector, and `--residuals` the
+//! last token's residual at every layer (layer L is the vector layer L
+//! reads, so entry 0 is the embedding and entry `num_layers` is what the
+//! final norm reads — the same series as transformers' `hidden_states`).
 
 const std = @import("std");
 const Io = std.Io;
@@ -91,7 +94,9 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings,
         defer cache.deinit();
         const logits = try gpa.alloc(f32, c.vocab_size);
         defer gpa.free(logits);
-        try model_mod.prefill(model, ws, &cache, &prompts, logits, null);
+        const residuals: ?[]f32 = if (settings.probe_residuals) try gpa.alloc(f32, (c.num_layers + 1) * c.hidden_size) else null;
+        defer if (residuals) |r| gpa.free(r);
+        try model_mod.prefill(model, ws, &cache, &prompts, logits, residuals);
         var top_buf: [top_k]Top = undefined;
         const top = topK(logits, &top_buf);
 
@@ -122,6 +127,13 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings,
             try js.write(response);
             try js.objectField("logits");
             try js.write(logits);
+            if (residuals) |r| {
+                try js.objectField("residuals");
+                try js.beginArray();
+                var l: usize = 0;
+                while (l <= c.num_layers) : (l += 1) try js.write(r[l * c.hidden_size ..][0..c.hidden_size]);
+                try js.endArray();
+            }
             try js.endObject();
         } else {
             try result_out.print("\nPrompt: {s}\nRendered ({d} tokens): {s}\nIds:", .{ user, ids.len, text });
@@ -129,6 +141,15 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings,
             try result_out.writeAll("\nTop first-token logits:\n");
             for (top) |t| try result_out.print("  {d:>8}  {d:>10.4}  {s}\n", .{ t.id, t.logit, model.tokenizer.id_to_token[t.id] });
             try result_out.print("Greedy ({d} tokens): {s}\n", .{ generated[0].len, response });
+            if (residuals) |r| {
+                try result_out.writeAll("Residual norm per layer (last token):\n");
+                var l: usize = 0;
+                while (l <= c.num_layers) : (l += 1) {
+                    var ss: f64 = 0;
+                    for (r[l * c.hidden_size ..][0..c.hidden_size]) |v| ss += @as(f64, v) * v;
+                    try result_out.print("  {d:>3}  {d:>12.4}\n", .{ l, @sqrt(ss) });
+                }
+            }
         }
         try result_out.flush();
     }
