@@ -918,7 +918,9 @@ spec("minimax_m2", tok="o200k", L=2, rotary_dim=4, qk_norm="full", lm_head="lm_h
      config={"model_type": "minimax_m2", "hidden_size": 32, "intermediate_size": 12, "num_hidden_layers": 2, "num_attention_heads": 4,
              "num_key_value_heads": 2, "head_dim": 8, "num_local_experts": 4, "num_experts_per_tok": 2, "rotary_dim": 4,
              "rms_norm_eps": 1e-6, "rope_theta": 5000000.0, "hidden_act": "silu", "max_position_embeddings": 128, "tie_word_embeddings": False})
-spec("minimax", tok="llama3", L=4, rotary_dim=4, lm_head="lm_head.weight", theta=1000000.0, eps=1e-5,
+# gelu rather than the releases' silu, so the lightning qkv activation is
+# checked to follow `hidden_act`.
+spec("minimax", tok="llama3", L=4, rotary_dim=4, lm_head="lm_head.weight", theta=1000000.0, eps=1e-5, act="gelu",
      linear_kind="lightning", linear_layers=[1, 0, 1, 0], residual_layout="minimax",
      mm_scales={"full": (2.0, 1.0), "linear": (1.5, 1.0), "mlp": (3.0, 0.5)},
      moe={"E": 4, "K": 2, "MI": 12, "shared": 0, "scoring": "softmax", "group_limited": False, "rsf": 1.0, "norm": True,
@@ -929,7 +931,7 @@ spec("minimax", tok="llama3", L=4, rotary_dim=4, lm_head="lm_head.weight", theta
              "layer_types": ["linear_attention", "full_attention", "linear_attention", "full_attention"],
              "full_attn_alpha_factor": 2.0, "full_attn_beta_factor": 1.0, "linear_attn_alpha_factor": 1.5, "linear_attn_beta_factor": 1.0,
              "mlp_alpha_factor": 3.0, "mlp_beta_factor": 0.5,
-             "rms_norm_eps": 1e-5, "rope_theta": 1000000.0, "hidden_act": "silu", "max_position_embeddings": 128, "tie_word_embeddings": False})
+             "rms_norm_eps": 1e-5, "rope_theta": 1000000.0, "hidden_act": "gelu", "max_position_embeddings": 128, "tie_word_embeddings": False})
 spec("minimax_m3", tok="o200k", L=3, I=16, rotary_dim=4, prefix="language_model.model.", lm_head="language_model.lm_head.weight", theta=5000000.0,
      norm="rms1p", qk_norm="head", mlp="gated_fused", gate_up="mlp.gate_up_proj.weight", down="mlp.down_proj.weight", dense_swiglu=(1.702, 7.0),
      moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "shared_inter": 16, "shared_fused": ("gate_up_proj.weight", "down_proj.weight"),
@@ -2250,7 +2252,8 @@ def generate_generic(family, out_dir):
         as the per-token recurrence the blocked prefill is equivalent to."""
         T = h.shape[0]
         p = h @ d["light_qkv"].T
-        p = (p / (1 + np.exp(-p))).reshape(T, NH, 3 * HD)
+        # `act_fn = ACT2FN[config.hidden_act]` on the fused projection.
+        p = act_fn(p).reshape(T, NH, 3 * HD)
         q, k, v = p[:, :, :HD], p[:, :, HD:2 * HD], p[:, :, 2 * HD:]
         base = 1 / (2 ** (8 / NH))
         factor = 1 - li / (L - 1 + 1e-5) + 1e-5

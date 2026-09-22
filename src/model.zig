@@ -3588,7 +3588,7 @@ fn kdaConvTap(lin: LinearWeights, dim: usize, kc: usize, j: usize, i: usize) f32
     return elemAt(w.dtype, w.data, (j - s * dim) * kc + i);
 }
 
-/// MiniMax lightning-attention sublayer: `silu(h Wqkvᵀ)` split per head into
+/// MiniMax lightning-attention sublayer: `act(h Wqkvᵀ)` split per head into
 /// q, k, v; per head the decayed recurrence `S = exp(-s_h) S + kᵀ v`,
 /// `o = q S` (the sequential form of the reference's blocked prefill, which
 /// it equals exactly); RMSNorm over every head, the sigmoid gate `σ(h Wgᵀ)`
@@ -3609,7 +3609,8 @@ fn lightningForward(model: *const Model, layer: *const Layer, li: usize, ws: *Wo
     const proj = try gpa.alloc(f32, n * 3 * qd);
     defer gpa.free(proj);
     try compute.matmulT(model.pool, gpa, proj, h, n, lin.light_qkv.?, null);
-    for (proj) |*v| v.* = tensor.silu(v.*);
+    // `ACT2FN[config.hidden_act]`: silu on the releases, but not fixed.
+    for (proj) |*v| v.* = c.activation.apply(v.*);
     const gate = try gpa.alloc(f32, n * qd);
     defer gpa.free(gate);
     try compute.matmulT(model.pool, gpa, gate, h, n, lin.light_gate.?, null);

@@ -1548,3 +1548,58 @@ empty system turn.
 keep `cohere`. Verified token for token against `apply_chat_template` on
 two prompts (one with surrounding whitespace, which the template strips),
 and a unit test covers a multi-turn conversation without a system message.
+
+## Bug 27 — MiniMax's lightning qkv hard-coded silu (fixed)
+
+**Symptom.** handoff item 4: `hf-tiny-v2/tiny-random-MiniMaxForCausalLM`
+diverged at the output of layer 1, its lightning-attention layer (6.3e-03).
+
+**Cause.** `MiniMaxLightningAttention` applies `act_fn = ACT2FN[config.hidden_act]`
+to the fused qkv projection; `lightningForward` applied `tensor.silu`
+unconditionally. The stub's `hidden_act` is `gelu` (the MoE experts, which
+do follow `hidden_act`, were right). With the stub's config switched to silu
+on both sides it was already exact, which located it. Every MiniMax release
+uses silu, so this never mattered for a real checkpoint — but the entry
+claimed to read the config, and the fixture generator hard-coded the same
+silu.
+
+**Fix.** the configured activation. The generator's lightning layer uses
+`act_fn`, and the `minimax` fixture now uses gelu, so it fails without the
+fix (checked: 322/323 with the fixture regenerated and the old code).
+
+    residuals: all 3 layers agree (worst 1.17e-07 relative)   (stub, was 6.30e-03)
+    first-token logits: ... 1.66e-07
+
+## Bug 28 — every released MiniMax-Text-01 / M1 was refused for `postnorm: true` (fixed)
+
+**Symptom.** recorded in the second pass as a gap: `MiniMaxAI/MiniMax-M1-40k`
+and MiniMax-Text-01 stop with `unsupported model: MiniMax 'postnorm' residual
+layout`, so the `minimax` entry had no release it could run.
+
+**Cause.** the refusal had the layouts the wrong way round. In the remote
+code (`modeling_minimax_text_01.py`):
+
+    residual = hidden_states
+    hidden_states = self.input_layernorm(hidden_states)
+    if self.postnorm:
+        residual = hidden_states
+
+`postnorm: true` takes the residual *after* the norm, which is exactly
+ditch's `.minimax` residual layout, and exactly what transformers' native
+`MiniMaxDecoderLayer` does unconditionally (it has no `postnorm` key at all;
+the stub, with no key, matched it to 1e-7). What ditch did not implement is
+the remote code's default, `postnorm: false`, and that is the one it
+accepted — silently running it with the post-norm residual.
+
+**Fix.** the native `minimax` type always runs post-norm, as transformers
+does; the remote-code types (`minimax_text_01`, `minimax_m1`) need
+`postnorm: true` and are refused with an accurate message otherwise.
+
+**Verification.**
+
+    $ ditch --dry-run hf://MiniMaxAI/MiniMax-Text-01-hf --max-ram 8GB --remote-chunk-size 1MB --no-input
+    * 413 safetensors shard(s); headers are fetched now, tensors on demand in 1.0MB chunks
+    * Architecture: minimax (80 layers, hidden size 6144, vocabulary 200064, F32 weights)
+      weights total            851.85GB (80 layers)
+      warp mode:     min 10.62GB (trunk + top-2 experts + workspace), with prefetch + expert cache + RAM caches 27.94GB
+    EXIT=2   (loaded; the 8 GB budget is then too small, as it should be)

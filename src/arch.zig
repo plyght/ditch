@@ -2758,8 +2758,13 @@ fn extraMiniMax(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
         s[0] = getF32Any(obj, &k[0], 1.0);
         s[1] = getF32Any(obj, &k[1], 1.0);
     }
-    if (getBool(obj, "postnorm", false)) {
-        std.log.err("unsupported model: MiniMax 'postnorm' residual layout", .{});
+    // `.minimax` takes the residual *after* each norm: the remote code's
+    // `postnorm: true`, which every released checkpoint sets, and the only
+    // layout transformers' native `minimax` has (it ignores the key). The
+    // remote code's default, `postnorm: false`, keeps the residual from
+    // before the norm; no release uses it and it is not implemented.
+    if (!std.mem.eql(u8, c.model_type, "minimax") and !getBool(obj, "postnorm", false)) {
+        std.log.err("unsupported model: MiniMax with postnorm: false (the residual taken before the norm); every release sets postnorm: true", .{});
         return error.UnsupportedArchitecture;
     }
     if (c.num_experts > 0) @memset(c.moe_layers, true);
@@ -4579,7 +4584,7 @@ pub const registry = [_]Arch{
             .fused_gate_up = &.{},
             .fused_down = &.{},
         },
-        .notes = "fixture: lightning attention layers (silu qkv, per-head decay recurrence, RMSNorm, sigmoid output gate) alternating with softmax attention with partial rotary, the renormalised residual layout with α/β scales, softmax top-k MoE. MiniMax-Text-01 / M1 (`layer_types` or `attn_type_list`). The recurrence runs sequentially.",
+        .notes = "fixture: lightning attention layers (`hidden_act` on the fused qkv, silu on the releases; per-head decay recurrence, RMSNorm, sigmoid output gate) alternating with softmax attention with partial rotary, the renormalised residual layout with α/β scales, softmax top-k MoE. MiniMax-Text-01 / M1 (`layer_types` or `attn_type_list`). The recurrence runs sequentially.",
         .extra = extraMiniMax,
     },
     .{
@@ -5476,7 +5481,7 @@ test "parseConfig handles the MiniMax, HunYuan, ERNIE and Granite MoE keys" {
     const a = arena.allocator();
     // Remote-code MiniMax-M1 keys: attn_type_list and layernorm_* scales.
     const m1 = try parseConfig(a,
-        \\{"model_type":"minimax_m1","hidden_size":64,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":16,"num_hidden_layers":4,"vocab_size":100,"rotary_dim":8,"attn_type_list":[0,0,0,1],"layernorm_full_attention_alpha":3.5,"layernorm_linear_attention_alpha":3.5,"layernorm_mlp_alpha":3.5,"layernorm_mlp_beta":1,"num_local_experts":8,"num_experts_per_tok":2}
+        \\{"model_type":"minimax_m1","hidden_size":64,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":16,"num_hidden_layers":4,"vocab_size":100,"rotary_dim":8,"attn_type_list":[0,0,0,1],"layernorm_full_attention_alpha":3.5,"layernorm_linear_attention_alpha":3.5,"layernorm_mlp_alpha":3.5,"layernorm_mlp_beta":1,"num_local_experts":8,"num_experts_per_tok":2,"postnorm":true}
     );
     try std.testing.expectEqual(LinearKind.lightning, m1.linear_kind);
     try std.testing.expectEqual(ResidualLayout.minimax, m1.residual_layout);
@@ -5485,6 +5490,12 @@ test "parseConfig handles the MiniMax, HunYuan, ERNIE and Granite MoE keys" {
     try std.testing.expectEqual(@as(f32, 3.5), m1.minimax_scales[1][0]);
     try std.testing.expectEqual(@as(f32, 1.0), m1.minimax_scales[2][1]);
     try std.testing.expect(m1.norm_topk_prob and m1.moe_layers[0]);
+    // Released checkpoints set `postnorm: true`, which is `.minimax` (it was
+    // refused before); the native `minimax` type is post-norm whatever the key says.
+    const mhf = try parseConfig(a,
+        \\{"model_type":"minimax","hidden_size":64,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":16,"num_hidden_layers":2,"vocab_size":100,"num_local_experts":8,"num_experts_per_tok":2,"postnorm":true}
+    );
+    try std.testing.expectEqual(ResidualLayout.minimax, mhf.residual_layout);
     // MiniMax M3: dense/sparse MLP schedule from moe_layer_freq, sparse attention accepted.
     const m3 = try parseConfig(a,
         \\{"model_type":"minimax_m3_vl","text_config":{"model_type":"minimax_m3_vl_text","hidden_size":64,"intermediate_size":16,"dense_intermediate_size":48,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":16,"num_hidden_layers":3,"vocab_size":100,"num_local_experts":8,"num_experts_per_tok":2,"moe_layer_freq":[0,1,1],"sparse_attention_config":{"sparse_attention_freq":[0,1,1],"sparse_block_size":64,"sparse_topk_blocks":8},"layer_types":["full_attention","minimax_m3_sparse","minimax_m3_sparse"]}}
