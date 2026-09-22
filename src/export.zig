@@ -67,7 +67,7 @@ pub fn peakBytes(model: *const Model, export_dtype: ?tensor.DType) u64 {
         var it = f.tensors.iterator();
         while (it.next()) |kv| {
             const info = kv.value_ptr.*;
-            const out_dtype = export_dtype orelse hfDtype(info.dtype);
+            const out_dtype = if (!info.dtype.isFloat() and !info.dtype.isQuantized()) info.dtype else export_dtype orelse hfDtype(info.dtype);
             const e = Entry{ .name = info.name, .info = info, .ref = model.store.refFor(fi, info), .out_dtype = out_dtype, .byte_len = info.numel() * out_dtype.size(), .edit = modifiedDelta(model, info.name) };
             const rows = rowsPerChunk(model, e);
             const cols = e.ref.cols;
@@ -195,7 +195,8 @@ fn saveModelInner(gpa: Allocator, io: Io, model: *const Model, dir: Io.Dir, opts
         var it = f.tensors.iterator();
         while (it.next()) |kv| {
             const info = kv.value_ptr.*;
-            const out_dtype = opts.export_dtype orelse hfDtype(info.dtype);
+            // Integer tables (DeepSeek V4's `tid2eid`) are never converted.
+            const out_dtype = if (!info.dtype.isFloat() and !info.dtype.isQuantized()) info.dtype else opts.export_dtype orelse hfDtype(info.dtype);
             const byte_len = info.numel() * out_dtype.size();
             try entries.append(gpa, .{ .name = info.name, .info = info, .ref = model.store.refFor(fi, info), .out_dtype = out_dtype, .byte_len = byte_len, .edit = modifiedDelta(model, info.name) });
             total += byte_len;

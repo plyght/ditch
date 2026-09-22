@@ -93,6 +93,10 @@ pub const File = struct {
     /// Synthetic data (see `Overlay`), addressed above `len`.
     overlays: std.ArrayList(Overlay) = .empty,
     next_virtual: u64 = 0,
+    /// The dtype of the first tensor the header parser skipped (unsupported
+    /// storage type such as FP8), so a loader can name it instead of failing
+    /// on a missing tensor.
+    skipped_dtype: ?[]const u8 = null,
 
     pub fn open(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, sub_path: []const u8) !*File {
         return openOptions(gpa, io, dir, sub_path, .{});
@@ -202,6 +206,7 @@ pub const File = struct {
             const dtype_str = (obj.object.get("dtype") orelse return error.InvalidSafetensors).string;
             const dtype = DType.fromSafetensors(dtype_str) orelse {
                 std.log.warn("skipping tensor {s} with unsupported dtype {s}", .{ name, dtype_str });
+                if (self.skipped_dtype == null) self.skipped_dtype = try arena.dupe(u8, dtype_str);
                 continue;
             };
             const shape_val = (obj.object.get("shape") orelse return error.InvalidSafetensors).array;
