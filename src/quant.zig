@@ -17,7 +17,7 @@ pub const k_scale_size = 12;
 /// Element count of one block.
 pub fn blockSize(dtype: tensor.DType) usize {
     return switch (dtype) {
-        .f32, .f16, .bf16 => 1,
+        .f32, .f16, .bf16, .i64 => 1,
         .q8_0, .q4_0, .q4_1, .q5_0, .q5_1 => qk,
         .q4_k, .q6_k, .q8_k => qk_k,
     };
@@ -28,6 +28,7 @@ pub fn blockBytes(dtype: tensor.DType) usize {
     return switch (dtype) {
         .f32 => 4,
         .f16, .bf16 => 2,
+        .i64 => 8,
         .q8_0 => 2 + qk, // 34
         .q4_0 => 2 + qk / 2, // 18
         .q4_1 => 4 + qk / 2, // 20
@@ -71,7 +72,7 @@ pub fn dequantize(dtype: tensor.DType, bytes: []const u8, out: []f32) void {
             .q4_k => dequantQ4K(b, y),
             .q6_k => dequantQ6K(b, y),
             .q8_k => dequantQ8K(b, y),
-            .f32, .f16, .bf16 => unreachable,
+            .f32, .f16, .bf16, .i64 => unreachable,
         }
     }
 }
