@@ -5077,7 +5077,7 @@ pub const registry = [_]Arch{
     .{
         .model_type = "ministral3",
         .llama_cpp = "llama",
-        .chat = "mistral",
+        .chat = "mistral_v7",
         .verified = true,
         .notes = "fixture: llama layout with Ministral 3's query scaling (1 + beta*log(1 + floor(pos / max_position_embeddings)) on every layer) and an optional sliding window.",
         .extra = extraMinistral3,

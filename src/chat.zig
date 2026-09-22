@@ -11,6 +11,9 @@ pub const Template = enum {
     llama3,
     llama2,
     mistral,
+    /// Mistral's V7 (tekken) template — Ministral 3, Mistral Small 3.x,
+    /// Magistral, Devstral: `<s>[SYSTEM_PROMPT]...[/SYSTEM_PROMPT][INST]...[/INST]`.
+    mistral_v7,
     gemma,
     /// Phi-3 / Phi-4: `<|user|>\n...<|end|>\n<|assistant|>\n`.
     phi3,
@@ -102,7 +105,7 @@ pub fn detect(chat_template: ?[]const u8, model_type: []const u8) Template {
         if (has(t, "<|user|>") and has(t, "<|endoftext|>")) return .zephyr;
         if (has(t, "<|user|>")) return .olmo;
         if (has(t, "<<SYS>>")) return .llama2;
-        if (has(t, "[INST]")) return .mistral;
+        if (has(t, "[INST]")) return if (has(t, "[SYSTEM_PROMPT]")) .mistral_v7 else .mistral;
     }
     if (arch.lookup(model_type)) |a| {
         if (Template.parse(a.chat)) |tpl| return tpl;
@@ -191,6 +194,19 @@ pub fn render(gpa: Allocator, template: Template, messages: []const Message) ![]
                         try w.print("{s} [/INST]", .{trim(m.content)});
                     },
                     .assistant => try w.print(" {s} </s><s>", .{trim(m.content)}),
+                }
+            }
+        },
+        .mistral_v7 => {
+            // Contents verbatim; nothing follows the last `[/INST]`. Without a
+            // system message the template inserts a long, model-specific
+            // default (dated), which ditch, always passing one, leaves out.
+            try w.writeAll("<s>");
+            for (messages) |m| {
+                switch (m.role) {
+                    .system => try w.print("[SYSTEM_PROMPT]{s}[/SYSTEM_PROMPT]", .{m.content}),
+                    .user => try w.print("[INST]{s}[/INST]", .{m.content}),
+                    .assistant => try w.print("{s}</s>", .{m.content}),
                 }
             }
         },
@@ -495,6 +511,13 @@ test "template detection and rendering" {
     const hy_ns = try render(gpa, .hunyuan, &.{.{ .role = .user, .content = "Hi" }});
     defer gpa.free(hy_ns);
     try std.testing.expectEqualStrings("<\u{ff5c}hy_begin\u{2581}of\u{2581}sentence\u{ff5c}><\u{ff5c}hy_User\u{ff5c}>Hi<\u{ff5c}hy_Assistant\u{ff5c}>", hy_ns);
+    // Mistral V7 (mistralai/Ministral-3-3B-Instruct-2512; token-for-token
+    // against apply_chat_template).
+    try std.testing.expectEqual(Template.mistral_v7, detect("{{- '[SYSTEM_PROMPT]' }}{{- '[INST]' }}", "ministral3"));
+    try std.testing.expectEqual(Template.mistral, detect("{{ '[INST] ' + message['content'] }}", "mistral"));
+    const m7 = try render(gpa, .mistral_v7, &.{ .{ .role = .system, .content = "Sys.\n" }, .{ .role = .user, .content = " Hi " }, .{ .role = .assistant, .content = "Yo" }, .{ .role = .user, .content = "Bye" } });
+    defer gpa.free(m7);
+    try std.testing.expectEqualStrings("<s>[SYSTEM_PROMPT]Sys.\n[/SYSTEM_PROMPT][INST] Hi [/INST]Yo</s>[INST]Bye[/INST]", m7);
     // A template that emits the BOS in front of a family that does not.
     try std.testing.expectEqualStrings("<|begin_of_text|>", templateBos("{{bos_token}}\n{%- if tools %}<|im_start|>", "<|begin_of_text|>"));
     try std.testing.expectEqualStrings("", templateBos("{% for m in messages %}<|im_start|>{{ bos_token }}", "<|begin_of_text|>"));

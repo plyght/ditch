@@ -1832,3 +1832,42 @@ trailing newline in the system prompt): equal. And end to end, float32:
 what I know about *hacking* government databases" against "…about
 government databases", with every residual within 4.4e-05 of the reference:
 float32 drift at a near-tie, not a forward-pass difference.)
+
+## Families config-checked before, now run on real weights (first *N* layers)
+
+`tools/truncate_checkpoint.py` makes a real-weight check possible for
+families whose smallest release does not fit a float32 reference in 15 GiB:
+it fetches only the embedding, the final norm, the head and the first *N*
+layers by range requests. Same comparison as everywhere else, float32.
+
+| Checkpoint (first N layers) | family | tokens | residuals | first-token logits |
+| --- | --- | :---: | :---: | ---: |
+| mistralai/Ministral-3-3B-Base-2512, N = 4 | `ministral3` | match (raw); template after bug 35 | all 5 agree | 2.02e-06 |
+
+Ministral 3 covers yarn rope scaling and tied embeddings inside the
+`mistral3` multimodal wrapper; the tokenizer (tekken, as `tokenizer.json`)
+matches `tokenizers` on 15 of 15 strings. (transformers warns that this
+`tokenizer.json`'s pre-tokenizer regex differs from Mistral's own tekken and
+offers `fix_mistral_regex=True`; ditch, like transformers' default and the
+`tokenizers` package, uses the file as shipped.)
+
+## Bug 35 — Mistral's V7 chat template was rendered as the old `[INST]` one (fixed)
+
+**Symptom.** on `mistralai/Ministral-3-3B-Instruct-2512`'s tokenizer, ditch
+rendered `<s>[INST] You are a helpful assistant.\n\nHi there[/INST]` where the
+model's template gives
+`<s>[SYSTEM_PROMPT]You are a helpful assistant.[/SYSTEM_PROMPT][INST] Hi there [/INST]`
+(11 tokens against 14).
+
+**Cause.** ditch had one `mistral` family: the v1–v3 layout, which folds the
+system prompt into the first `[INST]` and trims the contents. Mistral's V7
+("tekken") template — Ministral 3, Mistral Small 3.x, Magistral, Devstral —
+has a `[SYSTEM_PROMPT]` block and keeps the contents verbatim, and ditch
+detected it as `mistral` because it contains `[INST]`.
+
+**Fix.** a `mistral_v7` family, detected by `[SYSTEM_PROMPT]` together with
+`[INST]`, and named by the `ministral3` entry. Without a system message the
+V7 template inserts a long model-specific default prompt with the current
+date filled in; ditch always passes a system prompt, so the family does not
+reproduce that. Verified token for token against `apply_chat_template` on two
+system/user pairs, and a unit test covers a multi-turn conversation.
