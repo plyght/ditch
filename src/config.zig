@@ -208,6 +208,11 @@ pub const Settings = struct {
     remote_weights: bool = false,
     /// Size of the chunks fetched and cached by the remote source.
     remote_chunk_size: u64 = 8 << 20,
+    /// Bound of the remote source's on-disk chunk cache; least recently used
+    /// chunks are evicted to stay under it (trunk chunks last). null = half of
+    /// the free space on the cache filesystem plus what is already cached, at
+    /// most 64GB; 0 = keep nothing on disk (fetch, use, discard).
+    remote_cache_size: ?u64 = null,
     /// Write `<scratch_dir>/<model>.hotlist` at exit and warm the expert cache from it at start.
     hotlist: bool = true,
     system_prompt: []const u8 = "You are a helpful assistant.",
@@ -372,6 +377,10 @@ pub const help_sections = [_]HelpSection{
     \\                                 <cache-dir>/models/<id>/<rev>/chunks. http(s)://host/path/ works too.
     \\  --remote-weights               Treat a plain Hub id like hf://<id>.
     \\  --remote-chunk-size <size>     Fetch/cache granularity of the remote source (default: 8MB).
+    \\  --remote-cache-size <size>     Disk bound of the chunk cache; least recently used chunks are
+    \\                                 evicted, the trunk last (default: half the free disk space plus
+    \\                                 what is cached, at most 64GB; 0 keeps nothing on disk).
+    \\                                 Also DITCH_REMOTE_CACHE_SIZE.
     \\
     },
     .{ .title = "Abliteration", .body =
@@ -485,7 +494,7 @@ pub const help_sections = [_]HelpSection{
     \\  --config <path>                Configuration file, .lua or .toml (default: ./config.lua, else
     \\                                 ./config.toml). See config.default.lua for every option.
     \\  Precedence: flags > DITCH_* environment variables (DITCH_THREADS, DITCH_MAX_RAM, DITCH_CACHE,
-    \\  DITCH_DEVICE, DITCH_GPU_MEMORY, DITCH_NO_COLOR) > ./config.lua > $XDG_CONFIG_HOME/ditch/config.lua (~/.config/ditch/config.lua).
+    \\  DITCH_DEVICE, DITCH_GPU_MEMORY, DITCH_REMOTE_CACHE_SIZE, DITCH_NO_COLOR) > ./config.lua > $XDG_CONFIG_HOME/ditch/config.lua (~/.config/ditch/config.lua).
     \\  Every option accepts --name value or --name=value; flags and subcommands may come in any order.
     \\
     },
@@ -714,7 +723,7 @@ pub fn load(gpa: Allocator, io: std.Io, args: []const []const u8, environ: ?*std
 
     // Environment variables.
     if (environ) |env| {
-        const vars = [_][2][]const u8{ .{ "DITCH_THREADS", "threads" }, .{ "DITCH_MAX_RAM", "max_ram" }, .{ "DITCH_DEVICE", "device" }, .{ "DITCH_GPU_MEMORY", "gpu_memory" } };
+        const vars = [_][2][]const u8{ .{ "DITCH_THREADS", "threads" }, .{ "DITCH_MAX_RAM", "max_ram" }, .{ "DITCH_DEVICE", "device" }, .{ "DITCH_GPU_MEMORY", "gpu_memory" }, .{ "DITCH_REMOTE_CACHE_SIZE", "remote_cache_size" } };
         for (vars) |v| if (env.get(v[0])) |value| {
             applyOption(a, &settings, v[1], value) catch |err| {
                 try errors.append(a, try std.fmt.allocPrint(a, "invalid value for {s}: {s}", .{ v[0], @errorName(err) }));
@@ -923,7 +932,7 @@ fn applyOption(a: Allocator, s: *Settings, key: []const u8, value: []const u8) !
     } else if (eql(u8, key, "early_stop")) s.early_stop = try parseBool(value) else if (eql(u8, key, "no_early_stop")) s.early_stop = !(try parseBool(value)) else if (eql(u8, key, "warm_start")) s.warm_start = try a.dupe(u8, value) else if (eql(u8, key, "n_trials")) s.n_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_startup_trials")) s.n_startup_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "seed")) s.seed = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "study_checkpoint_dir")) s.study_checkpoint_dir = try a.dupe(u8, value) else if (eql(u8, key, "max_shard_size")) s.max_shard_size = try parseSize(value) else if (eql(u8, key, "max_ram")) s.max_ram = try parseSize(value) else if (eql(u8, key, "max_vram")) s.max_vram = try parseSize(value) else if (eql(u8, key, "device")) {
         if (compute.Kind.parse(value) == null) return error.InvalidEnum;
         s.device = try a.dupe(u8, value);
-    } else if (eql(u8, key, "gpu_memory")) s.gpu_memory = try parseSize(value) else if (eql(u8, key, "selftest")) s.selftest = try parseBool(value) else if (eql(u8, key, "scratch_dir")) s.scratch_dir = try a.dupe(u8, value) else if (eql(u8, key, "time_limit")) s.time_limit_seconds = try parseDuration(value) else if (eql(u8, key, "time_limit_seconds")) s.time_limit_seconds = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "budget_headroom")) s.budget_headroom = try parseSize(value) else if (eql(u8, key, "expert_cache")) s.expert_cache = try parseSize(value) else if (eql(u8, key, "visited_experts_only")) s.visited_experts_only = try parseBool(value) else if (eql(u8, key, "remote_weights")) s.remote_weights = try parseBool(value) else if (eql(u8, key, "remote_chunk_size")) s.remote_chunk_size = try parseSize(value) else if (eql(u8, key, "hotlist")) s.hotlist = try parseBool(value) else if (eql(u8, key, "no_hotlist")) s.hotlist = !(try parseBool(value)) else if (eql(u8, key, "checkpoint_action")) s.checkpoint_action = try a.dupe(u8, value) else if (eql(u8, key, "trial_index")) s.trial_index = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_additional_trials")) s.n_additional_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "model_action")) s.model_action = try a.dupe(u8, value) else if (eql(u8, key, "save_directory")) s.save_directory = try a.dupe(u8, value) else if (eql(u8, key, "export_dtype")) s.export_dtype = try a.dupe(u8, value) else if (eql(u8, key, "export_format")) s.export_format = try a.dupe(u8, value) else if (eql(u8, key, "gguf_dtype")) s.gguf_dtype = try a.dupe(u8, value) else if (eql(u8, key, "config")) {
+    } else if (eql(u8, key, "gpu_memory")) s.gpu_memory = try parseSize(value) else if (eql(u8, key, "selftest")) s.selftest = try parseBool(value) else if (eql(u8, key, "scratch_dir")) s.scratch_dir = try a.dupe(u8, value) else if (eql(u8, key, "time_limit")) s.time_limit_seconds = try parseDuration(value) else if (eql(u8, key, "time_limit_seconds")) s.time_limit_seconds = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "budget_headroom")) s.budget_headroom = try parseSize(value) else if (eql(u8, key, "expert_cache")) s.expert_cache = try parseSize(value) else if (eql(u8, key, "visited_experts_only")) s.visited_experts_only = try parseBool(value) else if (eql(u8, key, "remote_weights")) s.remote_weights = try parseBool(value) else if (eql(u8, key, "remote_chunk_size")) s.remote_chunk_size = try parseSize(value) else if (eql(u8, key, "remote_cache_size")) s.remote_cache_size = try parseSize(value) else if (eql(u8, key, "hotlist")) s.hotlist = try parseBool(value) else if (eql(u8, key, "no_hotlist")) s.hotlist = !(try parseBool(value)) else if (eql(u8, key, "checkpoint_action")) s.checkpoint_action = try a.dupe(u8, value) else if (eql(u8, key, "trial_index")) s.trial_index = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_additional_trials")) s.n_additional_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "model_action")) s.model_action = try a.dupe(u8, value) else if (eql(u8, key, "save_directory")) s.save_directory = try a.dupe(u8, value) else if (eql(u8, key, "export_dtype")) s.export_dtype = try a.dupe(u8, value) else if (eql(u8, key, "export_format")) s.export_format = try a.dupe(u8, value) else if (eql(u8, key, "gguf_dtype")) s.gguf_dtype = try a.dupe(u8, value) else if (eql(u8, key, "config")) {
         // handled in the first pass
     } else if (eql(u8, key, "reproduce")) s.reproduce = try a.dupe(u8, value) else if (eql(u8, key, "ignore_mismatches")) s.ignore_mismatches = try parseBool(value) else if (eql(u8, key, "bench_prompts")) s.bench_prompts = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "bench_tokens")) s.bench_tokens = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "bench_output")) s.bench_output = try a.dupe(u8, value) else if (eql(u8, key, "bench_kernels") or eql(u8, key, "kernels")) s.bench_kernels = try parseBool(value) else if (eql(u8, key, "accelerate")) s.accelerate = try parseBool(value) else if (eql(u8, key, "no_accelerate")) s.accelerate = !(try parseBool(value)) else if (eql(u8, key, "prompt")) {
         const list = try a.alloc([]const u8, s.probe_prompts.len + 1);
@@ -1089,6 +1098,28 @@ test "warp mode options" {
     try std.testing.expectEqual(@as(?u64, null), defaults.expert_cache);
     try std.testing.expectEqual(@as(?bool, null), defaults.visited_experts_only);
     try std.testing.expect(defaults.hotlist);
+    try std.testing.expectEqual(@as(?u64, null), defaults.remote_cache_size);
+}
+
+test "remote cache size: flag over environment, 0 allowed" {
+    const gpa = std.testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("DITCH_REMOTE_CACHE_SIZE", "20GB");
+    const from_env = [_][]const u8{ "ditch", "hf://Qwen/Qwen3-30B-A3B" };
+    var r1 = try load(gpa, std.testing.io, &from_env, &env);
+    defer r1.deinit();
+    try std.testing.expectEqual(@as(usize, 0), r1.errors.len);
+    try std.testing.expectEqual(@as(?u64, 20 << 30), r1.settings.remote_cache_size);
+    const from_flag = [_][]const u8{ "ditch", "--remote-cache-size", "0", "hf://Qwen/Qwen3-30B-A3B" };
+    var r2 = try load(gpa, std.testing.io, &from_flag, &env);
+    defer r2.deinit();
+    try std.testing.expectEqual(@as(?u64, 0), r2.settings.remote_cache_size);
+    try env.put("DITCH_REMOTE_CACHE_SIZE", "lots");
+    var r3 = try load(gpa, std.testing.io, &from_env, &env);
+    defer r3.deinit();
+    try std.testing.expectEqual(@as(usize, 1), r3.errors.len);
+    try std.testing.expect(std.mem.indexOf(u8, r3.errors[0], "DITCH_REMOTE_CACHE_SIZE") != null);
 }
 
 test "cli parsing" {

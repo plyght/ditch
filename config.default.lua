@@ -363,6 +363,18 @@ return {
   -- GGUF model must be local.
   -- remote_weights = false,
   -- remote_chunk_size = "8MB",
+  -- Disk bound of that chunk cache (per model and revision). When a new
+  -- chunk would exceed it, least recently used chunks are evicted, chunks of
+  -- the trunk (every tensor but the routed experts, re-read by every trial)
+  -- only once no expert chunk is left, and never a chunk being read or
+  -- written. Unset = half of the free space on the cache filesystem plus
+  -- what the cache already holds, at most 64GB: a model far bigger than the
+  -- disk never fills it, and the trunk of today's large MoE checkpoints
+  -- still fits. 0 = keep nothing on disk (fetch, use, discard; every forward
+  -- pass fetches the trunk again). A smaller bound than what is cached trims
+  -- the cache at start. `--dry-run` prints the trunk and per-expert bytes
+  -- next to the bound. Also DITCH_REMOTE_CACHE_SIZE.
+  -- remote_cache_size = "32GB",
 
   -- -------------------------------------------------------------------------
   -- Non-interactive use

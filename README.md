@@ -136,7 +136,12 @@ For mixture-of-experts models this becomes warp mode (after
 experts stay resident, routed experts are loaded on demand into an LRU cache
 sized by `--expert-cache`, and a hotlist warms the cache on the next run.
 `hf://` sources fetch only the tensors that are touched, using HTTP range
-requests cached on disk (`--remote-chunk-size`). Only experts visited during
+requests cached on disk (`--remote-chunk-size`). That cache is bounded by
+`--remote-cache-size` (default: half the free disk space, at most 64GB; `0`
+keeps nothing on disk): least recently used chunks are evicted, the trunk
+last, since every trial re-reads it. `--dry-run` prints the disk estimate
+(trunk, per-expert and cache bound) next to the memory one and says when the
+bound cannot hold the trunk. Only experts visited during
 calibration are scored and edited (`--visited-experts-only`); every expert is
 still exported. The honest cost: streamed decode re-reads the weights it needs
 for every generated token, so throughput is bound by storage bandwidth. Measure

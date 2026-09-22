@@ -216,7 +216,11 @@ pub const File = struct {
         var end: u64 = data_start;
         var it = self.tensors.iterator();
         while (it.next()) |kv| end = @max(end, kv.value_ptr.offset + kv.value_ptr.byte_len);
+        var rit = self.raw.iterator();
+        while (rit.next()) |kv| end = @max(end, kv.value_ptr.offset + kv.value_ptr.byte_len);
         self.len = end;
+        // Lets the chunk cache tell a short last chunk from a truncated one.
+        rf.setLength(end);
         return self;
     }
 

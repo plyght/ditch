@@ -279,8 +279,10 @@ Values are decoded to bf16, which is what the Hugging Face integrations
 produce. With `--max-ram` (streamed weights) a tensor is decoded row-chunk by
 row-chunk as it is read, so a quantised MoE never holds more than one expert of
 decoded weights; without a budget the decoded tensors stay resident, so a
-quantised checkpoint then needs the memory of its bf16 equivalent.
-`expert_dtype` values naming one of these formats are accepted. Any other
+quantised checkpoint then needs the memory of its bf16 equivalent. Over
+`hf://` the disk side is the opposite: the chunk cache holds the stored
+(quantised) bytes, so its disk estimate and `--remote-cache-size` are in
+stored bytes, not decoded ones. `expert_dtype` values naming one of these formats are accepted. Any other
 `quantization_config` is an error naming the format. The FP4 (e2m1) expert
 weights of the released DeepSeek V4 / V4.1 checkpoints are refused until
 dequantised.

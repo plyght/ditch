@@ -2,6 +2,9 @@
 //! that honours Range requests (tools/range_server.py): loading fetches only
 //! the small files, headers and norms; a prefill fetches the trunk plus the
 //! routed experts; chunks are cached on disk and a second load fetches nothing.
+//! The chunk cache stays under its bound (`--remote-cache-size`) through a
+//! forward pass, under concurrent fetches and at size 0, keeps the trunk
+//! over the experts, and detects and repairs truncated chunk files.
 
 const std = @import("std");
 const Io = std.Io;
@@ -106,7 +109,6 @@ test "remote source: headers up front, tensors on demand, chunks cached on disk"
     defer gpa.free(want);
 
     // First run: small files, then the shard headers (and the norms the loader reads).
-    const chunk: u64 = 4096;
     {
         const src = try remote.Source.open(gpa, io, &http, cache_root, base_url, .{ .chunk_size = chunk }, &sink.writer);
         defer src.deinit();
@@ -199,4 +201,488 @@ test "remote source: headers up front, tensors on demand, chunks cached on disk"
     var missing_buf: [96]u8 = undefined;
     const missing_url = try std.fmt.bufPrint(&missing_buf, "http://127.0.0.1:{d}/nope/", .{server.port});
     try std.testing.expectError(error.ModelNotFound, remote.Source.open(gpa, io, &http, cache_root, missing_url, .{}, &sink.writer));
+}
+
+// ---------------------------------------------------------------------------
+// Bounded chunk cache
+// ---------------------------------------------------------------------------
+
+const chunk: u64 = 4096;
+/// Eight tokens: the router picks more experts than the two-token prefill does.
+const long_ids = [_]u32{ 40, 100, 7, 250, 3, 199, 61, 120 };
+const shard_names = [_][]const u8{ "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors" };
+
+/// A temporary directory with a range server over the fixture and an HTTP client.
+const Env = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    tmp: std.testing.TmpDir,
+    root: []const u8,
+    server: Server,
+    base_url: []const u8,
+    arena: std.heap.ArenaAllocator,
+    environ: std.process.Environ.Map,
+    http: hf.Http,
+    sink: Io.Writer.Allocating,
+
+    fn init(self: *Env, gpa: std.mem.Allocator, io: Io) !void {
+        self.gpa = gpa;
+        self.io = io;
+        self.tmp = std.testing.tmpDir(.{});
+        errdefer self.tmp.cleanup();
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const n = try self.tmp.dir.realPath(io, &path_buf);
+        self.root = try gpa.dupe(u8, path_buf[0..n]);
+        errdefer gpa.free(self.root);
+        const log_path = try std.fs.path.join(gpa, &.{ self.root, "requests.log" });
+        defer gpa.free(log_path);
+        self.server = try Server.start(io, fixture, log_path);
+        errdefer self.server.stop(io);
+        self.base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/", .{self.server.port});
+        self.arena = std.heap.ArenaAllocator.init(gpa);
+        self.environ = std.process.Environ.Map.init(gpa);
+        self.http = try hf.Http.init(gpa, io, self.arena.allocator(), &self.environ);
+        self.sink = .init(gpa);
+    }
+
+    fn deinit(self: *Env) void {
+        self.sink.deinit();
+        self.http.deinit();
+        self.environ.deinit();
+        self.arena.deinit();
+        self.gpa.free(self.base_url);
+        self.server.stop(self.io);
+        self.gpa.free(self.root);
+        self.tmp.cleanup();
+    }
+
+    fn path(self: *Env, sub: []const u8) ![]u8 {
+        return std.fs.path.join(self.gpa, &.{ self.root, sub });
+    }
+
+    fn open(self: *Env, cache: []const u8, cache_size: ?u64) !*remote.Source {
+        return remote.Source.open(self.gpa, self.io, &self.http, cache, self.base_url, .{ .chunk_size = chunk, .cache_size = cache_size }, &self.sink.writer);
+    }
+};
+
+const Usage = struct { files: u64, bytes: u64, parts: u64 };
+
+/// Files and total bytes under `src`'s chunk directories (`.part` files included).
+fn chunkDirUsage(io: Io, src: *remote.Source) !Usage {
+    var u: Usage = .{ .files = 0, .bytes = 0, .parts = 0 };
+    for (src.files.items) |f| {
+        var dir = Io.Dir.cwd().openDir(io, f.chunk_dir, .{ .iterate = true }) catch continue;
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            // A file can be evicted between listing and stat.
+            const st = dir.statFile(io, entry.name, .{}) catch continue;
+            u.files += 1;
+            u.bytes += st.size;
+            if (std.mem.endsWith(u8, entry.name, ".part")) u.parts += 1;
+        }
+    }
+    return u;
+}
+
+fn loadRemote(gpa: std.mem.Allocator, io: Io, pool: *const tensor.Pool, src: *remote.Source, scratch: []const u8) !*Model {
+    return Model.loadWithOptions(gpa, io, pool, src.dir_path, .{ .store = .streamed, .remote = src, .scratch_dir = scratch });
+}
+
+test "remote chunk cache: bounded below the model, LRU with the trunk kept, bit-identical results" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const pool = tensor.Pool.init(io, 2);
+    var env: Env = undefined;
+    try env.init(gpa, io);
+    defer env.deinit();
+    const scratch = try env.path("scratch");
+    defer gpa.free(scratch);
+
+    const local = try Model.load(gpa, io, &pool, fixture);
+    defer local.deinit();
+    const want = try firstTokenLogits(gpa, local, &long_ids);
+    defer gpa.free(want);
+    var stored_total: u64 = 0;
+    for (local.files) |f| {
+        var it = f.tensors.iterator();
+        while (it.next()) |kv| stored_total += kv.value_ptr.byte_len;
+    }
+
+    // Unbounded reference run over the remote source.
+    const cache_a = try env.path("cache_a");
+    defer gpa.free(cache_a);
+    var footprint: remote.Footprint = undefined;
+    var unbounded: remote.Stats = undefined;
+    {
+        const src = try env.open(cache_a, std.math.maxInt(u64));
+        defer src.deinit();
+        const model = try loadRemote(gpa, io, &pool, src, scratch);
+        defer model.deinit();
+        footprint = try remote.planModel(src, gpa, model);
+        const got = try firstTokenLogits(gpa, model, &long_ids);
+        defer gpa.free(got);
+        try std.testing.expectEqualSlices(f32, want, got);
+        unbounded = src.stats();
+        try std.testing.expectEqual(@as(u64, 0), unbounded.chunks_evicted);
+        try std.testing.expectEqual(@as(u64, 0), unbounded.chunks_unpersisted);
+    }
+    // The footprint splits the stored bytes into trunk and experts (bf16
+    // fixture: the stored experts are exactly the model's routed experts).
+    try std.testing.expectEqual(stored_total, footprint.trunk_bytes + footprint.total_expert_bytes);
+    try std.testing.expectEqual(local.total_expert_bytes, footprint.total_expert_bytes);
+    try std.testing.expectEqual(@as(u64, 4 * 16), footprint.num_experts);
+    try std.testing.expectEqual(local.largest_expert_bytes, footprint.expert_bytes);
+    try std.testing.expect(footprint.trunk_chunk_bytes >= footprint.trunk_bytes);
+    try std.testing.expect(footprint.trunkFits());
+
+    // Bounded run: room for the trunk and a few chunks of experts, far less
+    // than the model and less than one pass touches.
+    const bound = footprint.trunk_chunk_bytes + 24 * chunk;
+    try std.testing.expect(bound < stored_total * 6 / 10);
+    try std.testing.expect(bound < unbounded.peak_cache_bytes);
+    const cache_b = try env.path("cache_b");
+    defer gpa.free(cache_b);
+    {
+        const src = try env.open(cache_b, bound);
+        defer src.deinit();
+        try std.testing.expectEqual(bound, src.cache_limit);
+        const model = try loadRemote(gpa, io, &pool, src, scratch);
+        defer model.deinit();
+        const fp = try remote.planModel(src, gpa, model);
+        try std.testing.expect(fp.trunkFits());
+        var dry: Io.Writer.Allocating = .init(gpa);
+        defer dry.deinit();
+        try fp.print(&dry.writer);
+        try std.testing.expect(std.mem.indexOf(u8, dry.written(), "the trunk stays cached") != null);
+        const got = try firstTokenLogits(gpa, model, &long_ids);
+        defer gpa.free(got);
+        try std.testing.expectEqualSlices(f32, want, got);
+        const first = src.stats();
+        try std.testing.expect(first.chunks_evicted > 0);
+        try std.testing.expect(first.peak_cache_bytes <= bound);
+        try std.testing.expect((try chunkDirUsage(io, src)).bytes <= bound);
+        // A second pass (the next trial) re-reads the trunk. It stayed
+        // cached, so only evicted expert chunks are fetched again.
+        model.expert_cache.?.trim();
+        const again = try firstTokenLogits(gpa, model, &long_ids);
+        defer gpa.free(again);
+        try std.testing.expectEqualSlices(f32, want, again);
+        const second = src.stats();
+        const refetched = second.ranges_fetched - first.ranges_fetched;
+        // Every trunk chunk a pass reads (the ones the unbounded run cached)
+        // is still on disk: evictions only took expert chunks.
+        var trunk_kept: u64 = 0;
+        for (src.files.items) |f| {
+            const a_dir = try std.mem.replaceOwned(u8, gpa, f.chunk_dir, cache_b, cache_a);
+            defer gpa.free(a_dir);
+            var dir_a = try Io.Dir.cwd().openDir(io, a_dir, .{});
+            defer dir_a.close(io);
+            var it = f.trunk.keyIterator();
+            while (it.next()) |idx| {
+                var nb: [32]u8 = undefined;
+                if (dir_a.access(io, try std.fmt.bufPrint(&nb, "{d}", .{idx.*}), .{})) |_| {
+                    const c = f.chunks.get(idx.*) orelse return error.TrunkChunkEvicted;
+                    try std.testing.expect(c.state == .present);
+                    trunk_kept += 1;
+                } else |_| {}
+            }
+        }
+        try std.testing.expect(trunk_kept > 0);
+        // So the next pass fetches only expert chunks again.
+        try std.testing.expect(refetched > 0);
+        try std.testing.expect(refetched < first.ranges_fetched);
+        try std.testing.expect(second.peak_cache_bytes <= bound);
+        try std.testing.expect((try chunkDirUsage(io, src)).bytes <= bound);
+        std.debug.print("\n[remote bounded cache] bound {d} B (trunk {d} B of chunks), stored model {d} B, unbounded pass cached {d} B: {d} evictions, {d} trunk chunks kept, pass 1 fetched {d} ranges, pass 2 {d}\n", .{ bound, fp.trunk_chunk_bytes, stored_total, unbounded.peak_cache_bytes, second.chunks_evicted, trunk_kept, first.ranges_fetched, refetched });
+    }
+    // Reopening with a smaller bound trims the cache to it first.
+    {
+        const src = try env.open(cache_b, bound / 2);
+        defer src.deinit();
+        try std.testing.expect(src.stats().chunks_evicted > 0);
+        try std.testing.expect((try chunkDirUsage(io, src)).bytes <= bound / 2);
+        const model = try loadRemote(gpa, io, &pool, src, scratch);
+        defer model.deinit();
+        const fp = try remote.planModel(src, gpa, model);
+        // The bound no longer holds the trunk: said once, with the size that would.
+        try std.testing.expect(!fp.trunkFits());
+        var note: Io.Writer.Allocating = .init(gpa);
+        defer note.deinit();
+        try fp.warn(&note.writer);
+        try std.testing.expect(std.mem.indexOf(u8, note.written(), "every forward pass will fetch it again. --remote-cache-size") != null);
+        try fp.print(&note.writer);
+        try std.testing.expect(std.mem.indexOf(u8, note.written(), "too small for the trunk") != null);
+        try std.testing.expect(fp.suggestedLimit() >= fp.trunk_chunk_bytes);
+        const got = try firstTokenLogits(gpa, model, &long_ids);
+        defer gpa.free(got);
+        try std.testing.expectEqualSlices(f32, want, got);
+        try std.testing.expect(src.stats().peak_cache_bytes <= bound / 2);
+        try std.testing.expect((try chunkDirUsage(io, src)).bytes <= bound / 2);
+    }
+}
+
+test "remote chunk cache: size 0 keeps nothing on disk" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const pool = tensor.Pool.init(io, 2);
+    var env: Env = undefined;
+    try env.init(gpa, io);
+    defer env.deinit();
+    const scratch = try env.path("scratch");
+    defer gpa.free(scratch);
+    const local = try Model.load(gpa, io, &pool, fixture);
+    defer local.deinit();
+    const want = try firstTokenLogits(gpa, local, &long_ids);
+    defer gpa.free(want);
+
+    const cache = try env.path("cache");
+    defer gpa.free(cache);
+    const src = try env.open(cache, 0);
+    defer src.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, env.sink.written(), "nothing is kept on disk") != null);
+    const model = try loadRemote(gpa, io, &pool, src, scratch);
+    defer model.deinit();
+    const fp = try remote.planModel(src, gpa, model);
+    try std.testing.expect(!fp.trunkFits());
+    const got = try firstTokenLogits(gpa, model, &long_ids);
+    defer gpa.free(got);
+    try std.testing.expectEqualSlices(f32, want, got);
+    // And again: every chunk is fetched again, the result does not change.
+    model.expert_cache.?.trim();
+    const again = try firstTokenLogits(gpa, model, &long_ids);
+    defer gpa.free(again);
+    try std.testing.expectEqualSlices(f32, want, again);
+    const st = src.stats();
+    try std.testing.expect(st.ranges_fetched > 0);
+    try std.testing.expect(st.chunks_unpersisted > 0);
+    try std.testing.expectEqual(@as(u64, 0), st.peak_cache_bytes);
+    try std.testing.expectEqual(@as(u64, 0), st.cache_bytes);
+    try std.testing.expectEqual(@as(u64, 0), (try chunkDirUsage(io, src)).files);
+}
+
+const reads_per_worker = 80;
+
+const Worker = struct {
+    src: *remote.Source,
+    original: [2][]const u8,
+    seed: u64,
+    failures: u32 = 0,
+    reads: u32 = 0,
+
+    fn run(self: *Worker, io: Io) void {
+        var prng = std.Random.DefaultPrng.init(self.seed);
+        const r = prng.random();
+        var buf: [3 * chunk]u8 = undefined;
+        var i: usize = 0;
+        while (i < reads_per_worker) : (i += 1) {
+            const fi = r.uintLessThan(usize, 2);
+            const data = self.original[fi];
+            const len = r.intRangeAtMost(usize, 1, buf.len);
+            const off = r.uintLessThan(usize, data.len - len);
+            self.src.files.items[fi].readRange(io, off, buf[0..len]) catch {
+                self.failures += 1;
+                continue;
+            };
+            if (!std.mem.eql(u8, buf[0..len], data[off..][0..len])) self.failures += 1;
+            self.reads += 1;
+        }
+    }
+};
+
+/// Samples the bytes on disk while the workers run.
+const Monitor = struct {
+    src: *remote.Source,
+    stop: std.atomic.Value(bool) = .init(false),
+    max_bytes: u64 = 0,
+    scans: u64 = 0,
+
+    fn run(self: *Monitor, io: Io) void {
+        // A directory listing is not a snapshot. Scanning under the source's
+        // lock makes it exact: no bytes can be reserved (so no new chunk file
+        // can appear) and no evicted chunk leaves the count until the scan
+        // ends, so every file seen is covered by the bound at once. A chunk
+        // renamed from `<index>.part` during the scan shows up under both
+        // names, so files are counted once per inode.
+        var seen = std.AutoHashMap(Io.File.INode, void).init(std.heap.page_allocator);
+        defer seen.deinit();
+        const lock = &self.src.lock;
+        while (!self.stop.load(.acquire)) {
+            io.sleep(Io.Duration.fromNanoseconds(200 * std.time.ns_per_us), .awake) catch {};
+            while (lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+            defer lock.store(false, .release);
+            seen.clearRetainingCapacity();
+            var bytes: u64 = 0;
+            for (self.src.files.items) |f| {
+                var dir = Io.Dir.cwd().openDir(io, f.chunk_dir, .{ .iterate = true }) catch continue;
+                defer dir.close(io);
+                var it = dir.iterate();
+                while (it.next(io) catch null) |entry| {
+                    const st = dir.statFile(io, entry.name, .{}) catch continue;
+                    const gop = seen.getOrPut(st.inode) catch continue;
+                    if (!gop.found_existing) bytes += st.size;
+                }
+            }
+            self.max_bytes = @max(self.max_bytes, bytes);
+            self.scans += 1;
+        }
+    }
+};
+
+test "remote chunk cache: eviction under concurrent fetches" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var env: Env = undefined;
+    try env.init(gpa, io);
+    defer env.deinit();
+    var original: [2][]u8 = undefined;
+    for (shard_names, 0..) |n, i| {
+        const p = try std.fs.path.join(gpa, &.{ fixture, n });
+        defer gpa.free(p);
+        original[i] = try Io.Dir.cwd().readFileAlloc(io, p, gpa, .unlimited);
+    }
+    defer for (original) |o| gpa.free(o);
+
+    const cache = try env.path("cache");
+    defer gpa.free(cache);
+    const bound = 12 * chunk;
+    const src = try env.open(cache, bound);
+    defer src.deinit();
+    try std.testing.expectEqual(@as(usize, 2), src.files.items.len);
+    for (src.files.items, 0..) |f, i| f.setLength(original[i].len);
+
+    var workers: [8]Worker = undefined;
+    var threads: [8]std.Thread = undefined;
+    for (&workers, 0..) |*w, i| w.* = .{ .src = src, .original = .{ original[0], original[1] }, .seed = 1000 + i };
+    var monitor: Monitor = .{ .src = src };
+    const mt = try std.Thread.spawn(.{}, Monitor.run, .{ &monitor, io });
+    for (&threads, &workers) |*t, *w| t.* = try std.Thread.spawn(.{}, Worker.run, .{ w, io });
+    for (threads) |t| t.join();
+    monitor.stop.store(true, .release);
+    mt.join();
+
+    var reads: u64 = 0;
+    for (workers) |w| {
+        try std.testing.expectEqual(@as(u32, 0), w.failures);
+        reads += w.reads;
+    }
+    try std.testing.expectEqual(@as(u64, 8 * reads_per_worker), reads);
+    const st = src.stats();
+    try std.testing.expect(st.chunks_evicted > 0);
+    try std.testing.expect(st.peak_cache_bytes <= bound);
+    try std.testing.expect(monitor.max_bytes <= bound);
+    const usage = try chunkDirUsage(io, src);
+    try std.testing.expect(usage.bytes <= bound);
+    try std.testing.expectEqual(@as(u64, 0), usage.parts);
+    // The index agrees with the disk, and what is on disk is the right bytes.
+    try std.testing.expectEqual(st.cache_bytes, usage.bytes);
+    for (src.files.items, 0..) |f, fi| {
+        var dir = try Io.Dir.cwd().openDir(io, f.chunk_dir, .{ .iterate = true });
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            const idx = try std.fmt.parseInt(u64, entry.name, 10);
+            const bytes = try dir.readFileAlloc(io, entry.name, gpa, .unlimited);
+            defer gpa.free(bytes);
+            const start: usize = @intCast(idx * chunk);
+            try std.testing.expectEqualSlices(u8, original[fi][start..@min(start + chunk, original[fi].len)], bytes);
+        }
+    }
+    std.debug.print("\n[remote concurrent eviction] {d} reads on 8 threads, bound {d} B: {d} fetches, {d} evictions, {d} served from RAM, peak {d} B, max seen on disk {d} B over {d} scans\n", .{ reads, bound, st.ranges_fetched, st.chunks_evicted, st.chunks_unpersisted, st.peak_cache_bytes, monitor.max_bytes, monitor.scans });
+}
+
+test "remote chunk cache: truncated chunks and leftover .part files are detected and fetched again" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const pool = tensor.Pool.init(io, 2);
+    var env: Env = undefined;
+    try env.init(gpa, io);
+    defer env.deinit();
+    const scratch = try env.path("scratch");
+    defer gpa.free(scratch);
+    const local = try Model.load(gpa, io, &pool, fixture);
+    defer local.deinit();
+    const want = try firstTokenLogits(gpa, local, &long_ids);
+    defer gpa.free(want);
+    const shard_path = try std.fs.path.join(gpa, &.{ fixture, shard_names[0] });
+    defer gpa.free(shard_path);
+    const shard_len = (try Io.Dir.cwd().statFile(io, shard_path, .{})).size;
+
+    const cache = try env.path("cache");
+    defer gpa.free(cache);
+    {
+        const src = try env.open(cache, null);
+        defer src.deinit();
+        const model = try loadRemote(gpa, io, &pool, src, scratch);
+        defer model.deinit();
+        const got = try firstTokenLogits(gpa, model, &long_ids);
+        defer gpa.free(got);
+        try std.testing.expectEqualSlices(f32, want, got);
+    }
+    // What an interrupted run, or a crash before the data reached the disk,
+    // could leave behind: short chunk files (chunk 0, read before the shard
+    // length is known, the shard's last chunk and every third one) and a
+    // stray `.part` file.
+    var truncated: usize = 0;
+    {
+        const src = try env.open(cache, null);
+        defer src.deinit();
+        var dir = try Io.Dir.cwd().openDir(io, src.files.items[0].chunk_dir, .{ .iterate = true });
+        defer dir.close(io);
+        const last = (shard_len - 1) / chunk;
+        var victims = std.ArrayList(u64).empty;
+        defer victims.deinit(gpa);
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            const idx = std.fmt.parseInt(u64, entry.name, 10) catch continue;
+            if (idx == 0 or idx == last or idx % 3 == 1) try victims.append(gpa, idx);
+        }
+        for (victims.items) |idx| {
+            var nb: [32]u8 = undefined;
+            const name = try std.fmt.bufPrint(&nb, "{d}", .{idx});
+            const file = try dir.openFile(io, name, .{ .mode = .read_write });
+            defer file.close(io);
+            const st = try file.stat(io);
+            try file.setLength(io, if (idx == 0) 100 else st.size / 2);
+            truncated += 1;
+        }
+        try dir.writeFile(io, .{ .sub_path = "5.part", .data = "partial" });
+    }
+    try std.testing.expect(truncated >= 3);
+    {
+        const src = try env.open(cache, null);
+        defer src.deinit();
+        // The stray .part file is gone before anything is read.
+        try std.testing.expectEqual(@as(u64, 0), (try chunkDirUsage(io, src)).parts);
+        const model = try loadRemote(gpa, io, &pool, src, scratch);
+        defer model.deinit();
+        const got = try firstTokenLogits(gpa, model, &long_ids);
+        defer gpa.free(got);
+        try std.testing.expectEqualSlices(f32, want, got);
+        const st = src.stats();
+        try std.testing.expect(st.chunks_invalid >= truncated);
+        try std.testing.expect(st.ranges_fetched >= truncated);
+        // Every chunk file of the first shard is whole again.
+        var dir = try Io.Dir.cwd().openDir(io, src.files.items[0].chunk_dir, .{ .iterate = true });
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            const idx = try std.fmt.parseInt(u64, entry.name, 10);
+            const stat = try dir.statFile(io, entry.name, .{});
+            try std.testing.expectEqual(@min(chunk, shard_len - idx * chunk), stat.size);
+        }
+    }
+    // A later run reads the repaired chunks without fetching anything.
+    {
+        const src = try env.open(cache, null);
+        defer src.deinit();
+        const model = try loadRemote(gpa, io, &pool, src, scratch);
+        defer model.deinit();
+        const got = try firstTokenLogits(gpa, model, &long_ids);
+        defer gpa.free(got);
+        try std.testing.expectEqualSlices(f32, want, got);
+        try std.testing.expectEqual(@as(u64, 0), src.stats().chunks_invalid);
+        try std.testing.expectEqual(@as(u64, 0), src.stats().ranges_fetched);
+    }
 }

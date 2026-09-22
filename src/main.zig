@@ -1516,7 +1516,7 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     var remote_src: ?*remote.Source = null;
     defer if (remote_src) |s| s.deinit();
     const model_dir = if (is_remote) blk: {
-        remote_src = try remote.Source.open(gpa, io, &http, cache_root, settings.model, .{ .revision = settings.model_commit, .chunk_size = settings.remote_chunk_size }, out);
+        remote_src = try remote.Source.open(gpa, io, &http, cache_root, settings.model, .{ .revision = settings.model_commit, .chunk_size = settings.remote_chunk_size, .cache_size = settings.remote_cache_size }, out);
         break :blk remote_src.?.dir_path;
     } else try hf.resolveModel(arena, &http, cache_root, settings.model, settings.model_commit, out);
     const model = try Model.loadWithOptions(gpa, io, pool, model_dir, .{ .store = store_mode, .budget = &budget, .expert_cache = settings.expert_cache, .remote = remote_src });
@@ -1526,6 +1526,7 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         if (remote_src) |s| {
             const st = s.stats();
             out.print("\nRemote source: fetched {d} ranges ({f}), {d} chunk reads served from the disk cache\n", .{ st.ranges_fetched, budget_mod.fmtBytes(st.bytes_fetched), st.chunks_from_disk }) catch {};
+            out.print("Chunk cache: {f} on disk of a {f} bound (peak {f}), {d} chunks evicted, {d} served from RAM without being kept\n", .{ budget_mod.fmtBytes(st.cache_bytes), budget_mod.fmtBytes(st.cache_limit), budget_mod.fmtBytes(st.peak_cache_bytes), st.chunks_evicted, st.chunks_unpersisted }) catch {};
         }
         if (model.expert_cache) |ec| {
             ec.stats().print(out, "\nExpert cache") catch {};
@@ -1542,6 +1543,11 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     }
     const c = &model.config;
     try out.print("* Architecture: {s} ({d} layers, hidden size {d}, vocabulary {d}, {s} weights)\n", .{ c.model_type, c.num_layers, c.hidden_size, c.vocab_size, model.dtype.safetensorsName() });
+    // What the chunk cache must hold; also marks the trunk's chunks so that
+    // eviction keeps them longest. Said once, here, when the trunk alone
+    // does not fit the bound.
+    const footprint: ?remote.Footprint = if (remote_src) |s| try remote.planModel(s, gpa, model) else null;
+    if (footprint) |fp| try fp.warn(out);
     if (model.expert_cache) |ec| {
         try out.print("* Weights: trunk streamed layer by layer from {s}, routed experts through an expert cache of {f} (warp mode)\n", .{ if (remote_src != null) "the remote source" else "disk", budget_mod.fmtBytes(ec.capacity) });
         if (settings.hotlist) {
@@ -1593,6 +1599,7 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     if (budget.limited() or settings.print_debug_information) {
         try out.writeAll("\n");
         try estimate.print(out);
+        if (footprint) |fp| try fp.print(out);
     }
     budget_mod.check(estimate, &budget, out) catch |err| switch (err) {
         error.BudgetTooSmall => {
@@ -1606,8 +1613,9 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         if (!(budget.limited() or settings.print_debug_information)) {
             try out.writeAll("\n");
             try estimate.print(out);
+            if (footprint) |fp| try fp.print(out);
         }
-        try con.log.writeAll("\nDry run: the model, prompts and memory estimate are in order; stopping here (exit 0).\n");
+        try con.log.writeAll(if (footprint != null) "\nDry run: the model, prompts, memory and disk estimates are in order; stopping here (exit 0).\n" else "\nDry run: the model, prompts and memory estimate are in order; stopping here (exit 0).\n");
         return;
     }
 

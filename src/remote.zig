@@ -8,17 +8,88 @@
 //! reuse them. Up to `max_in_flight` chunks are fetched concurrently (the
 //! weight store and the expert cache prefetch on background tasks).
 //!
+//! The chunk cache is bounded (`--remote-cache-size`): an in-memory index of
+//! the chunks on disk (built by scanning the chunk directories at open, in
+//! file-time order, then kept up to date on every read and write) tracks their
+//! total size and recency, and a write that would exceed the bound first
+//! evicts least-recently-used chunks. Chunks of the trunk (every tensor that
+//! is not a routed expert, re-read by every forward pass) are evicted only
+//! when no expert chunk is left to evict, so a bound that holds the trunk
+//! keeps it cached across trials. A chunk that is being read or written is
+//! never evicted. A chunk that cannot be kept on disk (bound 0, or everything
+//! else is in use) is served from a small in-RAM ring of recent chunks and
+//! then dropped. Chunks are written to `<index>.part` and renamed, leftover
+//! `.part` files are removed at open, and a chunk whose length does not fit
+//! the shard is detected on first use and fetched again.
+//!
 //! Model ids: `hf://owner/name` (the Hub, revision `main` or `--model-commit`),
 //! a plain `owner/name` when `--remote-weights` is set, or an `http(s)://.../`
 //! base URL that serves the model files.
 
 const std = @import("std");
 const Io = std.Io;
+const builtin = @import("builtin");
 const hf = @import("hf.zig");
+const budget_mod = @import("budget.zig");
+const model_mod = @import("model.zig");
 
 const Allocator = std.mem.Allocator;
+const fmtBytes = budget_mod.fmtBytes;
 
 pub const default_chunk_size: u64 = 8 << 20;
+
+/// Upper end of the default chunk cache bound. Large enough for the trunk
+/// of today's biggest open mixture-of-experts checkpoints plus their hottest
+/// experts, small enough that a laptop's disk is never filled by default.
+pub const default_cache_cap: u64 = 64 << 30;
+
+/// Chunks that could not be kept on disk are held here for the reads that
+/// follow right away (neighbouring tensors, row reads), then dropped.
+const ram_slots = 4;
+
+/// The default bound: half of what the cache could use on its filesystem
+/// (free space plus what it already holds), at most `default_cache_cap`.
+/// Without a free-space figure (unsupported platform) the cap itself.
+pub fn defaultCacheSize(free: ?u64, cached: u64) u64 {
+    const f = free orelse return default_cache_cap;
+    return @min(default_cache_cap, (f +| cached) / 2);
+}
+
+/// Bytes available to an unprivileged user on the filesystem holding `path`
+/// (null when it cannot be determined).
+pub fn diskFree(path: []const u8) ?u64 {
+    var zbuf: [std.fs.max_path_bytes]u8 = undefined;
+    if (path.len >= zbuf.len) return null;
+    @memcpy(zbuf[0..path.len], path);
+    zbuf[path.len] = 0;
+    const zpath: [*:0]const u8 = @ptrCast(&zbuf);
+    // Raw struct buffers: only the leading fields are read, so the exact
+    // size of the platform's struct does not matter.
+    var buf: [4096]u8 align(8) = undefined;
+    switch (builtin.os.tag) {
+        .linux => {
+            if (@sizeOf(usize) != 8) return null;
+            const linux = std.os.linux;
+            const rc = linux.syscall2(.statfs, @intFromPtr(zpath), @intFromPtr(&buf));
+            if (linux.errno(rc) != .SUCCESS) return null;
+            // struct statfs (64-bit): f_type, f_bsize, f_blocks, f_bfree, f_bavail, ..., f_frsize at 72.
+            const bsize = std.mem.readInt(u64, buf[8..16], .little);
+            const bavail = std.mem.readInt(u64, buf[32..40], .little);
+            const frsize = std.mem.readInt(u64, buf[72..80], .little);
+            return bavail *| (if (frsize != 0) frsize else bsize);
+        },
+        .macos => {
+            if (!builtin.link_libc) return null;
+            // struct statfs (64-bit inodes): u32 f_bsize, i32 f_iosize, u64 f_blocks, u64 f_bfree, u64 f_bavail.
+            const statfs = @extern(*const fn ([*:0]const u8, *anyopaque) callconv(.c) c_int, .{ .name = if (builtin.cpu.arch == .x86_64) "statfs$INODE64" else "statfs" });
+            if (statfs(zpath, &buf) != 0) return null;
+            const bsize = std.mem.readInt(u32, buf[0..4], builtin.cpu.arch.endian());
+            const bavail = std.mem.readInt(u64, buf[24..32], builtin.cpu.arch.endian());
+            return bavail *| bsize;
+        },
+        else => return null,
+    }
+}
 
 /// True for ids that select this source: `hf://`, `http://` and `https://`.
 pub fn isRemoteId(model: []const u8) bool {
@@ -35,8 +106,19 @@ pub const Stats = struct {
     /// Range requests sent to the server.
     ranges_fetched: u64,
     bytes_fetched: u64,
-    /// Chunk reads served from the disk cache.
+    /// Chunk reads served from the disk cache (chunks an earlier run left).
     chunks_from_disk: u64,
+    /// Bytes of chunks on disk now, the most there ever were in this run, and the bound.
+    cache_bytes: u64,
+    peak_cache_bytes: u64,
+    cache_limit: u64,
+    /// Chunks evicted to stay under the bound (at open and while running).
+    chunks_evicted: u64,
+    bytes_evicted: u64,
+    /// Fetched chunks served from RAM and dropped instead of being kept on disk.
+    chunks_unpersisted: u64,
+    /// Chunks found short or missing on disk and fetched again.
+    chunks_invalid: u64,
 };
 
 pub const Source = struct {
@@ -57,14 +139,41 @@ pub const Source = struct {
     ranges_fetched: std.atomic.Value(u64) = .init(0),
     bytes_fetched: std.atomic.Value(u64) = .init(0),
     chunks_from_disk: std.atomic.Value(u64) = .init(0),
+    chunks_evicted: std.atomic.Value(u64) = .init(0),
+    bytes_evicted: std.atomic.Value(u64) = .init(0),
+    chunks_unpersisted: std.atomic.Value(u64) = .init(0),
+    chunks_invalid: std.atomic.Value(u64) = .init(0),
+    write_failure_reported: std.atomic.Value(bool) = .init(false),
+
+    /// Bound of the chunk cache in bytes (0 = keep nothing on disk).
+    cache_limit: u64 = 0,
+    /// True when `cache_limit` is the default rather than a setting.
+    cache_limit_default: bool = false,
+    /// Free space on the cache filesystem when the source was opened.
+    disk_free: ?u64 = null,
+    /// Chunks on disk when the source was opened (before trimming to the bound).
+    cached_at_open: u64 = 0,
+    /// Guards every chunk index, the byte counters below and the RAM ring.
+    /// Held only for map lookups and updates, never across I/O.
+    lock: std.atomic.Value(bool) = .init(false),
+    /// Bytes of chunks on disk or reserved for a chunk being written.
+    cache_bytes: u64 = 0,
+    peak_cache_bytes: u64 = 0,
+    /// Recency clock. Starts above any file time in nanoseconds, so every
+    /// chunk used in this run is more recent than the ones scanned at open.
+    tick: u64 = 1 << 63,
+    ram: [ram_slots]RamSlot = @splat(.{}),
 
     pub const OpenOptions = struct {
         revision: ?[]const u8 = null,
         chunk_size: u64 = default_chunk_size,
+        /// Bound of the chunk cache (null = `defaultCacheSize`, 0 = nothing on disk).
+        cache_size: ?u64 = null,
     };
 
     /// Resolves `model` to a base URL and cache directory, fetches the small
-    /// files that are not cached yet and reads the shard index.
+    /// files that are not cached yet, reads the shard index and indexes the
+    /// chunks already on disk (trimming them to the bound).
     pub fn open(gpa: Allocator, io: Io, http: *hf.Http, cache_root: []const u8, model: []const u8, opts: OpenOptions, out: *Io.Writer) !*Source {
         const self = try gpa.create(Source);
         errdefer gpa.destroy(self);
@@ -79,6 +188,10 @@ pub const Source = struct {
             .shards = &.{},
         };
         errdefer self.arena.deinit();
+        errdefer {
+            for (self.files.items) |f| f.deinit();
+            self.files.deinit(gpa);
+        }
         const a = self.arena.allocator();
         const rev = opts.revision orelse "main";
         if (std.mem.startsWith(u8, model, "http://") or std.mem.startsWith(u8, model, "https://")) {
@@ -143,11 +256,36 @@ pub const Source = struct {
             }
         }.lt);
         self.shards = names.items;
-        try out.print("* {d} safetensors shard(s); headers are fetched now, tensors on demand in {f} chunks\n", .{ self.shards.len, @import("budget.zig").fmtBytes(self.chunk_size) });
+        try out.print("* {d} safetensors shard(s); headers are fetched now, tensors on demand in {f} chunks\n", .{ self.shards.len, fmtBytes(self.chunk_size) });
+
+        // Index the chunks earlier runs left, then apply the bound.
+        var cached_chunks: u64 = 0;
+        for (self.shards) |name| cached_chunks += try self.addFile(name);
+        self.cached_at_open = self.cache_bytes;
+        self.disk_free = diskFree(self.dir_path);
+        self.cache_limit_default = opts.cache_size == null;
+        self.cache_limit = opts.cache_size orelse defaultCacheSize(self.disk_free, self.cache_bytes);
+        var trimmed: u64 = 0;
+        var trimmed_bytes: u64 = 0;
+        while (self.cache_bytes > self.cache_limit) {
+            const freed = self.evictOne() orelse break;
+            trimmed += 1;
+            trimmed_bytes += freed;
+        }
+        try out.print("* Chunk cache: {f} in {d} chunks on disk, bound {f}", .{ fmtBytes(self.cache_bytes), cached_chunks - trimmed, fmtBytes(self.cache_limit) });
+        if (self.cache_limit == 0) {
+            try out.writeAll(" (nothing is kept on disk)");
+        } else if (self.cache_limit_default) {
+            try out.print(" (default: half of the free disk space plus what is cached, at most {f}; see --remote-cache-size)", .{fmtBytes(default_cache_cap)});
+        }
+        try out.writeAll("\n");
+        if (trimmed > 0) try out.print("* Chunk cache: evicted {d} least recently used chunks ({f}) to fit the bound\n", .{ trimmed, fmtBytes(trimmed_bytes) });
+        self.peak_cache_bytes = self.cache_bytes;
         return self;
     }
 
     pub fn deinit(self: *Source) void {
+        for (self.ram) |slot| if (slot.body.len > 0) self.gpa.free(slot.body);
         for (self.files.items) |f| f.deinit();
         self.files.deinit(self.gpa);
         self.arena.deinit();
@@ -182,8 +320,12 @@ pub const Source = struct {
         };
     }
 
-    /// Opens shard `name` for range reads (the header is read by the safetensors reader).
-    pub fn openFile(self: *Source, name: []const u8) !*RemoteFile {
+    /// Creates the shard's RemoteFile and indexes its chunk directory:
+    /// leftover `.part` files are deleted, empty or oversized chunks too,
+    /// and the rest are ordered by their file times. Returns the number of
+    /// chunks indexed.
+    fn addFile(self: *Source, name: []const u8) !u64 {
+        const io = self.io;
         const f = try self.gpa.create(RemoteFile);
         errdefer self.gpa.destroy(f);
         f.* = .{
@@ -192,23 +334,195 @@ pub const Source = struct {
             .url = try std.fmt.allocPrint(self.gpa, "{s}{s}", .{ self.base_url, name }),
             .chunk_dir = try std.fs.path.join(self.gpa, &.{ self.dir_path, "chunks", name }),
         };
-        errdefer {
-            self.gpa.free(f.name);
-            self.gpa.free(f.url);
-            self.gpa.free(f.chunk_dir);
+        {
+            errdefer {
+                self.gpa.free(f.name);
+                self.gpa.free(f.url);
+                self.gpa.free(f.chunk_dir);
+            }
+            try self.files.append(self.gpa, f);
         }
-        try Io.Dir.cwd().createDirPath(self.io, f.chunk_dir);
-        try self.files.append(self.gpa, f);
-        return f;
+        const cwd = Io.Dir.cwd();
+        try cwd.createDirPath(io, f.chunk_dir);
+        var dir = try cwd.openDir(io, f.chunk_dir, .{ .iterate = true });
+        defer dir.close(io);
+        var doomed = std.ArrayList([]u8).empty;
+        defer {
+            for (doomed.items) |d| self.gpa.free(d);
+            doomed.deinit(self.gpa);
+        }
+        var count: u64 = 0;
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            const index = std.fmt.parseInt(u64, entry.name, 10) catch {
+                // An interrupted write: never valid.
+                if (std.mem.endsWith(u8, entry.name, ".part")) try doomed.append(self.gpa, try self.gpa.dupe(u8, entry.name));
+                continue;
+            };
+            const st = dir.statFile(io, entry.name, .{}) catch continue;
+            if (st.size == 0 or st.size > self.chunk_size) {
+                try doomed.append(self.gpa, try self.gpa.dupe(u8, entry.name));
+                continue;
+            }
+            var t: i96 = st.mtime.nanoseconds;
+            if (st.atime) |at| t = @max(t, at.nanoseconds);
+            const tick: u64 = if (t <= 0) 0 else @intCast(@min(t, (1 << 63) - 1));
+            try f.chunks.put(self.gpa, index, .{ .state = .present, .size = st.size, .tick = tick, .from_disk = true });
+            self.cache_bytes += st.size;
+            count += 1;
+        }
+        for (doomed.items) |d| dir.deleteFile(io, d) catch {};
+        return count;
     }
 
-    pub fn stats(self: *const Source) Stats {
+    /// Returns the RemoteFile of shard `name` for range reads (the header is
+    /// read by the safetensors reader).
+    pub fn openFile(self: *Source, name: []const u8) !*RemoteFile {
+        for (self.files.items) |f| if (std.mem.eql(u8, f.name, name)) return f;
+        _ = try self.addFile(name);
+        return self.files.items[self.files.items.len - 1];
+    }
+
+    pub fn stats(self: *Source) Stats {
+        self.lockAcquire();
+        const cache_bytes = self.cache_bytes;
+        const peak = self.peak_cache_bytes;
+        self.lockRelease();
         return .{
             .ranges_fetched = self.ranges_fetched.load(.monotonic),
             .bytes_fetched = self.bytes_fetched.load(.monotonic),
             .chunks_from_disk = self.chunks_from_disk.load(.monotonic),
+            .cache_bytes = cache_bytes,
+            .peak_cache_bytes = peak,
+            .cache_limit = self.cache_limit,
+            .chunks_evicted = self.chunks_evicted.load(.monotonic),
+            .bytes_evicted = self.bytes_evicted.load(.monotonic),
+            .chunks_unpersisted = self.chunks_unpersisted.load(.monotonic),
+            .chunks_invalid = self.chunks_invalid.load(.monotonic),
         };
     }
+
+    fn lockAcquire(self: *Source) void {
+        while (self.lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    }
+
+    fn lockRelease(self: *Source) void {
+        self.lock.store(false, .release);
+    }
+
+    /// Under the lock.
+    fn nextTick(self: *Source) u64 {
+        self.tick += 1;
+        return self.tick;
+    }
+
+    const Victim = struct { file: *RemoteFile, index: u64 };
+
+    /// Under the lock: the least recently used chunk that is on disk and not
+    /// in use, expert chunks before trunk chunks.
+    fn pickVictim(self: *Source) ?Victim {
+        var best: ?Victim = null;
+        var best_trunk = true;
+        var best_tick: u64 = std.math.maxInt(u64);
+        for (self.files.items) |f| {
+            var it = f.chunks.iterator();
+            while (it.next()) |kv| {
+                const c = kv.value_ptr;
+                if (c.state != .present or c.pins > 0) continue;
+                const trunk = f.trunk.contains(kv.key_ptr.*);
+                const better = if (trunk != best_trunk) !trunk else c.tick < best_tick;
+                if (best == null or better) {
+                    best = .{ .file = f, .index = kv.key_ptr.* };
+                    best_trunk = trunk;
+                    best_tick = c.tick;
+                }
+            }
+        }
+        return best;
+    }
+
+    /// Evicts one chunk (see `pickVictim`); returns its size, or null when
+    /// nothing can be evicted right now. The chunk's bytes stay counted until
+    /// its file is gone, so the disk never holds more than the bound.
+    fn evictOne(self: *Source) ?u64 {
+        self.lockAcquire();
+        const v = self.pickVictim() orelse {
+            self.lockRelease();
+            return null;
+        };
+        v.file.chunks.getPtr(v.index).?.state = .evicting;
+        self.lockRelease();
+        v.file.deleteChunkFile(v.index);
+        self.lockAcquire();
+        const size = if (v.file.chunks.fetchRemove(v.index)) |kv| kv.value.size else 0;
+        self.cache_bytes -= size;
+        self.lockRelease();
+        _ = self.chunks_evicted.fetchAdd(1, .monotonic);
+        _ = self.bytes_evicted.fetchAdd(size, .monotonic);
+        return size;
+    }
+
+    /// Reserves `size` bytes of the bound for chunk `index` of `f` (which the
+    /// caller is fetching), evicting as needed. False when the chunk cannot
+    /// be kept on disk: the bound is smaller than the chunk, or every other
+    /// chunk is in use.
+    fn reserve(self: *Source, f: *RemoteFile, index: u64, size: u64) bool {
+        if (size > self.cache_limit) return false;
+        while (true) {
+            self.lockAcquire();
+            if (self.cache_bytes + size <= self.cache_limit) {
+                self.cache_bytes += size;
+                self.peak_cache_bytes = @max(self.peak_cache_bytes, self.cache_bytes);
+                f.chunks.getPtr(index).?.size = size;
+                self.lockRelease();
+                return true;
+            }
+            self.lockRelease();
+            _ = self.evictOne() orelse return false;
+        }
+    }
+
+    /// Under the lock.
+    fn ramFind(self: *Source, f: *RemoteFile, index: u64) ?usize {
+        for (&self.ram, 0..) |*s, i| {
+            if (s.file == f and s.index == index and s.body.len > 0) return i;
+        }
+        return null;
+    }
+
+    /// Under the lock: puts `body` in the RAM ring, replacing the least
+    /// recently used slot not in use. Returns what the caller must free
+    /// (the replaced body, or `body` itself when every slot is in use).
+    fn ramInsert(self: *Source, f: *RemoteFile, index: u64, body: []u8) []u8 {
+        var pick: ?usize = null;
+        for (&self.ram, 0..) |*s, i| {
+            if (s.pins > 0) continue;
+            if (s.body.len == 0) {
+                pick = i;
+                break;
+            }
+            if (pick == null or s.tick < self.ram[pick.?].tick) pick = i;
+        }
+        const i = pick orelse return body;
+        const old = self.ram[i].body;
+        self.ram[i] = .{ .file = f, .index = index, .body = body, .tick = self.nextTick() };
+        return old;
+    }
+
+    fn ramRelease(self: *Source, slot: usize) void {
+        self.lockAcquire();
+        self.ram[slot].pins -= 1;
+        self.lockRelease();
+    }
+};
+
+const RamSlot = struct {
+    file: ?*RemoteFile = null,
+    index: u64 = 0,
+    body: []u8 = &.{},
+    pins: u32 = 0,
+    tick: u64 = 0,
 };
 
 fn sanitizeUrl(a: Allocator, url: []const u8) ![]u8 {
@@ -229,31 +543,77 @@ pub const RemoteFile = struct {
     name: []const u8,
     url: []const u8,
     chunk_dir: []const u8,
-    /// Chunks known to be on disk or being fetched right now.
-    states: std.AutoHashMapUnmanaged(u64, State) = .empty,
-    lock: std.atomic.Value(bool) = .init(false),
+    /// Chunks on disk, being fetched or being evicted (guarded by `src.lock`).
+    chunks: std.AutoHashMapUnmanaged(u64, Chunk) = .empty,
+    /// Chunks that hold trunk tensors (see `Source.pickVictim`).
+    trunk: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// Length of the shard's data from its header (0 until known).
+    len: u64 = 0,
 
-    const State = enum { fetching, present };
+    const Chunk = struct {
+        state: enum { fetching, present, evicting },
+        /// Bytes on disk (or reserved while `fetching`).
+        size: u64 = 0,
+        tick: u64 = 0,
+        /// Readers of the file right now; a pinned chunk is never evicted.
+        pins: u32 = 0,
+        /// The length was checked against the shard length.
+        verified: bool = false,
+        /// Found too short: fetched again once no reader holds it.
+        bad: bool = false,
+        /// Left by an earlier run and not read yet in this one.
+        from_disk: bool = false,
+    };
+
+    const Acquired = union(enum) { disk, ram: usize, fetch };
 
     pub fn deinit(self: *RemoteFile) void {
         const gpa = self.src.gpa;
-        self.states.deinit(gpa);
+        self.chunks.deinit(gpa);
+        self.trunk.deinit(gpa);
         gpa.free(self.name);
         gpa.free(self.url);
         gpa.free(self.chunk_dir);
         gpa.destroy(self);
     }
 
-    fn lockAcquire(self: *RemoteFile) void {
-        while (self.lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
-    }
-
-    fn lockRelease(self: *RemoteFile) void {
-        self.lock.store(false, .release);
-    }
-
     fn chunkName(buf: []u8, index: u64) []const u8 {
         return std.fmt.bufPrint(buf, "{d}", .{index}) catch unreachable;
+    }
+
+    /// Records the shard length (known once the header is parsed); chunks
+    /// read before are checked against it again on their next use.
+    pub fn setLength(self: *RemoteFile, len: u64) void {
+        self.src.lockAcquire();
+        defer self.src.lockRelease();
+        self.len = len;
+        var it = self.chunks.valueIterator();
+        while (it.next()) |c| c.verified = false;
+    }
+
+    /// Marks the chunks overlapping `[offset, offset + len)` as trunk chunks.
+    pub fn markTrunk(self: *RemoteFile, offset: u64, len: u64) !void {
+        if (len == 0) return;
+        const cs = self.src.chunk_size;
+        self.src.lockAcquire();
+        defer self.src.lockRelease();
+        var i = offset / cs;
+        while (i <= (offset + len - 1) / cs) : (i += 1) try self.trunk.put(self.src.gpa, i, {});
+    }
+
+    /// Whether a chunk file of `size` bytes can be chunk `index` of this
+    /// shard: full-sized, or the shard's last chunk reaching its end.
+    fn validSize(self: *const RemoteFile, index: u64, size: u64) bool {
+        const cs = self.src.chunk_size;
+        if (size == 0 or size > cs) return false;
+        if (size == cs or self.len == 0) return true;
+        return index * cs + size >= self.len;
+    }
+
+    fn deleteChunkFile(self: *RemoteFile, index: u64) void {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&buf, "{s}/{d}", .{ self.chunk_dir, index }) catch return;
+        Io.Dir.cwd().deleteFile(self.src.io, path) catch {};
     }
 
     /// Reads `out.len` bytes at `offset`. Fails with `UnexpectedEndOfFile`
@@ -267,61 +627,177 @@ pub const RemoteFile = struct {
         const end = offset + out.len;
         while (pos < end) {
             const index = pos / cs;
-            try self.ensureChunk(io, dir, index);
             const in_chunk = pos - index * cs;
             const n: usize = @intCast(@min(cs - in_chunk, end - pos));
-            var name_buf: [32]u8 = undefined;
-            const file = try dir.openFile(io, chunkName(&name_buf, index), .{});
-            defer file.close(io);
-            const got = try file.readPositionalAll(io, out[@intCast(pos - offset)..][0..n], in_chunk);
-            if (got != n) return error.UnexpectedEndOfFile;
+            try self.readChunk(io, dir, index, in_chunk, out[@intCast(pos - offset)..][0..n]);
             pos += n;
         }
     }
 
-    /// Makes chunk `index` present on disk, fetching it unless another task
-    /// is already doing so (then waits for it).
-    fn ensureChunk(self: *RemoteFile, io: Io, dir: Io.Dir, index: u64) !void {
+    /// Copies `dest.len` bytes at `in_chunk` of chunk `index` into `dest`:
+    /// from the disk cache, the RAM ring, or a fetch.
+    fn readChunk(self: *RemoteFile, io: Io, dir: Io.Dir, index: u64, in_chunk: u64, dest: []u8) !void {
+        const src = self.src;
         var name_buf: [32]u8 = undefined;
         const name = chunkName(&name_buf, index);
-        while (true) {
-            self.lockAcquire();
-            const state = self.states.get(index);
-            if (state == .present) {
-                self.lockRelease();
-                return;
-            }
-            if (state == null) {
-                // Not seen in this run: on disk from an earlier run?
-                if (dir.access(io, name, .{})) |_| {
-                    self.states.put(self.src.gpa, index, .present) catch {};
-                    self.lockRelease();
-                    _ = self.src.chunks_from_disk.fetchAdd(1, .monotonic);
+        var retries: usize = 0;
+        while (true) switch (try self.acquire(io, index)) {
+            .disk => {
+                if (readFile(io, dir, name, in_chunk, dest)) {
+                    self.unpin(index, false);
                     return;
-                } else |_| {}
-                self.states.put(self.src.gpa, index, .fetching) catch {
-                    self.lockRelease();
-                    return error.OutOfMemory;
+                }
+                // Missing or too short (an earlier run was interrupted, or
+                // another process shares the cache): fetch it again (the
+                // next `acquire` drops it once no reader holds it).
+                self.unpin(index, true);
+                retries += 1;
+                if (retries > 3) return error.UnexpectedEndOfFile;
+            },
+            .ram => |slot| {
+                defer src.ramRelease(slot);
+                const body = src.ram[slot].body;
+                if (body.len < in_chunk + dest.len) return error.UnexpectedEndOfFile;
+                @memcpy(dest, body[@intCast(in_chunk)..][0..dest.len]);
+                return;
+            },
+            .fetch => {
+                const body = self.fetchChunk(io, index) catch |err| {
+                    self.abandon(index);
+                    return err;
                 };
-                self.lockRelease();
-                break;
-            }
-            // Someone else is fetching it.
-            self.lockRelease();
-            try io.sleep(Io.Duration.fromNanoseconds(2 * std.time.ns_per_ms), .awake);
-        }
-        self.fetchChunk(io, dir, index, name) catch |err| {
-            self.lockAcquire();
-            _ = self.states.remove(index);
-            self.lockRelease();
-            return err;
+                if (body.len > src.chunk_size or body.len < in_chunk + dest.len) {
+                    src.gpa.free(body);
+                    self.abandon(index);
+                    return error.UnexpectedEndOfFile;
+                }
+                @memcpy(dest, body[@intCast(in_chunk)..][0..dest.len]);
+                self.keep(io, dir, index, name, body);
+                return;
+            },
         };
-        self.lockAcquire();
-        self.states.put(self.src.gpa, index, .present) catch {};
-        self.lockRelease();
     }
 
-    fn fetchChunk(self: *RemoteFile, io: Io, dir: Io.Dir, index: u64, name: []const u8) !void {
+    fn readFile(io: Io, dir: Io.Dir, name: []const u8, in_chunk: u64, dest: []u8) bool {
+        const file = dir.openFile(io, name, .{}) catch return false;
+        defer file.close(io);
+        const got = file.readPositionalAll(io, dest, in_chunk) catch return false;
+        return got == dest.len;
+    }
+
+    /// Looks chunk `index` up. `.disk`: on disk and pinned (call `unpin`);
+    /// `.ram`: in the RAM ring and pinned (call `Source.ramRelease`);
+    /// `.fetch`: the caller now owns fetching it (call `keep` or `abandon`).
+    /// Waits while another task fetches or evicts it.
+    fn acquire(self: *RemoteFile, io: Io, index: u64) !Acquired {
+        const src = self.src;
+        while (true) {
+            src.lockAcquire();
+            if (self.chunks.getPtr(index)) |c| {
+                if (c.state == .present) {
+                    if (!c.verified) {
+                        c.verified = true;
+                        if (!self.validSize(index, c.size)) c.bad = true;
+                    }
+                    if (!c.bad) {
+                        c.pins += 1;
+                        c.tick = src.nextTick();
+                        const first = c.from_disk;
+                        c.from_disk = false;
+                        src.lockRelease();
+                        if (first) _ = src.chunks_from_disk.fetchAdd(1, .monotonic);
+                        return .disk;
+                    }
+                    if (c.pins == 0) {
+                        // Drop the bad file and take over fetching the chunk.
+                        c.state = .evicting;
+                        const size = c.size;
+                        src.lockRelease();
+                        self.deleteChunkFile(index);
+                        src.lockAcquire();
+                        src.cache_bytes -= size;
+                        self.chunks.getPtr(index).?.* = .{ .state = .fetching };
+                        src.lockRelease();
+                        _ = src.chunks_invalid.fetchAdd(1, .monotonic);
+                        return .fetch;
+                    }
+                }
+                // Being fetched, evicted, or a bad chunk still being read.
+                src.lockRelease();
+                try io.sleep(Io.Duration.fromNanoseconds(std.time.ns_per_ms), .awake);
+                continue;
+            }
+            if (src.ramFind(self, index)) |slot| {
+                src.ram[slot].pins += 1;
+                src.ram[slot].tick = src.nextTick();
+                src.lockRelease();
+                return .{ .ram = slot };
+            }
+            self.chunks.put(src.gpa, index, .{ .state = .fetching }) catch {
+                src.lockRelease();
+                return error.OutOfMemory;
+            };
+            src.lockRelease();
+            return .fetch;
+        }
+    }
+
+    fn unpin(self: *RemoteFile, index: u64, bad: bool) void {
+        self.src.lockAcquire();
+        defer self.src.lockRelease();
+        const c = self.chunks.getPtr(index) orelse return;
+        c.pins -= 1;
+        if (bad) c.bad = true;
+    }
+
+    /// Gives up fetching chunk `index` (after a failed fetch).
+    fn abandon(self: *RemoteFile, index: u64) void {
+        self.src.lockAcquire();
+        defer self.src.lockRelease();
+        if (self.chunks.fetchRemove(index)) |kv| self.src.cache_bytes -= kv.value.size;
+    }
+
+    /// Stores a fetched chunk: on disk when the bound allows (written to a
+    /// temporary name and renamed, so a chunk file is always complete),
+    /// otherwise in the RAM ring. Takes ownership of `body`.
+    fn keep(self: *RemoteFile, io: Io, dir: Io.Dir, index: u64, name: []const u8, body: []u8) void {
+        const src = self.src;
+        if (src.reserve(self, index, body.len)) {
+            if (writeChunk(io, dir, name, body)) {
+                src.lockAcquire();
+                const c = self.chunks.getPtr(index).?;
+                c.state = .present;
+                c.tick = src.nextTick();
+                c.verified = true;
+                src.lockRelease();
+                src.gpa.free(body);
+                return;
+            } else |err| {
+                if (!src.write_failure_reported.swap(true, .monotonic))
+                    std.log.warn("could not write to the chunk cache {s} ({s}); chunks that do not fit are fetched again when needed", .{ self.chunk_dir, @errorName(err) });
+                src.lockAcquire();
+                src.cache_bytes -= body.len;
+                self.chunks.getPtr(index).?.size = 0;
+                src.lockRelease();
+            }
+        }
+        src.lockAcquire();
+        _ = self.chunks.remove(index);
+        const drop = src.ramInsert(self, index, body);
+        src.lockRelease();
+        if (drop.len > 0) src.gpa.free(drop);
+        _ = src.chunks_unpersisted.fetchAdd(1, .monotonic);
+    }
+
+    fn writeChunk(io: Io, dir: Io.Dir, name: []const u8, body: []const u8) !void {
+        var tmp_buf: [48]u8 = undefined;
+        const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.part", .{name}) catch unreachable;
+        errdefer dir.deleteFile(io, tmp) catch {};
+        try dir.writeFile(io, .{ .sub_path = tmp, .data = body });
+        try dir.rename(tmp, dir, name, io);
+    }
+
+    fn fetchChunk(self: *RemoteFile, io: Io, index: u64) ![]u8 {
         const src = self.src;
         // Bounded concurrency across all shards of the source.
         while (true) {
@@ -336,15 +812,160 @@ pub const RemoteFile = struct {
         const start = index * src.chunk_size;
         const last = start + src.chunk_size - 1;
         const body = try src.http.getRange(self.url, start, last);
-        defer src.gpa.free(body);
         _ = src.ranges_fetched.fetchAdd(1, .monotonic);
         _ = src.bytes_fetched.fetchAdd(body.len, .monotonic);
-        var tmp_buf: [48]u8 = undefined;
-        const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.part", .{name}) catch unreachable;
-        try dir.writeFile(io, .{ .sub_path = tmp, .data = body });
-        try dir.rename(tmp, dir, name, io);
+        return body;
     }
 };
+
+/// What the remote source needs on disk for a model: the trunk (every stored
+/// tensor that is not a routed expert, re-read by every forward pass), the
+/// routed experts, and the configured chunk cache bound.
+pub const Footprint = struct {
+    chunk_size: u64,
+    /// Stored bytes of the trunk tensors, and of the chunks they span.
+    trunk_bytes: u64 = 0,
+    trunk_chunk_bytes: u64 = 0,
+    /// Stored bytes of the largest routed expert and of all of them.
+    expert_bytes: u64 = 0,
+    total_expert_bytes: u64 = 0,
+    num_experts: u64 = 0,
+    cache_limit: u64,
+    cache_limit_default: bool,
+    cache_bytes: u64,
+    disk_free: ?u64,
+
+    pub fn trunkFits(self: Footprint) bool {
+        return self.trunk_chunk_bytes <= self.cache_limit;
+    }
+
+    /// The smallest round bound that holds the trunk's chunks.
+    pub fn suggestedLimit(self: Footprint) u64 {
+        const t = self.trunk_chunk_bytes;
+        const unit: u64 = if (t >= 1 << 30) 1 << 30 else if (t >= 1 << 20) 1 << 20 else 1 << 10;
+        return (std.math.divCeil(u64, self.trunk_chunk_bytes, unit) catch unreachable) * unit;
+    }
+
+    pub fn print(self: Footprint, w: *Io.Writer) !void {
+        try w.print("Disk estimate (remote chunk cache, {f} chunks):\n", .{fmtBytes(self.chunk_size)});
+        try w.print("  trunk                    {f} stored, {f} of chunks (re-read by every forward pass)\n", .{ fmtBytes(self.trunk_bytes), fmtBytes(self.trunk_chunk_bytes) });
+        if (self.num_experts > 0)
+            try w.print("  routed expert            {f} each stored, {d} experts, {f} in total\n", .{ fmtBytes(self.expert_bytes), self.num_experts, fmtBytes(self.total_expert_bytes) });
+        try w.print("  chunk cache bound        {f}{s}, {f} cached now", .{ fmtBytes(self.cache_limit), if (self.cache_limit_default) " (default)" else "", fmtBytes(self.cache_bytes) });
+        if (self.disk_free) |f| try w.print(", {f} free on its filesystem", .{fmtBytes(f)});
+        try w.writeAll("\n");
+        if (self.cache_limit == 0) {
+            try w.writeAll("  nothing is kept on disk: every forward pass fetches the trunk again\n");
+        } else if (!self.trunkFits()) {
+            try w.print("  too small for the trunk: every forward pass fetches it again (--remote-cache-size {f} holds it)\n", .{fmtBytes(self.suggestedLimit())});
+        } else if (self.num_experts > 0) {
+            const room = self.cache_limit - self.trunk_chunk_bytes;
+            const experts = if (self.expert_bytes == 0) 0 else room / self.expert_bytes;
+            try w.print("  the trunk stays cached; room for {d} of {d} experts besides\n", .{ @min(experts, self.num_experts), self.num_experts });
+        }
+    }
+
+    /// The startup note when the bound cannot hold the trunk.
+    pub fn warn(self: Footprint, w: *Io.Writer) !void {
+        if (self.trunkFits()) return;
+        if (self.cache_limit == 0) {
+            try w.print("Note: --remote-cache-size 0 keeps nothing on disk, so every forward pass fetches the trunk ({f}) again.\n", .{fmtBytes(self.trunk_chunk_bytes)});
+            return;
+        }
+        try w.print("Note: the trunk spans {f} of remote chunks but the chunk cache is bounded at {f}{s}; every forward pass will fetch it again. --remote-cache-size {f} would keep it cached.\n", .{ fmtBytes(self.trunk_chunk_bytes), fmtBytes(self.cache_limit), if (self.cache_limit_default) " (the default)" else "", fmtBytes(self.suggestedLimit()) });
+    }
+};
+
+fn modulePrefix(name: []const u8) []const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return name;
+    return name[0..dot];
+}
+
+/// Measures `model`'s stored bytes by class and marks the chunks of the
+/// trunk, so that eviction keeps them longest. Tensors are classified by
+/// module (the name up to its last '.'), so the packed codes, scales and
+/// zero points of a quantised expert count with the expert.
+pub fn planModel(src: *Source, gpa: Allocator, model: *const model_mod.Model) !Footprint {
+    src.lockAcquire();
+    var fp: Footprint = .{
+        .chunk_size = src.chunk_size,
+        .cache_limit = src.cache_limit,
+        .cache_limit_default = src.cache_limit_default,
+        .cache_bytes = src.cache_bytes,
+        .disk_free = src.disk_free,
+    };
+    src.lockRelease();
+    const Group = struct { bytes: u64 = 0, experts: u32 = 0 };
+    var groups = std.StringHashMapUnmanaged(Group).empty;
+    defer groups.deinit(gpa);
+    for (model.layers) |*l| if (l.moe) |*m| for (m.experts) |*ex| {
+        var seen: [3][]const u8 = undefined;
+        var n_seen: usize = 0;
+        for ([_][]const u8{ ex.gate_ref.ref.name, ex.up_ref.ref.name, ex.down_ref.ref.name }) |name| {
+            const p = modulePrefix(name);
+            var dup = false;
+            for (seen[0..n_seen]) |s| dup = dup or std.mem.eql(u8, s, p);
+            if (dup) continue;
+            seen[n_seen] = p;
+            n_seen += 1;
+            const gop = try groups.getOrPut(gpa, p);
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            gop.value_ptr.experts += 1;
+        }
+        fp.num_experts += 1;
+    };
+    for (model.files) |f| {
+        const rf = switch (f.source) {
+            .remote => |r| r,
+            .local => continue,
+        };
+        var it = f.tensors.iterator();
+        while (it.next()) |kv| {
+            const info = kv.value_ptr.*;
+            // Decoded views of quantised tensors live above the file's bytes.
+            if (info.offset >= f.len) continue;
+            try classify(&groups, rf, &fp, info.name, info.offset, info.byte_len);
+        }
+        var rit = f.raw.iterator();
+        while (rit.next()) |kv| try classify(&groups, rf, &fp, kv.value_ptr.name, kv.value_ptr.offset, kv.value_ptr.byte_len);
+        const cs = src.chunk_size;
+        src.lockAcquire();
+        var tit = rf.trunk.keyIterator();
+        while (tit.next()) |idx| {
+            const start = idx.* * cs;
+            fp.trunk_chunk_bytes += if (f.len > start) @min(cs, f.len - start) else 0;
+        }
+        src.lockRelease();
+    }
+    var git = groups.valueIterator();
+    while (git.next()) |g| fp.total_expert_bytes += g.bytes;
+    for (model.layers) |*l| if (l.moe) |*m| for (m.experts) |*ex| {
+        var seen: [3][]const u8 = undefined;
+        var n_seen: usize = 0;
+        var bytes: u64 = 0;
+        for ([_][]const u8{ ex.gate_ref.ref.name, ex.up_ref.ref.name, ex.down_ref.ref.name }) |name| {
+            const p = modulePrefix(name);
+            var dup = false;
+            for (seen[0..n_seen]) |s| dup = dup or std.mem.eql(u8, s, p);
+            if (dup) continue;
+            seen[n_seen] = p;
+            n_seen += 1;
+            const g = groups.get(p).?;
+            bytes += g.bytes / @max(g.experts, 1);
+        }
+        fp.expert_bytes = @max(fp.expert_bytes, bytes);
+    };
+    return fp;
+}
+
+fn classify(groups: anytype, rf: *RemoteFile, fp: *Footprint, name: []const u8, offset: u64, len: u64) !void {
+    if (groups.getPtr(modulePrefix(name))) |g| {
+        g.bytes += len;
+        return;
+    }
+    fp.trunk_bytes += len;
+    try rf.markTrunk(offset, len);
+}
 
 /// Number of chunk files a full copy of a shard of `len` bytes needs.
 pub fn chunkCount(len: u64, chunk_size: u64) u64 {
@@ -361,4 +982,13 @@ test "remote id forms" {
     defer gpa.free(s);
     try std.testing.expectEqualStrings("127.0.0.1_8000_models_x", s);
     try std.testing.expectEqual(@as(u64, 3), chunkCount(20, 8));
+}
+
+test "default chunk cache bound" {
+    try std.testing.expectEqual(default_cache_cap, defaultCacheSize(null, 0));
+    try std.testing.expectEqual(@as(u64, 50 << 30), defaultCacheSize(80 << 30, 20 << 30));
+    try std.testing.expectEqual(default_cache_cap, defaultCacheSize(1 << 40, 0));
+    try std.testing.expectEqual(@as(u64, 0), defaultCacheSize(0, 0));
+    if (builtin.os.tag == .linux) try std.testing.expect(diskFree(".") != null);
+    try std.testing.expectEqualStrings("model.layers.0.mlp.experts.3.up_proj", modulePrefix("model.layers.0.mlp.experts.3.up_proj.weight_packed"));
 }

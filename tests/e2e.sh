@@ -612,6 +612,23 @@ requests=$(wc -l < "$TMP/range.log")
     2>&1 | tee "$TMP/remote2.log"
 grep -q "^Remote source: fetched 0 ranges" "$TMP/remote2.log" || fail "second remote run fetched ranges although the chunks were cached"
 [ "$(wc -l < "$TMP/range.log")" -eq "$requests" ] || fail "second remote run sent requests to the server"
+# A chunk cache bound below the trunk: the dry run prints the disk estimate
+# next to the memory one and says, once, which bound would hold the trunk.
+"$DITCH" "${REMOTE_COMMON[@]}" --cache-dir "$TMP/remote_small" --remote-chunk-size 4KB --remote-cache-size 64KB \
+    --dry-run > "$TMP/remote_dry.out" 2> "$TMP/remote_dry.log" || fail "a remote --dry-run must exit 0"
+[ ! -s "$TMP/remote_dry.out" ] || fail "the remote dry run wrote messages to stdout"
+grep -q "^Disk estimate (remote chunk cache, 4.0KB chunks):" "$TMP/remote_dry.log" || fail "no disk estimate in the remote dry run"
+grep -q "^  routed expert .* each stored, 64 experts" "$TMP/remote_dry.log" || fail "the disk estimate lacks the per-expert bytes"
+grep -q "^  chunk cache bound        64.0KB" "$TMP/remote_dry.log" || fail "the disk estimate lacks the configured bound"
+[ "$(grep -c "^Note: the trunk spans .* --remote-cache-size .* would keep it cached" "$TMP/remote_dry.log")" -eq 1 ] \
+    || fail "a bound below the trunk was not reported exactly once"
+used=$(find "$TMP/remote_small" -path '*/chunks/*' -type f -exec cat {} + | wc -c | tr -d ' ')
+[ "$used" -le 65536 ] || fail "the chunk cache holds $used bytes, over its 64KB bound"
+# DITCH_REMOTE_CACHE_SIZE=0: nothing is kept on disk.
+DITCH_REMOTE_CACHE_SIZE=0 "$DITCH" "${REMOTE_COMMON[@]}" --cache-dir "$TMP/remote_zero" --remote-chunk-size 4KB \
+    --dry-run > /dev/null 2> "$TMP/remote_zero.log" || fail "a remote --dry-run with a zero cache bound must exit 0"
+grep -q "nothing is kept on disk" "$TMP/remote_zero.log" || fail "DITCH_REMOTE_CACHE_SIZE=0 was not applied"
+[ -z "$(find "$TMP/remote_zero" -path '*/chunks/*' -type f)" ] || fail "--remote-cache-size 0 left chunk files on disk"
 "$DITCH" "${BIG_COMMON[@]}" --evaluate-model "$TMP/remote_out" 2>&1 | tee "$TMP/remote_eval.log"
 kl=$(grep "  \* KL divergence:" "$TMP/remote_eval.log" | tail -1 | awk '{print $4}')
 awk -v kl="$kl" 'BEGIN { exit !(kl < 1.0) }' || fail "KL divergence of the remote-source export is implausible: $kl"
