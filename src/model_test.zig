@@ -249,6 +249,12 @@ test "kimi_linear fixture (checkpoint layout: split convolutions, block_sparse_m
 test "kimi_linear fixture (Hugging Face layout: forget_gate, fused conv1d, stacked experts)" {
     try checkFixture("kimi_linear_hf");
 }
+test "mimo_v2_flash fixture (transformers spelling: layer_types, rope_parameters, stacked experts)" {
+    try checkFixture("mimo_v2_flash");
+}
+test "mimo_v2 fixture (hub spelling: hybrid_layer_pattern, chunked qkv_proj, omni and MTP pass-through)" {
+    try checkFixture("mimo_v2");
+}
 test "kimi_k25 fixture (DeepSeek V3 text config under a multimodal wrapper)" {
     try checkFixture("kimi_k25");
 }
@@ -407,6 +413,12 @@ test "glm4_moe edit, export and streamed reload (per-head q/k norms, sigmoid MoE
 }
 test "glm_moe_dsa edit, export and streamed reload (MLA sparse indexer as dense)" {
     try checkEditExportStream("glm_moe_dsa");
+}
+test "mimo_v2_flash edit, export and streamed reload (sinks on sliding layers, doubled kv heads, stacked experts, MTP pass-through)" {
+    try checkEditExportStream("mimo_v2_flash");
+}
+test "mimo_v2 edit, export and streamed reload (chunked qkv_proj, per-expert tensors, omni tensors pass-through)" {
+    try checkEditExportStream("mimo_v2");
 }
 test "deepseek_v4 edit, export and streamed reload (hyper-connections, hash routing, MTP pass-through)" {
     try checkEditExportStream("deepseek_v4");

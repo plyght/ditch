@@ -36,6 +36,7 @@ const Delta = tensor.Delta;
 const WeightRef = stream.WeightRef;
 
 pub const Config = arch.Config;
+const QkvLayout = arch.QkvLayout;
 pub const RopeScaling = arch.RopeScaling;
 pub const parseConfig = arch.parseConfig;
 
@@ -984,7 +985,7 @@ pub const Model = struct {
                 .v_bias = null,
                 .qkv_bias = null,
                 .o_bias = null,
-                .sinks = if (names.sinks) |t| self.loadVecOpt(try cat(arena, lp, t)) else null,
+                .sinks = if (names.sinks) |t| (self.loadVecOpt(try cat(arena, lp, t)) orelse if (names.sinks_alt) |alt| self.loadVecOpt(try cat(arena, lp, alt)) else null) else null,
                 .mla = null,
                 .gate = null,
                 .up = null,
@@ -1016,10 +1017,15 @@ pub const Model = struct {
                 layer.q_norm = null;
                 layer.k_norm = null;
             }
-            if (c.sinks and layer.sinks == null) {
+            if (c.sinks and layer.sinks == null and (!c.sinks_sliding_only or c.sliding_layers[i])) {
                 std.log.err("missing attention sinks in layer {d}", .{i});
                 return error.MissingWeights;
             }
+            if (layer.sinks) |sk| if (sk.len != c.num_heads) {
+                std.log.err("layer {d}: attention sinks have {d} entries, expected one per head ({d})", .{ i, sk.len, c.num_heads });
+                return error.InvalidConfig;
+            };
+            const kv_heads_i = c.layer_kv_heads[i];
 
             // Attention projections.
             if (c.dsv4 != null) {
@@ -1061,14 +1067,18 @@ pub const Model = struct {
                     return error.InvalidConfig;
                 }
                 layer.mla = mla;
-            } else if (c.qkv_layout != .separate) {
+            } else if (c.qkv_layout != .separate or (c.qkv_alt != null and names.qkv != null and names.q != null and self.find(try cat(arena, lp, names.q.?)) == null and self.find(try cat(arena, lp, names.qkv.?)) != null)) {
                 const qkv_name = try cat(arena, lp, names.qkv orelse return error.InvalidConfig);
                 layer.qkv = try self.loadMatT(qkv_name, c.arch.conv1d);
                 layer.qkv_bias = self.loadVecOpt(try biasName(arena, qkv_name));
                 layer.refs.add(.qkv, try self.ref(qkv_name), c.arch.conv1d);
-                const want = c.num_heads * c.head_dim + 2 * c.num_kv_heads * c.head_dim;
+                const want = c.num_heads * c.head_dim + kv_heads_i * (c.head_dim + c.v_head_dim);
                 if (layer.qkv.?.rows != want or layer.qkv.?.cols != c.hidden_size) {
                     std.log.err("layer {d}: fused qkv tensor is [{d}][{d}], expected [{d}][{d}]", .{ i, layer.qkv.?.rows, layer.qkv.?.cols, want, c.hidden_size });
+                    return error.InvalidConfig;
+                }
+                if (c.qkv_chunks != 0 and (c.num_heads % c.qkv_chunks != 0 or kv_heads_i % c.qkv_chunks != 0)) {
+                    std.log.err("layer {d}: fused qkv tensor is chunked {d} ways, which does not divide {d} heads / {d} kv heads", .{ i, c.qkv_chunks, c.num_heads, kv_heads_i });
                     return error.InvalidConfig;
                 }
             } else {
@@ -1085,8 +1095,8 @@ pub const Model = struct {
                 layer.refs.add(.k, try self.ref(k_name), false);
                 layer.refs.add(.v, try self.ref(v_name), false);
                 const qwant = if (c.gated_attention) 2 * c.num_heads * c.head_dim else c.num_heads * c.head_dim;
-                if (layer.q.?.rows != qwant or layer.k.?.rows != c.num_kv_heads * c.head_dim) {
-                    std.log.err("layer {d}: q/k projection shapes do not match the config (heads {d}, kv heads {d}, head_dim {d})", .{ i, c.num_heads, c.num_kv_heads, c.head_dim });
+                if (layer.q.?.rows != qwant or layer.k.?.rows != kv_heads_i * c.head_dim or layer.v.?.rows != kv_heads_i * c.v_head_dim) {
+                    std.log.err("layer {d}: q/k/v projection shapes do not match the config (heads {d}, kv heads {d}, head_dim {d}, v_head_dim {d})", .{ i, c.num_heads, kv_heads_i, c.head_dim, c.v_head_dim });
                     return error.InvalidConfig;
                 }
             }
@@ -1483,7 +1493,7 @@ pub const Model = struct {
         self.rope_cos = try arena.alloc(f32, self.rope_len * half);
         self.rope_sin = try arena.alloc(f32, self.rope_len * half);
         try self.fillRope(self.rope_cos, self.rope_sin, c.rope_theta, c.rope_scaling);
-        if (c.arch.norm == .rms_gemma and std.mem.startsWith(u8, c.model_type, "gemma3")) {
+        if (c.sliding_rope_local) {
             self.rope_cos_local = try arena.alloc(f32, self.rope_len * half);
             self.rope_sin_local = try arena.alloc(f32, self.rope_len * half);
             try self.fillRope(self.rope_cos_local, self.rope_sin_local, c.rope_local_theta, .none);
@@ -2086,7 +2096,7 @@ fn attentionWorker(ctx: *const AttnCtx, start: usize, end: usize) void {
     const c = &model.config;
     const hd = c.head_dim;
     const vd = c.v_head_dim;
-    const groups = c.num_heads / c.num_kv_heads;
+    const groups = c.num_heads / c.layer_kv_heads[ctx.layer];
     const slot = start / ctx.per;
     const scores_buf = ctx.scores[slot * ctx.max_keys ..][0..ctx.max_keys];
     const stride = ctx.cache.kv_dim;
@@ -2186,7 +2196,7 @@ pub const Workspace = struct {
     }
 
     fn fusedQkvRows(c: *const Config) usize {
-        return if (c.qkv_layout != .separate and c.mla == null) (c.num_heads + 2 * c.num_kv_heads) * c.head_dim else 0;
+        return if ((c.qkv_layout != .separate or c.qkv_alt != null) and c.mla == null) (c.num_heads + 2 * c.num_kv_heads) * c.head_dim else 0;
     }
 
     fn fusedGateUpCols(c: *const Config) usize {
@@ -2348,35 +2358,40 @@ fn clampAll(buf: []f32, limit: f32) void {
     for (buf) |*v| v.* = std.math.clamp(v.*, -limit, limit);
 }
 
-/// Splits one fused qkv row into q, k and v according to the family layout.
-fn scatterQkv(c: *const Config, fused: []const f32, q: []f32, k: []f32, v: []f32) void {
+/// Splits one fused qkv row into q, k and v (`[kv heads][head_dim]`, the
+/// first `v_head_dim` entries of every v head valid) according to `layout`.
+fn scatterQkv(c: *const Config, layout: QkvLayout, nkv: usize, fused: []const f32, q: []f32, k: []f32, v: []f32) void {
     const hd = c.head_dim;
+    const vd = c.v_head_dim;
     const nh = c.num_heads;
-    const nkv = c.num_kv_heads;
     const qd = nh * hd;
-    const kvd = nkv * hd;
-    switch (c.qkv_layout) {
+    const kd = nkv * hd;
+    switch (layout) {
         .separate => unreachable,
         .concat => {
             @memcpy(q, fused[0..qd]);
-            @memcpy(k, fused[qd..][0..kvd]);
-            @memcpy(v, fused[qd + kvd ..][0..kvd]);
+            @memcpy(k, fused[qd..][0..kd]);
+            for (0..nkv) |g| @memcpy(v[g * hd ..][0..vd], fused[qd + kd + g * vd ..][0..vd]);
         },
         .heads_interleaved => {
             std.debug.assert(nkv == nh);
             for (0..nh) |h| {
-                @memcpy(q[h * hd ..][0..hd], fused[h * 3 * hd ..][0..hd]);
-                @memcpy(k[h * hd ..][0..hd], fused[h * 3 * hd + hd ..][0..hd]);
-                @memcpy(v[h * hd ..][0..hd], fused[h * 3 * hd + 2 * hd ..][0..hd]);
+                @memcpy(q[h * hd ..][0..hd], fused[h * (2 * hd + vd) ..][0..hd]);
+                @memcpy(k[h * hd ..][0..hd], fused[h * (2 * hd + vd) + hd ..][0..hd]);
+                @memcpy(v[h * hd ..][0..vd], fused[h * (2 * hd + vd) + 2 * hd ..][0..vd]);
             }
         },
         .grouped => {
-            const groups = nh / nkv;
-            for (0..nkv) |g| {
-                const base = g * (groups + 2) * hd;
-                for (0..groups) |j| @memcpy(q[(g * groups + j) * hd ..][0..hd], fused[base + j * hd ..][0..hd]);
-                @memcpy(k[g * hd ..][0..hd], fused[base + groups * hd ..][0..hd]);
-                @memcpy(v[g * hd ..][0..hd], fused[base + (groups + 1) * hd ..][0..hd]);
+            // `chunks` blocks of `[q heads of the chunk | its k heads | its v heads]`.
+            const chunks = if (c.qkv_chunks != 0) c.qkv_chunks else nkv;
+            const qpc = nh / chunks;
+            const kpc = nkv / chunks;
+            const chunk_len = qpc * hd + kpc * (hd + vd);
+            for (0..chunks) |g| {
+                const base = g * chunk_len;
+                for (0..qpc) |j| @memcpy(q[(g * qpc + j) * hd ..][0..hd], fused[base + j * hd ..][0..hd]);
+                for (0..kpc) |j| @memcpy(k[(g * kpc + j) * hd ..][0..hd], fused[base + (qpc + j) * hd ..][0..hd]);
+                for (0..kpc) |j| @memcpy(v[(g * kpc + j) * hd ..][0..vd], fused[base + (qpc + kpc) * hd + j * vd ..][0..vd]);
             }
         },
     }
@@ -2851,16 +2866,18 @@ fn attention(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace
     const n = rows.len;
     const hd = c.head_dim;
     const qd = c.num_heads * hd;
-    const kvd = c.num_kv_heads * hd;
+    const nkv = c.layer_kv_heads[li];
+    const kvd = nkv * hd;
 
     if (layer.mla != null) {
         try mlaProject(model, layer, ws, h, n);
     } else if (layer.qkv) |w| {
-        const qkv_rows = qd + 2 * kvd;
+        const qkv_rows = w.rows;
+        const layout = if (c.qkv_layout != .separate) c.qkv_layout else c.qkv_alt.?;
         try tensor.matmulT(model.pool, gpa, ws.qkv, h, n, w, null);
         if (layer.qkv_bias) |b| addBias(ws.qkv, n, qkv_rows, b);
         var i: usize = 0;
-        while (i < n) : (i += 1) scatterQkv(c, ws.qkv[i * qkv_rows ..][0..qkv_rows], ws.q[i * qd ..][0..qd], ws.k[i * kvd ..][0..kvd], ws.v[i * kvd ..][0..kvd]);
+        while (i < n) : (i += 1) scatterQkv(c, layout, nkv, ws.qkv[i * qkv_rows ..][0..qkv_rows], ws.q[i * qd ..][0..qd], ws.k[i * kvd ..][0..kvd], ws.v[i * kvd ..][0..kvd]);
     } else if (c.gated_attention) {
         const tmp = try gpa.alloc(f32, n * 2 * qd);
         defer gpa.free(tmp);
@@ -2885,7 +2902,8 @@ fn attention(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace
         try tensor.matmulT(model.pool, gpa, ws.k, h, n, layer.k.?, null);
         try tensor.matmulT(model.pool, gpa, ws.v, h, n, layer.v.?, null);
         if (layer.k_bias) |b| addBias(ws.k, n, kvd, b);
-        if (layer.v_bias) |b| addBias(ws.v, n, kvd, b);
+        if (layer.v_bias) |b| addBias(ws.v, n, nkv * c.v_head_dim, b);
+        spreadValues(c, ws.v, n, nkv);
         try attentionTail(model, layer, li, ws, cache, rows, gate);
         return;
     } else {
@@ -2894,9 +2912,24 @@ fn attention(model: *const Model, layer: *const Layer, li: usize, ws: *Workspace
         try tensor.matmulT(model.pool, gpa, ws.v, h, n, layer.v.?, null);
         if (layer.q_bias) |b| addBias(ws.q, n, qd, b);
         if (layer.k_bias) |b| addBias(ws.k, n, kvd, b);
-        if (layer.v_bias) |b| addBias(ws.v, n, kvd, b);
+        if (layer.v_bias) |b| addBias(ws.v, n, nkv * c.v_head_dim, b);
+        spreadValues(c, ws.v, n, nkv);
     }
     try attentionTail(model, layer, li, ws, cache, rows, null);
+}
+
+/// Re-lays a `[n][kv heads * v_head_dim]` value projection out as
+/// `[n][kv heads][head_dim]` (the KV cache stride), in place, when the
+/// value heads are narrower than the key heads (MiMo V2).
+fn spreadValues(c: *const Config, v: []f32, n: usize, nkv: usize) void {
+    const hd = c.head_dim;
+    const vd = c.v_head_dim;
+    if (vd == hd) return;
+    var i: usize = n * nkv;
+    while (i > 0) {
+        i -= 1;
+        std.mem.copyBackwards(f32, v[i * hd ..][0..vd], v[i * vd ..][0..vd]);
+    }
 }
 
 /// Norms, RoPE, KV cache update, attention and the output projection shared
@@ -2909,13 +2942,15 @@ fn attentionTail(model: *const Model, layer: *const Layer, li: usize, ws: *Works
     const hidden = c.hidden_size;
     const hd = c.head_dim;
     const qd = c.num_heads * hd;
-    const kvd = c.num_kv_heads * hd;
+    const nkv = c.layer_kv_heads[li];
+    const kvd = nkv * hd;
     const half = c.rotary_dim / 2;
     if (c.clip_qkv) |clip| {
         clampAll(ws.q[0 .. n * qd], clip);
         clampAll(ws.k[0 .. n * kvd], clip);
         clampAll(ws.v[0 .. n * kvd], clip);
     }
+    if (c.value_scale != 1.0) tensor.scale(ws.v[0 .. n * kvd], c.value_scale);
 
     const use_rope = c.rope_layers[li];
     const sliding = c.sliding_layers[li];
@@ -2953,14 +2988,14 @@ fn attentionTail(model: *const Model, layer: *const Layer, li: usize, ws: *Works
             if (temp) |t| tensor.scale(q, t);
         }
         hh = 0;
-        while (hh < c.num_kv_heads) : (hh += 1) {
+        while (hh < nkv) : (hh += 1) {
             const k = krow[hh * hd ..][0..hd];
             if (norm_before) if (layer.k_norm) |nm| qkNormHead(c, k, nm, hh);
             if (use_rope) ropeHead(c, k[rope_off..], cr, sr);
             if (norm_after) if (layer.k_norm) |nm| qkNormHead(c, k, nm, hh);
         }
-        @memcpy(cache.kSlot(li, rows[i].b, rows[i].pos), krow);
-        @memcpy(cache.vSlot(li, rows[i].b, rows[i].pos), ws.v[i * kvd ..][0..kvd]);
+        @memcpy(cache.kSlot(li, rows[i].b, rows[i].pos)[0..kvd], krow);
+        @memcpy(cache.vSlot(li, rows[i].b, rows[i].pos)[0..kvd], ws.v[i * kvd ..][0..kvd]);
         cache.noteWrite(rows[i].pos);
     }
     const n_tasks = n * c.num_heads;
