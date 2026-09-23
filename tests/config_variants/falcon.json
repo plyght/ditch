@@ -1,0 +1,1 @@
+[{"new_decoder_architecture": true, "num_kv_heads": 2}, {"multi_query": false}, {"alibi": true}, {"parallel_attn": "$delete"}]

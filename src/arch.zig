@@ -1624,7 +1624,7 @@ fn parseConfigIn(arena: Allocator, json_text: []const u8, comptime find: Finder)
 /// Parses a `rope_scaling` / `rope_parameters` dictionary `rs` (`obj` is the
 /// model config it belongs to, for the fallback keys some families keep at
 /// the top level).
-fn parseRopeScaling(arena: Allocator, obj: std.json.ObjectMap, rs: std.json.ObjectMap, rotary_dim: usize, max_pos: usize) !RopeScaling {
+pub fn parseRopeScaling(arena: Allocator, obj: std.json.ObjectMap, rs: std.json.ObjectMap, rotary_dim: usize, max_pos: usize) !RopeScaling {
     var result: RopeScaling = .none;
     const t = getStr(rs, "rope_type") orelse getStr(rs, "type") orelse "";
     if (std.mem.eql(u8, t, "llama3")) {
@@ -1776,7 +1776,7 @@ fn kvSharing(c: *Config, obj: std.json.ObjectMap) !void {
     }
 }
 
-fn yarnMscale(scale: f32, mscale: f32) f32 {
+pub fn yarnMscale(scale: f32, mscale: f32) f32 {
     if (scale <= 1) return 1.0;
     return 0.1 * mscale * @log(scale) + 1.0;
 }
@@ -6079,30 +6079,75 @@ test "the Lua model definitions reproduce the Zig registry" {
             std.debug.print("no Lua definition for {s}\n", .{z.model_type});
             return error.TestUnexpectedResult;
         };
-        try std.testing.expectEqualStrings(try models.dumpFamily(arena, z), try models.dumpFamily(arena, l));
+        // A family whose hook became a Lua config function is compared by
+        // the configurations it parses to (below).
+        var zc = z.*;
+        var lc = l.*;
+        if (l.script != null) {
+            zc.extra = null;
+            lc.extra = null;
+        }
+        try std.testing.expectEqualStrings(try models.dumpFamily(arena, &zc), try models.dumpFamily(arena, &lc));
         for (z.aliases) |alias| try std.testing.expect(models.lookup(alias) == l);
     }
     try std.testing.expectEqual(registry.len, models.builtins().len);
 
-    // Every fixture's config.json parses to the same configuration either way.
-    const io = std.testing.io;
-    var dir = try std.Io.Dir.cwd().openDir(io, "tests/fixtures", .{ .iterate = true });
-    defer dir.close(io);
-    var it = dir.iterate();
+    // Every fixture's config.json, and every variant of it in
+    // tests/config_variants, parses to the same configuration either way.
     var checked: usize = 0;
-    while (try it.next(io)) |entry| {
-        if (entry.kind != .directory) continue;
-        const path = try std.fmt.allocPrint(arena, "{s}/config.json", .{entry.name});
-        const text = dir.readFileAlloc(io, path, arena, .limited(1 << 20)) catch continue;
-        const zig_dump = try dumpParsed(arena, text, lookupZig);
-        const lua_dump = try dumpParsed(arena, text, lookup);
+    for (try configCorpus(arena)) |entry| {
+        const zig_dump = try dumpParsed(arena, entry.text, lookupZig);
+        const lua_dump = try dumpParsed(arena, entry.text, lookup);
         std.testing.expectEqualStrings(zig_dump, lua_dump) catch |err| {
-            std.debug.print("fixture {s}\n", .{entry.name});
+            std.debug.print("config {s}:\n{s}\n", .{ entry.name, entry.text });
             return err;
         };
         checked += 1;
     }
     try std.testing.expect(checked > 100);
+}
+
+const CorpusEntry = struct { name: []const u8, text: []const u8 };
+
+/// The config.json of every fixture, then the variants of
+/// tests/config_variants/<fixture>.json: each is a list of patches applied
+/// to the fixture's config (a key set to "$delete" is removed), covering the
+/// keys the families read beyond what their fixture sets.
+fn configCorpus(arena: Allocator) ![]CorpusEntry {
+    const io = std.testing.io;
+    var out: std.ArrayList(CorpusEntry) = .empty;
+    var dir = try std.Io.Dir.cwd().openDir(io, "tests/fixtures", .{ .iterate = true });
+    defer dir.close(io);
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| if (entry.kind == .directory) try names.append(arena, try arena.dupe(u8, entry.name));
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    for (names.items) |name| {
+        const text = dir.readFileAlloc(io, try std.fmt.allocPrint(arena, "{s}/config.json", .{name}), arena, .limited(1 << 20)) catch continue;
+        try out.append(arena, .{ .name = name, .text = text });
+        const vpath = try std.fmt.allocPrint(arena, "tests/config_variants/{s}.json", .{name});
+        const vtext = std.Io.Dir.cwd().readFileAlloc(io, vpath, arena, .limited(1 << 20)) catch continue;
+        const base = try std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{});
+        const patches = try std.json.parseFromSliceLeaky(std.json.Value, arena, vtext, .{});
+        if (patches != .array) return error.InvalidConfig;
+        for (patches.array.items, 0..) |patch, k| {
+            if (patch != .object) return error.InvalidConfig;
+            var obj = try base.object.clone(arena);
+            var pit = patch.object.iterator();
+            while (pit.next()) |kv| {
+                if (kv.value_ptr.* == .string and std.mem.eql(u8, kv.value_ptr.string, "$delete")) {
+                    _ = obj.orderedRemove(kv.key_ptr.*);
+                } else try obj.put(arena, kv.key_ptr.*, kv.value_ptr.*);
+            }
+            const patched = try std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = obj }, .{});
+            try out.append(arena, .{ .name = try std.fmt.allocPrint(arena, "{s} variant {d}", .{ name, k + 1 }), .text = patched });
+        }
+    }
+    return out.items;
 }
 
 fn dumpParsed(arena: Allocator, text: []const u8, comptime find: Finder) ![]const u8 {

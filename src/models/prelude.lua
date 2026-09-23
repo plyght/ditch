@@ -1,4 +1,8 @@
--- Helpers every model definition sees (docs/models.md). A definition's
+-- Helpers every model definition sees (docs/models.md). Natives from Zig:
+-- warn(msg), unsupported(msg), invalid(msg), require(lib) (a library of
+-- src/models/lib), rope_scaling(rs, cfg, rotary_dim, max_positions) (ditch's
+-- reading of a rope_scaling table), yarn_mscale(scale, mscale), log32(x)
+-- (single-precision log) and pow(x, y) (ditch's double-precision power). A definition's
 -- `config` function receives the model's config.json as `cfg` (JSON objects
 -- and arrays are tables, arrays 1-based, a JSON null is `null`) and the
 -- parsed configuration as `c`, which it edits in place.

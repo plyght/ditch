@@ -42,6 +42,8 @@ pub fn build(b: *std.Build) void {
     });
     addLua(b, root);
     addHarness(b, root);
+    const definitions = modelDefinitions(b);
+    root.addImport("model_definitions", definitions);
     root.addOptions("build_options", options);
     if (metal) addMetal(b, root);
 
@@ -64,6 +66,7 @@ pub fn build(b: *std.Build) void {
     });
     addLua(b, test_mod);
     addHarness(b, test_mod);
+    test_mod.addImport("model_definitions", definitions);
     test_mod.addOptions("build_options", options);
     if (metal) addMetal(b, test_mod);
     // `-Dtest-filter=name`: run only the tests whose name contains it. Needed
@@ -110,6 +113,46 @@ fn addHarness(b: *std.Build, mod: *std.Build.Module) void {
         "ref_deepseek_v4.py",  "ref_deepseek_v41.py", "ref_kimi_k3.py", "ref_mimo_v2.py",  "check_abliteration.py",
     };
     for (files) |f| mod.addAnonymousImport(b.fmt("harness/{s}", .{f}), .{ .root_source_file = b.path(b.fmt("tools/{s}", .{f})) });
+}
+
+/// The built-in Lua model definitions: every `*.lua` file of src/models
+/// (families) and src/models/lib (libraries a definition can `require`),
+/// embedded by a generated module, so adding a family is adding a file.
+fn modelDefinitions(b: *std.Build) *std.Build.Module {
+    const io = b.graph.io;
+    const wf = b.addWriteFiles();
+    var index: std.Io.Writer.Allocating = .init(b.allocator);
+    const w = &index.writer;
+    w.writeAll("pub const File = struct { name: []const u8, source: []const u8 };\n") catch @panic("OOM");
+    for ([_][]const u8{ "files", "libs" }, [_][]const u8{ "src/models", "src/models/lib" }) |decl, sub| {
+        var names: std.ArrayList([]const u8) = .empty;
+        if (b.build_root.handle.openDir(io, sub, .{ .iterate = true })) |dir_const| {
+            var dir = dir_const;
+            defer dir.close(io);
+            var it = dir.iterate();
+            while (it.next(io) catch null) |entry| {
+                if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".lua")) continue;
+                if (std.mem.eql(u8, entry.name, "prelude.lua")) continue;
+                names.append(b.allocator, b.dupe(entry.name)) catch @panic("OOM");
+            }
+        } else |_| {}
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn lt(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.lt);
+        w.print("pub const {s} = [_]File{{\n", .{decl}) catch @panic("OOM");
+        for (names.items) |name| {
+            const dest = b.fmt("{s}/{s}", .{ decl, name });
+            _ = wf.addCopyFile(b.path(b.fmt("{s}/{s}", .{ sub, name })), dest);
+            w.print("    .{{ .name = \"{s}\", .source = @embedFile(\"{s}\") }},\n", .{ name, dest }) catch @panic("OOM");
+        }
+        w.writeAll("};\n") catch @panic("OOM");
+    }
+    _ = wf.addCopyFile(b.path("src/models/prelude.lua"), "prelude.lua");
+    w.writeAll("pub const prelude = @embedFile(\"prelude.lua\");\n") catch @panic("OOM");
+    const root = wf.add("model_definitions.zig", index.written());
+    return b.createModule(.{ .root_source_file = root });
 }
 
 /// Compiles the Objective-C shim of the Metal backend and links the frameworks

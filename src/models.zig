@@ -16,7 +16,8 @@ const std = @import("std");
 const arch = @import("arch.zig");
 const lua = @import("lua.zig");
 const chat = @import("chat.zig");
-const builtin_files = @import("models/builtin.zig").files;
+const definitions = @import("model_definitions");
+const builtin_files = definitions.files;
 
 const c = lua.c;
 const Allocator = std.mem.Allocator;
@@ -27,7 +28,7 @@ const Hook = *const fn (*Config, Allocator, std.json.ObjectMap) anyerror!void;
 
 pub const Error = error{ InvalidModelDefinition, OutOfMemory };
 
-const prelude = @embedFile("models/prelude.lua");
+const prelude = definitions.prelude;
 
 /// Where a load error is described (allocated in the registry's arena).
 pub const Diagnostic = struct {
@@ -83,6 +84,16 @@ fn initRegistry(diag: *Diagnostic) !*Registry {
     c.lua_setglobal(L, "unsupported");
     c.lua_pushcclosure(L, luaInvalid, 0);
     c.lua_setglobal(L, "invalid");
+    c.lua_pushcclosure(L, luaRequire, 0);
+    c.lua_setglobal(L, "require");
+    c.lua_pushcclosure(L, luaRopeScaling, 0);
+    c.lua_setglobal(L, "rope_scaling");
+    c.lua_pushcclosure(L, luaYarnMscale, 0);
+    c.lua_setglobal(L, "yarn_mscale");
+    c.lua_pushcclosure(L, luaLog32, 0);
+    c.lua_setglobal(L, "log32");
+    c.lua_pushcclosure(L, luaPow, 0);
+    c.lua_setglobal(L, "pow");
     if (c.luaL_loadbufferx(L, prelude.ptr, prelude.len, "prelude.lua", "t") != c.LUA_OK or c.lua_pcallk(L, 0, 0, 0, 0, null) != c.LUA_OK) {
         diag.message = try luaMessage(L, r.arena.allocator());
         return error.InvalidModelDefinition;
@@ -674,6 +685,129 @@ fn luaUnsupported(L: ?*c.lua_State) callconv(.c) c_int {
 
 fn luaInvalid(L: ?*c.lua_State) callconv(.c) c_int {
     return raiseMarked(L, invalid_marker);
+}
+
+/// `require(name)`: a built-in library of src/models/lib, run once in its own
+/// environment; its return value is cached.
+fn luaRequire(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    var len: usize = 0;
+    const p = c.luaL_checklstring(L, 1, &len);
+    const name = p[0..len];
+    _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "ditch_libs");
+    if (c.lua_type(L, -1) != c.LUA_TTABLE) {
+        c.lua_settop(L, -2);
+        c.lua_createtable(L, 0, 8);
+        c.lua_pushvalue(L, -1);
+        c.lua_setfield(L, c.LUA_REGISTRYINDEX, "ditch_libs");
+    }
+    const cache = c.lua_gettop(L);
+    c.lua_pushvalue(L, 1);
+    if (c.lua_gettable(L, cache) != c.LUA_TNIL) return 1;
+    c.lua_settop(L, cache);
+    for (definitions.libs) |lib| {
+        if (!std.mem.eql(u8, lib.name[0 .. lib.name.len - ".lua".len], name)) continue;
+        if (c.luaL_loadbufferx(L, lib.source.ptr, lib.source.len, lib.name.ptr, "t") != c.LUA_OK) return c.lua_error(L);
+        c.lua_createtable(L, 0, 0);
+        c.lua_createtable(L, 0, 1);
+        _ = c.lua_getglobal(L, "_G");
+        c.lua_setfield(L, -2, "__index");
+        _ = c.lua_setmetatable(L, -2);
+        _ = c.lua_setupvalue(L, -2, 1);
+        c.lua_callk(L, 0, 1, 0, null);
+        c.lua_pushvalue(L, 1);
+        c.lua_pushvalue(L, -2);
+        c.lua_settable(L, cache);
+        return 1;
+    }
+    return c.luaL_error(L, "require: no library '%s' (the built-in ones are src/models/lib/*.lua)", p);
+}
+
+/// Converts a Lua value (as built by `pushJson`) back into JSON.
+fn toJson(L: *c.lua_State, a: Allocator, idx: c_int, depth: usize) !std.json.Value {
+    const i = c.lua_absindex(L, idx);
+    switch (c.lua_type(L, i)) {
+        c.LUA_TNIL => return .null,
+        c.LUA_TBOOLEAN => return .{ .bool = c.lua_toboolean(L, i) != 0 },
+        c.LUA_TNUMBER => {
+            if (c.lua_isinteger(L, i) != 0) return .{ .integer = c.lua_tointegerx(L, i, null) };
+            return .{ .float = c.lua_tonumberx(L, i, null) };
+        },
+        c.LUA_TSTRING => {
+            var len: usize = 0;
+            const p = c.lua_tolstring(L, i, &len);
+            return .{ .string = try a.dupe(u8, p[0..len]) };
+        },
+        c.LUA_TTABLE => {
+            if (depth > 32) return error.OutOfMemory;
+            _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "ditch_null");
+            const is_null = c.lua_rawequal(L, -1, i) != 0;
+            c.lua_settop(L, -2);
+            if (is_null) return .null;
+            const n = c.lua_rawlen(L, i);
+            if (n > 0) {
+                var arr = std.json.Array.init(a);
+                for (0..n) |k| {
+                    _ = c.lua_rawgeti(L, i, @intCast(k + 1));
+                    defer c.lua_settop(L, -2);
+                    try arr.append(try toJson(L, a, -1, depth + 1));
+                }
+                return .{ .array = arr };
+            }
+            var obj: std.json.ObjectMap = .empty;
+            c.lua_pushnil(L);
+            while (c.lua_next(L, i) != 0) {
+                defer c.lua_settop(L, -2);
+                if (c.lua_type(L, -2) != c.LUA_TSTRING) continue;
+                var len: usize = 0;
+                const p = c.lua_tolstring(L, -2, &len);
+                try obj.put(a, try a.dupe(u8, p[0..len]), try toJson(L, a, -1, depth + 1));
+            }
+            return .{ .object = obj };
+        },
+        else => return .null,
+    }
+}
+
+/// `rope_scaling(rs, cfg, rotary_dim, max_positions)`: ditch's reading of a
+/// `rope_scaling` / `rope_parameters` table, as `c.rope_scaling` holds it.
+fn luaRopeScaling(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const rs = toJson(L, a, 1, 0) catch return c.luaL_error(L, "rope_scaling: out of memory");
+    const cfg = toJson(L, a, 2, 0) catch return c.luaL_error(L, "rope_scaling: out of memory");
+    if (rs != .object or cfg != .object) return c.luaL_error(L, "rope_scaling(rs, cfg, rotary_dim, max_positions): rs and cfg must be tables");
+    const rotary: usize = @intCast(@max(0, c.luaL_checkinteger(L, 3)));
+    const max_pos: usize = @intCast(@max(0, c.luaL_checkinteger(L, 4)));
+    const scaling = arch.parseRopeScaling(a, cfg.object, rs.object, rotary, max_pos) catch |err| return c.luaL_error(L, "rope_scaling: %s", @errorName(err).ptr);
+    pushValue(arch.RopeScaling, L, scaling, false);
+    return 1;
+}
+
+/// `yarn_mscale(scale, mscale)`: YaRN's attention factor, in ditch's f32.
+fn luaYarnMscale(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const scale: f32 = @floatCast(c.luaL_checknumber(L, 1));
+    const mscale: f32 = @floatCast(c.luaL_checknumber(L, 2));
+    c.lua_pushnumber(L, arch.yarnMscale(scale, mscale));
+    return 1;
+}
+
+/// `log32(x)`: the natural logarithm in single precision, as ditch computes it.
+fn luaLog32(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const x: f32 = @floatCast(c.luaL_checknumber(L, 1));
+    c.lua_pushnumber(L, @log(x));
+    return 1;
+}
+
+/// `pow(x, y)`: `x^y` in double precision, as ditch computes it.
+fn luaPow(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    c.lua_pushnumber(L, std.math.pow(f64, c.luaL_checknumber(L, 1), c.luaL_checknumber(L, 2)));
+    return 1;
 }
 
 /// Runs a definition's `config` function on a parsed configuration: `obj` is
