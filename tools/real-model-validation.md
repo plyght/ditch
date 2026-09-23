@@ -3868,3 +3868,33 @@ tokens. Its 1200 layer loads (24 layers x 50 forward passes) and 6920 expert
 loads are what the time goes to. Peak RSS: the float32 trunk (4.6 GB:
 embedding and LM head, 201088 x 2880 each), the 3 GB expert LRU, one layer.
 
+## Bug F10 — Gemma 4 was prompted in Gemma 3's format (fixed)
+
+**Symptom.** The first full-depth probe of `google/gemma-4-12B-it`: the text
+ditch rendered differed from the release's template, and so did the ids (40
+against 31 tokens).
+
+    transformers: '<bos><|turn>system\nYou are a helpful assistant.<turn|>\n<|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>'
+    ditch:        '<bos><start_of_turn>user\nYou are a helpful assistant.\n\nWhat is the capital of France?<end_of_turn>\n<start_of_turn>model\n'
+
+In Gemma 4's vocabulary `<start_of_turn>` is not a token at all, so ditch's
+prompt was spelled out piece by piece (`<`, `start`, `_`, `of`, ...).
+
+**Cause.** Gemma 4 replaced Gemma 2/3's turns: `<|turn>role\n ... <turn|>\n`.
+It also gave the system prompt a turn of its own, and its generation prompt
+closes an empty thinking channel (`<|channel>thought\n<channel|>`) unless
+`enable_thinking` is set. The template detector had no Gemma 4 form. The
+release's template does not contain `<start_of_turn>`, so detection fell
+through to the model type, `gemma4_unified` starts with `gemma`, and the
+registry entry said `chat = "gemma"`. The earlier Gemma 4 checks (E2B, 12B
+layers 0 and 5) were run on raw prompts, which is how this went unseen.
+
+**Fix.** A `gemma4` template, detected by `<|turn>` and named by the
+`gemma4` registry entry. It renders as the release's Jinja does for plain
+messages: BOS, the system turn when the first message is one, user and model
+turns with trimmed content, model turns with `strip_thinking` applied (what
+lies between `<|channel>` and `<channel|>` is dropped), and the generation
+prompt with the empty thinking channel. Tests pin the one-turn rendering and
+a four-message conversation, both copied from transformers'
+`apply_chat_template` on the release's tokenizer.
+

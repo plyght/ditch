@@ -24,6 +24,9 @@ pub const Template = enum {
     /// DeepSeek V2: `<｜begin▁of▁sentence｜>{system}\n\nUser: ...\n\nAssistant:`.
     deepseek_v2,
     gemma,
+    /// Gemma 4: `<|turn>user\n...<turn|>\n<|turn>model\n<|channel>thought\n<channel|>`,
+    /// with a system turn of its own (Gemma 2 / 3 fold the system prompt into the user's).
+    gemma4,
     /// Phi-3 / Phi-4: `<|user|>\n...<|end|>\n<|assistant|>\n`.
     phi3,
     /// Zephyr / StableLM-chat: `<|user|>\n...<|endoftext|>\n<|assistant|>\n`.
@@ -162,6 +165,7 @@ pub fn detect(chat_template: ?[]const u8, model_type: []const u8) Template {
         if (has(t, "<|start_header_id|>") and has(t, "Cutting Knowledge Date")) return if (has(t, "strftime_now")) .llama32 else .llama31;
         if (has(t, "<|start_header_id|>")) return .llama3;
         if (has(t, "<|header_start|>")) return .llama4;
+        if (has(t, "<|turn>")) return .gemma4;
         if (has(t, "<start_of_turn>")) return .gemma;
         if (has(t, "<|START_OF_TURN_TOKEN|>")) return if (has(t, "<|START_RESPONSE|>")) .cohere_response else .cohere;
         if (has(t, "<|start|>") and has(t, "<|message|>")) return .harmony;
@@ -308,6 +312,30 @@ pub fn render(gpa: Allocator, template: Template, messages: []const Message) ![]
                 }
             }
             try w.writeAll("<start_of_turn>model\n");
+        },
+        .gemma4 => {
+            try w.writeAll("<bos>");
+            var rest = messages;
+            if (rest.len > 0 and rest[0].role == .system) {
+                try w.print("<|turn>system\n{s}<turn|>\n", .{trim(rest[0].content)});
+                rest = rest[1..];
+            }
+            for (rest) |m| switch (m.role) {
+                .system, .user => try w.print("<|turn>{s}\n{s}<turn|>\n", .{ @tagName(m.role), trim(m.content) }),
+                .assistant => {
+                    // `strip_thinking`: what lies between `<|channel>` and `<channel|>` goes.
+                    try w.writeAll("<|turn>model\n");
+                    var kept: std.Io.Writer.Allocating = .init(gpa);
+                    defer kept.deinit();
+                    var parts = std.mem.splitSequence(u8, m.content, "<channel|>");
+                    while (parts.next()) |part| {
+                        const cut = std.mem.indexOf(u8, part, "<|channel>") orelse part.len;
+                        try kept.writer.writeAll(part[0..cut]);
+                    }
+                    try w.print("{s}<turn|>\n", .{trim(kept.written())});
+                },
+            };
+            try w.writeAll("<|turn>model\n<|channel>thought\n<channel|>");
         },
         .llama2 => {
             try w.writeAll("<s>");
@@ -866,6 +894,21 @@ test "template detection and rendering" {
     const g = try renderPrompt(gpa, .gemma, "Sys.", "Hi");
     defer gpa.free(g);
     try std.testing.expectEqualStrings("<bos><start_of_turn>user\nSys.\n\nHi<end_of_turn>\n<start_of_turn>model\n", g);
+    try std.testing.expectEqual(Template.gemma4, detect("{{- '<|turn>' + role + '\\n' }}<start_of_turn>", "gemma4_unified_text"));
+    try std.testing.expectEqual(Template.gemma4, detect(null, "gemma4_unified"));
+    const g4 = try renderPrompt(gpa, .gemma4, "Sys.", "Hi");
+    defer gpa.free(g4);
+    try std.testing.expectEqualStrings("<bos><|turn>system\nSys.<turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>", g4);
+    // The rendering of google/gemma-4-12B-it's template for a four-message
+    // conversation (transformers' apply_chat_template).
+    const g4_multi = try render(gpa, .gemma4, &.{
+        .{ .role = .system, .content = "You are a helpful assistant." },
+        .{ .role = .user, .content = "Hi" },
+        .{ .role = .assistant, .content = "<|channel>thought\nhmm<channel|>Hello! " },
+        .{ .role = .user, .content = " Q" },
+    });
+    defer gpa.free(g4_multi);
+    try std.testing.expectEqualStrings("<bos><|turn>system\nYou are a helpful assistant.<turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\nHello!<turn|>\n<|turn>user\nQ<turn|>\n<|turn>model\n<|channel>thought\n<channel|>", g4_multi);
     try std.testing.expectEqual(Template.kimi, detect("{{ '<|im_user|>user<|im_middle|>' }}", "deepseek_v3"));
     try std.testing.expectEqual(Template.kimi, detect(null, "kimi_k25"));
     try std.testing.expectEqual(Template.kimi_k3, detect(null, "kimi_k3"));

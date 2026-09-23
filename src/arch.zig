@@ -3768,7 +3768,7 @@ pub const registry = [_]Arch{
         // -26B-A4B); the same text config under another name.
         .aliases = &.{ "gemma4_text", "gemma4_unified", "gemma4_unified_text" },
         .llama_cpp = "gemma4",
-        .chat = "gemma",
+        .chat = "gemma4",
         .verified = true,
         .activation = .gelu_tanh,
         .tie_word_embeddings = true,
