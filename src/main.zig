@@ -1700,6 +1700,9 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         std.log.err("unknown chat template: {s} (expected model, or a family such as chatml, llama3, mistral, gemma or raw)", .{name});
         return error.InvalidChatTemplate;
     };
+    // The compiled chat template is metadata held for the whole run, like
+    // the model's arena: outside the budget, so that a budget too small for
+    // the weights is still explained by the feasibility check below.
     var format = try engine_mod.modelFormat(gpa, model, settings.chat_template);
     defer format.deinit();
     if (format.template != null) {
