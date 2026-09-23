@@ -100,6 +100,9 @@ if isinstance(lac, dict):
     for key in ('kda_layers', 'full_attn_layers'):
         if isinstance(lac.get(key), list):
             lac[key] = [new_id[x - one] + one for x in lac[key] if x - one in new_id]
+# Nemotron-H spells its layer kinds as one character per layer.
+if isinstance(tc.get('hybrid_override_pattern'), str):
+    tc['hybrid_override_pattern'] = ''.join(tc['hybrid_override_pattern'][j] for j in layers)
 # The dense-prefix count, for a cut that skips layers: the kept layers that
 # were dense (DeepSeek V3.2 --layers 0,3 keeps one dense layer, not three).
 if isinstance(tc.get('first_k_dense_replace'), int):
