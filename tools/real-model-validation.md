@@ -4960,7 +4960,7 @@ for float32.
   in memory for) against `ditch probe`: residuals within 5.3e-06, logits
   2.2e-06 of range, argmax and top-5 equal. The same chat-templated prompt on
   the unabliterated cut gives 1.0e-05 and 2.3e-06: the level belongs to the
-  prompt (15 tokens through the DeltaNet recurrence; the forward check's
+  prompt (64 chat tokens through the DeltaNet recurrence; the forward check's
   2-token prompt gave 2.7e-07), not to the edit.
 
 ## Exact ranges for scattered experts: gpt-oss-20b with a cache below its experts
