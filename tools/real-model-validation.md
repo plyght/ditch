@@ -2867,3 +2867,17 @@ arithmetic):
 | --- | :---: | :---: | ---: | :---: |
 | "The capital of France is" | match (5) | all 5 agree, worst 7.24e-07 (was 1.77e+00) | 6.26e-07 (was 1.05e+00) | match |
 | "Explain how rainbows form, …" | match (15) | all 5 agree, worst 6.68e-07 (was 1.72e+00) | 7.54e-07 (was 9.65e-01) | match |
+
+## Qwen3.8-2.4T-A95B (`qwen3_5_moe`): verified on real weights
+
+`Qwen/Qwen3.8-2.4T-A95B`, first 4 layers (three Gated DeltaNet, one gated full
+attention, every layer a 512-expert MoE with a shared expert), after Bug F4.
+The routed experts are stacked `[512, 4096, 8192]` / `[512, 8192, 2048]`
+tensors (32 GB and 16 GB a layer), left lazy in the cut and read one expert
+slab at a time (96 MB an expert) by `tools/ref_lazy_moe.py`; the 12 GB trunk
+is real. The disk allows only the experts a 2-token prompt routes to (7.3 GB
+over the four layers), so this is one short prompt, one generated token:
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "Paris is" | match (2) | all 5 agree, worst 2.65e-07 | 8.96e-07 | match (1 token) |

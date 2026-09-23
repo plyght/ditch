@@ -50,6 +50,12 @@ PROJ = {"gate": ("w1", "gate_proj"), "up": ("w3", "up_proj"), "down": ("w2", "do
 def dequant_expert(store, module, cfg_q):
     """The float32 `[out, in]` weight of `<module>` (a Linear's prefix), however it is stored."""
     k = store.keys()
+    if module + ".weight" in k and store.header[module + ".weight"]["dtype"] == "U8" and module + ".weight_scale" in k:
+        # MiMo V2.6's MXFP4 store (`store_dtype: mxfp4`): the same nibbles and
+        # E8M0 scales, named `weight` / `weight_scale`.
+        packed, scale = store.tensor(module + ".weight"), store.tensor(module + ".weight_scale")
+        q = torch.stack([E2M1[(packed & 0xF).long()], E2M1[(packed >> 4).long()]], -1).reshape(packed.shape[0], -1)
+        return q * torch.exp2(scale.float() - 127).repeat_interleave(32, 1)
     if module + ".weight" in k:
         w = store.tensor(module + ".weight")
         if module + ".weight_scale_inv" in k:  # FP8 blocks, dequantised to bf16 as the integrations do
@@ -162,6 +168,29 @@ def f32_arithmetic(model, store):
                 t.data = t.data.float()
 
 
+class LazyRows(torch.nn.Module):
+    """An `nn.Embedding` whose table is the row-concatenation of checkpoint
+    tensors `names` (Qwen4-Exp's `ngram_embedding.shard_{k}`, which
+    transformers concatenates at load: ~100 GB), reading only the rows looked up."""
+
+    def __init__(self, store, names):
+        super().__init__()
+        self.store, self.names = store, names
+        self.starts = [0]
+        for n in names:
+            self.starts.append(self.starts[-1] + store.header[n]["shape"][0])
+        self.dim = store.header[names[0]]["shape"][1]
+        self.weight = torch.empty(0)  # its device is all the caller asks about
+
+    def forward(self, ids):
+        flat = ids.reshape(-1).tolist()
+        out = torch.empty(len(flat), self.dim)
+        for i, r in enumerate(flat):
+            k = next(k for k in range(len(self.names)) if r < self.starts[k + 1])
+            out[i] = self.store.rows(self.names[k], [r - self.starts[k]])[0].float()
+        return out.view(*ids.shape, self.dim)
+
+
 class LazyStack:
     """Stands in for a stacked expert parameter: `stack[e]` is expert e's matrix."""
 
@@ -185,11 +214,22 @@ def load(model_dir, dtype=torch.float32):
     FP8_BLOCK = tuple(qcfg["weight_block_size"]) if qcfg.get("weight_block_size") else None
     lazy_names = [k for k in store.keys() if k in store.lazy["holes"]]
     pat = re.compile(r"^(.*layers\.(\d+)\..*experts)\.(\d+)\.(w1|w2|w3|gate_proj|up_proj|down_proj)\.")
-    prefixes = {}
+    stacked_pat = re.compile(r"^(.*layers\.(\d+)\..*experts)\.(gate_up_proj|down_proj)$")
+    prefixes, stacked = {}, {}
     for k in lazy_names:
         m = pat.match(k)
         if m:
             prefixes[int(m.group(2))] = m.group(1)
+        m = stacked_pat.match(k)
+        if m:
+            stacked.setdefault(int(m.group(2)), {})[m.group(3)] = k
+
+    ngram_pat = re.compile(r"^.*layers\.(\d+)\..*\.ngram_embedding\.shard_(\d+)\.weight$")
+    ngram = {}
+    for k in lazy_names:
+        m = ngram_pat.match(k)
+        if m:
+            ngram.setdefault(int(m.group(1)), {})[int(m.group(2))] = k
 
     # A view of the directory without the lazy file: transformers loads the trunk.
     view = tempfile.mkdtemp(prefix="ref_trunk_")
@@ -230,11 +270,31 @@ def load(model_dir, dtype=torch.float32):
                     super().__init__(*a, **kw)
                 # Empty placeholders: from_pretrained would otherwise allocate the stacks.
                 self.lazy_n = self.gate_up_proj.shape[0]
+                self.lazy_shapes = (tuple(self.gate_up_proj.shape[1:]), tuple(self.down_proj.shape[1:]))
                 self.gate_up_proj = torch.nn.Parameter(torch.empty(0), requires_grad=False)
                 self.down_proj = torch.nn.Parameter(torch.empty(0), requires_grad=False)
         Meta.__name__ = cls.__name__
         patched[cls.__name__] = (mod, cls, Meta)
         setattr(mod, cls.__name__, Meta)
+    # Lazy n-gram tables: a one-row placeholder at load, swapped for LazyRows below.
+    for mod in mods:
+        for n in dir(mod):
+            c = getattr(mod, n)
+            if not (ngram and isinstance(c, type) and n.endswith("NGramEmbedding")):
+                continue
+
+            class MetaNgram(c):
+                def __init__(self, *a, **kw):
+                    # Only the table is left out (its buffers are computed as usual).
+                    emb = torch.nn.Embedding
+                    torch.nn.Embedding = lambda rows, dim, *a2, **kw2: emb(1, dim)
+                    try:
+                        super().__init__(*a, **kw)
+                    finally:
+                        torch.nn.Embedding = emb
+            MetaNgram.__name__ = n
+            patched[n] = (mod, c, MetaNgram)
+            setattr(mod, n, MetaNgram)
     # Text-only probes: an image-text wrapper's vision tower and projector are
     # built empty (their tensors load as unexpected and are dropped), which
     # keeps a float32 reference of a large model inside the RAM.
@@ -291,15 +351,37 @@ def load(model_dir, dtype=torch.float32):
 
     dequant_fp8_trunk(model, store, wq)
     f32_arithmetic(model, store)
+    def slab_loader(name, want):
+        # Expert e of a stacked `[E, ...]` checkpoint tensor is its slab e.
+        def load_e(e):
+            t = store.rows(name, [e])[0].float()
+            if tuple(t.shape) != want:
+                if tuple(t.shape[::-1]) == want:
+                    t = t.transpose(0, 1).contiguous()
+                else:
+                    raise SystemExit(f"reference: {name}[{e}] is {tuple(t.shape)}, the model wants {want}")
+            return t.to(dtype)
+        return load_e
+
     n_swapped = 0
     for name, m in model.named_modules():
         if type(m).__name__ in patched and "gate_up_proj" in m._parameters and hasattr(m, "lazy_n"):
             li = int(re.search(r"layers\.(\d+)\.", name).group(1))
-            prefix = prefixes[li]
             n = m.lazy_n
             del m._parameters["gate_up_proj"], m._parameters["down_proj"]
-            m.gate_up_proj = LazyStack(expert_loader(prefix, "gate_up"), n)
-            m.down_proj = LazyStack(expert_loader(prefix, "down"), n)
+            if li in stacked:
+                m.gate_up_proj = LazyStack(slab_loader(stacked[li]["gate_up_proj"], m.lazy_shapes[0]), n)
+                m.down_proj = LazyStack(slab_loader(stacked[li]["down_proj"], m.lazy_shapes[1]), n)
+            else:
+                prefix = prefixes[li]
+                m.gate_up_proj = LazyStack(expert_loader(prefix, "gate_up"), n)
+                m.down_proj = LazyStack(expert_loader(prefix, "down"), n)
+            n_swapped += 1
+    for name, m in model.named_modules():
+        if type(m).__name__.endswith("NGramEmbedding") and ngram:
+            li = int(re.search(r"layers\.(\d+)\.", name).group(1))
+            parts = ngram[li]
+            m.ngram_embedding = LazyRows(store, [parts[i] for i in range(len(parts))])
             n_swapped += 1
     if n_swapped == 0 and store.lazy["holes"]:
         raise SystemExit("reference: the cut has lazy tensors but no experts module was made lazy")
