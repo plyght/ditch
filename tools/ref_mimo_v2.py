@@ -2,6 +2,11 @@
 
     python3 tools/probe_reference.py MODEL probe.json --dtype float32 --raw --trust-remote-code --factory tools/ref_mimo_v2.py
 
+MODEL is a truncated checkpoint directory, or a Hub id for the whole release
+at full depth: each decoder layer is then read from the Hub before it runs
+and dropped after (tools/ref_stream.py), and the experts the gate picks are
+read in parallel as it picks them.
+
 transformers has no `mimo_v2`, so the reference is the release's
 `modeling_mimo_v2.py` (MiMoV2ForCausalLM), run unmodified, text only (the
 vision and audio towers are not built). It has no dequantisation of its own
@@ -63,8 +68,16 @@ def fused_qkv(store, name, config, layer):
 
 
 def load(model_dir, dtype=torch.float32):
-    store = LazyCheckpoint(model_dir)
-    cfg = json.load(open(os.path.join(model_dir, "config.json")))
+    # A Hub id streams the whole release a layer at a time (tools/ref_stream.py).
+    streamed = not os.path.isdir(model_dir)
+    if streamed:
+        import ref_stream
+        from huggingface_hub import hf_hub_download
+        store = ref_stream.Store(ref_stream.Source(model_dir, os.environ.get("REF_STREAM_REVISION")))
+        cfg = json.load(open(hf_hub_download(model_dir, "config.json")))
+    else:
+        store = LazyCheckpoint(model_dir)
+        cfg = json.load(open(os.path.join(model_dir, "config.json")))
     q = cfg.get("quantization_config") or {}
     ref_lazy_moe.FP8_BLOCK = tuple(q["weight_block_size"]) if q.get("weight_block_size") else None
     ref_lazy_moe.ATTN_ROW_SHARDS = cfg.get("num_key_value_heads", 1)
@@ -94,6 +107,15 @@ def load(model_dir, dtype=torch.float32):
     model.model.swa_rotary_emb = rope(config=config, is_swa=True)
 
     keys = set(store.keys())
+
+    def value(name):
+        mname = name.rpartition(".")[0]
+        if name.endswith("self_attn.qkv_proj.weight"):
+            return fused_qkv(store, name, config, int(name.split(".layers.")[1].split(".")[0]))
+        if name.endswith(".weight") and name + "_scale_inv" in keys:
+            return dequant_expert(store, mname, {}).to(torch.bfloat16)
+        return store.tensor(name) if name in keys else None
+
     with torch.no_grad():
         missing = []
         for mname, m in model.named_modules():
@@ -103,13 +125,10 @@ def load(model_dir, dtype=torch.float32):
                 name = f"{mname}.{pname}" if mname else pname
                 if ".mlp.experts." in name:
                     continue
-                if name.endswith("self_attn.qkv_proj.weight"):
-                    t = fused_qkv(store, name, config, int(name.split(".layers.")[1].split(".")[0]))
-                elif pname == "weight" and name + "_scale_inv" in keys:
-                    t = dequant_expert(store, mname, {}).to(torch.bfloat16)
-                elif name in keys:
-                    t = store.tensor(name)
-                else:
+                if streamed and name.startswith("model.layers."):
+                    continue  # read when the layer runs
+                t = value(name)
+                if t is None:
                     missing.append(name)
                     continue
                 if tuple(t.shape) != tuple(p.shape):
@@ -125,7 +144,25 @@ def load(model_dir, dtype=torch.float32):
         for e, ex in enumerate(experts):
             base = f"model.layers.{i}.mlp.experts.{e}."
             ex.gate_proj, ex.up_proj, ex.down_proj = (LazyLinear(store, base + n) for n in ("gate_proj", "up_proj", "down_proj"))
-    left = [n for n, t in list(model.named_parameters()) + list(model.named_buffers()) if t.device.type == "meta"]
+        if streamed:
+            ref_stream.prefetch_routed(store, layer.mlp.gate, lambda e, i=i: [
+                f"model.layers.{i}.mlp.experts.{e}.{n}.{k}" for n in ("gate_proj", "up_proj", "down_proj")
+                for k in ("weight", "weight_scale", "weight_scale_inv")])
+    if streamed:
+        layers = list(model.model.layers)
+        linear_names = [{n + ".weight" for n, m in layer.named_modules() if isinstance(m, nn.Linear)} for layer in layers]
+
+        def layer_value(name, p):
+            t = value(name)
+            if t is None:
+                raise SystemExit(f"reference: {name} is not in the checkpoint")
+            i, rest = name.split(".layers.")[1].split(".", 1)
+            # Linear weights stay in their stored (or dequantised bf16) values; they compute in float32 below.
+            return t if rest in linear_names[int(i)] or not t.is_floating_point() else t.float()
+
+        ref_stream.stream_by_name(store, layers, "model.layers", layer_value)
+    left = [n for n, t in list(model.named_parameters()) + list(model.named_buffers())
+            if t.device.type == "meta" and not (streamed and n.startswith("model.layers."))]
     if left:
         raise SystemExit(f"reference: left on the meta device: {left[:6]}")
 
@@ -147,6 +184,6 @@ def load(model_dir, dtype=torch.float32):
             m.forward = types.MethodType(lambda self, ids: F.embedding(ids, self.weight).float(), m)
     with torch.no_grad():
         for p in model.parameters():
-            if id(p) not in linears and p.is_floating_point():
+            if id(p) not in linears and p.is_floating_point() and p.device.type != "meta":
                 p.data = p.data.float()
     return Reference(model, store)

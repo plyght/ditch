@@ -737,3 +737,38 @@ class LayerStreamer:
         layer = self.layers[i]
         for name, p in list(layer.named_parameters()):
             _set_param(layer, name, _meta_like(p, torch.float32))
+
+
+def prefetch_routed(store, gate, expert_names):
+    """A forward hook on a router: every expert its output's indices name is
+    read now, in parallel (`expert_names(e)` lists expert e's checkpoint tensors)."""
+    def hook(mod, inp, out):
+        outs = out if isinstance(out, (tuple, list)) else (out,)
+        idx = next((t for t in outs if torch.is_tensor(t) and not t.is_floating_point()), None)
+        if idx is None:
+            return
+        for e in torch.unique(idx).tolist():
+            names = expert_names(e)
+            store.prefetch(names[0], names)
+    gate.register_forward_hook(hook)
+
+
+def stream_by_name(store, layers, prefix, value):
+    """Streams `layers` (a model's decoder layers, whose parameters are named
+    `prefix.{i}.<name>` in the checkpoint) with forward hooks. `value(full name,
+    parameter)` computes a parameter's tensor from the store; the layer's
+    stored tensors (and their `_scale_inv` / `.scale` companions) are read in
+    parallel first."""
+    def fetch(i):
+        params = dict(layers[i].named_parameters())
+        names = [f"{prefix}.{i}.{n}" for n in params]
+        extra = [n + sfx for n in names for sfx in ("_scale_inv",)] + [n[: -len("weight")] + "scale" for n in names if n.endswith(".weight")]
+        store.prefetch(f"{prefix}.{i}.", names + extra)
+        out = {n: value(f"{prefix}.{i}.{n}", p) for n, p in params.items()}
+        store.take(f"{prefix}.{i}.")  # what the values did not read
+        return out
+    stream = LayerStreamer(layers, fetch)
+    for i, layer in enumerate(layers):
+        layer.register_forward_pre_hook(lambda m, a, i=i: stream.materialise(i))
+        layer.register_forward_hook(lambda m, a, o, i=i: stream.release(i))
+    return stream
