@@ -5179,3 +5179,116 @@ connection for a while once `after` range requests were served,
   thirds into its requests (and reports the outage and its end), and a probe
   killed (SIGKILL) part-way through its load and run again over the same
   cache prints the same, without fetching any chunk the killed run had kept.
+# ditch verify
+
+The model-checking workflow of the sessions above, built into ditch as one
+command:
+
+    ditch verify MODEL [--kinds | --layers L,L | --count K | --full] [--max-layers N] [--json] ...
+
+1. **Cut.** `ditch truncate MODEL --kinds OUT`, a Zig port of
+   `tools/truncate_checkpoint.py`: range reads, every per-layer config list
+   cut, quantisation as released. `--kinds` keeps the fewest layers covering
+   every layer kind and the layers the kept ones read. On Qwen2.5-0.5B and on
+   14 fixture families its output is byte-identical to the Python tool's
+   (`model.safetensors` and `config.json` text). `--full` skips the cut and
+   probes the whole release over `hf://`.
+2. **Forward pass.** `ditch probe --residuals --json` on the cut, run by
+   verify as a child process, like every step. A crash or an out-of-memory in
+   one step is reported, and the steps after it still run.
+3. **Reference.** The one place Python is used. ditch carries the harness
+   inside the binary (`tools/verify_reference.py`, `probe_reference.py`,
+   `ref_stream.py`, `ref_lazy_moe.py`, `lazy_checkpoint.py`, the DeepSeek
+   V4 / V4.1, Kimi K3 and MiMo V2 own-code references, and
+   `check_abliteration.py`, embedded by `build.zig` from `tools/`). It
+   writes the harness to the work directory and runs it with a `python3`
+   that has torch and transformers.
+   * `verify_reference.py --check-env` says what is importable. When
+     something is missing, the reference checks are skipped with the exact
+     `pip install` line.
+   * The reference is transformers' own class through `ref_stream.py` for
+     every family transformers has, else the release's own code.
+   * Checks, each with its numbers:
+     * **chat template and tokens:** the rendered prompt and its ids, against
+       the model's own Jinja template rendered by transformers;
+     * **residuals:** every layer's residual, with the first layer that
+       diverges past 1e-3 named, and on cuts of 4+ entries the ratio of the
+       last third's error to the first third's;
+     * **first-token logits:** within 1e-2 of the range, argmax equal;
+     * **greedy tokens:** paths that part on a near tie of the reference's own
+       logits, below 1e-3 of the range, are reported as ties.
+4. **Abliteration.** Two trials on the cut, with 8 harmful and 8 harmless
+   built-in prompts written to files (no dataset download),
+   `--expert-selection broad --visited-experts-only false`,
+   `--dump-directions`, trial 1 exported as float32.
+   * **directions:** finite unit vectors, one per residual entry.
+   * **export:** ditch's own reload check, argmax agreement 100%.
+   * **edit (Python):** every edited matrix recomputed by
+     `check_abliteration.py` as heretic's norm-preserving orthogonalisation.
+     It passes when the exported delta is within 1e-3 of the best rank-3
+     approximation of the exact edit.
+5. **Report.** A table on stdout, or `--json`:
+   `{"model", "layers": [int], "checks": [{"name", "status":
+   pass|fail|skip, "detail", "numbers": [{"key", "value"}]}], "ok"}`. Exit
+   status 1 when any check fails, 2 on a usage error.
+
+`.github/workflows/new-models.yml` runs it weekly, and on dispatch, over
+`tools/new_models.sh`'s candidates, and keeps one issue listing failures and
+unsupported models:
+* model_types new in the latest transformers release: the GitHub API, else
+  PyPI and the raw `auto_mappings.py`;
+* trending text-generation models on the Hub (`sort=trendingScore`,
+  ungated, safetensors, no re-quantised uploads);
+* a support check by `ditch --dry-run`, and `ditch add-model` when the binary
+  has it;
+* a size estimate against the runner's disk;
+* `ditch verify --kinds --max-layers k` on each supported one, one at a time.
+
+## Results
+
+`ditch verify MODEL --json --max-layers 4 --max-ram 8GB`, torch 2.14.0+cpu,
+transformers 5.17.0:
+
+| model | cut | template + ids | residuals | logits | greedy | abliteration (edit) | wall |
+| --- | --- | :---: | ---: | ---: | :---: | --- | ---: |
+| `Qwen/Qwen2.5-0.5B-Instruct` | layer 0 | pass | 2.4e-06 | 1.8e-06 | pass | 2 tensors, 2.9e-08 | 158 s |
+| `Qwen/Qwen2.5-0.5B-Instruct --full` | all 24 | pass | 4.3e-06 | 1.3e-06 | pass | (not run on --full) | |
+| `Qwen/Qwen3-0.6B` | layer 0 | pass | 7.0e-07 | 8.5e-07 | pass | 1 tensor, 7.9e-10 | 332 s |
+| `LiquidAI/LFM2-1.2B` | layers 0,1,2 | pass | 2.8e-06 | 1.5e-06 | pass | 2 tensors, 1.2e-08 | 519 s |
+| `HuggingFaceTB/SmolLM3-3B` | layers 0,3 (NoPE) | pass | 1.1e-06 | 1.3e-06 | pass | 4 tensors, 2.6e-07 | 744 s |
+| `microsoft/Phi-3.5-mini-instruct` | layer 0 | pass | 1.4e-06 | 8.6e-07 | pass | 1 tensor, 1.5e-08 | 299 s |
+| `ibm-granite/granite-4.0-h-tiny` | layers 0,5 (Mamba2 + MoE, attention + MoE) | pass | 1.5e-06 | 1.2e-06 | pass | 6 tensors / 132 matrices, 4.1e-06 | 357 s |
+| `Qwen/Qwen3-30B-A3B` | layer 0 (128 experts) | pass | 6.5e-07 | 5.4e-07 | pass | 1 tensor, 0 | 485 s |
+| `openai/gpt-oss-20b` | layers 0,1 (sliding, full) | pass | 1.7e-06 | 8.9e-07 | pass | 2 tensors, 3.2e-08 | 1900 s |
+| `google/gemma-3-1b-it` | — | — | — | — | — | — | truncate: gated (no token here) |
+
+Every reachable family passes every check. On the way, verify found three
+faults in the harness, none of them ditch's. All are fixed, and each would
+have shown as a ditch failure:
+* **The reference's greedy decoding was not greedy.** transformers merges the
+  release's `generation_config.json` into `generate()`, so
+  Qwen2.5-Instruct's `repetition_penalty: 1.1` applied even with
+  `do_sample=False`. On a one-layer cut that repeats a token, the reference
+  picked another token. Its own step-by-step forwards picked ditch's, so the
+  margin the check measures was negative. `probe_reference.py` now passes the
+  neutral values explicitly.
+* **`check_abliteration.py` took Granite's `output_linear` /
+  `shared_mlp` for attention.** It recomputed the MoE and shared MLP with the
+  attention kernel's λ: 0.93 excess on every expert, 4.1e-06 after the fix.
+  A study log with a non-UTF-8 byte also stopped it.
+* **Warp mode edits only visited experts.** Under `--max-ram`, the study
+  edits only the experts the prompts routed to. One of gpt-oss-20b's 64
+  experts in the cut was never visited, so it stayed unedited and counted as
+  a wrong edit. Verify now passes `--visited-experts-only false`.
+
+Limits:
+* The abliteration check exports float32. For a quantised MoE cut that is
+  several times the cut on disk: 12 GB for gpt-oss-20b's two MXFP4 layers.
+  The workflow's size estimate has to allow for it on a 14 GB runner.
+* Which matrices a two-trial study edits depends on the trial it lands on.
+  gpt-oss-20b's trial 1 edited the experts in one run and only `o_proj` in
+  the next. Different runs therefore cover different components.
+* The chat-template check needs Python today. The Jinja interpreter in Zig
+  (`src/jinja.zig`) that another session is building has not landed; verify
+  should use it when it does.
+
