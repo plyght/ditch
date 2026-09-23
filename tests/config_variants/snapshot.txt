@@ -1,0 +1,1969 @@
+family afmoe	791bc1f0b0644a46
+family apertus	7ba57f86f1e0c4e1
+family arcee	8831e7bb1c3bb355
+family baichuan	3d3cfaab55f3027a
+family biogpt	c3c57954302a3ef2
+family bitnet	80cd6e88d543f64a
+family bloom	6499ad0a6313504
+family chatglm	3ec1c08012e50f6b
+family codegen	4bbf87c1936d96b6
+family cohere	30ee3652076fe563
+family deepseek_v2	a94d214f76c900b6
+family deepseek_v3	ed64fd80d351e57a
+family deepseek_v32	a2cd1d0af6f6441a
+family deepseek_v4	639e124fca7a3cc9
+family deepseek_v41	72538a58b2bf22a2
+family dots1	5d2bc855eb8ff067
+family ernie4_5	e7100e0623f0bc5a
+family ernie4_5_moe	f76b571ef451fd6d
+family exaone	76a20404b4aca067
+family exaone4	9bd4f0309ff1c614
+family exaone_moe	9a655f39bbaf22cb
+family falcon	301c484f1345b121
+family falcon_h1	2c95b555bef32975
+family flex_olmo	edb39960bc8ae972
+family gemma2	6b08a01f6f492a19
+family gemma3	7bef3eecf2c1fc37
+family gemma3n	153601bbafced2a0
+family gemma4	2516f3bc12eff489
+family glm4	6af1d76fd84df525
+family glm4_moe	c95083cdc973a7f8
+family glm4_moe_lite	28f8afa41e7d3cc8
+family glm5_next	9fa8997399034274
+family glm_moe_dsa	e2ce4bbaf5aee7ce
+family gpt2	edc4f39ccc9f1484
+family gpt_bigcode	fb209239fc49b9c9
+family gpt_neo	14533398389a587e
+family gpt_neox	cbb965dbb82bc2d3
+family gpt_oss	6f8c45c2ef30c3db
+family gptj	3a2c6281b4a52e14
+family granite	faaeef97a5649b8b
+family granite_swa	6eea1033a6f06832
+family granitemoe	7ccb126b9cafd3a4
+family granitemoehybrid	2a3791b795cd7ab3
+family helium	c698626af8a6c053
+family hunyuan_v1_dense	9f7f2d47023e1a1d
+family hunyuan_v1_moe	567df8f07081a203
+family hy_v3	bb63f9447259ccaf
+family internlm2	c51cd49d313cc6df
+family jais2	5dab056c808f39e0
+family jamba	9022bc93312fd44d
+family kimi_k25	b4e42791996c294
+family kimi_k3	cf88b013aeb48e1a
+family kimi_linear	575c8a331847e673
+family laguna	fd42b947057c1dc
+family lfm2	273b422ae98fc7f9
+family llama	7afb343b13ba91d9
+family llama4	a0d17a6b900dadc2
+family mamba2	adb82edd5018677e
+family mellum	4e05621646d8d1b0
+family mimo_v2_flash	c64c2d8ce2e4b48c
+family minicpm	e8eff8a020cb0539
+family minimax	a9692f5ad6b2de80
+family minimax_m2	801aea678855fcb4
+family minimax_m3_vl_text	8e4a8b15359b309d
+family ministral3	4f4f58f1770d901
+family mistral	c37bab7dbec31afe
+family mistral4	98bddd8c9be59bf7
+family mixtral	b3950f887ca0bb1
+family mpt	aff6ed895be8a642
+family nanochat	bf2750aaddf1d50f
+family nemotron	2166f72558db329d
+family nemotron_h	5484764aae768557
+family olmo	ab70a7a55a9e023f
+family olmo2	253bd0d642d91a4b
+family olmoe	fca3ff736fd47b1f
+family opt	d10ff21d9e536c70
+family persimmon	73bb4c5a9dfbc748
+family phi	5af0c808ef53cf03
+family phi3	3e6b15b2c8361d9e
+family qwen2	eb0db35b496ac45d
+family qwen2_moe	732091ce46402961
+family qwen3	9b61385aafa2d978
+family qwen3_5	1df644dc60e5d491
+family qwen3_5_moe	a78e2b1d5763637e
+family qwen3_moe	1df5192a96acf81a
+family qwen3_next	7aa33a4848c19c8b
+family qwen4_exp	3083a9a277c3dd73
+family seed_oss	98737c0c33e897fb
+family smollm3	1ea4716d935387d1
+family solar_open	aab878c8fe602bdd
+family stablelm	68dac0a5de70471e
+family starcoder2	d19654c8c279077c
+family xglm	6386a08c0f22003b
+config afmoe	70efcef92eb6583a
+config afmoe variant 1	70efcef92eb6583a
+config afmoe variant 2	b708bab034118e7f
+config afmoe variant 3	62e04a3b674fad79
+config afmoe variant 4	b276f2232bb9c9a4
+config afmoe variant 5	58254dde7bc90619
+config afmoe variant 6	62e04a3b674fad79
+config afmoe variant 7	40fbd676e12e2b15
+config afmoe variant 8	40fbd676e12e2b15
+config afmoe variant 9	70efcef92eb6583a
+config afmoe variant 10	8d93aee788104479
+config afmoe variant 11	efbc3c99a45db19d
+config apertus	b233e930d1aba229
+config arcee	d15abd720b2b10c7
+config arcee variant 1	d15abd720b2b10c7
+config arcee variant 2	d15abd720b2b10c7
+config arcee variant 3	fd44eebd57d36501
+config baichuan	d4810079488b28b5
+config baichuan variant 1	95840d233fd0554c
+config baichuan variant 2	d75acbffadb2798a
+config baichuan variant 3	a2c8ae68670f4a44
+config baichuan variant 4	a2c8ae68670f4a44
+config baichuan variant 5	78398e302a2316d
+config baichuan variant 6	a2c8ae68670f4a44
+config baichuan variant 7	d75acbffadb2798a
+config baichuan variant 8	d4810079488b28b5
+config biogpt	cbdb9183724591e9
+config biogpt variant 1	781d5116d2304d08
+config biogpt variant 2	cbdb9183724591e9
+config biogpt variant 3	cbdb9183724591e9
+config biogpt variant 4	e7658b572d17c0bd
+config bitnet	5bd772dc6ad7f694
+config bloom	e8bdfb9cc5c36463
+config chatglm	fb927310518804b2
+config chatglm variant 1	a1677ff7b4c0a3a7
+config chatglm variant 2	e9014785c062fe1b
+config chatglm variant 3	50cbdbe44985339b
+config chatglm variant 4	a1677ff7b4c0a3a7
+config chatglm variant 5	17c496fe57c6e4e
+config chatglm variant 6	fb927310518804b2
+config chatglm variant 7	a00287e47f2d9d73
+config chatglm variant 8	a00287e47f2d9d73
+config chatglm variant 9	fb927310518804b2
+config chatglm variant 10	fb927310518804b2
+config chatglm variant 11	854dcc4af886ebc4
+config chatglm variant 12	854dcc4af886ebc4
+config chatglm variant 13	854dcc4af886ebc4
+config chatglm variant 14	984984bb5e1db34e
+config chatglm variant 15	2750fd08c624146f
+config chatglm variant 16	fb927310518804b2
+config chatglm variant 17	87bad75c6fac04e5
+config chatglm variant 18	e143995e51be5b25
+config chatglm variant 19	e143995e51be5b25
+config chatglm variant 20	e143995e51be5b25
+config chatglm variant 21	e143995e51be5b25
+config codegen	5c1d5a1bdc80cf78
+config codegen variant 1	83ecb69dcf9ff918
+config codegen variant 2	83ecb69dcf9ff918
+config codegen variant 3	f0c88e158843edf2
+config codegen variant 4	e143995e51be5b25
+config codegen variant 5	e143995e51be5b25
+config cohere	d062999224f4c4d2
+config cohere variant 1	a9aa4be4f931001f
+config cohere variant 2	a9aa4be4f931001f
+config cohere variant 3	160add0742c73586
+config cohere variant 4	4adf3651550bfd0b
+config cohere variant 5	4adf3651550bfd0b
+config cohere variant 6	d062999224f4c4d2
+config cohere variant 7	30b37d8d482d2a2d
+config cohere variant 8	f81d917e06710055
+config cohere variant 9	30b37d8d482d2a2d
+config cohere variant 10	3921a46a76d6d1a9
+config cohere variant 11	563a035c5bf6e4fa
+config deepseek_v2	af6e5697b9403b9c
+config deepseek_v2 variant 1	cbc6b08c99ede346
+config deepseek_v2 variant 2	af6e5697b9403b9c
+config deepseek_v2 variant 3	cbc6b08c99ede346
+config deepseek_v2 variant 4	af6e5697b9403b9c
+config deepseek_v2 variant 5	58321d1b9016cbcb
+config deepseek_v2 variant 6	5c28aa6a032cc714
+config deepseek_v2 variant 7	af6e5697b9403b9c
+config deepseek_v2 variant 8	af6e5697b9403b9c
+config deepseek_v2 variant 9	af6e5697b9403b9c
+config deepseek_v2 variant 10	af6e5697b9403b9c
+config deepseek_v2 variant 11	c3482b7ff697209
+config deepseek_v2 variant 12	af6e5697b9403b9c
+config deepseek_v2 variant 13	af6e5697b9403b9c
+config deepseek_v2 variant 14	c3482b7ff697209
+config deepseek_v2 variant 15	c3482b7ff697209
+config deepseek_v2 variant 16	d471c649fa856d14
+config deepseek_v2 variant 17	d471c649fa856d14
+config deepseek_v2 variant 18	d471c649fa856d14
+config deepseek_v2 variant 19	d471c649fa856d14
+config deepseek_v2 variant 20	af6e5697b9403b9c
+config deepseek_v2 variant 21	b99ff563a4609b14
+config deepseek_v2 variant 22	899657b6297f9268
+config deepseek_v2 variant 23	899657b6297f9268
+config deepseek_v2 variant 24	af6e5697b9403b9c
+config deepseek_v2 variant 25	af6e5697b9403b9c
+config deepseek_v2 variant 26	70867514235026fd
+config deepseek_v2 variant 27	d28f5dea61b7843f
+config deepseek_v2 variant 28	18de1ae4904692a4
+config deepseek_v2 variant 29	d28f5dea61b7843f
+config deepseek_v3	916be5f0cb39de11
+config deepseek_v3 variant 1	275b845bba624107
+config deepseek_v3 variant 2	916be5f0cb39de11
+config deepseek_v3 variant 3	275b845bba624107
+config deepseek_v3 variant 4	916be5f0cb39de11
+config deepseek_v3 variant 5	916be5f0cb39de11
+config deepseek_v3 variant 6	26431af82b13396e
+config deepseek_v3 variant 7	c9f415245f852032
+config deepseek_v3 variant 8	c9f415245f852032
+config deepseek_v3 variant 9	c9f415245f852032
+config deepseek_v3 variant 10	c9f415245f852032
+config deepseek_v3 variant 11	f5f5496d65f7102f
+config deepseek_v3 variant 12	916be5f0cb39de11
+config deepseek_v3 variant 13	916be5f0cb39de11
+config deepseek_v3 variant 14	f5f5496d65f7102f
+config deepseek_v3 variant 15	f5f5496d65f7102f
+config deepseek_v3 variant 16	40d5c70fdc17357c
+config deepseek_v3 variant 17	40d5c70fdc17357c
+config deepseek_v3 variant 18	40d5c70fdc17357c
+config deepseek_v3 variant 19	40d5c70fdc17357c
+config deepseek_v3 variant 20	916be5f0cb39de11
+config deepseek_v3 variant 21	b99ff563a4609b14
+config deepseek_v3 variant 22	f215fdd4a9d054b
+config deepseek_v3 variant 23	f215fdd4a9d054b
+config deepseek_v3 variant 24	916be5f0cb39de11
+config deepseek_v3 variant 25	916be5f0cb39de11
+config deepseek_v3 variant 26	65caa4f22289df9b
+config deepseek_v3 variant 27	65a53d881b9ada2c
+config deepseek_v3 variant 28	b0f7dadcb3636621
+config deepseek_v3 variant 29	65a53d881b9ada2c
+config deepseek_v32	886167f93cb74f89
+config deepseek_v32 variant 1	939d2766b2f4105a
+config deepseek_v32 variant 2	552c94e87542b889
+config deepseek_v32 variant 3	552c94e87542b889
+config deepseek_v32 variant 4	3736e0b7217183e0
+config deepseek_v32 variant 5	552c94e87542b889
+config deepseek_v32 variant 6	552c94e87542b889
+config deepseek_v32 variant 7	b65ecf8fdc4268c3
+config deepseek_v32 variant 8	1e2f75d09e109ab7
+config deepseek_v32 variant 9	b99ff563a4609b14
+config deepseek_v32 variant 10	b5997228aaac0277
+config deepseek_v3_latent_eps	8ad36cee4d076be2
+config deepseek_v3_latent_eps variant 1	85e118a1cf26512a
+config deepseek_v3_latent_eps variant 2	3710deb56ac171a8
+config deepseek_v3_latent_eps variant 3	b99ff563a4609b14
+config deepseek_v3_latent_eps variant 4	c1238986239325e2
+config deepseek_v4	a51a5bd5bd7d7100
+config deepseek_v4 variant 1	e143995e51be5b25
+config deepseek_v4 variant 2	a51a5bd5bd7d7100
+config deepseek_v4 variant 3	a51a5bd5bd7d7100
+config deepseek_v4 variant 4	6a7d4f3c85408b8a
+config deepseek_v4 variant 5	6a7d4f3c85408b8a
+config deepseek_v4 variant 6	6be5c34690f61e44
+config deepseek_v4 variant 7	a51a5bd5bd7d7100
+config deepseek_v4 variant 8	b99ff563a4609b14
+config deepseek_v4 variant 9	b99ff563a4609b14
+config deepseek_v4 variant 10	b99ff563a4609b14
+config deepseek_v4 variant 11	6be5c34690f61e44
+config deepseek_v4 variant 12	6be5c34690f61e44
+config deepseek_v4 variant 13	6be5c34690f61e44
+config deepseek_v4 variant 14	26d85698768c1198
+config deepseek_v4 variant 15	3d1d632cd27def14
+config deepseek_v4 variant 16	df9e98020a3cf2a6
+config deepseek_v4 variant 17	a51a5bd5bd7d7100
+config deepseek_v4 variant 18	c73cee277ce391c5
+config deepseek_v4 variant 19	a51a5bd5bd7d7100
+config deepseek_v4 variant 20	563185c213ae1f5e
+config deepseek_v4 variant 21	b99ff563a4609b14
+config deepseek_v4 variant 22	b99ff563a4609b14
+config deepseek_v4 variant 23	b99ff563a4609b14
+config deepseek_v4 variant 24	fcd7f5ac673d2436
+config deepseek_v4 variant 25	b99ff563a4609b14
+config deepseek_v4 variant 26	7eb0d7683f06b707
+config deepseek_v4 variant 27	4d0fb8d69a4614db
+config deepseek_v4 variant 28	ffdda4a8b714da87
+config deepseek_v4 variant 29	4a028e36e6bed87
+config deepseek_v4 variant 30	aa9e7447b2e9aee7
+config deepseek_v4 variant 31	6f219ab7a91d1b9a
+config deepseek_v4 variant 32	e1dac755a65f35b7
+config deepseek_v4 variant 33	fb5033df017a893c
+config deepseek_v4 variant 34	6024618580316e61
+config deepseek_v4 variant 35	82ed846fdcfe7c10
+config deepseek_v4 variant 36	dac18d49544760df
+config deepseek_v4 variant 37	a51a5bd5bd7d7100
+config deepseek_v4 variant 38	a51a5bd5bd7d7100
+config deepseek_v4 variant 39	a51a5bd5bd7d7100
+config deepseek_v4 variant 40	6df77466e2c34484
+config deepseek_v4 variant 41	5d48130b914a7d5d
+config deepseek_v4 variant 42	6024618580316e61
+config deepseek_v4 variant 43	14d05f8c9578987e
+config deepseek_v4 variant 44	82ed846fdcfe7c10
+config deepseek_v4 variant 45	82ed846fdcfe7c10
+config deepseek_v4 variant 46	82ed846fdcfe7c10
+config deepseek_v4 variant 47	82ed846fdcfe7c10
+config deepseek_v4 variant 48	5382a7ad471b588a
+config deepseek_v4 variant 49	30a19247f1258da6
+config deepseek_v4 variant 50	30a19247f1258da6
+config deepseek_v4 variant 51	a51a5bd5bd7d7100
+config deepseek_v4 variant 52	a51a5bd5bd7d7100
+config deepseek_v4 variant 53	109b562ab5e20ba7
+config deepseek_v4 variant 54	3f57f0b8daff5d18
+config deepseek_v4 variant 55	109b562ab5e20ba7
+config deepseek_v4 variant 56	109b562ab5e20ba7
+config deepseek_v4 variant 57	e03411441f19d0fc
+config deepseek_v4 variant 58	729bf32eef4bc167
+config deepseek_v4 variant 59	9c63240087588d66
+config deepseek_v4 variant 60	a51a5bd5bd7d7100
+config deepseek_v4 variant 61	4193e28453767bdd
+config deepseek_v4 variant 62	553d06226e0a007e
+config deepseek_v4 variant 63	a51a5bd5bd7d7100
+config deepseek_v4 variant 64	ed302d7791cdc872
+config deepseek_v4 variant 65	b99ff563a4609b14
+config deepseek_v4 variant 66	b99ff563a4609b14
+config deepseek_v4 variant 67	ab2bc69f35101b88
+config deepseek_v4 variant 68	ed302d7791cdc872
+config deepseek_v4 variant 69	1472c7ceb07c7da1
+config deepseek_v4 variant 70	58b87f2683f9b3c6
+config deepseek_v4 variant 71	b99ff563a4609b14
+config deepseek_v4 variant 72	c66101168b88eef7
+config deepseek_v4 variant 73	a51a5bd5bd7d7100
+config deepseek_v4 variant 74	d8c9a282dc03c6d1
+config deepseek_v4 variant 75	b99ff563a4609b14
+config deepseek_v4 variant 76	b99ff563a4609b14
+config deepseek_v4 variant 77	a51a5bd5bd7d7100
+config deepseek_v4 variant 78	af533a42583a0139
+config deepseek_v4 variant 79	c66101168b88eef7
+config deepseek_v4 variant 80	c66101168b88eef7
+config deepseek_v4 variant 81	b99ff563a4609b14
+config deepseek_v4 variant 82	b99ff563a4609b14
+config deepseek_v4 variant 83	a51a5bd5bd7d7100
+config deepseek_v4 variant 84	e143995e51be5b25
+config deepseek_v4 variant 85	b99ff563a4609b14
+config deepseek_v4 variant 86	af533a42583a0139
+config deepseek_v4 variant 87	b99ff563a4609b14
+config deepseek_v4 variant 88	b99ff563a4609b14
+config deepseek_v4 variant 89	bb0222649175e3e9
+config deepseek_v4 variant 90	549bca93f39d8445
+config deepseek_v4 variant 91	2268681ead978ec
+config deepseek_v4 variant 92	918651087b163f8b
+config deepseek_v4 variant 93	b99ff563a4609b14
+config deepseek_v4 variant 94	b99ff563a4609b14
+config deepseek_v4 variant 95	30611419f3b71ed4
+config deepseek_v4 variant 96	b99ff563a4609b14
+config deepseek_v4 variant 97	b99ff563a4609b14
+config deepseek_v4 variant 98	a51a5bd5bd7d7100
+config deepseek_v4 variant 99	6488e7001e39db29
+config deepseek_v41	8009f81ed45dfc28
+config deepseek_v41 variant 1	8009f81ed45dfc28
+config deepseek_v41 variant 2	be3003bfef3c9ab4
+config deepseek_v41 variant 3	8009f81ed45dfc28
+config deepseek_v41 variant 4	8009f81ed45dfc28
+config deepseek_v41 variant 5	e143995e51be5b25
+config deepseek_v41 variant 6	de38bd74425157cd
+config deepseek_v41 variant 7	d62649c766cb8cc7
+config deepseek_v41 variant 8	8009f81ed45dfc28
+config deepseek_v41 variant 9	d62649c766cb8cc7
+config deepseek_v41 variant 10	8009f81ed45dfc28
+config deepseek_v41 variant 11	b99ff563a4609b14
+config deepseek_v41 variant 12	41d15b7629c74dfd
+config deepseek_v41 variant 13	b99ff563a4609b14
+config deepseek_v41 variant 14	b299fbdfd615d4b
+config deepseek_v41 variant 15	b99ff563a4609b14
+config deepseek_v41 variant 16	b99ff563a4609b14
+config deepseek_v41 variant 17	8009f81ed45dfc28
+config deepseek_v41 variant 18	b99ff563a4609b14
+config deepseek_v41 variant 19	8009f81ed45dfc28
+config deepseek_v41 variant 20	5f92be057199f24b
+config deepseek_v41 variant 21	b99ff563a4609b14
+config deepseek_v41 variant 22	8009f81ed45dfc28
+config deepseek_v41 variant 23	8009f81ed45dfc28
+config deepseek_v41 variant 24	6b6caea873be4e89
+config deepseek_v41 variant 25	b99ff563a4609b14
+config deepseek_v41 variant 26	6b6caea873be4e89
+config deepseek_v41 variant 27	a67334310a60efb
+config deepseek_v41 variant 28	8009f81ed45dfc28
+config deepseek_v41 variant 29	b99ff563a4609b14
+config deepseek_v41 variant 30	b99ff563a4609b14
+config deepseek_v41 variant 31	b99ff563a4609b14
+config deepseek_v41 variant 32	983756fecb1e30ba
+config deepseek_v41 variant 33	8009f81ed45dfc28
+config deepseek_v41 variant 34	8009f81ed45dfc28
+config deepseek_v41 variant 35	8009f81ed45dfc28
+config deepseek_v41 variant 36	8009f81ed45dfc28
+config deepseek_v41 variant 37	b99ff563a4609b14
+config deepseek_v41 variant 38	8009f81ed45dfc28
+config deepseek_v41 variant 39	d093da6cc293cd36
+config deepseek_v41 variant 40	8009f81ed45dfc28
+config deepseek_v41 variant 41	d093da6cc293cd36
+config deepseek_v41 variant 42	b99ff563a4609b14
+config deepseek_v41 variant 43	93523cc621c1c997
+config deepseek_v41 variant 44	b99ff563a4609b14
+config deepseek_v41 variant 45	a02479fda791e9ec
+config deepseek_v41 variant 46	b6d6d9f0cc341ca9
+config deepseek_v41 variant 47	627a06414d34c2d1
+config deepseek_v41 variant 48	4873ee7752060ab5
+config deepseek_v41 variant 49	56eceff96393fe0a
+config deepseek_v41 variant 50	56eceff96393fe0a
+config deepseek_v41 variant 51	b99ff563a4609b14
+config deepseek_v41 variant 52	211f92a8c812eaf6
+config deepseek_v41 variant 53	b99ff563a4609b14
+config deepseek_v41 variant 54	b3caa612288d057c
+config deepseek_v41 variant 55	9bcf84d8daa2630c
+config deepseek_v41 variant 56	b99ff563a4609b14
+config deepseek_v41 variant 57	b99ff563a4609b14
+config deepseek_v41 variant 58	b99ff563a4609b14
+config deepseek_v41 variant 59	56eceff96393fe0a
+config deepseek_v41 variant 60	a0d856573c70df6e
+config deepseek_v41 variant 61	690eb556e5e387c2
+config deepseek_v41 variant 62	8009f81ed45dfc28
+config deepseek_v41 variant 63	4a34161131ed933a
+config deepseek_v41 variant 64	b8c10292e749e06f
+config deepseek_v41 variant 65	482e96386332bf9f
+config deepseek_v41 variant 66	25afa9df59a8cc22
+config deepseek_v41 variant 67	bcb1e18027d6f6e
+config deepseek_v41 variant 68	f4a244bbc03e07e0
+config deepseek_v41 variant 69	e71294dec5faf53c
+config deepseek_v41 variant 70	24d8b1a56d64af2d
+config deepseek_v41 variant 71	613fd2b4806575a9
+config deepseek_v41 variant 72	e60781fd4f675fe5
+config deepseek_v41 variant 73	89c52bc6ad0b302
+config deepseek_v41 variant 74	8467842ff6c489b
+config deepseek_v41 variant 75	52e640ccc32fa14c
+config deepseek_v41 variant 76	b99ff563a4609b14
+config deepseek_v41 variant 77	43530567abc76241
+config deepseek_v41 variant 78	bb3e7a56b17d079b
+config deepseek_v41 variant 79	d8cfde0af4513dcc
+config deepseek_v41 variant 80	16da4ad08bba108f
+config deepseek_v41 variant 81	b99ff563a4609b14
+config deepseek_v41 variant 82	b99ff563a4609b14
+config deepseek_v41 variant 83	d093da6cc293cd36
+config deepseek_v41 variant 84	b99ff563a4609b14
+config deepseek_v4_hubnames	a51a5bd5bd7d7100
+config deepseek_v4_hubnames variant 1	bb0222649175e3e9
+config deepseek_v4_hubnames variant 2	c66101168b88eef7
+config deepseek_v4_hubnames variant 3	82ed846fdcfe7c10
+config deepseek_v4_native	96b5087056622ff3
+config deepseek_v4_native variant 1	3e4c885a021d4bee
+config deepseek_v4_native variant 2	6d0f794d70754c6
+config deepseek_v4_native variant 3	cd92bc0261f1faec
+config dots1	5e1763bb483d2b0c
+config dots1 variant 1	b99ff563a4609b14
+config dots1 variant 2	203146adc7f679de
+config dots1 variant 3	203146adc7f679de
+config dots1 variant 4	4a16498154925d3f
+config dots1 variant 5	3960e9da6a763637
+config dots1 variant 6	5e1763bb483d2b0c
+config dots1 variant 7	5e1763bb483d2b0c
+config dots1 variant 8	da5439273007e945
+config ernie4_5	19349f59dd952100
+config ernie4_5 variant 1	74c1e19217220c38
+config ernie4_5 variant 2	74c1e19217220c38
+config ernie4_5 variant 3	19349f59dd952100
+config ernie4_5 variant 4	74c1e19217220c38
+config ernie4_5_moe	125720bbb915d9bf
+config ernie4_5_moe variant 1	f75b5d59466c3e0c
+config ernie4_5_moe variant 2	125720bbb915d9bf
+config ernie4_5_moe variant 3	125720bbb915d9bf
+config ernie4_5_moe variant 4	125720bbb915d9bf
+config ernie4_5_moe variant 5	487853b1b5008c94
+config ernie4_5_moe variant 6	487853b1b5008c94
+config ernie4_5_moe variant 7	b31e072d174bf25e
+config ernie4_5_moe variant 8	b4d07bf1aa11c9ad
+config ernie4_5_moe variant 9	86711d5bd9064960
+config ernie4_5_moe variant 10	125720bbb915d9bf
+config ernie4_5_moe variant 11	dccdac675ac46dcb
+config ernie4_5_moe variant 12	1315dffcfec510b8
+config ernie4_5_moe variant 13	125720bbb915d9bf
+config ernie4_5_moe variant 14	1315dffcfec510b8
+config ernie4_5_moe variant 15	fd89a1939d81ea6c
+config ernie4_5_moe variant 16	1315dffcfec510b8
+config ernie4_5_moe variant 17	125720bbb915d9bf
+config ernie4_5_moe variant 18	86711d5bd9064960
+config exaone	dcd3716dbaae021b
+config exaone4	77c67ccfec1738e2
+config exaone4 variant 1	b41f5a3c4755db60
+config exaone4 variant 2	805cfb64890c1d02
+config exaone4 variant 3	7f4e42f7e87d3ef7
+config exaone4 variant 4	7f4e42f7e87d3ef7
+config exaone4 variant 5	b41f5a3c4755db60
+config exaone4 variant 6	5a626317deb58b8b
+config exaone4 variant 7	77c67ccfec1738e2
+config exaone4 variant 8	77c67ccfec1738e2
+config exaone4 variant 9	77c67ccfec1738e2
+config exaone4 variant 10	77c67ccfec1738e2
+config exaone4 variant 11	7f4e42f7e87d3ef7
+config exaone4 variant 12	40cb08205a6c9a4d
+config exaone4 variant 13	40cb08205a6c9a4d
+config exaone4 variant 14	79772c3b1e9ddbc
+config exaone4 variant 15	40cb08205a6c9a4d
+config exaone4 variant 16	5d55d1f0d2b59d18
+config exaone_moe	83ab356cde7e23c7
+config exaone_moe variant 1	83ab356cde7e23c7
+config exaone_moe variant 2	a12e8a69de84569
+config exaone_moe variant 3	6cc329f0b37d70db
+config exaone_moe variant 4	d96aa3d87df55119
+config exaone_moe variant 5	3d2edc9e8323f8a7
+config exaone_moe variant 6	83ab356cde7e23c7
+config exaone_moe variant 7	a12e8a69de84569
+config exaone_moe variant 8	83ab356cde7e23c7
+config exaone_moe variant 9	67eb1c5667bd7b44
+config exaone_moe variant 10	1054198c7e9a520f
+config exaone_moe variant 11	83ab356cde7e23c7
+config exaone_moe variant 12	b99ff563a4609b14
+config exaone_moe variant 13	598ca479666b9a8
+config exaone_moe variant 14	c6db5fc43eabf929
+config exaone_moe variant 15	91f5fafd21862101
+config exaone_moe variant 16	83ab356cde7e23c7
+config falcon	99e17c404acd0782
+config falcon variant 1	9ce57b935058b576
+config falcon variant 2	9a6a2417e5e54ecf
+config falcon variant 3	5339466aef2961d0
+config falcon variant 4	99e17c404acd0782
+config falcon variant 5	99e17c404acd0782
+config falcon variant 6	b99ff563a4609b14
+config falcon_h1	d52e7c4e44b56f6e
+config falcon_h1 variant 1	d52e7c4e44b56f6e
+config falcon_h1 variant 2	314fff604b15815d
+config falcon_h1 variant 3	2d4a54b75da4ef05
+config falcon_h1 variant 4	d52e7c4e44b56f6e
+config falcon_h1 variant 5	b99ff563a4609b14
+config falcon_h1 variant 6	d52e7c4e44b56f6e
+config falcon_h1 variant 7	d52e7c4e44b56f6e
+config falcon_h1 variant 8	314fff604b15815d
+config falcon_h1 variant 9	b99ff563a4609b14
+config falcon_h1 variant 10	d52e7c4e44b56f6e
+config falcon_h1 variant 11	d52e7c4e44b56f6e
+config falcon_h1 variant 12	b99ff563a4609b14
+config falcon_h1 variant 13	d52e7c4e44b56f6e
+config falcon_h1 variant 14	d52e7c4e44b56f6e
+config falcon_h1 variant 15	b99ff563a4609b14
+config falcon_h1 variant 16	b99ff563a4609b14
+config falcon_h1 variant 17	b99ff563a4609b14
+config falcon_h1 variant 18	c8bcfa7dc671dd55
+config falcon_h1 variant 19	b99ff563a4609b14
+config falcon_h1 variant 20	b5006825e20ad94c
+config falcon_h1 variant 21	498310562ab2a38c
+config falcon_h1 variant 22	97b863cc94ca0107
+config falcon_h1 variant 23	d52e7c4e44b56f6e
+config falcon_h1 variant 24	e26d41dd4fc28115
+config falcon_h1 variant 25	7f002b6150194e96
+config falcon_h1 variant 26	d52e7c4e44b56f6e
+config falcon_h1 variant 27	d52e7c4e44b56f6e
+config falcon_h1 variant 28	d52e7c4e44b56f6e
+config falcon_h1 variant 29	d52e7c4e44b56f6e
+config falcon_h1 variant 30	c391d7a9182dc86a
+config falcon_h1 variant 31	d52e7c4e44b56f6e
+config falcon_h1 variant 32	c391d7a9182dc86a
+config falcon_h1 variant 33	c391d7a9182dc86a
+config falcon_h1 variant 34	d52e7c4e44b56f6e
+config falcon_h1 variant 35	8d2a3c846636a32d
+config falcon_h1 variant 36	8d2a3c846636a32d
+config falcon_h1 variant 37	d52e7c4e44b56f6e
+config falcon_h1 variant 38	d52e7c4e44b56f6e
+config falcon_h1 variant 39	f93946b19bb04d0
+config falcon_h1 variant 40	30bdf4e78763a6c9
+config falcon_h1 variant 41	d2f7858078d0c37a
+config falcon_h1 variant 42	e691e61edc140a98
+config falcon_h1 variant 43	e744dd0dae0304fc
+config falcon_h1 variant 44	7d5fc95d4fbb433c
+config falcon_h1 variant 45	75b6479dcb09f62
+config falcon_h1 variant 46	75b6479dcb09f62
+config falcon_h1 variant 47	97760c395bd8cbf2
+config falcon_h1 variant 48	97760c395bd8cbf2
+config falcon_h1 variant 49	97760c395bd8cbf2
+config falcon_h1 variant 50	97760c395bd8cbf2
+config falcon_h1 variant 51	9682768e1885b8af
+config falcon_h1 variant 52	a75de148bc6810e0
+config falcon_h1 variant 53	694696113d7a8d08
+config falcon_h1 variant 54	4c0693d43eee3045
+config falcon_h1 variant 55	4c0693d43eee3045
+config falcon_h1 variant 56	57c1cf2e8325095a
+config falcon_h1 variant 57	f6dcd74ef80f885
+config falcon_h1 variant 58	eb419ace1a431fd5
+config falcon_h1 variant 59	d52e7c4e44b56f6e
+config falcon_h1 variant 60	1d005286df6751d2
+config falcon_h1 variant 61	8d2a3c846636a32d
+config falcon_h1 variant 62	c391d7a9182dc86a
+config falcon_h1 variant 63	b2d1c0e673ce66c
+config falcon_h1 variant 64	1d005286df6751d2
+config falcon_h1 variant 65	d25944869942875
+config falcon_h1 variant 66	d52e7c4e44b56f6e
+config falcon_h1 variant 67	443a0dea0e97d418
+config falcon_h1_nonorm	1d005286df6751d2
+config falcon_rw	727f19285bb7e140
+config flex_olmo	c364e866e1092abd
+config flex_olmo variant 1	2285118da170a635
+config flex_olmo variant 2	c364e866e1092abd
+config flex_olmo variant 3	87c76ed2fe576430
+config gemma2	c9f5da9d10ab428f
+config gemma2 variant 1	c9f5da9d10ab428f
+config gemma2 variant 2	6be9d4ee5cc6b2a5
+config gemma2 variant 3	c9f5da9d10ab428f
+config gemma2 variant 4	3679fbf8452f2b6b
+config gemma2 variant 5	c9f5da9d10ab428f
+config gemma2 variant 6	dfbe6bf315d0dd6
+config gemma2 variant 7	26b816ddd4cb307b
+config gemma2 variant 8	d9728dacee7b5b24
+config gemma2 variant 9	bdcbea28f2e459dc
+config gemma3	4ae2ca3de8734f95
+config gemma3 variant 1	4ae2ca3de8734f95
+config gemma3 variant 2	a17f7a26fd3994b7
+config gemma3 variant 3	4ae2ca3de8734f95
+config gemma3 variant 4	a82094e221461fbf
+config gemma3 variant 5	51791a2a416a21da
+config gemma3 variant 6	4ae2ca3de8734f95
+config gemma3 variant 7	4ae2ca3de8734f95
+config gemma3 variant 8	b37518a925229b24
+config gemma3 variant 9	8f9c9f8e1674802a
+config gemma3 variant 10	9fefb05dfc6a083a
+config gemma3 variant 11	3b2a8c1ef6591223
+config gemma3 variant 12	4ae2ca3de8734f95
+config gemma3 variant 13	4ae2ca3de8734f95
+config gemma3 variant 14	4ae2ca3de8734f95
+config gemma3 variant 15	5677f789b772cd0b
+config gemma3 variant 16	35ba4133c1b295aa
+config gemma3 variant 17	933dd0098664fd52
+config gemma3 variant 18	7c073b8bbd6cf249
+config gemma3 variant 19	883cd53a54575e27
+config gemma3 variant 20	ebd7ac6c38cbec9d
+config gemma3 variant 21	933dd0098664fd52
+config gemma3 variant 22	d70d1d4c7053a9d8
+config gemma3 variant 23	73da9c3b196adc01
+config gemma3 variant 24	d7e186d70724a810
+config gemma3 variant 25	757507920fd64b0b
+config gemma3 variant 26	d3eccff17b7d2437
+config gemma3 variant 27	41164705b324158e
+config gemma3 variant 28	d9a173b637e1aed2
+config gemma3 variant 29	c5e1c151be9cc4c6
+config gemma3 variant 30	4ae2ca3de8734f95
+config gemma3 variant 31	4ae2ca3de8734f95
+config gemma3 variant 32	4ae2ca3de8734f95
+config gemma3 variant 33	4ae2ca3de8734f95
+config gemma3n	a02181752773c0ac
+config gemma3n variant 1	a02181752773c0ac
+config gemma3n variant 2	b832d5b54316ed7e
+config gemma3n variant 3	8fc7c67a7f6a479a
+config gemma3n variant 4	a039b6a102b61241
+config gemma3n variant 5	30b3cb5fbeab5d21
+config gemma3n variant 6	983d2900c00ff782
+config gemma3n variant 7	728eef7a841a18d2
+config gemma3n variant 8	728eef7a841a18d2
+config gemma3n variant 9	4dc9ded6c63cf26d
+config gemma3n variant 10	4dc9ded6c63cf26d
+config gemma3n variant 11	b99ff563a4609b14
+config gemma3n variant 12	6f6ee3e26521f14c
+config gemma3n variant 13	b99ff563a4609b14
+config gemma3n variant 14	a02181752773c0ac
+config gemma3n variant 15	45f75326e676411f
+config gemma3n variant 16	b99ff563a4609b14
+config gemma3n variant 17	a02181752773c0ac
+config gemma3n variant 18	c4a9dc8dd5e6b95
+config gemma3n variant 19	2d170316ad5bfbba
+config gemma3n variant 20	b99ff563a4609b14
+config gemma3n variant 21	b99ff563a4609b14
+config gemma3n variant 22	e51474943b9469d6
+config gemma3n variant 23	a02181752773c0ac
+config gemma3n variant 24	c154c0e4b615c2c0
+config gemma3n variant 25	c154c0e4b615c2c0
+config gemma3n variant 26	a02181752773c0ac
+config gemma3n variant 27	b99ff563a4609b14
+config gemma3n variant 28	b50d50816429e300
+config gemma3n variant 29	c7b1e06434c2114d
+config gemma3n variant 30	3450d0dd736e4f8a
+config gemma3n variant 31	b99ff563a4609b14
+config gemma3n variant 32	b99ff563a4609b14
+config gemma3n variant 33	3450d0dd736e4f8a
+config gemma3n variant 34	3450d0dd736e4f8a
+config gemma3n variant 35	3450d0dd736e4f8a
+config gemma3n variant 36	5e7c0b64f0646634
+config gemma3n variant 37	b99ff563a4609b14
+config gemma3n variant 38	4f667441f033852a
+config gemma3n variant 39	b99ff563a4609b14
+config gemma3n variant 40	3450d0dd736e4f8a
+config gemma3n variant 41	97cc41cd3a932b87
+config gemma3n variant 42	5094c2d47053affd
+config gemma3n variant 43	62589993ecbeb3c6
+config gemma4	8a1863976d2c77de
+config gemma4 variant 1	8a1863976d2c77de
+config gemma4 variant 2	a47aa80a5f51d953
+config gemma4 variant 3	e143995e51be5b25
+config gemma4 variant 4	8a1863976d2c77de
+config gemma4 variant 5	8a1863976d2c77de
+config gemma4 variant 6	e143995e51be5b25
+config gemma4 variant 7	e143995e51be5b25
+config gemma4 variant 8	8a1863976d2c77de
+config gemma4 variant 9	8a1863976d2c77de
+config gemma4 variant 10	b99ff563a4609b14
+config gemma4 variant 11	39c3a9089bd204e4
+config gemma4 variant 12	acb46582248e64d0
+config gemma4 variant 13	e7cdba1dfd59a3fc
+config gemma4 variant 14	b99ff563a4609b14
+config gemma4 variant 15	5a6cbfd65bafdb84
+config gemma4 variant 16	5a6cbfd65bafdb84
+config gemma4 variant 17	35b448c150cc340c
+config gemma4 variant 18	35b448c150cc340c
+config gemma4 variant 19	8a1863976d2c77de
+config gemma4 variant 20	e3dacaddd44580c3
+config gemma4 variant 21	e3dacaddd44580c3
+config gemma4 variant 22	e3dacaddd44580c3
+config gemma4 variant 23	35b448c150cc340c
+config gemma4 variant 24	bfe19f7c20513c7d
+config gemma4 variant 25	fc3b34e07ad52797
+config gemma4 variant 26	1ccaac8eb5a364a7
+config gemma4 variant 27	79258e9dd6a85cdf
+config gemma4 variant 28	1ccaac8eb5a364a7
+config gemma4 variant 29	fc3b34e07ad52797
+config gemma4 variant 30	fc3b34e07ad52797
+config gemma4 variant 31	fc3b34e07ad52797
+config gemma4 variant 32	f5acfb345decf075
+config gemma4 variant 33	fc3b34e07ad52797
+config gemma4 variant 34	abda9ccc625b3f82
+config gemma4 variant 35	abda9ccc625b3f82
+config gemma4 variant 36	fc3b34e07ad52797
+config gemma4 variant 37	8a1863976d2c77de
+config gemma4 variant 38	8a1863976d2c77de
+config gemma4 variant 39	a8a918c9b7604b2b
+config gemma4 variant 40	79cf37561a0b0ffe
+config gemma4 variant 41	8a1863976d2c77de
+config gemma4 variant 42	8a1863976d2c77de
+config gemma4 variant 43	8a1863976d2c77de
+config gemma4 variant 44	8a1863976d2c77de
+config gemma4 variant 45	8a1863976d2c77de
+config gemma4 variant 46	ea5c2bd4d4285d99
+config gemma4 variant 47	ea5c2bd4d4285d99
+config gemma4 variant 48	885d72c7ed2fe18e
+config gemma4 variant 49	bc1bd0d692272e38
+config gemma4 variant 50	a15e65e8a3a0e83b
+config gemma4 variant 51	7acc5763c2de80ad
+config gemma4 variant 52	66b720d5b7612aa3
+config gemma4 variant 53	da954c8af733cbe5
+config gemma4 variant 54	c191499b06cf2775
+config gemma4 variant 55	c62d5445962d0c05
+config gemma4 variant 56	9d5357b6490cc75d
+config gemma4 variant 57	7749c5da61973151
+config gemma4 variant 58	ef4fa4fc4d47fff5
+config gemma4 variant 59	d83efbae2864c756
+config glm4	c57650cd27e8dc7
+config glm4 variant 1	c57650cd27e8dc7
+config glm4 variant 2	c57650cd27e8dc7
+config glm4 variant 3	c57650cd27e8dc7
+config glm4 variant 4	48dba207a42c437
+config glm4 variant 5	4550d4e15b1091f1
+config glm4 variant 6	c57650cd27e8dc7
+config glm4 variant 7	d37863856856d63a
+config glm4_moe	77095ca36afe0062
+config glm4_moe variant 1	a7f052d3726c3194
+config glm4_moe variant 2	a7f052d3726c3194
+config glm4_moe variant 3	77095ca36afe0062
+config glm4_moe variant 4	77095ca36afe0062
+config glm4_moe variant 5	d791e8769671136
+config glm4_moe variant 6	a9356598e44a4b60
+config glm4_moe variant 7	77095ca36afe0062
+config glm4_moe variant 8	9ee6d880ccddf27e
+config glm4_moe variant 9	77095ca36afe0062
+config glm4_moe variant 10	3401dd13012aaf1
+config glm4_moe variant 11	3401dd13012aaf1
+config glm4_moe_lite	13d872661c468b24
+config glm4_moe_lite variant 1	ec7f4d900ed19aef
+config glm4_moe_lite variant 2	13d872661c468b24
+config glm4_moe_lite variant 3	13d872661c468b24
+config glm4_moe_lite variant 4	13d872661c468b24
+config glm4_moe_lite variant 5	13d872661c468b24
+config glm4_moe_lite variant 6	e80db62b321f0ee2
+config glm4_moe_lite variant 7	13d872661c468b24
+config glm4_moe_lite variant 8	81d3676d136109bb
+config glm4_moe_lite variant 9	b99ff563a4609b14
+config glm4_moe_lite variant 10	ff17c94ffe6bc650
+config glm4_moe_lite variant 11	129a19ba142ec50f
+config glm4_moe_lite variant 12	129a19ba142ec50f
+config glm4_moe_lite variant 13	13d872661c468b24
+config glm4_moe_lite variant 14	b99ff563a4609b14
+config glm4_moe_lite variant 15	13d872661c468b24
+config glm4_moe_lite variant 16	e143995e51be5b25
+config glm4_moe_lite variant 17	b99ff563a4609b14
+config glm4_moe_lite variant 18	b99ff563a4609b14
+config glm4_moe_lite variant 19	b99ff563a4609b14
+config glm4_moe_lite variant 20	b99ff563a4609b14
+config glm4_moe_lite variant 21	91a6fc0176ff836
+config glm4_moe_lite variant 22	ce200e65c306f82c
+config glm4_moe_lite variant 23	a8708bc8a8df2151
+config glm4_moe_lite variant 24	b99ff563a4609b14
+config glm4_moe_lite variant 25	247e9446c3a5e51a
+config glm4_moe_lite variant 26	247e9446c3a5e51a
+config glm5_next	2970456be510f14f
+config glm5_next variant 1	69a640c0c70c2ef7
+config glm5_next variant 2	2970456be510f14f
+config glm5_next variant 3	68728b5ab679e747
+config glm5_next variant 4	ad5d0bd1a6f315b
+config glm5_next variant 5	69a640c0c70c2ef7
+config glm5_next variant 6	92798ed976e66d50
+config glm5_next variant 7	2970456be510f14f
+config glm5_next variant 8	e374c6d39f1ea126
+config glm5_next variant 9	f189b1cb19c85b5a
+config glm5_next variant 10	69a640c0c70c2ef7
+config glm5_next variant 11	2970456be510f14f
+config glm5_next variant 12	69a640c0c70c2ef7
+config glm5_next variant 13	69a640c0c70c2ef7
+config glm5_next variant 14	69a640c0c70c2ef7
+config glm5_next variant 15	bbd582dc50411dbc
+config glm5_next variant 16	2970456be510f14f
+config glm5_next variant 17	64e659d55cff9ff
+config glm5_next variant 18	b99ff563a4609b14
+config glm5_next variant 19	2970456be510f14f
+config glm5_next variant 20	b99ff563a4609b14
+config glm5_next variant 21	b99ff563a4609b14
+config glm5_next variant 22	b99ff563a4609b14
+config glm5_next variant 23	b99ff563a4609b14
+config glm5_next variant 24	b99ff563a4609b14
+config glm5_next variant 25	b99ff563a4609b14
+config glm5_next variant 26	acd945751bc9d088
+config glm5_next variant 27	e143995e51be5b25
+config glm5_next variant 28	b99ff563a4609b14
+config glm5_next variant 29	b99ff563a4609b14
+config glm5_next variant 30	b99ff563a4609b14
+config glm5_next variant 31	5c490fdb7af700b2
+config glm5_next variant 32	2970456be510f14f
+config glm5_next variant 33	2970456be510f14f
+config glm5_next variant 34	f8efe674ac87c71a
+config glm5_next variant 35	ebe5ea2be57806c7
+config glm5_next variant 36	b99ff563a4609b14
+config glm5_next variant 37	369e2681c50bbe06
+config glm5_next variant 38	2970456be510f14f
+config glm5_next variant 39	2970456be510f14f
+config glm5_next variant 40	bba84d6ae2ca281d
+config glm5_next variant 41	bba84d6ae2ca281d
+config glm5_next variant 42	2970456be510f14f
+config glm5_next variant 43	bba84d6ae2ca281d
+config glm5_next variant 44	c4f56e35742f4274
+config glm5_next variant 45	98f1abd2bb36dcce
+config glm5_next variant 46	e143995e51be5b25
+config glm5_next variant 47	5a6f645f067c40f8
+config glm5_next variant 48	b99ff563a4609b14
+config glm5_next variant 49	8d32b81a5055786d
+config glm5_next variant 50	b54445447c2d20e3
+config glm5_next variant 51	2970456be510f14f
+config glm5_next variant 52	e2f3610998e21c27
+config glm5_next variant 53	2970456be510f14f
+config glm5_next variant 54	d46d441f410ecbcb
+config glm5_next variant 55	951358dc6e2a6b6d
+config glm5_next variant 56	b99ff563a4609b14
+config glm5_next variant 57	a7ce86aba034465b
+config glm5_next variant 58	75a904375e823b07
+config glm5_next variant 59	689577a6518d8c90
+config glm5_next variant 60	9a79f05496110730
+config glm5_next variant 61	e143995e51be5b25
+config glm5_next variant 62	e143995e51be5b25
+config glm5_next variant 63	2970456be510f14f
+config glm_moe_dsa	eed5615c4b356af0
+config glm_moe_dsa variant 1	aff74339a29c03c6
+config glm_moe_dsa variant 2	eed5615c4b356af0
+config glm_moe_dsa variant 3	eed5615c4b356af0
+config glm_moe_dsa variant 4	eed5615c4b356af0
+config glm_moe_dsa variant 5	eed5615c4b356af0
+config glm_moe_dsa variant 6	eed5615c4b356af0
+config glm_moe_dsa variant 7	61a82ef5316c5e9b
+config glm_moe_dsa variant 8	eed5615c4b356af0
+config glm_moe_dsa variant 9	93a39f6edb8c8d53
+config gpt2	7258b355b70d3a22
+config gpt_bigcode	6a249d7913e716a0
+config gpt_bigcode variant 1	340ada4c4df1c400
+config gpt_bigcode variant 2	6a249d7913e716a0
+config gpt_bigcode variant 3	340ada4c4df1c400
+config gpt_bigcode variant 4	6a249d7913e716a0
+config gpt_neo	32791b040a928b66
+config gpt_neo variant 1	2ea468fcbb03769d
+config gpt_neo variant 2	caafee412759dec9
+config gpt_neo variant 3	32791b040a928b66
+config gpt_neo variant 4	94b0e4cb9ef4c75f
+config gpt_neo variant 5	5719e0e0232055c9
+config gpt_neo variant 6	32791b040a928b66
+config gpt_neo variant 7	32791b040a928b66
+config gpt_neo variant 8	32791b040a928b66
+config gpt_neo variant 9	317c628b63301901
+config gpt_neo variant 10	32791b040a928b66
+config gpt_neo variant 11	32791b040a928b66
+config gpt_neo variant 12	317c628b63301901
+config gpt_neo variant 13	317c628b63301901
+config gpt_neo variant 14	317c628b63301901
+config gpt_neo variant 15	bf8d64d4c167daa2
+config gpt_neo variant 16	32791b040a928b66
+config gpt_neo variant 17	32791b040a928b66
+config gpt_neo variant 18	32791b040a928b66
+config gpt_neo variant 19	32791b040a928b66
+config gpt_neo variant 20	317c628b63301901
+config gpt_neo variant 21	32791b040a928b66
+config gpt_neo variant 22	bf8d64d4c167daa2
+config gpt_neo variant 23	5719e0e0232055c9
+config gpt_neo variant 24	32791b040a928b66
+config gpt_neo variant 25	317c628b63301901
+config gpt_neox	640e2eb8e59b5ed5
+config gpt_neox variant 1	640e2eb8e59b5ed5
+config gpt_neox variant 2	fc803e2072300c2e
+config gpt_neox variant 3	640e2eb8e59b5ed5
+config gpt_neox variant 4	640e2eb8e59b5ed5
+config gpt_neox variant 5	640e2eb8e59b5ed5
+config gpt_oss	d98499da1ad91113
+config gpt_oss variant 1	ab9f1520ca73dd
+config gpt_oss variant 2	d98499da1ad91113
+config gpt_oss variant 3	d4c717efc870232
+config gpt_oss variant 4	64e2a6a1e97d4e17
+config gpt_oss variant 5	d98499da1ad91113
+config gpt_oss variant 6	306308de16d702b
+config gpt_oss variant 7	4c575ab17d4cd570
+config gpt_oss variant 8	92c203b7f31cfaa7
+config gpt_oss variant 9	274ad2beb292b570
+config gpt_oss_mxfp4	dc9f22de7e619bfe
+config gpt_oss_mxfp4 variant 1	dc9f22de7e619bfe
+config gpt_oss_mxfp4 variant 2	36eed63d5b42aedc
+config gpt_oss_mxfp4 variant 3	b4c54ba9688fa065
+config gptj	c59ac999ddfc0798
+config gptj variant 1	2ec71bd66d5b1513
+config gptj variant 2	2ec71bd66d5b1513
+config gptj variant 3	2ec71bd66d5b1513
+config gptj variant 4	2ec71bd66d5b1513
+config gptj variant 5	4766aa1c7e84876e
+config granite	f73aaaff037fbf13
+config granite variant 1	e87561bf7342c063
+config granite variant 2	c52cd5b2fb2de060
+config granite variant 3	8854e07eee4e8d05
+config granite variant 4	8854e07eee4e8d05
+config granite variant 5	be06a33a19d559a5
+config granite variant 6	8854e07eee4e8d05
+config granite variant 7	e1d01f023347cef3
+config granite variant 8	a2c1e50a88dfdc7b
+config granite variant 9	1b2ef476ce19a958
+config granite variant 10	1b2ef476ce19a958
+config granite variant 11	c0508c80870ff776
+config granite variant 12	4bc4cb4fe217dc85
+config granite variant 13	1b2ef476ce19a958
+config granite variant 14	661f2363e66fd6d2
+config granite variant 15	d70a8ac822ccd903
+config granite variant 16	6da2d6d1388440ab
+config granite_swa	ae13eebf46b0394c
+config granite_swa variant 1	e0257225a49ef6c2
+config granite_swa variant 2	de4a29b0b12b90e4
+config granite_swa variant 3	ea5471ae50d8584d
+config granite_swa variant 4	ea5471ae50d8584d
+config granite_swa variant 5	22e86aa8f6454b02
+config granite_swa variant 6	ea5471ae50d8584d
+config granite_swa variant 7	ea5471ae50d8584d
+config granite_swa variant 8	feed206e7d8bfe96
+config granite_swa variant 9	94222a0b8b4e985c
+config granite_swa variant 10	196424ef096fc2ef
+config granitemoe	f20ce21d0fff95dc
+config granitemoe variant 1	a5b919ab7e7f3556
+config granitemoe variant 2	9e037a7c78f348f4
+config granitemoe variant 3	ef9a0137911f8354
+config granitemoe variant 4	ef9a0137911f8354
+config granitemoe variant 5	b1712c00472f808d
+config granitemoe variant 6	ef9a0137911f8354
+config granitemoe variant 7	ef9a0137911f8354
+config granitemoe variant 8	cd2578ae5c4e227c
+config granitemoe variant 9	c3981ecc6b1fb0c5
+config granitemoe variant 10	1917d1e872634311
+config granitemoe variant 11	27feb855982f0394
+config granitemoehybrid	2ee16f7a76b28edd
+config granitemoehybrid_attn	de01955bfdb9ad6d
+config granitemoehybrid_attn variant 1	c6c11c639adebe56
+config granitemoehybrid_attn variant 2	c6c11c639adebe56
+config granitemoehybrid_attn variant 3	411c8adb426450bb
+config granitemoehybrid_attn variant 4	96d7de57b711bedb
+config granitemoehybrid_attn variant 5	de01955bfdb9ad6d
+config granitemoehybrid_attn variant 6	46aab192a521139e
+config granitemoehybrid_attn variant 7	2ee16f7a76b28edd
+config granitemoehybrid_attn variant 8	ef09999bbdddac54
+config granitemoehybrid_attn variant 9	695812090a926f5c
+config granitemoehybrid_attn variant 10	299cb1b108540833
+config granitemoehybrid_attn variant 11	299cb1b108540833
+config granitemoehybrid_attn variant 12	32e300e73b052755
+config granitemoehybrid_attn variant 13	7cf0894e28044b98
+config granitemoehybrid_attn variant 14	7cf0894e28044b98
+config granitemoehybrid_attn variant 15	e94c62395530485f
+config granitemoehybrid_attn variant 16	7cf0894e28044b98
+config granitemoehybrid_attn variant 17	5583ee2f170f51ec
+config granitemoehybrid_attn variant 18	7f037ac822eb9723
+config granitemoehybrid_attn variant 19	7f037ac822eb9723
+config granitemoehybrid_attn variant 20	c588e9c9fbd59153
+config granitemoehybrid_attn variant 21	43b0e4c3424975aa
+config granitemoehybrid_attn variant 22	2ee16f7a76b28edd
+config granitemoehybrid_attn variant 23	2ee16f7a76b28edd
+config granitemoehybrid_attn variant 24	2ee16f7a76b28edd
+config granitemoehybrid_attn variant 25	21e3c1ddcf114b38
+config granitemoehybrid_attn variant 26	411c8adb426450bb
+config granitemoehybrid_attn variant 27	5ef936550299d750
+config granitemoehybrid_attn variant 28	b0cb48fd3677f821
+config granitemoehybrid_attn variant 29	2ee16f7a76b28edd
+config granitemoehybrid_attn variant 30	e1cf120f7acd9d7a
+config granitemoehybrid_attn variant 31	ec2a5d90554694ca
+config granitemoehybrid_attn variant 32	2ee16f7a76b28edd
+config granitemoehybrid_attn variant 33	1d74a450078499d1
+config granitemoehybrid_attn variant 34	2ee16f7a76b28edd
+config granitemoehybrid_attn variant 35	b99ff563a4609b14
+config granitemoehybrid_attn variant 36	2ee16f7a76b28edd
+config granitemoehybrid_attn variant 37	b99ff563a4609b14
+config granitemoehybrid_attn variant 38	786ef0509c881b32
+config granitemoehybrid_attn variant 39	2ee16f7a76b28edd
+config granitemoehybrid_attn variant 40	49290cf494913afe
+config granitemoehybrid_attn variant 41	a55ae0dbe4e0137b
+config granitemoehybrid_attn variant 42	2ee16f7a76b28edd
+config granitemoehybrid_attn variant 43	70facf3ca5ca5c57
+config granitemoehybrid_attn variant 44	2ee16f7a76b28edd
+config granitemoehybrid_attn variant 45	1a5c80dbe759de11
+config granitemoehybrid_attn variant 46	2ee16f7a76b28edd
+config granitemoehybrid_attn variant 47	2ee16f7a76b28edd
+config granitemoehybrid_attn variant 48	2ee16f7a76b28edd
+config granitemoehybrid_attn variant 49	78dd3748636cb616
+config granitemoehybrid_attn variant 50	2ee16f7a76b28edd
+config granitemoehybrid_attn variant 51	2ee16f7a76b28edd
+config granitemoehybrid_attn variant 52	2ee16f7a76b28edd
+config granitemoehybrid_attn variant 53	de01955bfdb9ad6d
+config granitemoehybrid_dense	daeb6ff67c69871b
+config granitemoehybrid_dense variant 1	d3892b88a448b18a
+config granitemoehybrid_dense variant 2	ac20bc9ead70d727
+config granitemoehybrid_dense variant 3	daeb6ff67c69871b
+config granitemoehybrid_dense variant 4	97f7d349f3f7c2fc
+config granitemoehybrid_dense variant 5	87edd00a298b556
+config helium	f3c0dbe88a6139fd
+config hunyuan_v1_dense	66dabdd4b220d119
+config hunyuan_v1_dense variant 1	d33d8dca011ae6ba
+config hunyuan_v1_dense variant 2	d33d8dca011ae6ba
+config hunyuan_v1_dense variant 3	7a3fcffb6d6c13d9
+config hunyuan_v1_dense variant 4	8a4fa0711ca225f6
+config hunyuan_v1_dense variant 5	b1b1f0fe3409562f
+config hunyuan_v1_dense variant 6	60606eb3f6322242
+config hunyuan_v1_dense variant 7	66dabdd4b220d119
+config hunyuan_v1_dense variant 8	d33d8dca011ae6ba
+config hunyuan_v1_dense variant 9	66dabdd4b220d119
+config hunyuan_v1_dense variant 10	f1f071b5cf69db0f
+config hunyuan_v1_dense variant 11	f1f071b5cf69db0f
+config hunyuan_v1_dense variant 12	d33d8dca011ae6ba
+config hunyuan_v1_dense variant 13	91b9bd19160946d6
+config hunyuan_v1_dense variant 14	66dabdd4b220d119
+config hunyuan_v1_dense variant 15	291b2fe531f3a00f
+config hunyuan_v1_dense variant 16	a44c20596fb658aa
+config hunyuan_v1_dense variant 17	f1f071b5cf69db0f
+config hunyuan_v1_dense variant 18	d33d8dca011ae6ba
+config hunyuan_v1_moe	e0fba00cb55141a
+config hunyuan_v1_moe variant 1	e143995e51be5b25
+config hunyuan_v1_moe variant 2	e0fba00cb55141a
+config hunyuan_v1_moe variant 3	e143995e51be5b25
+config hunyuan_v1_moe variant 4	a178b36b487b44a0
+config hunyuan_v1_moe variant 5	e0fba00cb55141a
+config hunyuan_v1_moe variant 6	e0fba00cb55141a
+config hunyuan_v1_moe variant 7	e143995e51be5b25
+config hunyuan_v1_moe variant 8	e0fba00cb55141a
+config hunyuan_v1_moe variant 9	2f4b769f6e2298cb
+config hunyuan_v1_moe variant 10	2f4b769f6e2298cb
+config hunyuan_v1_moe variant 11	b99ff563a4609b14
+config hunyuan_v1_moe variant 12	2f4b769f6e2298cb
+config hunyuan_v1_moe variant 13	2f4b769f6e2298cb
+config hunyuan_v1_moe variant 14	2790ac942d815539
+config hunyuan_v1_moe variant 15	84918376286499d2
+config hunyuan_v1_moe variant 16	2790ac942d815539
+config hunyuan_v1_moe variant 17	e143995e51be5b25
+config hunyuan_v1_moe variant 18	cbd780f549fba941
+config hunyuan_v1_moe variant 19	cbd780f549fba941
+config hunyuan_v1_moe variant 20	336242baf6b815e
+config hunyuan_v1_moe variant 21	e719e68dfdbfed8f
+config hunyuan_v1_moe variant 22	a5397c3b9e87883
+config hunyuan_v1_moe variant 23	e4a4c398b34f88db
+config hunyuan_v1_moe variant 24	8a0732d5224b23a0
+config hunyuan_v1_moe variant 25	336242baf6b815e
+config hunyuan_v1_moe variant 26	336242baf6b815e
+config hunyuan_v1_moe variant 27	535a48e3de7c2f50
+config hunyuan_v1_moe variant 28	7f146cc28131c03f
+config hunyuan_v1_moe variant 29	7f146cc28131c03f
+config hunyuan_v1_moe variant 30	336242baf6b815e
+config hunyuan_v1_moe variant 31	7f146cc28131c03f
+config hunyuan_v1_moe variant 32	4c97ebe0301e863f
+config hy_v3	f64be2e10dad2563
+config hy_v3 variant 1	f9f4183eeaba1b88
+config hy_v3 variant 2	355c1bdb34646e
+config hy_v3 variant 3	22c7e3188977c9af
+config hy_v3 variant 4	45ccbb67d7dcf286
+config hy_v3 variant 5	f64be2e10dad2563
+config hy_v3 variant 6	6df87f9a076e35d0
+config internlm2	b125258e31be1105
+config jais2	5a8aa238f540baa0
+config jais2 variant 1	5a8aa238f540baa0
+config jais2 variant 2	5a8aa238f540baa0
+config jais2 variant 3	ae537d3324676adb
+config jamba	fff9de51b81fb0c0
+config jamba variant 1	fff9de51b81fb0c0
+config jamba variant 2	b6944167f7396113
+config jamba variant 3	18dd59087d1af208
+config jamba variant 4	fff9de51b81fb0c0
+config jamba variant 5	e31b28c9fa3061a2
+config jamba variant 6	2077f69b2bde8dd5
+config jamba variant 7	b99ff563a4609b14
+config jamba variant 8	fff9de51b81fb0c0
+config jamba variant 9	7f8b055a0e88e593
+config jamba variant 10	de1690a4fa1275ac
+config jamba variant 11	de1690a4fa1275ac
+config jamba variant 12	b99ff563a4609b14
+config jamba variant 13	fff9de51b81fb0c0
+config jamba variant 14	de1690a4fa1275ac
+config jamba variant 15	78efd638d7bb9818
+config jamba variant 16	83dd26f9f306ab73
+config jamba variant 17	dff269daf6e66a93
+config jamba variant 18	83dd26f9f306ab73
+config jamba variant 19	83dd26f9f306ab73
+config jamba variant 20	fbcc144e2d75cdf7
+config jamba variant 21	83dd26f9f306ab73
+config jamba variant 22	14056108be160689
+config jamba variant 23	dff269daf6e66a93
+config jamba variant 24	fff9de51b81fb0c0
+config jamba variant 25	5fb5f89cd5f0a99a
+config jamba variant 26	fbcc144e2d75cdf7
+config jamba variant 27	c9b29292525a804a
+config jamba variant 28	c9b29292525a804a
+config jamba variant 29	c9b29292525a804a
+config jamba variant 30	fc3293ce26a5300d
+config jamba variant 31	e4b6939412edb38a
+config jamba variant 32	fff9de51b81fb0c0
+config jamba variant 33	e4b6939412edb38a
+config jamba variant 34	c21d862f42e6cb8f
+config jamba variant 35	c21d862f42e6cb8f
+config jamba variant 36	13529988003659a
+config jamba variant 37	3da2ab602c4fa55c
+config jamba variant 38	e519e0716f4e5af
+config jamba variant 39	901770e3d0a36d13
+config jamba variant 40	fff9de51b81fb0c0
+config jamba variant 41	50266a4d2d52ef8e
+config kimi_k25	67c171d233c282c
+config kimi_k25 variant 1	31e73b748c91d066
+config kimi_k25 variant 2	19a5178abb6495bf
+config kimi_k25 variant 3	19a5178abb6495bf
+config kimi_k25 variant 4	b99ff563a4609b14
+config kimi_k25 variant 5	26f76664e6e7124e
+config kimi_k25 variant 6	42213a5c53658b5f
+config kimi_k3	28f9be231e4b0535
+config kimi_k3 variant 1	a7862c69629e971
+config kimi_k3 variant 2	edc13873ef9812cd
+config kimi_k3 variant 3	1a4c881c758d09b7
+config kimi_k3 variant 4	9a39c98e37e1bcd1
+config kimi_k3 variant 5	ee9e3ed9ca3b162
+config kimi_k3 variant 6	931bfedd1e54142c
+config kimi_k3 variant 7	bef91b19f4827be9
+config kimi_k3 variant 8	3f2f5f10764e3755
+config kimi_k3 variant 9	21c3038f510cb870
+config kimi_k3 variant 10	21c3038f510cb870
+config kimi_k3 variant 11	e6596a05354e6d32
+config kimi_k3 variant 12	3dcb4d163a53423e
+config kimi_k3 variant 13	3f483fe4ec2211da
+config kimi_k3 variant 14	b33c9c2c6eb4eef5
+config kimi_k3 variant 15	e143995e51be5b25
+config kimi_k3_mxfp4	115d3584d46ca8f7
+config kimi_k3_mxfp4 variant 1	d5004a2e62f02f9e
+config kimi_k3_mxfp4 variant 2	e4e47aab774036f1
+config kimi_k3_mxfp4 variant 3	cebd0ca37d42949b
+config kimi_linear	eb9bea91abe6bf43
+config kimi_linear variant 1	49d598201f1f67af
+config kimi_linear variant 2	3149e438c587fd8b
+config kimi_linear variant 3	e2a840f6264eab44
+config kimi_linear variant 4	49d598201f1f67af
+config kimi_linear variant 5	3149e438c587fd8b
+config kimi_linear variant 6	3149e438c587fd8b
+config kimi_linear variant 7	fb0f30b33b1b1e5f
+config kimi_linear variant 8	985c36dbc95fbd82
+config kimi_linear variant 9	3149e438c587fd8b
+config kimi_linear variant 10	fb0f30b33b1b1e5f
+config kimi_linear variant 11	eb9bea91abe6bf43
+config kimi_linear variant 12	376b5c0c118f40e7
+config kimi_linear variant 13	ad5f13d2fcfab7a3
+config kimi_linear variant 14	fff93999387bb540
+config kimi_linear variant 15	8460b9ee8ab0ab3a
+config kimi_linear variant 16	eb9bea91abe6bf43
+config kimi_linear variant 17	eb9bea91abe6bf43
+config kimi_linear variant 18	2058efb1678f1fb1
+config kimi_linear variant 19	eb72cd2a5b3580e4
+config kimi_linear variant 20	eb9bea91abe6bf43
+config kimi_linear variant 21	e143995e51be5b25
+config kimi_linear variant 22	e143995e51be5b25
+config kimi_linear variant 23	eb9bea91abe6bf43
+config kimi_linear variant 24	eb9bea91abe6bf43
+config kimi_linear variant 25	9726a8265e25b6ef
+config kimi_linear variant 26	fb0f30b33b1b1e5f
+config kimi_linear variant 27	b99ff563a4609b14
+config kimi_linear variant 28	eb9bea91abe6bf43
+config kimi_linear variant 29	115ae4dbf31385e3
+config kimi_linear variant 30	f4f638b9fd910a4a
+config kimi_linear variant 31	5c66a1ff7590b49b
+config kimi_linear variant 32	1ef3eb0e000a4865
+config kimi_linear variant 33	f4f638b9fd910a4a
+config kimi_linear variant 34	f4f638b9fd910a4a
+config kimi_linear variant 35	6ea5a49deaefd0a6
+config kimi_linear variant 36	60ab3ec6f0e1eea7
+config kimi_linear variant 37	60ab3ec6f0e1eea7
+config kimi_linear variant 38	6ea5a49deaefd0a6
+config kimi_linear variant 39	5e141013d3a62b8a
+config kimi_linear variant 40	5e141013d3a62b8a
+config kimi_linear variant 41	eb9bea91abe6bf43
+config kimi_linear variant 42	eb9bea91abe6bf43
+config kimi_linear variant 43	88aca2c5c6c6abaa
+config kimi_linear variant 44	b99ff563a4609b14
+config kimi_linear variant 45	88aca2c5c6c6abaa
+config kimi_linear variant 46	663be7aca89a1ca8
+config kimi_linear variant 47	663be7aca89a1ca8
+config kimi_linear variant 48	eb9bea91abe6bf43
+config kimi_linear variant 49	64f4c10da4add80b
+config kimi_linear variant 50	eb9bea91abe6bf43
+config kimi_linear variant 51	3c32f60eafa695fb
+config kimi_linear variant 52	133765186309d24e
+config kimi_linear variant 53	1516edd2346bca3f
+config kimi_linear variant 54	eb9bea91abe6bf43
+config kimi_linear variant 55	b45534e83908226f
+config kimi_linear variant 56	17ec258eb298468d
+config kimi_linear variant 57	133765186309d24e
+config kimi_linear variant 58	17ec258eb298468d
+config kimi_linear variant 59	eb9bea91abe6bf43
+config kimi_linear variant 60	eb9bea91abe6bf43
+config kimi_linear variant 61	3061f2005574c9d7
+config kimi_linear variant 62	f7e45e7b71ef67fd
+config kimi_linear variant 63	304fa92fcec060aa
+config kimi_linear_hf	3088ce820cd6a785
+config kimi_linear_hf variant 1	9a5b809e3f072d97
+config kimi_linear_hf variant 2	6f827fe2281e66ae
+config kimi_linear_hf variant 3	695663f2e2c9b0b
+config kimi_linear_hf variant 4	a743daa82ec32dad
+config kimi_linear_hf variant 5	35764cf173b503a3
+config kimi_linear_hf variant 6	31086c9a93661b7d
+config kimi_linear_hf variant 7	3088ce820cd6a785
+config kimi_linear_hf variant 8	e6fa40dffe51cf6a
+config kimi_linear_hf variant 9	eb4c4136163e97db
+config kimi_linear_hf variant 10	3088ce820cd6a785
+config kimi_linear_hf variant 11	92cd9f88434c9e47
+config kimi_linear_hf variant 12	9df95c7cfc0a96a4
+config kimi_linear_hf variant 13	b99ff563a4609b14
+config kimi_linear_hf variant 14	3088ce820cd6a785
+config kimi_linear_hf variant 15	d319718ca9e85360
+config kimi_linear_hf variant 16	3088ce820cd6a785
+config kimi_linear_hf variant 17	3088ce820cd6a785
+config kimi_linear_hf variant 18	d802e84a7e7882c4
+config kimi_linear_hf variant 19	21ff0a77acf60055
+config laguna	4abab8ac48c034fc
+config laguna variant 1	21d340b139af7da8
+config laguna variant 2	b99ff563a4609b14
+config laguna variant 3	4abab8ac48c034fc
+config laguna variant 4	b99ff563a4609b14
+config laguna variant 5	b99ff563a4609b14
+config laguna variant 6	b99ff563a4609b14
+config laguna variant 7	abbb3f330453c01
+config laguna variant 8	21d340b139af7da8
+config laguna variant 9	21d340b139af7da8
+config laguna variant 10	21d340b139af7da8
+config laguna variant 11	21d340b139af7da8
+config laguna variant 12	b99ff563a4609b14
+config laguna variant 13	bb43a99a23e36a9e
+config laguna variant 14	8d521f8b70b91ce5
+config laguna variant 15	8d521f8b70b91ce5
+config laguna variant 16	8d521f8b70b91ce5
+config laguna variant 17	8d521f8b70b91ce5
+config laguna variant 18	8907633ed514463b
+config laguna variant 19	78fab9035178ca70
+config laguna variant 20	78fab9035178ca70
+config laguna variant 21	4abab8ac48c034fc
+config lfm2	1e45cd4f030b3a25
+config lfm2 variant 1	1e45cd4f030b3a25
+config lfm2 variant 2	b479d1dfc8e0afc3
+config lfm2 variant 3	87ecb4334cef36dd
+config lfm2 variant 4	cf43eee6e0c8fabb
+config lfm2 variant 5	87ecb4334cef36dd
+config lfm2 variant 6	cf43eee6e0c8fabb
+config lfm2 variant 7	87ecb4334cef36dd
+config lfm2 variant 8	1e45cd4f030b3a25
+config lfm2 variant 9	1e45cd4f030b3a25
+config lfm2 variant 10	b1fb2fa18d450bf9
+config lfm2 variant 11	b99ff563a4609b14
+config lfm2 variant 12	1e45cd4f030b3a25
+config lfm2 variant 13	d6bcb8325581c803
+config lfm2 variant 14	1e45cd4f030b3a25
+config lfm2 variant 15	1e45cd4f030b3a25
+config lfm2 variant 16	1e45cd4f030b3a25
+config lfm2 variant 17	a09f0f92020082aa
+config lfm2 variant 18	a09f0f92020082aa
+config lfm2 variant 19	67622cda842c0438
+config lfm2 variant 20	1e45cd4f030b3a25
+config lfm2 variant 21	67622cda842c0438
+config lfm2 variant 22	ac65bbfc371ae1b9
+config lfm2 variant 23	1e45cd4f030b3a25
+config lfm2 variant 24	3f1b52652d164a6
+config lfm2 variant 25	87700bdf9125fbc1
+config lfm2 variant 26	36e4db5532b7e4f
+config lfm2 variant 27	1c1f5b17dcb97500
+config llama	e2f6cfac0c97bdf
+config llama4	1632cd8497d0def4
+config llama4 variant 1	71292c8c170de8e9
+config llama4 variant 2	1632cd8497d0def4
+config llama4 variant 3	1fd0fffe07eb611f
+config llama4 variant 4	1fd0fffe07eb611f
+config llama4 variant 5	71292c8c170de8e9
+config llama4 variant 6	71292c8c170de8e9
+config llama4 variant 7	71292c8c170de8e9
+config llama4 variant 8	71292c8c170de8e9
+config llama4 variant 9	71292c8c170de8e9
+config llama4 variant 10	c181d77992bede45
+config llama4 variant 11	c181d77992bede45
+config llama4 variant 12	1632cd8497d0def4
+config llama4 variant 13	f1310380c6e2dd80
+config llama4 variant 14	f1310380c6e2dd80
+config llama4 variant 15	f5bf18e8c185c8d1
+config llama4 variant 16	af4ec91602a1933f
+config llama4 variant 17	1632cd8497d0def4
+config llama4 variant 18	d26ee0abc23a5f4e
+config llama4 variant 19	65e9c1a49f09b2d3
+config llama4 variant 20	2294f101da05838f
+config llama4 variant 21	1632cd8497d0def4
+config llama4 variant 22	1bab1add125837fd
+config llama4 variant 23	8ea1f7978b525da9
+config mamba2	2979a23c1dfa2b14
+config mellum	f09d2426342e7a57
+config mellum variant 1	ef80c4ae48b4416d
+config mellum variant 2	f09d2426342e7a57
+config mellum variant 3	ef80c4ae48b4416d
+config mellum variant 4	f09d2426342e7a57
+config mimo_v2	2be3f10f2616bb6e
+config mimo_v2 variant 1	2be3f10f2616bb6e
+config mimo_v2 variant 2	8abf01ed69fb2846
+config mimo_v2 variant 3	2be3f10f2616bb6e
+config mimo_v2 variant 4	8abf01ed69fb2846
+config mimo_v2 variant 5	2be3f10f2616bb6e
+config mimo_v2 variant 6	2be3f10f2616bb6e
+config mimo_v2 variant 7	2be3f10f2616bb6e
+config mimo_v2 variant 8	e143995e51be5b25
+config mimo_v2 variant 9	2be3f10f2616bb6e
+config mimo_v2 variant 10	2be3f10f2616bb6e
+config mimo_v2 variant 11	2be3f10f2616bb6e
+config mimo_v2 variant 12	e143995e51be5b25
+config mimo_v2 variant 13	e143995e51be5b25
+config mimo_v2 variant 14	2be3f10f2616bb6e
+config mimo_v2 variant 15	2be3f10f2616bb6e
+config mimo_v2 variant 16	e003410acc1f3375
+config mimo_v2 variant 17	b99ff563a4609b14
+config mimo_v2 variant 18	b99ff563a4609b14
+config mimo_v2 variant 19	b99ff563a4609b14
+config mimo_v2 variant 20	b99ff563a4609b14
+config mimo_v2 variant 21	b99ff563a4609b14
+config mimo_v2 variant 22	3fd28f0b442cadd7
+config mimo_v2 variant 23	b1afab351116086
+config mimo_v2 variant 24	b1afab351116086
+config mimo_v2 variant 25	e4bc18741ca50e52
+config mimo_v2 variant 26	2f8f339ae0ecb4f5
+config mimo_v2 variant 27	e4bc18741ca50e52
+config mimo_v2 variant 28	e4bc18741ca50e52
+config mimo_v2 variant 29	2be3f10f2616bb6e
+config mimo_v2 variant 30	ae88e6db8e356841
+config mimo_v2 variant 31	f39b0533e9c714f5
+config mimo_v2 variant 32	39a0f10a2ad8674b
+config mimo_v2 variant 33	6db77a348fc2cd0c
+config mimo_v2 variant 34	6db77a348fc2cd0c
+config mimo_v2 variant 35	2be3f10f2616bb6e
+config mimo_v2 variant 36	2be3f10f2616bb6e
+config mimo_v2 variant 37	6b149024db507013
+config mimo_v2 variant 38	da7799d35d545452
+config mimo_v2 variant 39	6b149024db507013
+config mimo_v2 variant 40	b99ff563a4609b14
+config mimo_v2 variant 41	2be3f10f2616bb6e
+config mimo_v2 variant 42	b99ff563a4609b14
+config mimo_v2 variant 43	b99ff563a4609b14
+config mimo_v2 variant 44	4c250f2d10d3e2ee
+config mimo_v2 variant 45	e143995e51be5b25
+config mimo_v2 variant 46	11d757c0d51886ab
+config mimo_v2 variant 47	11d757c0d51886ab
+config mimo_v2 variant 48	e143995e51be5b25
+config mimo_v2 variant 49	b99ff563a4609b14
+config mimo_v2 variant 50	e143995e51be5b25
+config mimo_v2 variant 51	2be3f10f2616bb6e
+config mimo_v2 variant 52	e143995e51be5b25
+config mimo_v2 variant 53	e143995e51be5b25
+config mimo_v2 variant 54	b64a43108dd76dea
+config mimo_v2 variant 55	b64a43108dd76dea
+config mimo_v2 variant 56	ac66f511aeb365d4
+config mimo_v2 variant 57	fd80285a71f6f669
+config mimo_v2 variant 58	b64a43108dd76dea
+config mimo_v2 variant 59	84c2070371a27a38
+config mimo_v2 variant 60	30d36ddb58b1bb55
+config mimo_v2 variant 61	84c2070371a27a38
+config mimo_v2 variant 62	b99ff563a4609b14
+config mimo_v2 variant 63	b99ff563a4609b14
+config mimo_v2 variant 64	e27dae388ee44ebf
+config mimo_v2 variant 65	84c2070371a27a38
+config mimo_v2 variant 66	ab0f506fd9842c5
+config mimo_v2 variant 67	44181ed224ea598d
+config mimo_v2 variant 68	939926c47fbbb391
+config mimo_v2 variant 69	ab0f506fd9842c5
+config mimo_v2 variant 70	93c0d26e4bc095a8
+config mimo_v2 variant 71	54e9a3cb72e8e821
+config mimo_v2 variant 72	a294343d6088fd22
+config mimo_v2 variant 73	93c0d26e4bc095a8
+config mimo_v2 variant 74	e143995e51be5b25
+config mimo_v2 variant 75	2be3f10f2616bb6e
+config mimo_v2 variant 76	ab0f506fd9842c5
+config mimo_v2 variant 77	2be3f10f2616bb6e
+config mimo_v2 variant 78	ab0f506fd9842c5
+config mimo_v2 variant 79	6a23f40b5b199577
+config mimo_v2 variant 80	2be3f10f2616bb6e
+config mimo_v2 variant 81	916a683a5cae1fd8
+config mimo_v2 variant 82	7ef0e97cd1cf0d7d
+config mimo_v2 variant 83	90290d0798fe5cc2
+config mimo_v2 variant 84	69628b165865e72b
+config mimo_v2 variant 85	922ef3d1220971aa
+config mimo_v2 variant 86	922ef3d1220971aa
+config mimo_v2 variant 87	9804f2b14fa64372
+config mimo_v2 variant 88	e143995e51be5b25
+config mimo_v2 variant 89	e143995e51be5b25
+config mimo_v2 variant 90	c5b648d2f319e52f
+config mimo_v2 variant 91	e5508249dd850a71
+config mimo_v2 variant 92	db4e1593bdefb440
+config mimo_v2 variant 93	64640798d676c0a
+config mimo_v2 variant 94	2be3f10f2616bb6e
+config mimo_v2 variant 95	2be3f10f2616bb6e
+config mimo_v2 variant 96	bcbeabc2acf0e996
+config mimo_v2 variant 97	eb3e9b7508895190
+config mimo_v2 variant 98	b99ff563a4609b14
+config mimo_v2 variant 99	2be3f10f2616bb6e
+config mimo_v2 variant 100	a65d2dea416e91c
+config mimo_v2 variant 101	a65d2dea416e91c
+config mimo_v2 variant 102	7c15a812ac00cb90
+config mimo_v2 variant 103	2be3f10f2616bb6e
+config mimo_v2 variant 104	2fbd68680242844c
+config mimo_v2 variant 105	480955681e99906c
+config mimo_v2 variant 106	2be3f10f2616bb6e
+config mimo_v2 variant 107	42c85e438bc94391
+config mimo_v2 variant 108	2be3f10f2616bb6e
+config mimo_v2 variant 109	a76fa9e466224772
+config mimo_v2 variant 110	6592215319e8467e
+config mimo_v2 variant 111	b99ff563a4609b14
+config mimo_v2 variant 112	b99ff563a4609b14
+config mimo_v2 variant 113	9cc773aced6c0ae4
+config mimo_v2 variant 114	2be3f10f2616bb6e
+config mimo_v2 variant 115	2be3f10f2616bb6e
+config mimo_v2 variant 116	2be3f10f2616bb6e
+config mimo_v2 variant 117	2be3f10f2616bb6e
+config mimo_v2 variant 118	6373d0d2abab1c09
+config mimo_v2 variant 119	b99ff563a4609b14
+config mimo_v2 variant 120	b99ff563a4609b14
+config mimo_v2 variant 121	b99ff563a4609b14
+config mimo_v2 variant 122	b99ff563a4609b14
+config mimo_v2 variant 123	b99ff563a4609b14
+config mimo_v2 variant 124	b99ff563a4609b14
+config mimo_v2 variant 125	d9736988298f580
+config mimo_v2 variant 126	f3aaa45f0d28d3a7
+config mimo_v2 variant 127	2763d620f7b531ad
+config mimo_v2 variant 128	483d1bfee7287c96
+config mimo_v2 variant 129	b5591919a3997bef
+config mimo_v2_flash	3af57ca60c1bc63c
+config mimo_v2_flash variant 1	3af57ca60c1bc63c
+config mimo_v2_flash variant 2	67dfa1649a855fac
+config mimo_v2_flash variant 3	7971deeaa7ae4cd6
+config mimo_v2_flash variant 4	1dc0074061167f14
+config mimo_v2_flash variant 5	f200f5617f81058b
+config mimo_v2_flash variant 6	3af57ca60c1bc63c
+config mimo_v2_flash variant 7	e143995e51be5b25
+config mimo_v2_flash variant 8	8b8e7943c37e9f81
+config mimo_v2_flash variant 9	cf542a456993dcdb
+config mimo_v2_flash variant 10	3b8638e1f6bed755
+config mimo_v2_flash variant 11	3b2c6ee1a71f5799
+config mimo_v2_flash variant 12	e143995e51be5b25
+config mimo_v2_flash variant 13	207e6c4886d6783
+config mimo_v2_flash variant 14	3af57ca60c1bc63c
+config mimo_v2_flash variant 15	e143995e51be5b25
+config mimo_v2_flash variant 16	1dc0074061167f14
+config mimo_v2_flash variant 17	3af57ca60c1bc63c
+config mimo_v2_flash variant 18	a33e8ade5ebd436d
+config mimo_v2_flash variant 19	141fcce00870f226
+config mimo_v2_flash variant 20	cdcec0b37c42040e
+config mimo_v2_flash variant 21	5d4266bb653cdb3a
+config mimo_v2_flash variant 22	3af57ca60c1bc63c
+config mimo_v2_flash variant 23	453651555cde9d3d
+config mimo_v2_flash variant 24	d6e94713efb72b20
+config mimo_v2_flash variant 25	987b37481ee83396
+config mimo_v2_flash variant 26	3af57ca60c1bc63c
+config mimo_v2_flash variant 27	64a1f8687a3b0644
+config mimo_v2_flash variant 28	2f919ead30dccea4
+config mimo_v2_flash variant 29	b99ff563a4609b14
+config mimo_v2_flash variant 30	245313233ce55bba
+config mimo_v2_flash variant 31	b99ff563a4609b14
+config mimo_v2_flash variant 32	750df5a86d507cbe
+config mimo_v2_flash variant 33	5946cf3db36b189a
+config mimo_v2_flash variant 34	d7b6284a6d9a3384
+config mimo_v2_flash variant 35	e143995e51be5b25
+config mimo_v2_flash variant 36	3af57ca60c1bc63c
+config mimo_v2_flash variant 37	b6d2f9c31c108c76
+config mimo_v2_flash variant 38	5fc1d80d8a6936b4
+config mimo_v2_flash variant 39	b99ff563a4609b14
+config mimo_v2_flash variant 40	5c5a31d089473fa9
+config mimo_v2_flash variant 41	8c6f1ffcdf1eecb1
+config mimo_v2_flash variant 42	4773dbdec256e59f
+config mimo_v2_flash variant 43	133318b7fa13a8c1
+config mimo_v2_fp8	ed9300d305ef1813
+config mimo_v2_fp8 variant 1	936380ca1f80b44e
+config mimo_v2_fp8 variant 2	868a17536cf37174
+config mimo_v2_fp8 variant 3	ed9300d305ef1813
+config mimo_v2_fp8 variant 4	e143995e51be5b25
+config mimo_v2_mxfp4	27da7792c72c59b6
+config mimo_v2_mxfp4 variant 1	42ec32ba45690708
+config mimo_v2_mxfp4 variant 2	25192687c4159d02
+config mimo_v2_mxfp4 variant 3	e143995e51be5b25
+config mimo_v2_mxfp4 variant 4	27da7792c72c59b6
+config mimo_v2_mxfp4 variant 5	27da7792c72c59b6
+config mimo_v2_mxfp4 variant 6	e143995e51be5b25
+config mimo_v2_mxfp4 variant 7	27da7792c72c59b6
+config mimo_v2_mxfp4 variant 8	e143995e51be5b25
+config mimo_v2_mxfp4 variant 9	3d885353a3037026
+config mimo_v2_split_fp8	fcfa6585e95f9f01
+config mimo_v2_split_fp8 variant 1	a463852149353433
+config mimo_v2_split_fp8 variant 2	e2dc26ea7e8e94d5
+config mimo_v2_split_fp8 variant 3	fcfa6585e95f9f01
+config minicpm	d4bc83cbdeefee4e
+config minicpm variant 1	6c4def7c33f50b86
+config minicpm variant 2	adadab5eeefa8938
+config minicpm variant 3	1d520349d2632666
+config minicpm variant 4	41366cdcad17990e
+config minicpm variant 5	75a6941755e42b80
+config minicpm variant 6	2c62391cfee801a8
+config minicpm variant 7	7328ca838b5d6623
+config minicpm variant 8	6dea6e0e6ad699cc
+config minicpm variant 9	d4bc83cbdeefee4e
+config minicpm variant 10	d4bc83cbdeefee4e
+config minicpm variant 11	97d8839000b27d53
+config minicpm variant 12	9a9a364586124d0a
+config minicpm variant 13	e143995e51be5b25
+config minimax	e301e8b04c2384ba
+config minimax variant 1	e301e8b04c2384ba
+config minimax variant 2	7a772d5423746f14
+config minimax variant 3	eed0ac52a583d110
+config minimax variant 4	e301e8b04c2384ba
+config minimax variant 5	7cea93ed5ed0fe1
+config minimax variant 6	eed0ac52a583d110
+config minimax variant 7	eed0ac52a583d110
+config minimax variant 8	eed0ac52a583d110
+config minimax variant 9	eed0ac52a583d110
+config minimax variant 10	eed0ac52a583d110
+config minimax variant 11	eed0ac52a583d110
+config minimax variant 12	eed0ac52a583d110
+config minimax variant 13	e301e8b04c2384ba
+config minimax variant 14	279094dcd4e968f2
+config minimax variant 15	4812bfcad84e2844
+config minimax variant 16	e301e8b04c2384ba
+config minimax variant 17	76fca0f88b26b13c
+config minimax variant 18	be827f4ece648e5f
+config minimax variant 19	e301e8b04c2384ba
+config minimax variant 20	e301e8b04c2384ba
+config minimax variant 21	c3d35fa7a2b35e1e
+config minimax variant 22	e143995e51be5b25
+config minimax variant 23	1fd72e36d99f50ac
+config minimax variant 24	75f7f5fbb5abbf63
+config minimax variant 25	e143995e51be5b25
+config minimax variant 26	e143995e51be5b25
+config minimax variant 27	e143995e51be5b25
+config minimax variant 28	e301e8b04c2384ba
+config minimax variant 29	74564f88e52036e2
+config minimax variant 30	5483ef862b8abbe
+config minimax variant 31	5483ef862b8abbe
+config minimax variant 32	211d0d53167c3b04
+config minimax_m2	c21b606157f477fd
+config minimax_m2 variant 1	98f9dbf6b43b9a5c
+config minimax_m2 variant 2	c6cfbb7aced658e0
+config minimax_m2 variant 3	98f9dbf6b43b9a5c
+config minimax_m2 variant 4	98f9dbf6b43b9a5c
+config minimax_m2 variant 5	3db4dd77576cc148
+config minimax_m2 variant 6	c21b606157f477fd
+config minimax_m2 variant 7	c21b606157f477fd
+config minimax_m2 variant 8	2645a8c0285bf7b5
+config minimax_m2 variant 9	aa0b5cc03043aca2
+config minimax_m2 variant 10	aa0b5cc03043aca2
+config minimax_m3	9c1f4309ea3cab16
+config minimax_m3 variant 1	9c1f4309ea3cab16
+config minimax_m3 variant 2	4ff82186f17638d7
+config minimax_m3 variant 3	9c1f4309ea3cab16
+config minimax_m3 variant 4	9c1f4309ea3cab16
+config minimax_m3 variant 5	ca02188e261d68b2
+config minimax_m3 variant 6	9c1f4309ea3cab16
+config minimax_m3 variant 7	d648c1a942b4d17e
+config minimax_m3 variant 8	ae013a5e2161009f
+config minimax_m3 variant 9	9c1f4309ea3cab16
+config minimax_m3 variant 10	4fad8d7983394456
+config minimax_m3 variant 11	5083ee22c69a9b75
+config minimax_m3 variant 12	9c1f4309ea3cab16
+config minimax_m3 variant 13	5083ee22c69a9b75
+config minimax_m3 variant 14	d0af14146cb1a80
+config minimax_m3 variant 15	c97ec393e418e84d
+config minimax_m3 variant 16	978b72412c347838
+config minimax_m3 variant 17	e2a6382d1cca6e99
+config minimax_m3 variant 18	febe0126604601d6
+config minimax_m3 variant 19	6551c0380600b52f
+config minimax_m3 variant 20	9c1f4309ea3cab16
+config minimax_m3 variant 21	e14aff42a4e947b0
+config minimax_m3 variant 22	9c1f4309ea3cab16
+config minimax_m3 variant 23	9c1f4309ea3cab16
+config minimax_m3 variant 24	6551c0380600b52f
+config minimax_m3 variant 25	6551c0380600b52f
+config minimax_m3 variant 26	e14aff42a4e947b0
+config minimax_m3 variant 27	9c1f4309ea3cab16
+config minimax_m3 variant 28	9c1f4309ea3cab16
+config minimax_m3 variant 29	9c1f4309ea3cab16
+config minimax_m3 variant 30	6551c0380600b52f
+config minimax_m3 variant 31	6551c0380600b52f
+config minimax_m3 variant 32	6551c0380600b52f
+config minimax_m3 variant 33	3f6dcfcac6b7822f
+config minimax_m3 variant 34	3f6dcfcac6b7822f
+config minimax_m3 variant 35	9c1f4309ea3cab16
+config minimax_m3 variant 36	9c1f4309ea3cab16
+config minimax_m3 variant 37	9c1f4309ea3cab16
+config minimax_m3 variant 38	9c1f4309ea3cab16
+config minimax_m3 variant 39	9c1f4309ea3cab16
+config minimax_m3 variant 40	9c1f4309ea3cab16
+config minimax_m3 variant 41	9c1f4309ea3cab16
+config minimax_m3 variant 42	9c1f4309ea3cab16
+config minimax_m3_split	9c1f4309ea3cab16
+config minimax_m3_split variant 1	568ab299dc5db8aa
+config minimax_m3_split variant 2	5083ee22c69a9b75
+config minimax_m3_split variant 3	978b72412c347838
+config minimax_m3_split variant 4	d648c1a942b4d17e
+config ministral3	54a34a1804e2a2f3
+config ministral3 variant 1	8ec53f9bc05e7d7c
+config ministral3 variant 2	189a734f8b08acaf
+config ministral3 variant 3	20b7d57962410ab9
+config ministral3 variant 4	ea74ca2c3b62eb7e
+config ministral3 variant 5	54a34a1804e2a2f3
+config ministral3 variant 6	54a34a1804e2a2f3
+config ministral3 variant 7	f29b79e694bb1cb8
+config ministral3 variant 8	8ec53f9bc05e7d7c
+config ministral3 variant 9	271a796d6bfbbd10
+config mistral	e22e96b7d15b05a3
+config mistral4	5ae1df6b401b4e8d
+config mistral4 variant 1	4601b836343ea0b4
+config mistral4 variant 2	5ae1df6b401b4e8d
+config mistral4 variant 3	4601b836343ea0b4
+config mistral4 variant 4	cce3a73d48f5a90f
+config mistral4 variant 5	cce3a73d48f5a90f
+config mistral4 variant 6	b99ff563a4609b14
+config mistral4 variant 7	e3a2eaecb518f483
+config mistral4 variant 8	5ae1df6b401b4e8d
+config mistral4 variant 9	5ae1df6b401b4e8d
+config mistral4 variant 10	8de75cb2f6bfd790
+config mistral4 variant 11	8939d7983a5d72fb
+config mistral4 variant 12	b0403c64a86fa0aa
+config mistral4 variant 13	5ae1df6b401b4e8d
+config mistral4 variant 14	251a1f717b06fdef
+config mistral4 variant 15	cfb599da0875ceaa
+config mistral4 variant 16	f47e713033055d7f
+config mistral4 variant 17	2b1504bad8c6a032
+config mistral4 variant 18	8f0c63650c32994e
+config mistral4 variant 19	e3b43f80a3a1183a
+config mistral4 variant 20	cfb599da0875ceaa
+config mistral4 variant 21	cfb599da0875ceaa
+config mixtral	19a9b3e17299ef97
+config mixtral variant 1	d210c86b318b055
+config mixtral variant 2	19a9b3e17299ef97
+config mixtral variant 3	d210c86b318b055
+config mixtral variant 4	19a9b3e17299ef97
+config mixtral variant 5	19a9b3e17299ef97
+config mpt	6b5f599ef9d92bd7
+config mpt variant 1	d771cac1766b9998
+config mpt variant 2	5578c533f258558e
+config mpt variant 3	b9e4393bf9028659
+config mpt variant 4	f89f149cdb6a6adc
+config mpt variant 5	2872badead405536
+config mpt variant 6	6b5f599ef9d92bd7
+config mpt variant 7	6b5f599ef9d92bd7
+config mpt variant 8	28392bb0414d9029
+config mpt variant 9	5e6ecd57a6b2201f
+config mpt variant 10	7500e6cd4cdeadf1
+config mpt variant 11	6b5f599ef9d92bd7
+config mpt variant 12	6b5f599ef9d92bd7
+config mpt variant 13	28392bb0414d9029
+config mpt variant 14	6b5f599ef9d92bd7
+config mpt variant 15	6b5f599ef9d92bd7
+config mpt variant 16	6b5f599ef9d92bd7
+config mpt variant 17	6b5f599ef9d92bd7
+config mpt variant 18	e143995e51be5b25
+config mpt variant 19	6b5f599ef9d92bd7
+config mpt variant 20	6b5f599ef9d92bd7
+config nanochat	ed1daf2c57bf8fb3
+config nanochat variant 1	ed1daf2c57bf8fb3
+config nanochat variant 2	7ab19f87e9b2496e
+config nanochat variant 3	dedd1c71b94c4261
+config nanochat variant 4	ed1daf2c57bf8fb3
+config nanochat variant 5	7ab19f87e9b2496e
+config nemotron	deffb0af0a56af0e
+config nemotron variant 1	deffb0af0a56af0e
+config nemotron variant 2	deffb0af0a56af0e
+config nemotron variant 3	deffb0af0a56af0e
+config nemotron variant 4	5aab9fdb9d8258d2
+config nemotron variant 5	c11066dccf3cd75d
+config nemotron variant 6	deffb0af0a56af0e
+config nemotron_h	a668a3a0ec6936cd
+config nemotron_h variant 1	cf8cc797df15dfed
+config nemotron_h variant 2	4bc65f70e12c09cc
+config nemotron_h variant 3	b3a42d7168c85d85
+config nemotron_h variant 4	84b14b48f0c14722
+config nemotron_h variant 5	b99ff563a4609b14
+config nemotron_h variant 6	e807728e93c9d247
+config nemotron_h variant 7	a668a3a0ec6936cd
+config nemotron_h variant 8	37057ef1d385fe7
+config nemotron_h variant 9	c9251590e1dd0635
+config nemotron_h variant 10	d32c3480b0943eaa
+config nemotron_h variant 11	c9251590e1dd0635
+config nemotron_h variant 12	ccdfb674aebcb94a
+config nemotron_h variant 13	a668a3a0ec6936cd
+config nemotron_h variant 14	e143995e51be5b25
+config nemotron_h variant 15	a668a3a0ec6936cd
+config nemotron_h variant 16	a668a3a0ec6936cd
+config nemotron_h variant 17	de3c4ac0b0dcca0c
+config nemotron_h variant 18	a668a3a0ec6936cd
+config nemotron_h variant 19	e143995e51be5b25
+config nemotron_h variant 20	a668a3a0ec6936cd
+config nemotron_h variant 21	a668a3a0ec6936cd
+config nemotron_h variant 22	a668a3a0ec6936cd
+config nemotron_h variant 23	54cea591e94e0d0
+config nemotron_h variant 24	10cee2a44558d4c0
+config nemotron_h variant 25	ed5484b7158bfdb3
+config nemotron_h variant 26	b99ff563a4609b14
+config nemotron_h variant 27	b99ff563a4609b14
+config nemotron_h variant 28	e143995e51be5b25
+config nemotron_h variant 29	e143995e51be5b25
+config nemotron_h variant 30	b99ff563a4609b14
+config nemotron_h variant 31	b99ff563a4609b14
+config nemotron_h variant 32	b99ff563a4609b14
+config nemotron_h variant 33	b99ff563a4609b14
+config nemotron_h variant 34	a668a3a0ec6936cd
+config nemotron_h variant 35	160040c220f9ccc5
+config nemotron_h variant 36	10cee2a44558d4c0
+config nemotron_h variant 37	10f507cea53e37d6
+config nemotron_h variant 38	10f507cea53e37d6
+config nemotron_h variant 39	b99ff563a4609b14
+config nemotron_h variant 40	7c1fff7c6dbe5db0
+config nemotron_h variant 41	b99ff563a4609b14
+config nemotron_h variant 42	e143995e51be5b25
+config nemotron_h variant 43	e143995e51be5b25
+config nemotron_h variant 44	a668a3a0ec6936cd
+config nemotron_h variant 45	a668a3a0ec6936cd
+config nemotron_h variant 46	34d6a4bbe14d00ee
+config nemotron_h variant 47	b99ff563a4609b14
+config nemotron_h variant 48	a668a3a0ec6936cd
+config nemotron_h variant 49	a668a3a0ec6936cd
+config nemotron_h variant 50	bbcf31b4aaef1ce4
+config nemotron_h variant 51	a668a3a0ec6936cd
+config nemotron_h variant 52	a668a3a0ec6936cd
+config nemotron_h variant 53	eaec3b6fb89b210b
+config nemotron_h variant 54	5b3f26b55e083dc9
+config nemotron_h variant 55	2c359707c47418a6
+config nemotron_h variant 56	2979a23c1dfa2b14
+config nemotron_h variant 57	2a13734fb026a1bb
+config nemotron_h variant 58	2a94ea49cc89f99a
+config nemotron_h variant 59	9bc96bb81390e0bb
+config nemotron_h variant 60	2979a23c1dfa2b14
+config nemotron_h variant 61	2979a23c1dfa2b14
+config nemotron_h variant 62	2979a23c1dfa2b14
+config nemotron_h variant 63	2979a23c1dfa2b14
+config nemotron_h variant 64	2979a23c1dfa2b14
+config nemotron_h variant 65	2979a23c1dfa2b14
+config nemotron_h variant 66	5c4d5b192e6e9ee2
+config nemotron_h variant 67	b99ff563a4609b14
+config nemotron_h variant 68	2979a23c1dfa2b14
+config nemotron_h variant 69	2979a23c1dfa2b14
+config nemotron_h variant 70	b99ff563a4609b14
+config nemotron_h variant 71	2979a23c1dfa2b14
+config nemotron_h variant 72	b4412b679ae420b
+config nemotron_h variant 73	b99ff563a4609b14
+config nemotron_h variant 74	bdad77c4bb92f61b
+config nemotron_h variant 75	b99ff563a4609b14
+config nemotron_h variant 76	2979a23c1dfa2b14
+config nemotron_h variant 77	5ccc6d18a4f6fb42
+config nemotron_h variant 78	90ec9e9cd0860733
+config nemotron_h variant 79	b99ff563a4609b14
+config nemotron_h variant 80	a78378f729ef7cac
+config nemotron_h variant 81	2979a23c1dfa2b14
+config nemotron_h variant 82	63864cf6f4e1684c
+config nemotron_h variant 83	f34fb3aee5d4bc8b
+config nemotron_h variant 84	2979a23c1dfa2b14
+config nemotron_h variant 85	4862c5293ef198ee
+config nemotron_h variant 86	2979a23c1dfa2b14
+config olmo	f0576ff03a5dfb48
+config olmo2	fa3b0ad2b42669ef
+config olmoe	83281ea6c7d6f853
+config olmoe variant 1	6abffd9b38484431
+config olmoe variant 2	6abffd9b38484431
+config olmoe variant 3	83281ea6c7d6f853
+config olmoe variant 4	7614b04bd060055
+config opt	4cf4958625e866c6
+config opt variant 1	4cf4958625e866c6
+config opt variant 2	4cf4958625e866c6
+config opt variant 3	4cf4958625e866c6
+config opt variant 4	4cf4958625e866c6
+config opt variant 5	4cf4958625e866c6
+config opt variant 6	4cf4958625e866c6
+config opt variant 7	26e03f038377305
+config opt variant 8	4cf4958625e866c6
+config opt variant 9	e143995e51be5b25
+config opt variant 10	e143995e51be5b25
+config opt variant 11	e143995e51be5b25
+config persimmon	efafa87b328da3c5
+config persimmon variant 1	ddeb6777ce609e2e
+config persimmon variant 2	efafa87b328da3c5
+config persimmon variant 3	efafa87b328da3c5
+config persimmon variant 4	efafa87b328da3c5
+config phi	85a9829bfdb9be81
+config phi variant 1	e7c7f54bec15a34
+config phi variant 2	e7c7f54bec15a34
+config phi variant 3	85a9829bfdb9be81
+config phi variant 4	85a9829bfdb9be81
+config phi3	4115007cc9f7bf96
+config phi3 variant 1	1072aecee3c2abd8
+config phi3 variant 2	530a4706b99dbae3
+config qwen2	7f9188cc12e6d672
+config qwen2 variant 1	7e44079065b4f8e2
+config qwen2 variant 2	7f9188cc12e6d672
+config qwen2 variant 3	401badb17c24a170
+config qwen2 variant 4	9aa7a689a531289
+config qwen2 variant 5	7e44079065b4f8e2
+config qwen2_fp8	9e5f2540a9fe4a5b
+config qwen2_fp8 variant 1	ce66f85bb39b98a
+config qwen2_int4	38fab31bcea21ad3
+config qwen2_int4_actorder	38fab31bcea21ad3
+config qwen2_moe	9ba3fbf47e37efc1
+config qwen3	726736a67ef7ece5
+config qwen3_5	6bb6a1501b535e3e
+config qwen3_5 variant 1	6bb6a1501b535e3e
+config qwen3_5 variant 2	ba7797fcb66a20fc
+config qwen3_5_moe	a158a18c1b82fc65
+config qwen3_5_moe variant 1	a158a18c1b82fc65
+config qwen3_5_moe variant 2	a158a18c1b82fc65
+config qwen3_5_moe variant 3	1140ad53d38a1553
+config qwen3_5_moe variant 4	a158a18c1b82fc65
+config qwen3_5_moe variant 5	a158a18c1b82fc65
+config qwen3_5_moe variant 6	a12f68d0e0e3c4a3
+config qwen3_5_moe variant 7	7eabc64abab94ef3
+config qwen3_5_moe variant 8	34175d9c5acfad74
+config qwen3_5_moe variant 9	a158a18c1b82fc65
+config qwen3_5_moe variant 10	a12f68d0e0e3c4a3
+config qwen3_moe	790701ce80b3c966
+config qwen3_moe_big	71db16ba39337cc6
+config qwen3_moe_fused	790701ce80b3c966
+config qwen3_moe_fused_t	790701ce80b3c966
+config qwen3_next	f2246e37ace50ea2
+config qwen3_next variant 1	7b0ce4bd42c8e102
+config qwen3_next variant 2	7b0ce4bd42c8e102
+config qwen3_next variant 3	8fba6460d79e4c32
+config qwen4_exp	b383af0372f55620
+config qwen4_exp variant 1	f867de825f6e2e
+config qwen4_exp variant 2	f867de825f6e2e
+config qwen4_exp variant 3	f867de825f6e2e
+config qwen4_exp variant 4	e143995e51be5b25
+config qwen4_exp variant 5	f867de825f6e2e
+config qwen4_exp variant 6	b383af0372f55620
+config qwen4_exp variant 7	e143995e51be5b25
+config qwen4_exp variant 8	f867de825f6e2e
+config qwen4_exp variant 9	f867de825f6e2e
+config qwen4_exp variant 10	e0daf3b9beeb0ddd
+config qwen4_exp variant 11	b383af0372f55620
+config qwen4_exp variant 12	e0daf3b9beeb0ddd
+config qwen4_exp variant 13	d075a8e3300b7103
+config qwen4_exp variant 14	e143995e51be5b25
+config qwen4_exp variant 15	dfd60bc85c258147
+config qwen4_exp variant 16	eed4bed998e6cb32
+config qwen4_exp variant 17	dfd60bc85c258147
+config qwen4_exp variant 18	712149f8cc00ef08
+config qwen4_exp variant 19	60b5f08d4428976d
+config qwen4_exp variant 20	b383af0372f55620
+config qwen4_exp variant 21	afb04c350232c382
+config qwen4_exp variant 22	476fe873efc169fb
+config qwen4_exp variant 23	476fe873efc169fb
+config qwen4_exp variant 24	dd884ba28558c19b
+config qwen4_exp variant 25	cedddc8571ea93ed
+config qwen4_exp variant 26	b99ff563a4609b14
+config qwen4_exp variant 27	b99ff563a4609b14
+config qwen4_exp variant 28	dd884ba28558c19b
+config qwen4_exp variant 29	cedddc8571ea93ed
+config qwen4_exp variant 30	1f7a82ff3eb7cfcc
+config qwen4_exp variant 31	b99ff563a4609b14
+config qwen4_exp variant 32	43bc2cb2c5286b68
+config qwen4_exp variant 33	171a833af443956f
+config qwen4_exp variant 34	b99ff563a4609b14
+config qwen4_exp variant 35	b99ff563a4609b14
+config qwen4_exp variant 36	b99ff563a4609b14
+config qwen4_exp variant 37	b99ff563a4609b14
+config qwen4_exp variant 38	a3bca434bca6b1ad
+config qwen4_exp variant 39	e07bffc5e7939d84
+config qwen4_exp variant 40	b99ff563a4609b14
+config qwen4_exp variant 41	b99ff563a4609b14
+config qwen4_exp variant 42	b99ff563a4609b14
+config qwen4_exp variant 43	b383af0372f55620
+config qwen4_exp variant 44	b99ff563a4609b14
+config qwen4_exp variant 45	bfb2162eae24250
+config qwen4_exp variant 46	bfb2162eae24250
+config qwen4_exp variant 47	bfb2162eae24250
+config qwen4_exp variant 48	bfb2162eae24250
+config qwen4_exp variant 49	b383af0372f55620
+config qwen4_exp variant 50	86be35829d2e6535
+config qwen4_exp variant 51	b99ff563a4609b14
+config qwen4_exp variant 52	b99ff563a4609b14
+config qwen4_exp variant 53	e143995e51be5b25
+config qwen4_exp variant 54	b383af0372f55620
+config qwen4_exp variant 55	b99ff563a4609b14
+config qwen4_exp variant 56	b99ff563a4609b14
+config qwen4_exp variant 57	b99ff563a4609b14
+config qwen4_exp variant 58	b383af0372f55620
+config qwen4_exp variant 59	b99ff563a4609b14
+config qwen4_exp variant 60	375420f69720feb7
+config qwen4_exp variant 61	b99ff563a4609b14
+config qwen4_exp variant 62	b99ff563a4609b14
+config qwen4_exp variant 63	b0c99da322b90d0a
+config qwen4_exp variant 64	c13879abb522f7c9
+config qwen4_exp variant 65	b383af0372f55620
+config qwen4_exp variant 66	b99ff563a4609b14
+config qwen4_exp variant 67	b99ff563a4609b14
+config qwen4_exp variant 68	ecd37c6e20d0ec4d
+config qwen4_exp variant 69	b99ff563a4609b14
+config qwen4_exp variant 70	b383af0372f55620
+config qwen4_exp variant 71	b99ff563a4609b14
+config qwen4_exp variant 72	b99ff563a4609b14
+config qwen4_exp variant 73	b99ff563a4609b14
+config qwen4_exp variant 74	b99ff563a4609b14
+config qwen4_exp variant 75	b383af0372f55620
+config qwen4_exp variant 76	b99ff563a4609b14
+config qwen4_exp variant 77	b99ff563a4609b14
+config qwen4_exp variant 78	259b008c19b466ac
+config qwen4_exp variant 79	bfb2162eae24250
+config qwen4_exp variant 80	f6c8e286bf7e579c
+config qwen4_exp variant 81	bb5c1dc5a6a066d7
+config qwen4_exp variant 82	17224e084952a141
+config qwen4_exp variant 83	5262b41e2c232b05
+config qwen4_exp variant 84	59b294917e45590d
+config qwen4_exp variant 85	e121e61fe3a01c6b
+config qwen4_exp variant 86	b383af0372f55620
+config qwen4_exp variant 87	f8c03176ce6a9b3f
+config qwen4_exp variant 88	7c7f33c6e0dfeb4f
+config seed_oss	fc934bca881dc963
+config smollm3	b257ed4d0e188035
+config smollm3 variant 1	b257ed4d0e188035
+config smollm3 variant 2	60f733fa3d114e53
+config smollm3 variant 3	60f733fa3d114e53
+config smollm3 variant 4	a3bbf8fcdbb3d735
+config smollm3 variant 5	60f733fa3d114e53
+config smollm3 variant 6	60f733fa3d114e53
+config smollm3 variant 7	3d860072cd7f25b0
+config smollm3 variant 8	b257ed4d0e188035
+config smollm3 variant 9	b257ed4d0e188035
+config smollm3 variant 10	b257ed4d0e188035
+config smollm3 variant 11	a3bbf8fcdbb3d735
+config smollm3 variant 12	3d860072cd7f25b0
+config smollm3 variant 13	60f733fa3d114e53
+config smollm3 variant 14	a3bbf8fcdbb3d735
+config smollm3 variant 15	60f733fa3d114e53
+config solar_open	9024ba28b423a4f3
+config solar_open variant 1	b99ff563a4609b14
+config solar_open variant 2	990803dec5abd091
+config solar_open variant 3	da871144868e83b1
+config solar_open variant 4	2daa1a9070ce3b2f
+config solar_open variant 5	42b494a551e811e0
+config solar_open variant 6	b79ae9f664d1945a
+config solar_open variant 7	9024ba28b423a4f3
+config stablelm	ad25b014a379586c
+config stablelm variant 1	e74044791b96f095
+config stablelm variant 2	e74044791b96f095
+config stablelm variant 3	ad25b014a379586c
+config stablelm variant 4	f8e9f5d9add10a38
+config stablelm variant 5	ad25b014a379586c
+config stablelm variant 6	e74044791b96f095
+config starcoder2	5f7cabeded790dff
+config starcoder2 variant 1	8096cf761acd9366
+config starcoder2 variant 2	5f7cabeded790dff
+config starcoder2 variant 3	5f7cabeded790dff
+config starcoder2 variant 4	5f7cabeded790dff
+config starcoder2 variant 5	5f7cabeded790dff
+config starcoder2 variant 6	e143995e51be5b25
+config xglm	8546fb51cb41c4bc
+config xglm variant 1	3a39a2315a5fdb9d
+config xglm variant 2	8546fb51cb41c4bc
+config xglm variant 3	3a39a2315a5fdb9d
+config xglm variant 4	ad6e2778cb80117f
