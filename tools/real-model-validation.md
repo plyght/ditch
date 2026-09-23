@@ -3456,10 +3456,9 @@ float32, every layer agrees to 3e-06. ditch keeps float32 slopes.
 | facebook/opt-125m | `opt` | whole, re-saved as safetensors | match (raw) | 9.54e-07 | 2.58e-07 |
 | tiiuae/falcon-rw-1b | `falcon` (sequential, ALiBi) | whole, re-saved | match (raw) | 2.23e-04 (bf16 ALiBi, bug 65) | 1.50e-05 |
 | nvidia/Minitron-4B-Base | `nemotron` | first 3 layers of the loaded bf16 model, saved as safetensors | match (raw) | 1.71e-06 | 2.47e-06 |
+| EleutherAI/gpt-j-6b (`float16` revision) | `gptj` | first 3 layers, read from the `.bin` with a memory-mapped `torch.load`, saved as float32 safetensors | match (raw) | 1.34e-06 | 9.50e-07 |
 
-Left: `EleutherAI/gpt-j-6b` (24 GB of float32 `.bin`, more than this machine
-can load to convert; its layout is CodeGen's, which is verified),
-`baichuan-inc/Baichuan2-7B-Chat` (15 GB of `.bin` plus remote code),
+Left: `baichuan-inc/Baichuan2-7B-Chat` (15 GB of `.bin` plus remote code),
 `adept/persimmon-8b-*` (`.bin` and no `tokenizer.json`).
 
 ## Gemma 3n (`gemma3n_text`): verified on real weights
