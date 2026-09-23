@@ -10,6 +10,7 @@ const std = @import("std");
 const Io = std.Io;
 const hf = @import("hf.zig");
 const remote = @import("remote.zig");
+const safetensors = @import("safetensors.zig");
 const model_mod = @import("model.zig");
 const tensor = @import("tensor.zig");
 
@@ -602,6 +603,38 @@ test "remote source: a rate-limited server is waited out, the concurrent readers
     const text = try Io.Dir.cwd().readFileAlloc(io, log_path, gpa, .unlimited);
     defer gpa.free(text);
     try std.testing.expectEqual(@as(usize, 12), std.mem.count(u8, text, " 429 "));
+}
+
+test "remote source: a read that fails while loading is reported, not taken for a missing tensor" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const pool = tensor.Pool.init(io, 2);
+    var env: Env = undefined;
+    try env.init(gpa, io);
+    defer env.deinit();
+    const scratch = try env.path("scratch");
+    defer gpa.free(scratch);
+    // The range requests the shard headers take.
+    const header_ranges = blk: {
+        const cache = try env.path("cache_probe");
+        defer gpa.free(cache);
+        const src = try env.open(cache, null);
+        defer src.deinit();
+        for (src.shards) |n| {
+            const f = try safetensors.File.openRemote(gpa, io, try src.openFile(n));
+            f.close(gpa, io);
+        }
+        break :blk src.stats().ranges_fetched;
+    };
+    // The same load from a server that fails every range request after
+    // those: the norms (read at load) fail with the server's error.
+    const url = try std.fmt.allocPrint(gpa, "{s}failafter-{d}/", .{ env.base_url, header_ranges });
+    defer gpa.free(url);
+    const cache = try env.path("cache");
+    defer gpa.free(cache);
+    const src = try remote.Source.open(gpa, io, &env.http, cache, url, .{ .chunk_size = chunk }, &env.sink.writer);
+    defer src.deinit();
+    try std.testing.expectError(error.NotFound, loadRemote(gpa, io, &pool, src, scratch));
 }
 
 test "remote chunk cache: size 0 keeps nothing on disk" {

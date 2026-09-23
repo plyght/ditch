@@ -582,7 +582,7 @@ fn deinterleave(arena: Allocator, v: []const f32) ![2][]f32 {
 /// silently without it.
 fn loadCorrectionBias(model: anytype, arena: Allocator, lp: []const u8, name: ?[]const u8) !?[]const f32 {
     const t = name orelse return null;
-    if (model.loadVecOpt(try cat(arena, &.{ lp, t }))) |v| return v;
+    if ((try model.loadVecOpt(try cat(arena, &.{ lp, t })))) |v| return v;
     const gate = ".gate.e_score_correction_bias";
     const bare = ".e_score_correction_bias";
     const alt = if (std.mem.endsWith(u8, t, gate))
@@ -591,7 +591,7 @@ fn loadCorrectionBias(model: anytype, arena: Allocator, lp: []const u8, name: ?[
         try std.mem.concat(arena, u8, &.{ t[0 .. t.len - bare.len], gate })
     else
         return null;
-    return model.loadVecOpt(try cat(arena, &.{ lp, alt }));
+    return (try model.loadVecOpt(try cat(arena, &.{ lp, alt })));
 }
 
 /// Loads the MoE block of layer `li` with tensor prefix `lp` (e.g. "model.layers.3.").
@@ -617,7 +617,7 @@ pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !Mo
         .layer_index = li,
         .router = try model.loadMat(router_name),
         .router_ref = router_ref,
-        .router_bias = model.loadVecOpt(try model_mod.biasName(arena, router_name)),
+        .router_bias = (try model.loadVecOpt(try model_mod.biasName(arena, router_name))),
         .correction_bias = try loadCorrectionBias(model, arena, lp, names.router_correction_bias),
         .top_k = @min(c.num_experts_per_tok, n_experts),
         .norm_topk_prob = c.norm_topk_prob,
@@ -671,7 +671,7 @@ pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !Mo
         }
         if (c.moe_latent_norm) {
             const norm_name = try cat(arena, &.{ lp, names.latent_norm orelse return error.InvalidConfig });
-            lat.norm = model.loadVecOpt(norm_name) orelse {
+            lat.norm = (try model.loadVecOpt(norm_name)) orelse {
                 std.log.err("missing tensor: {s}", .{norm_name});
                 return error.MissingWeights;
             };
@@ -807,8 +807,8 @@ pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !Mo
                 .gate_ref = up_ref,
                 .up_ref = up_ref,
                 .down_ref = .{ .ref = try model.ref(down_name) },
-                .gate_bias = model.loadVecOpt(try model_mod.biasName(arena, up_name)),
-                .down_bias = model.loadVecOpt(try model_mod.biasName(arena, down_name)),
+                .gate_bias = (try model.loadVecOpt(try model_mod.biasName(arena, up_name))),
+                .down_bias = (try model.loadVecOpt(try model_mod.biasName(arena, down_name))),
                 .gated = false,
             };
         }
@@ -825,9 +825,9 @@ pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !Mo
                 .gate_ref = .{ .ref = try model.ref(gate_name) },
                 .up_ref = .{ .ref = try model.ref(up_name) },
                 .down_ref = .{ .ref = try model.ref(down_name) },
-                .gate_bias = model.loadVecOpt(try model_mod.biasName(arena, gate_name)),
-                .up_bias = model.loadVecOpt(try model_mod.biasName(arena, up_name)),
-                .down_bias = model.loadVecOpt(try model_mod.biasName(arena, down_name)),
+                .gate_bias = (try model.loadVecOpt(try model_mod.biasName(arena, gate_name))),
+                .up_bias = (try model.loadVecOpt(try model_mod.biasName(arena, up_name))),
+                .down_bias = (try model.loadVecOpt(try model_mod.biasName(arena, down_name))),
             };
         }
     }
@@ -851,7 +851,7 @@ pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !Mo
                 .gate_ref = undefined,
                 .up_ref = undefined,
                 .down_ref = .{ .ref = try model.ref(down_name) },
-                .gate_vec = if (names.shared_expert_gate) |g| model.loadVecOpt(try cat(arena, &.{ lp, g })) else null,
+                .gate_vec = if (names.shared_expert_gate) |g| (try model.loadVecOpt(try cat(arena, &.{ lp, g }))) else null,
             };
             const fused_name: ?[]const u8 = if (names.shared_gate_up) |t| try cat(arena, &.{ sp, t }) else null;
             if (fused_name != null and model.find(fused_name.?) != null) {

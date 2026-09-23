@@ -4286,3 +4286,21 @@ decode step fetches its 144 experts layer by layer: the 4 experts of a layer
 are known only when its router has run, so each layer waits for a round of
 8 MB range requests (~2-3 s at the per-stream rate here) and the link idles
 between layers. That, not the bandwidth, is the ~263 s a token.
+
+## Bug F14 — a failed read at load was taken for a missing tensor (fixed)
+
+The dry run of `hf://Qwen/Qwen3.8-2.4T-A95B` during the rate-limited
+stretch (before F13) ended with `error: missing tensor:
+model.layers.62.post_attention_layernorm.weight`, a tensor the index lists
+(in shard 150, whose reads were answered 429). `Model.loadVecOpt`, which
+reads every norm, bias and small vector at load, returned null for a read
+that failed (`readVecF32(...) catch null`), the same as for a tensor the
+checkpoint does not have. A required norm then reported a missing tensor
+instead of the network error; an optional one (a projection or norm bias,
+attention sinks, a router bias, a shared-expert gate) was silently dropped,
+loading a different model from the one on the Hub. `loadVecOpt` now returns
+the read error, and its 42 callers pass it on. `tools/range_server.py`
+serves a `/failafter-<n>/` prefix that answers 404 to every range request
+after the first n. Regression test: "remote source: a read that fails while
+loading is reported, not taken for a missing tensor" (`src/remote_test.zig`;
+before the fix it fails with `MissingWeights`).

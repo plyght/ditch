@@ -11,7 +11,8 @@ serves until killed. Every request is appended to the log file as
 
 A path under `/ratelimit-<n>/` serves the same files, but the first <n> Range
 requests under that prefix are answered 429 Too Many Requests (a rate-limited
-Hub).
+Hub). Under `/failafter-<n>/` the Range requests after the first <n> are
+answered 404 (a read that fails once the shard headers are in).
 """
 import http.server
 import os
@@ -52,6 +53,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     self.record(self.headers.get("Range"), 429, 0)
+                    return
+        m = re.match(r"^/failafter-(\d+)(/.*)$", rel)
+        if m:
+            rel = m.group(2)
+            if self.headers.get("Range"):
+                key = "after-" + m.group(1)
+                with LIMIT_LOCK:
+                    LIMITED[key] = LIMITED.get(key, 0) + 1
+                    failing = LIMITED[key] > int(m.group(1))
+                if failing:
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    self.record(self.headers.get("Range"), 404, 0)
                     return
         path = os.path.normpath(os.path.join(ROOT, rel.lstrip("/")))
         if not path.startswith(ROOT) or not os.path.isfile(path):
