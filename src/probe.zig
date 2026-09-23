@@ -90,8 +90,17 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings,
         const ids = try model.tokenizer.encode(gpa, text, !settings.probe_raw and engine.add_special);
         defer gpa.free(ids);
         const prompts = [_][]u32{ids};
+        const max_new = @max(settings.max_response_length, 1);
+        const logits = try gpa.alloc(f32, c.vocab_size);
+        defer gpa.free(logits);
+        const residuals: ?[]f32 = if (settings.probe_residuals) try gpa.alloc(f32, (c.num_layers + 1) * c.hidden_size) else null;
+        defer if (residuals) |r| gpa.free(r);
+        // One prefill gives the greedy reply and the exact first-token logits.
         const start = Io.Timestamp.now(io, .awake);
-        const generated = try engine.generateBatch(gpa, &prompts, @max(settings.max_response_length, 1));
+        const ws = try engine.ensureWorkspace(ids.len, 1, engine.kvBytes(1, ids.len + max_new + 1));
+        var cache = try model_mod.KvCache.initFor(model, gpa, 1, ids.len + max_new + 1);
+        defer cache.deinit();
+        const generated = try model_mod.generateKeep(model, ws, &cache, &prompts, max_new, .{ .logits = logits, .residuals = residuals });
         const gen_seconds = @as(f64, @floatFromInt(start.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds)) / 1e9;
         defer {
             for (generated) |g| model.gpa.free(g);
@@ -99,16 +108,7 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings,
         }
         const response = try model.tokenizer.decode(gpa, generated[0], false);
         defer gpa.free(response);
-        // First-token logits: a separate prefill so the vector is exact
-        // (`generate` only keeps the argmax).
-        const ws = try engine.ensureWorkspace(ids.len, 1, 0);
-        var cache = try model_mod.KvCache.initFor(model, gpa, 1, ids.len + 1);
-        defer cache.deinit();
-        const logits = try gpa.alloc(f32, c.vocab_size);
-        defer gpa.free(logits);
-        const residuals: ?[]f32 = if (settings.probe_residuals) try gpa.alloc(f32, (c.num_layers + 1) * c.hidden_size) else null;
-        defer if (residuals) |r| gpa.free(r);
-        try model_mod.prefill(model, ws, &cache, &prompts, logits, residuals);
+
         var top_buf: [top_k]Top = undefined;
         const top = topK(logits, &top_buf);
 

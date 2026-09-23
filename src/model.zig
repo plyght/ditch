@@ -5178,12 +5178,28 @@ pub fn prefill(model: *const Model, ws: *Workspace, cache: *KvCache, prompts: []
 
 /// Greedy generation for a batch of prompts.
 pub fn generate(model: *const Model, ws: *Workspace, cache: *KvCache, prompts: []const []const u32, max_new_tokens: usize) ![][]u32 {
+    return generateKeep(model, ws, cache, prompts, max_new_tokens, .{});
+}
+
+/// What `generateKeep` hands back from its prefill besides the tokens.
+pub const GenerateKeep = struct {
+    /// `[prompts][vocab]`: the first-token logits.
+    logits: ?[]f32 = null,
+    /// As `prefill`'s `residuals` (single prompt).
+    residuals: ?[]f32 = null,
+};
+
+/// `generate`, keeping the prefill's first-token logits and residuals (so a
+/// caller that also wants them does not pay for a second prefill, which in
+/// warp mode over a remote source fetches the prompt's experts again).
+pub fn generateKeep(model: *const Model, ws: *Workspace, cache: *KvCache, prompts: []const []const u32, max_new_tokens: usize, keep: GenerateKeep) ![][]u32 {
     const gpa = model.gpa;
     const c = &model.config;
     const b = prompts.len;
-    const logits = try gpa.alloc(f32, b * c.vocab_size);
-    defer gpa.free(logits);
-    try prefill(model, ws, cache, prompts, logits, null);
+    const owned: []f32 = if (keep.logits == null) try gpa.alloc(f32, b * c.vocab_size) else &.{};
+    defer if (keep.logits == null) gpa.free(owned);
+    const logits = keep.logits orelse owned;
+    try prefill(model, ws, cache, prompts, logits[0 .. b * c.vocab_size], keep.residuals);
 
     var outputs = try gpa.alloc(std.ArrayList(u32), b);
     defer gpa.free(outputs);

@@ -150,7 +150,7 @@ pub const Engine = struct {
         return &self.ws.?;
     }
 
-    fn kvBytes(self: *Engine, batch: usize, max_len: usize) u64 {
+    pub fn kvBytes(self: *Engine, batch: usize, max_len: usize) u64 {
         const c = &self.model.config;
         return model_mod.KvCache.bytesFor(c.num_layers, batch, max_len, c.kvDim());
     }
