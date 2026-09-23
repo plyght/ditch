@@ -448,6 +448,32 @@ fn outsideTextModel(name: []const u8) ?[]const u8 {
         .{ "nextn", "multi-token prediction head" }, .{ "rotary_emb.inv_freq", "precomputed RoPE table" },
     };
     for (parts) |p| if (std.mem.indexOf(u8, name, p[0]) != null) return p[1];
+    // A layer past num_hidden_layers (DeepSeek V3's layer 61) is a
+    // multi-token prediction module the text model never runs.
+    if (layerIndex(name)) |i| if (i >= text_layers) return "multi-token prediction layer past num_hidden_layers";
+    // Quantisation scales, zero points and packed codes belong to a weight
+    // (dequant.zig turns them into it).
+    for (quant_aux) |suffix| if (std.mem.endsWith(u8, name, suffix)) return "quantisation data of a weight";
+    return null;
+}
+
+/// num_hidden_layers of the checkpoint being drafted (see `outsideTextModel`).
+var text_layers: usize = std.math.maxInt(usize);
+
+const quant_aux = [_][]const u8{ "_scale_inv", ".weight_scale", ".weight_zero_point", ".weight_shape", ".weight_g_idx", ".input_scale", ".input_zero_point", ".weight_global_scale", ".input_global_scale", "_scales", ".qzeros", ".g_idx", ".scale" };
+
+/// The number after a `layers.` (or `h.`, `blocks.`) path segment.
+fn layerIndex(name: []const u8) ?usize {
+    for ([_][]const u8{ "layers.", "h.", "blocks.", "block." }) |key| {
+        var start: usize = 0;
+        while (std.mem.indexOfPos(u8, name, start, key)) |k| {
+            start = k + 1;
+            if (k > 0 and name[k - 1] != '.') continue;
+            const rest = name[k + key.len ..];
+            const end = std.mem.indexOfScalar(u8, rest, '.') orelse continue;
+            return std.fmt.parseInt(usize, rest[0..end], 10) catch continue;
+        }
+    }
     return null;
 }
 
@@ -985,6 +1011,14 @@ fn configType(a: Allocator, text: []const u8) !struct { top: ?[]const u8, text: 
     return .{ .top = top, .text = inner };
 }
 
+fn textLayers(a: Allocator, text: []const u8) usize {
+    const v = std.json.parseFromSliceLeaky(std.json.Value, a, arch.sanitizeJson(a, text) catch return std.math.maxInt(usize), .{}) catch return std.math.maxInt(usize);
+    if (v != .object) return std.math.maxInt(usize);
+    const o = if (v.object.get("text_config")) |tc| (if (tc == .object) tc.object else v.object) else v.object;
+    for ([_][]const u8{ "num_hidden_layers", "n_layer", "n_layers", "num_layers" }) |k| if (arch.getNum(o, k)) |n| if (n > 0) return @intFromFloat(n);
+    return std.math.maxInt(usize);
+}
+
 fn userModelsDir(ctx: Ctx) ![]const u8 {
     if (ctx.settings.models_dir) |d| return d;
     const base = (try config.configDir(ctx.arena, ctx.env)) orelse {
@@ -1037,6 +1071,7 @@ pub fn run(ctx: Ctx) !u8 {
         std.log.err("config.json names no model_type", .{});
         return 1;
     };
+    text_layers = textLayers(a, config_text);
     try out.print("* config.json: model_type {s}{s}{s}; {d} tensors in {d} safetensors file(s)\n", .{ own_type, if (types.text != null) " (text config of " else "", if (types.text != null) try std.fmt.allocPrint(a, "{s})", .{types.top orelse "?"}) else "", ck.tensors.len, ck.shards.len });
     const known = models.lookup(own_type) orelse if (types.top) |t| models.lookup(t) else null;
     if (known) |k| try out.print("* {s} is already defined ({s}, {s}): the draft is compared with it\n", .{ own_type, k.model_type, models.origin(k) });
