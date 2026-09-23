@@ -550,22 +550,35 @@ test "remote chunk cache: a full filesystem bounds the cache at what it holds" {
     try env.init(gpa, io);
     defer env.deinit();
     const shard = "model-00001-of-00002.safetensors";
-    const cache = try env.path("cache");
-    defer gpa.free(cache);
-    const src = try env.openWith(cache, std.math.maxInt(u64), 4);
-    defer src.deinit();
-    const rf = try src.openFile(shard);
-    const held = src.stats().cache_bytes;
-    src.test_disk_bytes = held + 10 * chunk;
-    const got = try gpa.alloc(u8, 30 * chunk);
-    defer gpa.free(got);
-    try rf.readRange(io, 0, got);
-    const st = src.stats();
-    // The first write past the filesystem shrinks the bound; later chunks evict older ones.
-    try std.testing.expect(st.cache_limit <= held + 10 * chunk);
-    try std.testing.expect(st.chunks_evicted > 0);
-    try std.testing.expect(st.chunks_unpersisted <= 4);
-    try std.testing.expect(st.cache_bytes <= st.cache_limit);
+    // One connection, then four at once.
+    for ([_]u32{ 1, 4 }) |connections| {
+        const cache = try env.path(if (connections == 1) "cache_1" else "cache_4");
+        defer gpa.free(cache);
+        const src = try env.openWith(cache, std.math.maxInt(u64), connections);
+        defer src.deinit();
+        const rf = try src.openFile(shard);
+        const held = src.stats().cache_bytes;
+        const cap = held + 10 * chunk;
+        src.test_disk_bytes = cap;
+        const got = try gpa.alloc(u8, 30 * chunk);
+        defer gpa.free(got);
+        try rf.readRange(io, 0, got);
+        const st = src.stats();
+        // The first write past the filesystem bounds the cache at what is on
+        // disk; later chunks evict older ones and are written.
+        try std.testing.expect(st.cache_limit <= cap);
+        try std.testing.expect(st.chunks_evicted > 0);
+        try std.testing.expect(st.cache_bytes <= st.cache_limit);
+        try std.testing.expect((try chunkDirUsage(io, src)).bytes <= cap);
+        // Only the chunks between the network and the disk when it filled go
+        // unpersisted: a chunk holds its connection slot until it is written,
+        // so there are at most `connections` of them (exactly one with one).
+        if (connections == 1) {
+            try std.testing.expectEqual(@as(u64, 1), st.chunks_unpersisted);
+        } else {
+            try std.testing.expect(st.chunks_unpersisted >= 1 and st.chunks_unpersisted <= connections);
+        }
+    }
 }
 
 test "remote source: a rate-limited server is waited out, the concurrent readers backing off together" {
