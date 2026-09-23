@@ -518,8 +518,12 @@ fn tryLoad(ctx: Ctx, ck: *const Checkpoint, dir_path: []const u8, f: *const Arch
     const model = loaded catch |err| {
         result.why = try cap.errors(a);
         if (result.why.len == 0) result.why = @errorName(err);
-        for (cap.lines.items) |l| if (std.mem.startsWith(u8, l.text, "missing tensor: ")) {
-            result.missing = l.text["missing tensor: ".len..];
+        // "missing tensor: NAME", "missing router tensor NAME", ...
+        for (cap.lines.items) |l| if (l.level == .err and std.mem.startsWith(u8, l.text, "missing ")) {
+            var it = std.mem.tokenizeScalar(u8, l.text, ' ');
+            while (it.next()) |tok| if (std.mem.indexOfScalar(u8, tok, '.') != null and !std.mem.endsWith(u8, tok, ":")) {
+                result.missing = tok;
+            };
         };
         return result;
     };
@@ -557,6 +561,9 @@ fn outsideTextModel(name: []const u8) ?[]const u8 {
     if (quantised) for (quant_aux) |suffix| if (std.mem.endsWith(u8, name, suffix)) return "quantisation data of a weight";
     return null;
 }
+
+/// Why the families refused the config.json (see `match`).
+var refusals: std.ArrayList([]const u8) = .empty;
 
 /// num_hidden_layers of the checkpoint being drafted, and whether it names
 /// a quantization_config (see `outsideTextModel`).
@@ -807,6 +814,7 @@ fn expectedShape(a: Allocator, c: *const arch.Config, field: []const u8, li: usi
         .{ "post_ff_norm", H }, .{ "mlp_norm", H },
     };
     for (vectors) |e| if (std.mem.eql(u8, e[0], field)) return try a.dupe(usize, &.{e[1]});
+    if (std.mem.eql(u8, field, "router_correction_bias")) return try a.dupe(usize, &.{c.num_experts});
     // q/k norms: one weight per head, or one per projection row.
     const q = std.mem.eql(u8, field, "q_norm");
     if (q or std.mem.eql(u8, field, "k_norm")) return switch (c.qk_norm) {
@@ -832,7 +840,7 @@ fn proposeRename(a: Allocator, ck: *const Checkpoint, f: *const Arch, c: *const 
     for (unread) |n| {
         const p = locate(names, prefix, c.num_layers, c.num_experts, n);
         if ((p.layer == null) != (place.layer == null) or (p.layer != null and p.layer.? != place.layer.?)) continue;
-        if ((p.expert == null) != (place.expert == null)) continue;
+        if ((p.expert == null) != (place.expert == null) or (p.expert != null and p.expert.? != place.expert.?)) continue;
         const t = ck.find(n) orelse continue;
         if (want) |w| if (!t.is(w)) continue;
         if (want == null and !std.mem.eql(u8, std.fs.path.extension(n), std.fs.path.extension(missing))) continue;
@@ -896,7 +904,10 @@ fn structuralOverrides(a: Allocator, ck: *const Checkpoint, f: *const Arch, c: *
     }
     const pfx = prefix.?;
     const lp0 = try expand(a, names.layer, pfx, 0, null);
-    for (ck.tensors) |t| if (std.mem.startsWith(u8, t.name, lp0)) return out.items;
+    for (ck.tensors) |t| if (std.mem.startsWith(u8, t.name, lp0)) {
+        try expertPath(a, ck, names, pfx, c, &out);
+        return out.items;
+    };
     // Another path with exactly num_hidden_layers indices.
     var paths: std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(usize, void)) = .{};
     for (ck.tensors) |t| {
@@ -921,6 +932,41 @@ fn structuralOverrides(a: Allocator, ck: *const Checkpoint, f: *const Arch, c: *
     const rel = if (std.mem.startsWith(u8, path, pfx)) path[pfx.len..] else path;
     try out.append(a, .{ .field = "layer", .value = try std.fmt.allocPrint(a, "\"{{p}}{s}{{i}}.\"", .{rel}), .why = try std.fmt.allocPrint(a, "guess: `{s}N.` is the one path numbered 0..{d}, one per layer", .{ path, c.num_layers - 1 }) });
     return out.items;
+}
+
+/// Routed experts under another path within the layer (`feed_forward.experts.{e}.`
+/// for `mlp.experts.{e}.`): the one path of the first MoE layer numbered
+/// 0..num_experts-1. Stacked experts (one tensor per layer) need none.
+fn expertPath(a: Allocator, ck: *const Checkpoint, names: *const Names, pfx: []const u8, c: *const arch.Config, out: *std.ArrayList(Override)) !void {
+    if (c.num_experts == 0) return;
+    const li = for (c.moe_layers, 0..) |m, i| {
+        if (m) break i;
+    } else return;
+    const lp = try expand(a, names.layer, pfx, li, null);
+    const ep = try std.fmt.allocPrint(a, "{s}{s}", .{ lp, try expand(a, names.expert, pfx, li, 0) });
+    var paths: std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(usize, void)) = .{};
+    for (ck.tensors) |t| {
+        if (std.mem.startsWith(u8, t.name, ep)) return;
+        if (!std.mem.startsWith(u8, t.name, lp)) continue;
+        const rel = t.name[lp.len..];
+        var it = std.mem.splitScalar(u8, rel, '.');
+        var pos: usize = 0;
+        while (it.next()) |seg| : (pos += seg.len + 1) {
+            const n = std.fmt.parseInt(usize, seg, 10) catch continue;
+            const gop = try paths.getOrPut(a, rel[0..pos]);
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            try gop.value_ptr.put(a, n, {});
+            break;
+        }
+    }
+    var found: ?[]const u8 = null;
+    var it = paths.iterator();
+    while (it.next()) |kv| if (kv.value_ptr.count() == c.num_experts) {
+        if (found != null) return;
+        found = kv.key_ptr.*;
+    };
+    const path = found orelse return;
+    try out.append(a, .{ .field = "expert", .value = try std.fmt.allocPrint(a, "\"{s}{{e}}.\"", .{path}), .why = try std.fmt.allocPrint(a, "guess: `{s}N.` is the one path of an MoE layer numbered 0..{d}, one per expert", .{ path, c.num_experts - 1 }) });
 }
 
 /// Fields read at model level (the others are relative to a layer).
@@ -1341,7 +1387,8 @@ pub fn run(ctx: Ctx) !u8 {
 
     // 3. Match.
     const chosen = (try match(ctx, &ck, work, own_type, config_text)) orelse {
-        std.log.err("no known family reads this config.json (every one refused it); a new family needs a definition written by hand (docs/models.md)", .{});
+        std.log.err("no known family reads this config.json; a new family needs a definition written by hand (docs/models.md). What the families said:", .{});
+        for (refusals.items) |r| std.log.err("  {s}", .{r});
         return 1;
     };
 
@@ -1413,6 +1460,9 @@ fn match(ctx: Ctx, ck: *const Checkpoint, work: []const u8, own_type: []const u8
         }
     }
     capture = null;
+    // The distinct reasons, for a checkpoint no family reads.
+    refusals.clearRetainingCapacity();
+    for (quiet.lines.items) |l| if (l.level == .err and !contains(refusals.items, l.text) and refusals.items.len < 6) try refusals.append(a, l.text);
     std.mem.sort(Candidate, candidates.items, {}, struct {
         fn gt(_: void, x: Candidate, y: Candidate) bool {
             if (x.score != y.score) return x.score > y.score;
