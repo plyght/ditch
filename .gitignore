@@ -6,3 +6,4 @@ checkpoints/
 /.claude/
 out/
 bench-*.md
+__pycache__/
