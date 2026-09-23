@@ -1,6 +1,6 @@
 -- The Gemma family's config keys: the rotary tables of Gemma 3 and later,
 -- KV-shared layers and per-layer input embeddings (Gemma 3n / 4), and the
--- config functions of Gemma 2 / 3 and Gemma 3n.
+-- config functions of Gemma 2 / 3, Gemma 3n and Gemma 4.
 local M = {}
 
 -- `x` truncated to an integer and rounded down to an even number.
@@ -149,6 +149,72 @@ function M.config_gemma3n(cfg, c)
   for _, s in ipairs(c.activation_sparsity) do
     if s < 0 or s >= 1 then invalid("gemma3n: activation_sparsity_pattern values must lie in [0, 1)") end
   end
+end
+
+-- A key of `per_layer_config` read as a layer index the way Zig's
+-- `std.fmt.parseInt(usize, key, 10)` reads it: an optional sign, decimal
+-- digits with underscores between them, and "-" only before zero.
+-- nil when it is not one; math.huge when it exceeds every layer index.
+local function layer_index(key)
+  local sign, body = key:match("^([+-]?)(.*)$")
+  if body == "" or body:sub(1, 1) == "_" or body:sub(-1) == "_" or body:find("[^0-9_]") then return nil end
+  local digits = body:gsub("_", ""):gsub("^0+", "")
+  if digits == "" then return 0 end
+  if sign == "-" then return nil end
+  if #digits > 15 then return math.huge end
+  return math.tointeger(tonumber(digits))
+end
+
+-- Gemma 4.
+function M.config_gemma4(cfg, c)
+  default_activation(cfg, c)
+  if str(cfg.use_bidirectional_attention) == "all" then
+    unsupported("Gemma 4 with bidirectional attention on every token")
+  end
+  if flag(cfg.enable_moe_block, false) then
+    unsupported("Gemma 4 MoE block (a routed expert block in parallel with the dense MLP, as in gemma-4-26B-A4B) is not implemented")
+  end
+  if cfg.layer_types == nil then
+    -- 5 local, 1 global; the last layer is always global.
+    each_layer(c.sliding_layers, function(i) return (i + 1) % 6 ~= 0 end)
+  end
+  if c.num_layers > 0 then c.sliding_layers[c.num_layers] = false end
+  if c.sliding_window == nil then c.sliding_window = 512 end
+  c.attention_scale = 1.0
+  c.v_norm = true
+  c.k_eq_v = flag(cfg.attention_k_eq_v, false)
+  -- Global layers use their own head size and KV heads: `global_head_dim`
+  -- (512 unless given) and `num_global_key_value_heads`, or an explicit
+  -- `per_layer_config` table indexed by layer.
+  local global_hd = int(cfg.global_head_dim, 512)
+  local global_kv = c.num_kv_heads
+  if type(cfg.num_global_key_value_heads) == "number" and c.k_eq_v then
+    global_kv = int(cfg.num_global_key_value_heads, global_kv)
+  end
+  local plc = obj(cfg.per_layer_config)
+  if plc then
+    -- The first entry, in config.json's order, of a global layer.
+    for _, k in ipairs(keys(plc)) do
+      local idx = layer_index(k)
+      local lc = obj(plc[k])
+      if idx and idx < c.num_layers and not c.sliding_layers[idx + 1] and lc then
+        global_hd = int(lc.head_dim, global_hd)
+        global_kv = int(lc.num_key_value_heads, global_kv)
+        break
+      end
+    end
+  end
+  for i = 1, c.num_layers do
+    if not c.sliding_layers[i] then
+      c.layer_head_dim[i] = global_hd
+      c.layer_kv_heads[i] = global_kv
+    end
+  end
+  M.rope(cfg, c, c.head_dim, global_hd)
+  M.kv_sharing(cfg, c)
+  M.per_layer_embeddings(cfg, c, 256)
+  -- KV-shared layers may carry a double-wide MLP; the weights say which.
+  if flag(cfg.use_double_wide_mlp, false) and int(cfg.num_kv_shared_layers, 0) > 0 then c.intermediate_varies = true end
 end
 
 return M

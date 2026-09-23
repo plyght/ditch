@@ -11,5 +11,7 @@
   {"no_rope_layers": {"a": 1}},
   {"no_rope_layers": [true, 0]},
   {"no_rope_layers": [0, 0, 0, 0, 0]},
-  {"no_rope_layers": [], "no_rope_layer_interval": "$delete"}
+  {"no_rope_layers": [], "no_rope_layer_interval": "$delete"},
+  {"no_rope_layers": {}, "no_rope_layer_interval": 2},
+  {"no_rope_layers": [], "no_rope_layer_interval": 2}
 ]
