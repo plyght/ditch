@@ -3954,3 +3954,20 @@ the Hub's bandwidth here (the prefill touches 645 of the 768 experts); once
 they are on disk the run is bound by decoding them into the 5.67 GB expert
 cache (29% hits, 56 misses a decode step). 0.245 tokens/s here against
 0.289 above: 16 tokens amortise the 87-token prefill less than 24 did.
+
+## Mistral Small 4 at full depth over `hf://`: dry run only
+
+`ditch --dry-run hf://mistralai/Mistral-Small-4-119B-2603 --max-ram 10GB
+--remote-cache-size 18GB`:
+
+    weights total 222.40GB (36 layers), trunk per layer 102.5MB
+    routed expert 48.0MB decoded / 24.0MB stored (fp8), 4608 experts, 108GB stored
+    warp mode: min 6.61GB, with prefetch + expert cache + RAM caches 24.28GB
+    expert cache 5.75GB = 122 experts; trunk 4.62GB stored, stays cached; 558 experts fit beside it
+
+Not run: at top-4 of 128 experts in 36 layers, a short prompt's prefill
+routes to most of the 108 GB of experts and each generated token fetches
+~144 of them (~3.4 GB), which at the ~12-19 MB/s the Hub serves here is
+hours for the first pass, with the working set 6x the 18 GB of chunk cache
+this disk allows (the same limit as gpt-oss-120b). The RAM side fits (6.6 GB
+minimum). Its arithmetic is verified on the truncated cut above.
