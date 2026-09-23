@@ -4968,3 +4968,16 @@ its layout), and to say why a config is refused.
   exactly. The residual comparison is inconclusive: the release's remote
   code returns NaN on the one-layer cut (its looped forward pass), and the
   independent edit recomputation did not run for the same reason.
+* **learning-unit/L1-30B-A5B** (`gravity_moe`, a model_type ditch did not
+  know; the draft is `base = "deepseek_v2"` with zero edits), cut to layers
+  0 (dense) and 2 (MoE) of the release and compared with the release's own
+  code: the rendered chat prompt and its token ids are identical, the
+  residuals agree to 4.8e-7 relative, the first-token logits to 6.7e-7 of
+  their range with the same argmax, and the greedy tokens are identical on
+  both prompts. The abliteration study, the refusal directions and the
+  export round trip pass.
+
+In both runs the last check, the independent recomputation of the edit
+(`check_abliteration.py`), exited 0 without writing its report and is marked
+failed by verify; that is verify's harness, the same for any model, and not
+the draft.
