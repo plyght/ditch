@@ -5359,7 +5359,12 @@ Limits:
 * Which matrices a two-trial study edits depends on the trial it lands on.
   gpt-oss-20b's trial 1 edited the experts in one run and only `o_proj` in
   the next. Different runs therefore cover different components.
-* The chat-template check needs Python today. The Jinja interpreter in Zig
-  (`src/jinja.zig`) that another session is building has not landed; verify
-  should use it when it does.
+* The exact chat-template comparison needs Python. Without it, verify still
+  reports **chat template (Jinja)**, which needs no Python: whether ditch
+  prompted with the model's own template, rendered by its Jinja interpreter
+  (`src/jinja.zig`, which renders templates the way transformers does), or
+  fell back to a named family because the template would not parse or
+  render (fail, with ditch's warning). Run with `--python /nonexistent`, the
+  report is truncate, load and forward, and chat template (Jinja) passed, the
+  reference skipped with its `pip install` line, exit 0.
 

@@ -429,6 +429,7 @@ const Verify = struct {
             return false;
         }
         try self.add(.{ .name = "load and forward", .status = .pass, .detail = self.fmt("ditch probe ran {d} prompt(s)", .{self.o.prompts.len}) });
+        if (!self.o.raw) try self.add(templateCheck(self.arena, self.readFile(try self.path("probe.log")) orelse ""));
         return true;
     }
 
@@ -687,6 +688,26 @@ pub fn referenceChecks(arena: Allocator, text: []const u8, tolerance: f64) ![]Ch
     return out.items;
 }
 
+/// Which template ditch prompted with (`ditch probe`'s "chat template NAME"):
+/// the model's own, rendered by src/jinja.zig as transformers renders it, or
+/// a named family because the model's would not parse or render. Needs no
+/// Python; the reference's comparison of the rendered text is the stronger check.
+pub fn templateCheck(arena: Allocator, log: []const u8) Check {
+    const name = "chat template (Jinja)";
+    const key = "chat template ";
+    const at = std.mem.lastIndexOf(u8, log, key) orelse return .{ .name = name, .status = .skip, .detail = "the probe did not say which template it used" };
+    const rest = log[at + key.len ..];
+    const used = rest[0 .. std.mem.indexOfAny(u8, rest, " \n") orelse rest.len];
+    if (std.mem.eql(u8, used, "model")) return .{ .name = name, .status = .pass, .detail = "the model's own template, rendered by ditch's Jinja interpreter" };
+    // A warning means the model has a template ditch could not use.
+    if (std.mem.indexOf(u8, log, "prompting with the ")) |w| {
+        const line_end = std.mem.indexOfScalarPos(u8, log, w, '\n') orelse log.len;
+        const line_start = if (std.mem.lastIndexOfScalar(u8, log[0..w], '\n')) |n| n + 1 else 0;
+        return .{ .name = name, .status = .fail, .detail = std.fmt.allocPrint(arena, "fell back to {s}: {s}", .{ used, log[line_start..line_end] }) catch "fell back" };
+    }
+    return .{ .name = name, .status = .skip, .detail = std.fmt.allocPrint(arena, "the model ships no chat template; ditch uses its {s} family", .{used}) catch "" };
+}
+
 /// `--dump-directions` output: a safetensors file whose `directions` are finite unit vectors.
 pub fn directionsCheck(arena: Allocator, bytes: []const u8) Check {
     const name = "abliteration directions";
@@ -866,6 +887,16 @@ test "export and edit checks" {
     try std.testing.expectEqual(Status.pass, (try editCheck(a, ok_edit)).status);
     const bad_edit = "{\"changed\": [\"a\"], \"unchanged\": 3, \"matrices\": 1, \"unchecked\": [], \"worst_excess\": 0.2, \"scope\": \"per layer\", \"bf16\": false}";
     try std.testing.expectEqual(Status.fail, (try editCheck(a, bad_edit)).status);
+}
+
+test "template check" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try std.testing.expectEqual(Status.pass, templateCheck(a, "* Architecture: qwen2 (24 layers, vocabulary 151936, BF16 weights), chat template model\n").status);
+    const fell = "warning: the model's chat template failed to render (x); prompting with the chatml template instead\n* Architecture: qwen2 (2 layers), chat template chatml\n";
+    try std.testing.expectEqual(Status.fail, templateCheck(a, fell).status);
+    try std.testing.expectEqual(Status.skip, templateCheck(a, "* Architecture: gpt2 (2 layers), chat template raw\n").status);
 }
 
 test "directions check" {
