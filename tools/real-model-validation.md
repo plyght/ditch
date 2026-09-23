@@ -4994,7 +4994,7 @@ export.
 
 * **Edited set:** `self_attn.o_proj` in layers 1 and 2 and every routed
   expert's `down_proj` there; layer 0 lies outside both weight windows of the
-  trial (its distances 1.91 and 1.22 exceed 1.12 and the MLP's). `qkv_proj`,
+  trial (its distances 1.91 and 1.22 exceed the windows, 1.12 and 1.09). `qkv_proj`,
   `gate_proj`/`up_proj`, the router, the attention sinks and the layer-0 MLP
   are untouched. The checker first listed layers 0 and 2's `qkv_proj` as edited
   (6.7% bit-equal): it had dequantised them with one 128 x 128 grid, where
