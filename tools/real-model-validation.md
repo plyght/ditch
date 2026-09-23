@@ -3041,3 +3041,42 @@ prompt by design, and the forward pass is compared on ditch's ids.
 | --- | :---: | :---: | ---: |
 | "The capital of France is" | system prompt merged (see above) | all 5 agree, worst 8.57e-07 | 7.39e-07 |
 | "Explain how rainbows form, …" | same | all 5 agree, worst 6.09e-07 | 5.73e-07 |
+
+## The older families, in float32 against transformers
+
+The first pass compared these families on first-token logits in bf16, or not
+at all. `probe --residuals` against float32 transformers, whole model where it
+fits (N = all layers), else the first N layers; `raw` = a base model probed
+with `--raw`. Bugs 60-62 were found here.
+
+| checkpoint | family | N | tokens | residuals (worst) |
+| --- | --- | ---: | :---: | ---: |
+| openai-community/gpt2 | `gpt2` | 12 (all) | match (raw) | 1.27e-06 |
+| bigcode/tiny_starcoder_py | `gpt_bigcode` | 20 (all) | match (raw) | 3.87e-07 |
+| EleutherAI/pythia-160m | `gpt_neox` | 12 (all) | match (raw) | 9.25e-05 (after bug 60) |
+| bigscience/bloomz-560m | `bloom` | 24 (all) | match (raw) | 6.99e-07 (after bug 62) |
+| AntonV/mamba2-130m-hf | `mamba2` | 24 (all) | match (raw) | 1.88e-06 (see below) |
+| allenai/OLMo-1B-hf | `olmo` | 16 (all) | match (raw) | 2.19e-06 |
+| allenai/OLMo-2-0425-1B-Instruct | `olmo2` | 16 (all) | match | 7.07e-07 |
+| unsloth/Llama-3.2-1B-Instruct | `llama` | 16 (all) | match (after bug 61) | 4.48e-06 |
+| unsloth/gemma-3-1b-it | `gemma3_text` | 8 | match | 9.50e-07 |
+| unsloth/gemma-2-2b-it | `gemma2` | 4 | system merged (above) | 8.57e-07 |
+| stabilityai/stablelm-2-1_6b-chat | `stablelm` | 24 (all) | match | 4.67e-06 |
+| microsoft/phi-2 | `phi` | 4 | match (raw) | 5.80e-07 |
+| microsoft/Phi-3.5-mini-instruct | `phi3` | 3 | match | 1.60e-06 |
+| HuggingFaceTB/SmolLM3-3B | `smollm3` | 4 | match | 9.82e-07 |
+| bigcode/starcoder2-3b | `starcoder2` | 3 | match (raw) | 2.09e-06 |
+| mistralai/Mistral-7B-Instruct-v0.3 | `mistral` | 3 | match | 7.13e-06 |
+
+First-token logits agree to 6e-06 of their range or better in every row.
+
+**Mamba2 and the reference.** transformers' Mamba, Mamba2 and FalconMamba
+record each block's *output* in `hidden_states`, with no embedding entry, then
+the normalised last state, so the list is shifted by one against every other
+family's. `tools/probe_reference.py` now puts the embedding first for those
+families and drops the normalised entry; before that, every Mamba2 residual
+looked wrong although the logits agreed to 3e-06.
+
+Not runnable, by design: `facebook/opt-125m`, `tiiuae/falcon-rw-1b` and
+`nvidia/Nemotron-Mini-4B-Instruct` ship `pytorch_model.bin` (and `.nemo`)
+only, no safetensors.

@@ -249,6 +249,11 @@ def main():
             input_ids = torch.tensor([entry["ids"]])
             out = model(input_ids=input_ids, output_hidden_states=want_residuals)
             ref = out.logits[0, -1].float().numpy()
+            # The Mamba families record each block's *output* and no embedding
+            # entry: put the embedding first so entry L is what layer L reads (the
+            # last block's output is then the pre-norm last entry; the normed one goes).
+            if want_residuals and getattr(model.config, "model_type", "") in ("mamba", "mamba2", "falcon_mamba"):
+                out.hidden_states = (model.get_input_embeddings()(input_ids),) + tuple(out.hidden_states)[:-1]
         if want_residuals:
             hc = captured.get("hc")
             collapsed = [hc[i] for i in sorted(hc)] if hc else None
