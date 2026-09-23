@@ -1122,7 +1122,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
     // Nested attention config (MPT).
     const attn_cfg: std.json.ObjectMap = getObj(obj, "attn_config") orelse obj;
 
-    const hidden = getIntAny(obj, &.{ "hidden_size", "n_embd", "d_model" }, 0);
+    const hidden = getIntAny(obj, &.{ "hidden_size", "n_embd", "n_embed", "d_model" }, 0); // n_embed: the BLOOM releases
     var heads = getIntAny(obj, &.{ "num_attention_heads", "n_head", "n_heads", "attention_heads", "num_heads" }, 0);
     var layers = getIntAny(obj, &.{ "num_hidden_layers", "n_layer", "n_layers", "num_layers" }, 0);
     // Block-type lists (Nemotron-H `layers_block_type`) or a hybrid pattern
@@ -5870,4 +5870,14 @@ test "parseConfig: EXAONE MoE global layers have no RoPE" {
         \\{"model_type":"exaone_moe","hidden_size":64,"num_attention_heads":4,"num_key_value_heads":2,"num_hidden_layers":4,"vocab_size":100,"num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":16,"sliding_window":128,"sliding_window_pattern":"LLLG"}
     );
     try std.testing.expect(pat.rope_layers[1] and !pat.sliding_layers[3] and !pat.rope_layers[3]);
+}
+
+test "parseConfig: BLOOM's n_embed spelling of the hidden size" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const c = try parseConfig(arena.allocator(),
+        \\{"model_type":"bloom","n_embed":64,"n_layer":2,"num_attention_heads":4,"vocab_size":100,"layer_norm_epsilon":1e-5}
+    );
+    try std.testing.expectEqual(@as(usize, 64), c.hidden_size);
+    try std.testing.expectEqual(@as(usize, 2), c.num_layers);
 }

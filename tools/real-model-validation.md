@@ -3000,3 +3000,19 @@ rendering expectations for both are transformers' own output.
 | --- | :---: | :---: | ---: | :---: |
 | Llama-3.2-1B-Instruct, "The capital of France is" | match (46) | all 17 agree, worst 4.48e-06 | 1.48e-06 | match |
 | Llama-3.2-1B-Instruct, "Explain how rainbows form, …" | match (52) | all 17 agree, worst 2.51e-06 | 1.13e-06 | match |
+
+## Bug 62 — no BLOOM release could be loaded: `n_embed` (fixed)
+
+**Symptom.** `bigscience/bloomz-560m` stopped at `error: InvalidConfig`.
+
+**Cause.** The BLOOM releases spell the hidden size `n_embed` (GPT-2's is
+`n_embd`); transformers' `BloomConfig` takes it as a backward-compatible
+keyword. ditch read `hidden_size`, `n_embd` and `d_model`, found none and got
+a hidden size of 0. The fixture uses `hidden_size`.
+
+**Fix.** `n_embed` is read as well; a parse test covers the release spelling.
+
+| model | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| bloomz-560m, "The capital of France is" | match (5, raw) | all 25 agree, worst 4.76e-07 | 5.32e-07 | match |
+| bloomz-560m, "Explain how rainbows form, …" | match (12, raw) | all 25 agree, worst 6.99e-07 | 3.85e-07 | match |
