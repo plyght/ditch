@@ -79,7 +79,7 @@ cfg = json.load(open(f"{out}/config.json"))
 tc = cfg.get('text_config', cfg)
 n_orig = tc['num_hidden_layers']
 tc['num_hidden_layers'] = N
-for key in ('layer_types', 'mlp_layer_types', 'num_attention_heads_per_layer', 'compress_ratios', 'is_moe_layer', 'sliding_windows', 'hybrid_layer_pattern', 'moe_layer_freq', 'no_rope_layers'):
+for key in ('layer_types', 'mlp_layer_types', 'num_attention_heads_per_layer', 'compress_ratios', 'is_moe_layer', 'sliding_windows', 'hybrid_layer_pattern', 'moe_layer_freq', 'no_rope_layers', 'intermediate_size', 'activation_sparsity_pattern'):
     if isinstance(tc.get(key), list): tc[key] = [tc[key][j] for j in layers]
 # MiMo V2: transformers' mimo_v2_flash derives the layer kinds from the layer
 # index (full at 0 and every 6th) unless `layer_types` says; in a cut the

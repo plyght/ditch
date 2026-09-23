@@ -3358,11 +3358,9 @@ render and the replacements.
 | allenai/FlexOlmo-7x7B-1T | `flex_olmo` | 2, lazy | match | 1.12e-06 | 8.31e-07 |
 | ibm-granite/granite-4.0-h-tiny | `granitemoehybrid` (MoE) | 6 | match | 1.84e-06 | 1.11e-06 |
 
-`unsloth/gemma-3n-E2B-it` cannot be cut this way: its per-layer embedding
-table (`embed_tokens_per_layer`, [vocab, layers x 256], 4 GB) has to be sliced
-by columns, which range requests on a row-major tensor cannot do in one piece,
-and ditch (like transformers) refuses a table sized for 30 layers in a
-5-layer model. Gemma 3n stays verified on the transformers stub only.
+`unsloth/gemma-3n-E2B-it` could not be cut at first: its per-layer embedding
+table (`embed_tokens_per_layer`, [vocab, layers x 256]) has to be sliced by
+columns. It is now verified on real weights, see "Gemma 3n" below.
 
 ## Gemma 4 12B (`gemma4_unified`): verified on real weights
 
@@ -3463,3 +3461,21 @@ Left: `EleutherAI/gpt-j-6b` (24 GB of float32 `.bin`, more than this machine
 can load to convert; its layout is CodeGen's, which is verified),
 `baichuan-inc/Baichuan2-7B-Chat` (15 GB of `.bin` plus remote code),
 `adept/persimmon-8b-*` (`.bin` and no `tokenizer.json`).
+
+## Gemma 3n (`gemma3n_text`): verified on real weights
+
+`unsloth/gemma-3n-E2B-it` (the ungated copy of Google's release), first 5
+layers (four sliding, one full), vision and audio towers dropped:
+`tools/truncate_checkpoint.py` slices the per-layer embedding table and its
+projection to the kept layers' 256-wide blocks (5 x 256 columns / rows), and
+now also cuts `intermediate_size` and `activation_sparsity_pattern` when they
+are per-layer lists (transformers refuses 30 entries for 5 layers).
+`num_kv_shared_layers` is 0 in the cut, since the ten shared layers are the
+last ten, so KV sharing itself is not exercised here; AltUp (four streams),
+LAuReL, the per-layer inputs, the 0.95 activation sparsity of these layers
+and both attention kinds are.
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (21) | all 6 agree, worst 7.04e-07 | 6.59e-07 | match |
+| "Explain how rainbows form, …" | match (25) | all 6 agree, worst 7.74e-07 | 6.14e-07 | match |
