@@ -3016,3 +3016,28 @@ a hidden size of 0. The fixture uses `hidden_size`.
 | --- | :---: | :---: | ---: | :---: |
 | bloomz-560m, "The capital of France is" | match (5, raw) | all 25 agree, worst 4.76e-07 | 5.32e-07 | match |
 | bloomz-560m, "Explain how rainbows form, …" | match (12, raw) | all 25 agree, worst 6.99e-07 | 3.85e-07 | match |
+
+## Gemma 2 (`gemma2`): verified; transformers' default attention drops the softcap
+
+`unsloth/gemma-2-2b-it` (the ungated copy of Google's release), first 4 layers.
+
+**Symptom.** Layer 0's output differed by 3.5e-03 of its magnitude.
+
+**Cause: the reference.** transformers loads Gemma 2 with `sdpa` attention by
+default, and that path does not apply `attn_logit_softcapping` (50): with the
+reference's softcap removed its output did not change at all. Loaded with
+`attn_implementation="eager"`, which applies it, layer 0 agrees to 5.9e-07.
+ditch applies the softcap, as the model was trained. `tools/probe_reference.py`
+now loads eager attention for any config with `attn_logit_softcapping`.
+(heretic loads models with transformers' default attention, so on Gemma 2 it
+runs without the attention softcap.)
+
+**Prompt.** Gemma 2's template raises on a system message; transformers'
+reference retries without it, ditch puts the system prompt at the head of the
+first user turn, as Gemma 3's template does. So the ids differ by the system
+prompt by design, and the forward pass is compared on ditch's ids.
+
+| prompt | tokens | residuals | first-token logits |
+| --- | :---: | :---: | ---: |
+| "The capital of France is" | system prompt merged (see above) | all 5 agree, worst 8.57e-07 | 7.39e-07 |
+| "Explain how rainbows form, …" | same | all 5 agree, worst 6.09e-07 | 5.73e-07 |

@@ -185,8 +185,16 @@ def main():
         spec.loader.exec_module(factory)
         model = factory.load(args.model, getattr(torch, args.dtype))
     else:
+        # transformers' default sdpa attention silently skips an attention
+        # logit softcap (Gemma 2); eager attention applies it, as the model does.
         try:
-            model = AutoModelForCausalLM.from_pretrained(args.model, dtype=getattr(torch, args.dtype), trust_remote_code=trc)
+            cfg = AutoConfig.from_pretrained(args.model, trust_remote_code=trc)
+            softcap = getattr(getattr(cfg, "text_config", cfg), "attn_logit_softcapping", None)
+        except Exception:
+            softcap = None
+        extra = {"attn_implementation": "eager"} if softcap else {}
+        try:
+            model = AutoModelForCausalLM.from_pretrained(args.model, dtype=getattr(torch, args.dtype), trust_remote_code=trc, **extra)
         except ValueError:
             # Not registered with AutoModelForCausalLM (Mistral 4): use the class the config names.
             import transformers
