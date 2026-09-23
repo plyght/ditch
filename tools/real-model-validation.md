@@ -4040,3 +4040,30 @@ gpt-oss's experts load in parallel. With a cache smaller than the trunk
 (20 of 22.3 GB), every later token would fetch ~2.3 GB again; with 23 GB of
 cache disk the second pass would read only local chunks. The RAM side is
 small (3.2 GB). Its arithmetic is verified on the truncated cut above.
+## gpt-oss-120b at full depth: verified
+
+`openai/gpt-oss-120b`, all 36 layers (alternating 128-token sliding and full
+attention with sinks, 128 MXFP4 experts a layer, top-4). A short raw prompt
+keeps the routed working set inside this disk: "The capital of France is"
+(5 tokens, `--raw`), 4 greedy tokens. The chat-formatted 87-token prompt
+routes to ~57 GB of experts (the network-bound run above). ditch:
+`--max-ram 10GB --remote-cache-size 21GB --raw --max-response-length 4`.
+Reference: `tools/ref_stream.py`, experts lazy and prefetched as the router
+picks them, `REF_STREAM_CACHE_GB=20`.
+
+| prompt | tokens | residuals (37 entries) | first-token logits | greedy (4 tokens) |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (5) | all agree, worst 2.90e-06 (layer 14) | 4.37e-07 | match: ` Paris.\n\nGreat` |
+
+Per layer: 1.2e-07 after layer 0, then 1.3e-07 to 2.9e-06 with no trend. The
+last ten entries are all below 9e-07, so the error does not grow with depth.
+
+| side | fetched | peak RSS | wall |
+| --- | ---: | ---: | ---: |
+| ditch | 24.61 GB, 3155 ranges (the 21 GB chunk cache evicted 464 chunks) | 7.27 GB | 1695 s |
+| reference | 13.95 GB, 3549 requests (+18.6 GB from its cache); 1516 expert loads | 10.27 GB | 547 s |
+
+The reference's time is split between the Hub and transformers' own MXFP4
+dequantiser (`convert_moe_packed_tensors`, one expert at a time on the main
+thread) while the next experts download.
+
