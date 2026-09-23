@@ -779,6 +779,18 @@ const role_words = [_]struct { field: []const u8, words: []const []const u8 }{
     .{ .field = "lm_head", .words = &.{ "lm_head", "output", "head" } },
 };
 
+/// Whether `name` says another slot's role more than `field`'s.
+fn roleConflict(field: []const u8, name: []const u8) bool {
+    const own = roleScore(field, name);
+    for (role_words) |r| {
+        if (std.mem.eql(u8, r.field, field)) continue;
+        // Expert and dense twins share their words.
+        if (std.mem.endsWith(u8, r.field, field) or std.mem.endsWith(u8, field, r.field)) continue;
+        if (roleScore(r.field, name) > own) return true;
+    }
+    return false;
+}
+
 fn roleScore(field: []const u8, name: []const u8) usize {
     for (role_words) |r| if (std.mem.eql(u8, r.field, field)) {
         var s: usize = 0;
@@ -844,6 +856,8 @@ fn proposeRename(a: Allocator, ck: *const Checkpoint, f: *const Arch, c: *const 
         const t = ck.find(n) orelse continue;
         if (want) |w| if (!t.is(w)) continue;
         if (want == null and !std.mem.eql(u8, std.fs.path.extension(n), std.fs.path.extension(missing))) continue;
+        // A name that says another role (`dense` for q) is not this one.
+        if (roleConflict(field, p.rel)) continue;
         const s = roleScore(field, p.rel) + 1;
         if (s > best_score) {
             best = n;
