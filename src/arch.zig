@@ -2333,7 +2333,7 @@ fn configCorpus(arena: Allocator) ![]CorpusEntry {
         try out.append(arena, .{ .name = name, .text = text });
         const vpath = try std.fmt.allocPrint(arena, "tests/config_variants/{s}.json", .{name});
         const vtext = std.Io.Dir.cwd().readFileAlloc(io, vpath, arena, .limited(1 << 20)) catch continue;
-        const base = try std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{});
+        const base = try std.json.parseFromSliceLeaky(std.json.Value, arena, try sanitizeJson(arena, text), .{});
         const patches = try std.json.parseFromSliceLeaky(std.json.Value, arena, vtext, .{});
         if (patches != .array) return error.InvalidConfig;
         for (patches.array.items, 0..) |patch, k| {

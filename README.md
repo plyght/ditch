@@ -107,9 +107,11 @@ remaining 11 (`baichuan`, `bitnet`, `deepseek_v3`, `granite_swa`, `hy_v3`,
 random-weight stub: their releases are gated, lack a usable tokenizer, are
 refused by design or were never published, except `deepseek_v3`, `minimax` and
 `minimax_m2`, whose releases have only been config-checked so far.
-A family ditch does not know yet can be added without rebuilding, as a Lua
-file in `~/.config/ditch/models/` ([the
-schema](docs/models.md#model-definitions-in-lua)).
+A family ditch does not know yet can be added without rebuilding: `ditch
+add-model <model>` reads the checkpoint's config and tensor names (not its
+weights), matches them against the known families, writes a commented draft
+definition to `~/.config/ditch/models/` and checks it with `ditch verify`
+([the schema](docs/models.md#model-definitions-in-lua)).
 **[docs/models.md](docs/models.md) is the full list**:
 every `model_type`, its aliases, what each fixture covers, which checkpoint
 verifies it on real weights, and every caveat; the numbers are in

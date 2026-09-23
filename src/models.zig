@@ -638,10 +638,9 @@ fn pushJson(L: *c.lua_State, v: std.json.Value) void {
         .bool => |b| c.lua_pushboolean(L, @intFromBool(b)),
         .integer => |n| c.lua_pushinteger(L, n),
         .float => |f| c.lua_pushnumber(L, f),
-        .number_string => |s| {
-            const f = std.fmt.parseFloat(f64, s) catch 0;
-            c.lua_pushnumber(L, f);
-        },
+        // A number std.json could not hold (an integer beyond 64 bits): ditch's
+        // readers see no number there, so neither does a definition.
+        .number_string => _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "ditch_null"),
         .string => |s| _ = c.lua_pushlstring(L, s.ptr, s.len),
         .array => |arr| {
             c.lua_createtable(L, @intCast(arr.items.len), 0);
