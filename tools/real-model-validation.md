@@ -2499,3 +2499,15 @@ expert choice was a tie); the real router does.
 | --- | :---: | :---: | ---: | :---: |
 | "The capital of France is" | match (19) | all 4 agree, worst 1.75e-06 | 5.76e-07 | match |
 | "Explain how rainbows form, …" | match (26) | all 4 agree, worst 1.20e-06 | 4.45e-07 | match |
+
+## Hunyuan-A13B (`hunyuan_v1_moe`): verified
+
+`tencent/Hunyuan-A13B-Instruct`, first 2 layers (64-expert top-8 MoE with a
+shared MLP, q/k norms after the rope), routed experts lazy through
+`tools/ref_lazy_moe.py`: the first reference run fills the experts the prompts
+route to, then both sides are run again on the filled file.
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (14) | all 3 agree, worst 6.36e-07 | 7.67e-07 | match |
+| "Explain how rainbows form, …" | match (20) | all 3 agree, worst 6.51e-07 | 8.04e-07 | match |
