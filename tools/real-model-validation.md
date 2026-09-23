@@ -3450,3 +3450,16 @@ The remaining 2e-04 is transformers': `build_alibi_tensor` rounds the slopes
 (and their products with the positions) to bf16, and Falcon-RW's 32 heads
 have slopes that are not powers of two. With the reference's ALiBi built in
 float32, every layer agrees to 3e-06. ditch keeps float32 slopes.
+
+## `.bin`-only releases, converted
+
+| checkpoint | family | how | tokens | residuals (worst) | first-token logits |
+| --- | --- | --- | :---: | ---: | ---: |
+| facebook/opt-125m | `opt` | whole, re-saved as safetensors | match (raw) | 9.54e-07 | 2.58e-07 |
+| tiiuae/falcon-rw-1b | `falcon` (sequential, ALiBi) | whole, re-saved | match (raw) | 2.23e-04 (bf16 ALiBi, bug 65) | 1.50e-05 |
+| nvidia/Minitron-4B-Base | `nemotron` | first 3 layers of the loaded bf16 model, saved as safetensors | match (raw) | 1.71e-06 | 2.47e-06 |
+
+Left: `EleutherAI/gpt-j-6b` (24 GB of float32 `.bin`, more than this machine
+can load to convert; its layout is CodeGen's, which is verified),
+`baichuan-inc/Baichuan2-7B-Chat` (15 GB of `.bin` plus remote code),
+`adept/persimmon-8b-*` (`.bin` and no `tokenizer.json`).
