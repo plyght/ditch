@@ -4324,3 +4324,38 @@ as the range reads (F13). `tools/range_server.py` serves a
 Regression test: "remote source: rate-limited small files are waited for,
 not taken for missing ones" (`src/remote_test.zig`, the native client and
 curl; it fails with the old mapping).
+## Gemma 4 (`gemma4`): dense, per-layer inputs, KV sharing
+
+`google/gemma-4-E2B-it`, layers 0-4, 15 and 19 (sliding, global and KV-shared),
+towers dropped, the per-layer input table cut to the kept layers.
+
+* **Edited set:** `self_attn.o_proj` of cut layers 2-6 and `mlp.down_proj` of
+  1-6, exactly the layers the trial's two kernels reach; the per-layer input
+  gate and projection, the norms (Gemma's post-attention and post-feedforward
+  norms follow the edited matrices) and the embedding tables untouched, as in
+  heretic.
+* **Arithmetic, f32 export of the trial:** all 11 matrices within 7.4e-08 of
+  the rank-3 optimum of the exact edit.
+* **bf16 export:** 99.87-99.94% of the elements equal `bf16(W + D₃)`; the rest
+  rounding ties. ditch's reload validation: max first-token logit difference
+  0.37 for the bf16 export (the rounding of the merged weights, which this
+  7-layer cut amplifies), 0.0002 for the f32 export.
+* **Export:** transformers (`tools/ref_lazy_moe.py`) on the f32 export against
+  `ditch probe` on it: residuals within 1.5e-06, logits 2.5e-06, ids equal
+  after bug 69.
+
+### Bug 69 — gemma-4-E2B-it was prompted with an empty thought block its template does not write (fixed)
+
+**Symptom.** On the export above, transformers' ids were 5 shorter: ditch
+ended the prompt `<|turn>model\n<|channel>thought\n<channel|>`, the release's
+template `<|turn>model\n`.
+
+**Cause.** Bug F10 took the Gemma 4 format from `gemma-4-12B-it`, whose
+template appends the empty thought block when thinking is off (`{%- if not
+enable_thinking -%}{{- '<|channel>thought\n<channel|>' -}}`). `gemma-4-E2B-it`'s
+template has no such branch: its generation prompt is the model turn alone.
+
+**Fix.** A `gemma4_plain` template, chosen when the release's template does not
+contain the empty thought block's literal; tests cover both detections and the
+render. The trial above was calibrated with the old prompt, which changes its
+directions, not the arithmetic this section checks.
