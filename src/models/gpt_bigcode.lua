@@ -27,5 +27,7 @@ return {
     up = "mlp.c_fc.weight",
     down = "mlp.c_proj.weight",
   },
-  hook = "gpt_bigcode",
+  config = function(cfg, c)
+    if flag(cfg.multi_query, true) then c.num_kv_heads = 1 else c.num_kv_heads = c.num_heads end
+  end,
 }

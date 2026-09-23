@@ -16,5 +16,11 @@ return {
     up = false,
     gate_up = "mlp.gate_up_proj.weight",
   },
-  hook = "glm4",
+  config = function(cfg, c)
+    if type(cfg.partial_rotary_factor) ~= "number" then
+      c.rotary_dim = c.head_dim // 2
+      c.rope_freq_dim = c.rotary_dim
+    end
+    c.attention_bias = flag(cfg.attention_bias, true)
+  end,
 }

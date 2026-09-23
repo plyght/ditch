@@ -598,7 +598,7 @@ Helpers every definition sees:
 
 | Helper | |
 | --- | --- |
-| `num(v, d)`, `int(v, d)`, `flag(v, d)`, `str(v)`, `obj(v)` | A number, a non-negative integer (truncated), a boolean (or a non-zero integer), a string, a table, or the default `d` when `v` is missing, null or of another type: how ditch reads every key. |
+| `num(v, d)`, `int(v, d)`, `flag(v, d)`, `str(v)`, `obj(v)` | A number, a non-negative integer (truncated), a boolean (or a non-zero integer), a string, a JSON object (not an array), or the default `d` when `v` is missing, null or of another type: how ditch reads every key. |
 | `present(v)` | The key exists, even as null. |
 | `len(v)` | Length of a JSON array (0 otherwise). |
 | `each_layer(list, f)` | `list[i + 1] = f(i)` for every zero-based layer `i`. |

@@ -33,9 +33,10 @@ function str(v)
   return nil
 end
 
--- A JSON object (a table that is not `null`), or nil.
+-- A JSON object (a table that is neither `null` nor a non-empty array), or
+-- nil. An empty array cannot be told from an empty object.
 function obj(v)
-  if type(v) == "table" and v ~= null then return v end
+  if type(v) == "table" and v ~= null and #v == 0 then return v end
   return nil
 end
 

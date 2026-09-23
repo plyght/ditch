@@ -1,0 +1,1 @@
+[{"partial_rotary_factor": "$delete"}, {"partial_rotary_factor": null}, {"partial_rotary_factor": "0.5"}, {"partial_rotary_factor": 1}, {"attention_bias": false}, {"attention_bias": "$delete"}, {"partial_rotary_factor": "$delete", "head_dim": 6, "hidden_size": 24}]

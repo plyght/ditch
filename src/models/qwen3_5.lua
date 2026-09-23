@@ -20,5 +20,5 @@ return {
     lin_norm = "linear_attn.norm.weight",
     lin_out = "linear_attn.out_proj.weight",
   },
-  hook = "qwen_hybrid",
+  config = require("qwen_hybrid").config,
 }

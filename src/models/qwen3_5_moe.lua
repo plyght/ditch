@@ -22,5 +22,5 @@ return {
     shared_expert = "mlp.shared_expert.",
     shared_expert_gate = "mlp.shared_expert_gate.weight",
   },
-  hook = "qwen_hybrid",
+  config = require("qwen_hybrid").config,
 }
