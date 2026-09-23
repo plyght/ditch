@@ -193,7 +193,7 @@ fn copySideFiles(io: Io, src: Io.Dir, dst: Io.Dir, tiktoken: bool) void {
     }
 }
 
-test "saveModel carries the remote code" {
+test "saveModel carries the remote code and names the export dtype" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -220,12 +220,90 @@ test "saveModel carries the remote code" {
     defer model.deinit();
     var sink: Io.Writer.Allocating = .init(gpa);
     defer sink.deinit();
-    try saveModel(gpa, io, model, out_dir, .{}, &sink.writer);
+    try saveModel(gpa, io, model, out_dir, .{ .export_dtype = .f32 }, &sink.writer);
     var out = try Io.Dir.cwd().openDir(io, out_dir, .{});
     defer out.close(io);
+    // The config names the dtype the weights were written in.
+    const config = try out.readFileAlloc(io, "config.json", gpa, .limited(1 << 20));
+    defer gpa.free(config);
+    try std.testing.expect(std.mem.indexOf(u8, config, "\"torch_dtype\": \"float32\"") != null);
     for ([_][]const u8{ "modeling_kimi_k3.py", "configuration_kimi_k3.py", "tokenization_kimi.py", "media_utils.py", "chat_template.jinja" }) |name| {
         try out.access(io, name, .{});
     }
+}
+
+/// `config.json` with every floating-point `dtype` / `torch_dtype` (top level
+/// and nested text / vision configs) naming `dtype`: transformers loads with
+/// `dtype="auto"` from it, so a float32 export that still said bfloat16 would
+/// be rounded back to bf16 on load.
+fn withConfigDtype(gpa: Allocator, json: []const u8, dtype: tensor.DType) ![]u8 {
+    const name: []const u8 = switch (dtype) {
+        .f32 => "float32",
+        .f16 => "float16",
+        .bf16 => "bfloat16",
+        else => return gpa.dupe(u8, json),
+    };
+    var out: Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    var i: usize = 0;
+    while (i < json.len) {
+        const at = std.mem.indexOfScalarPos(u8, json, i, '"') orelse break;
+        const key_end = stringEnd(json, at) orelse break;
+        const key = json[at + 1 .. key_end];
+        var j = key_end + 1;
+        while (j < json.len and std.ascii.isWhitespace(json[j])) : (j += 1) {}
+        if (j < json.len and json[j] == ':' and (std.mem.eql(u8, key, "dtype") or std.mem.eql(u8, key, "torch_dtype"))) {
+            j += 1;
+            while (j < json.len and std.ascii.isWhitespace(json[j])) : (j += 1) {}
+            if (j < json.len and json[j] == '"') {
+                const v_end = stringEnd(json, j) orelse break;
+                const value = json[j + 1 .. v_end];
+                for ([_][]const u8{ "float32", "float16", "bfloat16" }) |f| {
+                    if (std.mem.eql(u8, value, f)) {
+                        try out.writer.writeAll(json[i .. j + 1]);
+                        try out.writer.writeAll(name);
+                        try out.writer.writeByte('"');
+                        i = v_end + 1;
+                        break;
+                    }
+                } else {
+                    try out.writer.writeAll(json[i .. v_end + 1]);
+                    i = v_end + 1;
+                }
+                continue;
+            }
+        }
+        // Not a dtype key: copy through the string (a key or a value).
+        try out.writer.writeAll(json[i .. key_end + 1]);
+        i = key_end + 1;
+    }
+    try out.writer.writeAll(json[i..]);
+    return out.toOwnedSlice();
+}
+
+/// The index of the quote closing the JSON string that opens at `start`.
+fn stringEnd(json: []const u8, start: usize) ?usize {
+    var k = start + 1;
+    while (k < json.len) : (k += 1) switch (json[k]) {
+        '\\' => k += 1,
+        '"' => return k,
+        else => {},
+    };
+    return null;
+}
+
+test "withConfigDtype names the export dtype" {
+    const gpa = std.testing.allocator;
+    const json =
+        \\{"dtype": "bfloat16", "text_config": {"torch_dtype":"bfloat16", "model_type": "x"},
+        \\ "quantization_config": {"dtype": "int8"}, "name": "dtype", "note": "a \"dtype\": \"bfloat16\" in a string"}
+    ;
+    const got = try withConfigDtype(gpa, json, .f32);
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings(
+        \\{"dtype": "float32", "text_config": {"torch_dtype":"float32", "model_type": "x"},
+        \\ "quantization_config": {"dtype": "int8"}, "name": "dtype", "note": "a \"dtype\": \"bfloat16\" in a string"}
+    , got);
 }
 
 pub const SaveOptions = struct {
@@ -308,7 +386,11 @@ fn saveModelInner(gpa: Allocator, io: Io, model: *const Model, dir: Io.Dir, opts
     }
 
     // Config and tokenizer files.
-    try dir.writeFile(io, .{ .sub_path = "config.json", .data = model.export_config_json });
+    if (opts.export_dtype) |dt| {
+        const config = try withConfigDtype(gpa, model.export_config_json, dt);
+        defer gpa.free(config);
+        try dir.writeFile(io, .{ .sub_path = "config.json", .data = config });
+    } else try dir.writeFile(io, .{ .sub_path = "config.json", .data = model.export_config_json });
     try dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = model.tokenizer_json });
     if (model.generation_config_json) |g| try dir.writeFile(io, .{ .sub_path = "generation_config.json", .data = g });
     if (model.tokenizer_config_json) |t| try dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = t });

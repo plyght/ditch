@@ -3835,6 +3835,7 @@ evict older ones as they would at the configured bound. Regression test:
 (`src/remote_test.zig`, a simulated filesystem capacity; it fails without
 the fix).
 
+
 # Full-depth reference
 
 Until now every frontier family was compared with its reference on a cut: the
@@ -4193,6 +4194,53 @@ episode. `tools/range_server.py` serves a `/ratelimit-<n>/` prefix whose
 first n range requests get a 429. Regression test: "remote source: a
 rate-limited server is waited out, the concurrent readers backing off
 together" (`src/remote_test.zig`).
+
+## GLM-5.3-Flash at full depth: verified (mHC streams across all 45 layers)
+
+The spot check the frontier session asked for: a model whose state crosses
+the whole depth. `zai-org/GLM-5.3-Flash` carries 4 mHC hyper-connection
+streams through all 45 layers (34 Kimi Delta Attention layers, 11 DSA layers,
+3 dense then 42 MoE layers of 288 FP8 experts, top-8). One raw 11-token
+prompt ("Explain how rainbows form, in two sentences."), prefill plus the
+first greedy token. (GLM-5.3 itself is MLA + DSA with no hyper-connections,
+so the Flash model is the one this check needs.)
+
+ditch: `ditch probe hf://zai-org/GLM-5.3-Flash --max-ram 10GB
+--remote-cache-size 8GB --raw --max-response-length 1 --residuals --json`.
+Reference: transformers' `glm5_next` through `tools/ref_stream.py`
+(`REF_STREAM_EXPERT_CACHE_GB=0.5 REF_STREAM_PREFETCH_GB=0.5`, no disk
+cache). The reference's FP8 weights were first checked against a manual
+dequantisation on a KDA and an MLA layer (identical, the 576-row partial
+blocks included), and its F32 router correction bias against the checkpoint
+(identical). Residuals are compared as each layer's collapsed block input
+(the reference's own `attn_hc` output).
+
+| tokens | residuals (46 entries) | first-token logits | greedy |
+| :---: | :---: | ---: | :---: |
+| match (11) | all agree, worst 4.42e-05 (entry 38) | 2.33e-05 | match: ` Use` |
+
+Per entry: 7.4e-08 at the first collapse, then 5.9e-07 to 4.2e-06 up to entry
+26, a step to 3.0e-05 at entry 27 (the output of layer 26, a KDA layer
+between two others), then flat between 1.9e-05 and 4.4e-05 to the end. So
+the error does not accumulate with depth: one layer adds a step, and the
+following 18 layers neither amplify nor reduce it. The level matches the cut's
+1e-5 KDA drift (see "GLM-5.3-Flash: verified on real weights" and Bug F9), 25x
+inside the 1e-3 bar. Top-5 first tokens identical (` Use`, ` Then`,
+` Include`, ` A`, ` `).
+
+| side | fetched | peak RSS | wall |
+| --- | ---: | ---: | ---: |
+| ditch | 127.41 GB, 16317 ranges (8 GB chunk cache, 15293 evictions); 2168 experts | 10.76 GB | 6723 s |
+| reference | 71.36 GB, 15176 requests; 45 layer loads, 2168 expert loads | 9.01 GB | 910 s |
+
+ditch fetched ~19 MB/s through this machine's proxy, with repeated TLS
+resets. Its first attempt ended on a Hub rate limit (F13 in the speed
+session's numbering) and was run again after that fix. Two reference
+attempts were killed by the out-of-memory killer while other checks shared
+the machine, and the third ran alone.
+Kimi K3 (Attention Residual over earlier layers) was not run: the owner
+revised the scope to one spot check, and K3's full-depth prefill is 106 GB of
+trunk plus ~120 GB of experts on each side.
 
 # Abliteration on the new families
 
@@ -4842,6 +4890,29 @@ float32 export.
   probe` on the export: residuals within 7.9e-07, logits 7.0e-07 of range,
   argmax and top-5 equal. ditch's reload check 0.0000.
 
+## Abliteration: GLM-5.3-Flash (`glm5_next`), KDA and MLA under mHC, FP8 blocks
+
+`zai-org/GLM-5.3-Flash`, layers 0 and 3 (KDA with the dense MLP, then NoPE
+MLA with the DSA indexer and the first MoE layer), the first 8 experts
+(`--experts 8`), mHC hyper-connections (4 streams) around every block, FP8
+with 128 x 128 blocks; float32 export (its config now says float32, bug 72).
+
+* **Edited set:** `self_attn.o_proj` in both layers (the KDA one, then the
+  MLA one), layer 0's `mlp.down_proj`, every routed expert's `down_proj` and
+  `shared_experts.down_proj`. The hyper-connection tensors (`attn_hc.*`,
+  `mlp_hc.*`, `hc_head`), the KDA gates, the indexer, the MLA projections and
+  the vision tower are untouched: a block writes into the streams only
+  through its output projection, which is where the direction is taken out.
+* **Maths:** FP8 originals dequantised by the checker; all 12 edited matrices
+  within 1.6e-06 of the best rank-3 approximation of the exact edit.
+* **Export:** transformers' `modeling_glm5_next.py` (torch KDA path) on the
+  export against `ditch probe`: residuals within 5.2e-06 (this family's
+  forward check sits at the same level, from the mHC mixing), logits 1.6e-06
+  of range, argmax and top-5 equal. The reference is the new
+  `tools/ref_plain.py`; `tools/ref_lazy_moe.py`, which this family's forward
+  check used, builds the routed experts empty for a lazy file and now also
+  keeps a sharded directory's index when there is no lazy file.
+
 ## Exact ranges for scattered experts: gpt-oss-20b with a cache below its experts
 
 After the account of gpt-oss-120b's decode above (whole 8 MB chunks per
@@ -4889,6 +4960,23 @@ copies every top-level `*.py` beside the tokenizer and processor files: the
 modules `auto_map` names and the ones they import, as transformers'
 `save_pretrained` does for remote code. Test: `saveModel carries the remote
 code` exports the qwen2 fixture with Kimi K3's file names beside it.
+
+## Bug 72 — a float32 export's config still said bfloat16 (fixed)
+
+**Symptom.** GLM-5.3's `--export-dtype f32` export held float32 tensors, but
+its `config.json` kept the release's `"dtype": "bfloat16"`. transformers'
+default `from_pretrained(..., dtype="auto")` takes the dtype from there, so
+the float32 export was loaded rounded to bf16 unless the caller passed
+`dtype=torch.float32` (the comparisons here always do, which hid it).
+
+**Cause.** `saveModel` wrote the source config (less `quantization_config`)
+whatever `export_dtype` was.
+
+**Fix.** With an `export_dtype`, every floating-point `dtype` / `torch_dtype`
+in `config.json` (top level and nested text / vision configs) names it; other
+`dtype` keys (a quantisation scheme's) are left alone. Tests:
+`withConfigDtype names the export dtype`, and `saveModel carries the remote
+code and names the export dtype` exports the qwen2 fixture as float32.
 
 # Lua model definitions and add-model
 
@@ -5091,50 +5179,3 @@ connection for a while once `after` range requests were served,
   thirds into its requests (and reports the outage and its end), and a probe
   killed (SIGKILL) part-way through its load and run again over the same
   cache prints the same, without fetching any chunk the killed run had kept.
-## GLM-5.3-Flash at full depth: verified (mHC streams across all 45 layers)
-
-The spot check the frontier session asked for: a model whose state crosses
-the whole depth. `zai-org/GLM-5.3-Flash` carries 4 mHC hyper-connection
-streams through all 45 layers (34 Kimi Delta Attention layers, 11 DSA layers,
-3 dense then 42 MoE layers of 288 FP8 experts, top-8). One raw 11-token
-prompt ("Explain how rainbows form, in two sentences."), prefill plus the
-first greedy token. (GLM-5.3 itself is MLA + DSA with no hyper-connections,
-so the Flash model is the one this check needs.)
-
-ditch: `ditch probe hf://zai-org/GLM-5.3-Flash --max-ram 10GB
---remote-cache-size 8GB --raw --max-response-length 1 --residuals --json`.
-Reference: transformers' `glm5_next` through `tools/ref_stream.py`
-(`REF_STREAM_EXPERT_CACHE_GB=0.5 REF_STREAM_PREFETCH_GB=0.5`, no disk
-cache). The reference's FP8 weights were first checked against a manual
-dequantisation on a KDA and an MLA layer (identical, the 576-row partial
-blocks included), and its F32 router correction bias against the checkpoint
-(identical). Residuals are compared as each layer's collapsed block input
-(the reference's own `attn_hc` output).
-
-| tokens | residuals (46 entries) | first-token logits | greedy |
-| :---: | :---: | ---: | :---: |
-| match (11) | all agree, worst 4.42e-05 (entry 38) | 2.33e-05 | match: ` Use` |
-
-Per entry: 7.4e-08 at the first collapse, then 5.9e-07 to 4.2e-06 up to entry
-26, a step to 3.0e-05 at entry 27 (the output of layer 26, a KDA layer
-between two others), then flat between 1.9e-05 and 4.4e-05 to the end. So
-the error does not accumulate with depth: one layer adds a step, and the
-following 18 layers neither amplify nor reduce it. The level matches the cut's
-1e-5 KDA drift (see "GLM-5.3-Flash: verified on real weights" and Bug F9), 25x
-inside the 1e-3 bar. Top-5 first tokens identical (` Use`, ` Then`,
-` Include`, ` A`, ` `).
-
-| side | fetched | peak RSS | wall |
-| --- | ---: | ---: | ---: |
-| ditch | 127.41 GB, 16317 ranges (8 GB chunk cache, 15293 evictions); 2168 experts | 10.76 GB | 6723 s |
-| reference | 71.36 GB, 15176 requests; 45 layer loads, 2168 expert loads | 9.01 GB | 910 s |
-
-ditch fetched ~19 MB/s through this machine's proxy, with repeated TLS
-resets. Its first attempt ended on a Hub rate limit (F13 in the speed
-session's numbering) and was run again after that fix. Two reference
-attempts were killed by the out-of-memory killer while other checks shared
-the machine, and the third ran alone.
-Kimi K3 (Attention Residual over earlier layers) was not run: the owner
-revised the scope to one spot check, and K3's full-depth prefill is 106 GB of
-trunk plus ~120 GB of experts on each side.
-
