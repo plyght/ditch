@@ -3583,3 +3583,47 @@ max first-token logit difference of 0.0748 (argmax 100%) against the
 in-memory model: that is the bf16 rounding of the merged `W + ΔW` in the
 export, since the in-memory model keeps the delta in float32. The same trial
 exported with `--export-dtype f32` validates at 0.0000.
+
+## InternLM2 with a converted tokenizer, and bugs 66-67
+
+`internlm/internlm2_5-1_8b-chat` ships a SentencePiece `tokenizer.model` and
+no `tokenizer.json`; ditch's refusal message tells the user to save one with
+`AutoTokenizer`. Doing that under transformers 5 (`InternLM2TokenizerFast`,
+the release's remote code) writes a `tokenizer.json` that is not the model's
+tokenizer: no normalizer and no pre-tokenizer (spaces are dropped:
+"a helpful" becomes `ah` `elp`), and the chat tokens renumbered after the
+vocabulary (`<|im_start|>` 92549 in a 92544-row embedding; the release's own
+id is 92543). transformers' reference fails on it with an index error, and
+the release's `tokenizer.model` cannot be read by the installed sentencepiece
+(`piece must not include null character`). InternLM2 therefore stays
+unverified: no working tokenizer can be produced here. Two ditch bugs came out
+of it.
+
+### Bug 66 — a token id past the embedding table read the last row (fixed)
+
+**Symptom.** ditch ran the prompt above without complaint.
+
+**Cause.** `Model.embedRow` clamped the id to the last row of the embedding,
+so any token the checkpoint has no row for was silently embedded as another
+token.
+
+**Fix.** An id at or past the table's row count is an error naming the
+mismatch (`token id 92549 is outside the embedding table (92544 rows): the
+tokenizer does not match the checkpoint`); a test covers the range check.
+
+### Bug 67 — BPE kept characters it cannot spell as merge barriers (fixed)
+
+**Symptom.** On that `tokenizer.json`, ditch encoded "You are a helpful
+assistant." as `a` `help` … where `tokenizers` gives `ah` `elp` ….
+
+**Cause.** In `tokenizers`' BPE a character with no vocabulary entry, when
+there is neither byte fallback nor an unknown token, is left out of the word
+before merging, so its neighbours can merge across it. ditch kept it as a
+symbol, which blocked every merge across it, and then emitted nothing for it.
+
+**Fix.** In exactly that case ditch removes such characters before merging; a
+test (`tokenizers` gives [2, 3] for its input) covers it. The existing
+byte-level round-trip test had a merge (`Ġ w`) whose part `w` was not in its
+vocabulary, which `tokenizers` refuses to load; `w` was added to it.
+Byte-level tokenizers have every byte in their vocabulary, so nothing changes
+for them.

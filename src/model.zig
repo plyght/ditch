@@ -1920,9 +1920,17 @@ pub const Model = struct {
     }
 
     /// Reads embedding row `t` as f32 (a positional read in streamed mode).
+    /// A token id past the table is an error, not a clamp: it means the
+    /// tokenizer does not belong to the checkpoint (a converted tokenizer.json
+    /// that numbered its added tokens after the vocabulary), and reading the
+    /// last row instead would run a different prompt without a word.
     pub fn embedRow(self: *const Model, t: u32, out: []f32) !void {
+        const row = embedRowIndex(t, self.embed_ref.rows) catch |err| {
+            std.log.err("token id {d} is outside the embedding table ({d} rows): the tokenizer does not match the checkpoint", .{ t, self.embed_ref.rows });
+            return err;
+        };
         const store: *stream.WeightStore = @constCast(&self.store);
-        try store.readRow(self.embed_ref, @min(t, self.embed_ref.rows - 1), out);
+        try store.readRow(self.embed_ref, row, out);
     }
 
     /// Reads the learned position embedding for `pos` (with the family's offset).
@@ -2489,6 +2497,16 @@ fn alibiSlopes(arena: Allocator, n: usize) ![]f32 {
         }
     }
     return out;
+}
+
+fn embedRowIndex(t: u32, rows: usize) error{TokenOutOfRange}!usize {
+    if (t >= rows) return error.TokenOutOfRange;
+    return t;
+}
+
+test "a token id past the embedding table is an error" {
+    try std.testing.expectEqual(@as(usize, 92543), try embedRowIndex(92543, 92544));
+    try std.testing.expectError(error.TokenOutOfRange, embedRowIndex(92549, 92544));
 }
 
 test "layer index from templates" {

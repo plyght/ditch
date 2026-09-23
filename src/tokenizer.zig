@@ -1411,6 +1411,29 @@ pub const Tokenizer = struct {
             return;
         }
         if (self.unigram_scores.len > 0) return self.unigramWord(gpa, word, out);
+        // A character with no vocabulary entry, no byte fallback and no unknown
+        // token is left out before merging, as `tokenizers`' BPE does, so its
+        // neighbours can merge across it ("a h" with the space dropped).
+        if (!self.rank_bpe and !self.byte_fallback and self.unk_id == null) {
+            var kept = std.ArrayList(u8).empty;
+            defer kept.deinit(gpa);
+            var dropped = false;
+            var i: usize = 0;
+            while (i < word.len) {
+                const n = std.unicode.utf8ByteSequenceLength(word[i]) catch 1;
+                const end = @min(word.len, i + n);
+                if (self.vocab.get(word[i..end]) != null) try kept.appendSlice(gpa, word[i..end]) else dropped = true;
+                i = end;
+            }
+            if (dropped) {
+                var sub = std.ArrayList(u32).empty;
+                defer sub.deinit(gpa);
+                try self.bpeWord(gpa, kept.items, &sub);
+                try self.cacheWord(word, sub.items);
+                try out.appendSlice(gpa, sub.items);
+                return;
+            }
+        }
         var ids = std.ArrayList(u32).empty;
         defer ids.deinit(gpa);
 
@@ -2431,7 +2454,7 @@ test "added tokens absorb the whitespace their lstrip / rstrip flags name (Phi-3
 test "byte-level bpe round trip" {
     const gpa = std.testing.allocator;
     const json =
-        \\{"model":{"type":"BPE","vocab":{"h":0,"e":1,"l":2,"o":3,"he":4,"ll":5,"hell":6,"hello":7,"Ġ":8,"Ġw":9,"<|end|>":10},
+        \\{"model":{"type":"BPE","vocab":{"h":0,"e":1,"l":2,"o":3,"he":4,"ll":5,"hell":6,"hello":7,"Ġ":8,"Ġw":9,"<|end|>":10,"w":11},
         \\"merges":["h e","l l","he ll","hell o","Ġ w"]},
         \\"pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated"},{"type":"ByteLevel","add_prefix_space":false,"use_regex":false}]},
         \\"decoder":{"type":"ByteLevel"},
@@ -2617,4 +2640,19 @@ test "sentencepiece whitespace normalisation collapses runs and drops the leadin
     const ids = try tok.encode(gpa, "  a\t\tb ", false);
     defer gpa.free(ids);
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 1, 3, 1 }, ids);
+}
+
+test "BPE leaves out a character it cannot spell before merging" {
+    const gpa = std.testing.allocator;
+    // No pre-tokenizer, no byte fallback, no unk token, and no " " in the
+    // vocabulary: tokenizers drops the space and merges "a" with "h".
+    const json =
+        \\{"model":{"type":"BPE","byte_fallback":false,"vocab":{"a":0,"h":1,"ah":2,"x":3},"merges":["a h"]},
+        \\"normalizer":null,"pre_tokenizer":null,"added_tokens":[]}
+    ;
+    const tok = try Tokenizer.parse(gpa, json, null);
+    defer tok.deinit();
+    const ids = try tok.encode(gpa, "a hx", false);
+    defer gpa.free(ids);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 3 }, ids);
 }
