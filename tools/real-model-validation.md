@@ -4172,3 +4172,24 @@ evict older ones as they would at the configured bound. Regression test:
 "remote chunk cache: a full filesystem bounds the cache at what it holds"
 (`src/remote_test.zig`, a simulated filesystem capacity; it fails without
 the fix).
+
+## Bug F13 — the Hub's rate limit ended a streamed run after its prefill (fixed)
+
+The streamed gpt-oss-120b run above (after F12's disk-full stretch, with
+the routed-expert prefetch) finished its 87-token prefill in about 55
+minutes (2392 of the 4608 experts visited, the expert cache 0% hits as the
+dry run warned: it holds 122 experts, fewer than one layer's 128) and made
+its first decode step (144 misses). Then the Hub began answering `429 Too
+Many Requests`: after about an hour of 8 MB range requests at 3-4 a second
+it rate-limits an anonymous client. Each request retried twice, 2 and 4 s
+later, and the run exited with `HttpError` after 3535 s.
+
+A 429 (or 503) is now `error.RateLimited`, retried on a schedule of its own
+(5, 10, 20, 40, then 60 s, about 10 minutes in all) that does not use up the
+other retries. The back-off is shared: no request of the source starts
+before it ends, so the 16 concurrent readers wait together instead of each
+spending its retries against the same limit, and it is reported once per
+episode. `tools/range_server.py` serves a `/ratelimit-<n>/` prefix whose
+first n range requests get a 429. Regression test: "remote source: a
+rate-limited server is waited out, the concurrent readers backing off
+together" (`src/remote_test.zig`).
