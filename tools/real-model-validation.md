@@ -3923,3 +3923,37 @@ prompt with the empty thinking channel. Tests pin the one-turn rendering and
 a four-message conversation, both copied from transformers'
 `apply_chat_template` on the release's tokenizer.
 
+## Gemma 4 12B at full depth: verified (after Bug F10)
+
+`google/gemma-4-12B-it`, all 48 layers (sliding and global, the global
+layers' 512-wide heads with keys reused as values, proportional RoPE, final
+softcap), chat template with the system turn, 6 greedy tokens. ditch:
+`--max-ram 12GB --remote-cache-size 23GB`, which holds the whole 22.2 GB of
+text weights, so every pass after the first reads from disk. Reference:
+`tools/ref_stream.py`, dense (no lazy experts), the tied 262144 x 3840
+embedding as float32 in the trunk (4 GB), `REF_STREAM_CACHE_GB=23`.
+
+| prompt | tokens | residuals (49 entries) | first-token logits | greedy (6 tokens) |
+| --- | :---: | :---: | ---: | :---: |
+| "What is the capital of France?" | match (31) | all agree, worst 6.58e-06 (layer 47) | 1.78e-06 | match: `The capital of France is **` |
+| "Explain how rainbows form, in two sentences." | match (33) | all agree, worst 7.51e-06 (layer 47) | 1.71e-06 | match: `Rainbows form when sunlight enters` |
+
+Per layer, both prompts: between 8e-08 and 3.5e-06 from layer 1 to 46, with
+no trend with depth, then 6.6e-06 / 7.5e-06 at entry 47 (the output of
+layer 46) and 2.9e-06 / 1.5e-06 at the final norm's input. The first probe,
+before the template fix, ran the same arithmetic on ditch's wrong ids and
+also agreed everywhere (worst 9.0e-06, again at entry 47; logits 4.4e-06),
+so the fix changed the prompt and nothing else.
+
+| side | fetched | peak RSS | wall |
+| --- | ---: | ---: | ---: |
+| ditch | 22.20 GB, 2841 ranges | 3.08 GB | 1557 s |
+| reference | 35.98 GB, 1603 requests (+272 GB from its cache) | 8.62 GB | 853 s |
+
+The reference fetched more than the model because its 23 GB cache stops
+0.8 GB short of the 23.8 GB of shards it reads, and it fetches 16 ranges in
+parallel. Measured here: one HTTP stream gets ~40 MB/s from the Hub, 4
+streams ~56 MB/s, 16 streams ~110 MB/s. ditch's `hf://` source fetched at
+~15-19 MB/s in both runs, so a wider fetch is the obvious speedup for ditch's
+first pass.
+
