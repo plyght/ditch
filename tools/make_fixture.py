@@ -514,6 +514,7 @@ spec("phi", NKV=4, norm="ln", eps=1e-5, parallel=True, pre_ff_norm=None, final_n
              "max_position_embeddings": 128, "tie_word_embeddings": False})
 spec("gpt_neox", NKV=4, prefix="gpt_neox.", embed="embed_in.weight", final_norm="final_layer_norm.weight", lm_head="embed_out.weight", norm="ln", eps=1e-5,
      parallel=True, qkv="attention.query_key_value.weight", qkv_layout="heads", o="attention.dense.weight", attn_bias=True,
+     pre_ff_norm=None, mlp_norm="post_attention_layernorm.weight",
      mlp="dense", up="mlp.dense_h_to_4h.weight", down="mlp.dense_4h_to_h.weight", mlp_bias=True, act="gelu", rotary_dim=2, theta=20000.0,
      config={"model_type": "gpt_neox", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4,
              "rotary_pct": 0.25, "rotary_emb_base": 20000, "layer_norm_eps": 1e-5, "use_parallel_residual": True, "hidden_act": "gelu",

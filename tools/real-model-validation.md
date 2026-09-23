@@ -2948,3 +2948,33 @@ both prompts). `tools/probe_reference.py` now takes Qwen4-Exp's
 | --- | :---: | :---: | ---: | :---: |
 | "The capital of France is" | match (5) | all 5 agree, worst 3.69e-06 | 7.17e-07 | match |
 | "Explain how rainbows form, …" | match (15) | all 5 agree, worst 1.66e-05 | 2.58e-06 | match |
+
+## Bug 60 — GPT-NeoX's MLP read the attention's input norm (fixed)
+
+**Symptom.** `EleutherAI/pythia-160m`, whole model, `--raw`: layer 0's output
+differed by 3.9e-01 of its magnitude and the argmax disagreed. With the MLP's
+output projection zeroed on both sides, attention agreed to 3.5e-07; with
+the attention's zeroed, the rest still differed by 6.3e-01.
+
+**Cause.** In ditch's parallel-residual path the MLP reads the layer's
+`mlp_norm` when the family names one and otherwise the attention's
+`input_layernorm` output: the GPT-J / Phi / Cohere / StableLM layout, one norm
+for both branches. GPT-NeoX has a norm per branch,
+`x + attn(input_layernorm(x)) + mlp(post_attention_layernorm(x))`, but
+`neox_style_names` named no `mlp_norm`, so `post_attention_layernorm` was
+loaded as the unused `pre_ff_norm` and every Pythia / GPT-NeoX MLP was fed the
+wrong normalisation. The fixture was written from the same reading and
+agreed. (Falcon 40B's `ln_mlp` already takes the `mlp_norm` path; StableLM's
+parallel layers have no second norm.)
+
+**Fix.** `neox_style_names` names `post_attention_layernorm` as `mlp_norm`;
+the fixture spec does the same and was regenerated, and fails on the old code
+(logits off by 2.4).
+
+| model | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| pythia-160m, "The capital of France is" | match (5, raw) | all 13 agree, worst 5.08e-05 | 8.15e-07 | match |
+| pythia-160m, "Explain how rainbows form, …" | match (11, raw) | all 13 agree, worst 9.25e-05 | 1.18e-06 | match |
+
+The residual bar is looser here than elsewhere because Pythia's residual
+stream grows to large magnitudes in its last layers; the logits agree to 1e-06.

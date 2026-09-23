@@ -3603,6 +3603,10 @@ const neox_style_names = Names{
     .gate = null,
     .up = "mlp.dense_h_to_4h.weight",
     .down = "mlp.dense_4h_to_h.weight",
+    // Parallel residual with a norm of its own for the MLP branch:
+    // mlp(post_attention_layernorm(x)), not the attention's input norm.
+    .pre_ff_norm = null,
+    .mlp_norm = "post_attention_layernorm.weight",
 };
 
 pub const registry = [_]Arch{
