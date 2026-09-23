@@ -15,7 +15,7 @@ difference, next to the best any rank-3 delta can do (ditch stores a rank-3 delt
 export is also compared bit for bit with bf16(W + D3), D3 the optimal rank-3 delta.
 """
 import json, re, sys, os, math, torch
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, '/home/user/ditch/tools')
 from lazy_checkpoint import LazyCheckpoint
 from ref_lazy_moe import dequant_expert
 from safetensors import safe_open
@@ -59,6 +59,15 @@ def orig(name):  # float32 view of a source tensor, dequantised (and rounded to 
         return convert_moe_packed_tensors(src.tensor(base + '_blocks'), src.tensor(base + '_scales')).float()
     if name in keys and src.header[name]['dtype'] not in ('F8_E4M3', 'U8', 'I8', 'I32'):
         return src.tensor(name).float()
+    if name in keys and src.header[name]['dtype'] == 'F8_E4M3':
+        # FP8 with a per-tensor, per-expert ([E, 1, 1]) or per-block scale
+        sname = next((c for c in (base + '.weight_scale_inv', name + '_scale_inv', base + '.weight_scale', name + '_scale') if c in keys), None)
+        w = src.tensor(name).float(); s = src.tensor(sname).float()
+        if s.dim() == 0 or s.numel() == 1 or (s.dim() == w.dim() and all(a in (1, b) for a, b in zip(s.shape, w.shape))):
+            return (w * s).to(torch.bfloat16).float()
+        bs = q.get('weight_block_size') or [-(-w.shape[-2] // s.shape[-2]), -(-w.shape[-1] // s.shape[-1])]
+        s = s.repeat_interleave(bs[0], -2)[..., : w.shape[-2], :].repeat_interleave(bs[1], -1)[..., : w.shape[-1]]
+        return (w * s).to(torch.bfloat16).float()
     return dequant_expert(src, base, wq).to(torch.bfloat16).float()
 exp_files = [os.path.join(out, f) for f in sorted(os.listdir(out)) if f.endswith('.safetensors')]
 changed, unchanged, checks, bits = [], 0, [], []
@@ -78,6 +87,16 @@ for fpath in exp_files:
         for name in f.keys():
             if name not in src.keys() and name + '_blocks' not in src.keys() and name.replace('.weight', '') + '.weight_scale_inv' not in src.keys() and not any(k.startswith(name[:-7]) for k in src.keys() if name.endswith('.weight')):
                 continue
+            shp = f.get_slice(name).get_shape()
+            big = len(shp) >= 2 and shp[0] * shp[1] * (shp[2] if len(shp) > 2 else 1) > 300_000_000 and name in src.keys() and src.header[name]['dtype'] in ('BF16', 'F16', 'F32')
+            if big:  # large plain tensors (embeddings, heads): compared in row chunks
+                sl = f.get_slice(name); diff = False
+                with safe_open(os.path.join(cut, 'model.safetensors'), 'pt') if os.path.exists(os.path.join(cut, 'model.safetensors')) else None as g:
+                    gs = g.get_slice(name)
+                    for r0 in range(0, shp[0], 8192):
+                        if not torch.equal(sl[r0:r0 + 8192].float(), gs[r0:r0 + 8192].float()): diff = True; break
+                if not diff: unchanged += 1; continue
+                print('  large tensor changed:', name); changed.append(name); continue
             E = f.get_tensor(name).float()
             try: O = orig(name)
             except Exception as e: print('  (cannot read original', name, e, ')'); continue
@@ -113,7 +132,8 @@ for fpath in exp_files:
                     dif = (pred - Em).abs()
                     far = int(((dif > step * 1.0001) & (dif > 1e-5 * Om.abs().mean())).sum())
                     ulp = (far, float(dif.max() / Om.abs().mean()))
-                    err = float((D - De).norm() / De.norm()); opt = rank_err(De)
+                    err = float((D - De).norm() / De.norm())
+                    opt = float(((pred.double() - Om.double()) - De).norm() / De.norm())  # the floor: bf16(W + D3) itself
                     checks.append((label, comp, li, lam, err, opt)); bits.append((label, same, ulp))
                     continue
                 err = float((D - De).norm() / De.norm()); opt = rank_err(De)
@@ -124,17 +144,9 @@ worst = 0
 for label, comp, li, lam, err, opt in checks:
     if err is None: print(f'  ?? {label}: no kernel weight / not [hidden, *] (comp {comp}, layer {li})'); continue
     worst = max(worst, err - opt)
-    if len(checks) <= 40 or err - opt > 1e-3: print(f'  {label}: {comp} layer {li} λ={lam:.4f}  |D-Dexact|/|Dexact| = {err:.2e}  (best rank-3: {opt:.2e})')
+    if len(checks) <= 40 or err - opt > 1e-3: print(f'  {label}: {comp} layer {li} λ={lam:.4f}  |D-Dexact|/|Dexact| = {err:.2e}  (best rank-3{", rounded" if EXP_BF16 else ""}: {opt:.2e})')
 for b in bits: print('   bits', b[0], 'equal %.6f' % b[1], 'far', b[2][0], 'max %.2e' % b[2][1])
 if EXP_BF16:
-    print(f'bf16 export: worst share of elements equal to bf16(W + D3): {min(b[1] for b in bits) if bits else 1:.6f}; elements more than one bf16 step (and 1e-5 of mean |W|) apart: {sum(b[2][0] for b in bits) if bits else 0}; largest difference {max(b[2][1] for b in bits) if bits else 0:.1e} of mean |W|; over {len(bits)} matrices; (E-W) against the exact edit (rounding included): worst excess over the rank-3 optimum {worst:.2e}; scope {scope}')
+    print(f'bf16 export: worst share of elements equal to bf16(W + D3): {min(b[1] for b in bits) if bits else 1:.6f}; elements more than one bf16 step (and 1e-5 of mean |W|) apart: {sum(b[2][0] for b in bits) if bits else 0}; largest difference {max(b[2][1] for b in bits) if bits else 0:.1e} of mean |W|; over {len(bits)} matrices; (E-W) against the exact edit: worst excess over the error of bf16(W + D3) itself {worst:.2e}; scope {scope}')
 else:
     print(f'worst excess over the rank-3 optimum: {worst:.2e} over {len(checks)} matrices; scope {scope}')
-if json_out:
-    # For `ditch verify`: what changed, and each edit against its recomputation.
-    summary = dict(changed=changed, unchanged=unchanged, matrices=len(checks),
-                   unchecked=[c[0] for c in checks if c[4] is None], worst_excess=worst, scope=scope, bf16=bool(EXP_BF16))
-    if EXP_BF16 and bits:
-        summary.update(bits_equal_min=min(b[1] for b in bits), bits_far=sum(b[2][0] for b in bits),
-                       bits_max_rel=max(b[2][1] for b in bits))
-    json.dump(summary, open(json_out, 'w'), indent=1)

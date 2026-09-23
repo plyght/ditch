@@ -172,7 +172,7 @@ n_trials=$(grep -c '"type":"trial"' "$CKPT")
 [ "$(tail -n 1 "$CKPT")" = '{"type":"finished"}' ] || fail "resumed study not marked finished"
 
 echo "==> Interactive menus and chat over stdin"
-printf '1\n1\n2\nHello, who are you?\n\n4\n' | "$DITCH" "${COMMON[@]}" --n-trials 4 --interactive 2>&1 | tee "$TMP/chat.log"
+printf '1\n1\n3\nHello, who are you?\n\n5\n' | "$DITCH" "${COMMON[@]}" --n-trials 4 --interactive 2>&1 | tee "$TMP/chat.log"
 grep -q "Show the results from the previous run" "$TMP/chat.log" || fail "checkpoint menu not shown"
 grep -q "Which trial do you want to use?" "$TMP/chat.log" || fail "trial menu not shown"
 grep -q "Assistant: " "$TMP/chat.log" || fail "chat did not produce a response"
@@ -648,6 +648,22 @@ grep -q '"passed":true' "$TMP/selftest.json" || fail "selftest JSON does not rep
 if grep -q '"ok":false' "$TMP/selftest.json"; then fail "the CPU backend deviates from the reference kernels"; fi
 if "$DITCH" selftest --device nonsuch > "$TMP/selftest_bad.log" 2>&1; then fail "an unknown device was accepted"; fi
 grep -q "device" "$TMP/selftest_bad.log" || fail "the unknown device was not named in the error"
+
+echo "==> add-model: an unknown model_type, a draft definition, then a run with it"
+AM="$TMP/add_model"
+mkdir -p "$AM/src" "$AM/models"
+cp tests/fixtures/qwen2/* "$AM/src/"
+python3 -c "import json,sys; p=sys.argv[1]; c=json.load(open(p)); c['model_type']='qwen2_renamed_e2e'; c.pop('architectures',None); json.dump(c,open(p,'w'))" "$AM/src/config.json"
+code=0; "$DITCH" "$AM/src" --dry-run --no-input > /dev/null 2> "$AM/unknown.log" || code=$?
+[ "$code" -ne 0 ] || fail "an unknown model_type was accepted"
+grep -q "ditch add-model $AM/src" "$AM/unknown.log" || fail "the unknown model_type did not suggest ditch add-model"
+"$DITCH" add-model "$AM/src" --models-dir "$AM/models" --cache-dir "$TMP/add_model_cache" --dry-run \
+    > "$AM/draft.out" 2> "$AM/add_model.log" || fail "ditch add-model failed"
+grep -q 'base = "qwen2"' "$AM/models/qwen2_renamed_e2e.lua" || fail "the draft does not name qwen2 as its base"
+cmp -s "$AM/draft.out" "$AM/models/qwen2_renamed_e2e.lua" || fail "the draft on stdout differs from the file written"
+"$DITCH" "${COMMON[@]/tests\/fixtures\/qwen2/$AM/src}" --models-dir "$AM/models" --dry-run \
+    > /dev/null 2> "$AM/run.log" || fail "a run with the drafted definition failed"
+grep -q "Architecture: qwen2_renamed_e2e" "$AM/run.log" || fail "the drafted definition was not used"
 
 echo
 echo "e2e: all checks passed"

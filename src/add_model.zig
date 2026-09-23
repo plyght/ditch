@@ -1,0 +1,1954 @@
+//! `ditch add-model MODEL`: drafts a Lua model definition (docs/models.md)
+//! for a checkpoint, then checks it.
+//!
+//! 1. **Read.** What describes the model without its weights: config.json,
+//!    the tokenizer files and chat template, and every safetensors header
+//!    (range requests for a Hub id, `hf://` or an http(s) URL; the files
+//!    themselves for a directory). Nothing else is downloaded.
+//! 2. **Shape-only copy.** The small files, and each shard as its real
+//!    header followed by a hole the size of its data (a sparse file: every
+//!    tensor has its name, dtype and shape, and reads as zeros).
+//! 3. **Match.** The copy is loaded as each plausible known family with
+//!    ditch's own loader, which names the first tensor a family needs that
+//!    the checkpoint lacks, while `safetensors.lookup_log` records which
+//!    checkpoint tensors it read. A family that loads and reads every tensor
+//!    of the text model is a match. A missing tensor is matched to an unread
+//!    one of the same place, shape and role, and the load is retried with
+//!    that name.
+//! 4. **Config keys.** A config.json key is read by the definition when
+//!    changing or removing it changes the parsed configuration; the others
+//!    are listed, less the ones that never matter to a forward pass.
+//! 5. **Draft and check.** The definition, with a comment on every guess and
+//!    on everything left unmapped, goes to the user models directory
+//!    (`$XDG_CONFIG_HOME/ditch/models`, or `--models-dir`), and `ditch
+//!    verify` runs on the model with it (skipped with `--dry-run`).
+
+const std = @import("std");
+const Io = std.Io;
+const arch = @import("arch.zig");
+const models = @import("models.zig");
+const chat = @import("chat.zig");
+const config = @import("config.zig");
+const hf = @import("hf.zig");
+const remote = @import("remote.zig");
+const safetensors = @import("safetensors.zig");
+const tensor = @import("tensor.zig");
+const model_mod = @import("model.zig");
+const verify = @import("verify.zig");
+const gguf = @import("gguf.zig");
+const tokenizer_mod = @import("tokenizer.zig");
+const dequant = @import("dequant.zig");
+const gguf_model = @import("gguf_model.zig");
+
+const Allocator = std.mem.Allocator;
+const Arch = arch.Arch;
+const Names = arch.Names;
+
+pub const Ctx = struct {
+    gpa: Allocator,
+    arena: Allocator,
+    io: Io,
+    env: *std.process.Environ.Map,
+    settings: *const config.Settings,
+    http: *hf.Http,
+    cache_root: []const u8,
+    pool: *const tensor.Pool,
+    out: *Io.Writer,
+    result: *Io.Writer,
+};
+
+// ---------------------------------------------------------------------------
+// Log capture
+// ---------------------------------------------------------------------------
+
+/// While set, log messages are collected here instead of printed (see
+/// `logFn` in main.zig): a trial load's "missing tensor" is data, not an error.
+pub var capture: ?*Capture = null;
+
+pub const Capture = struct {
+    arena: Allocator,
+    lines: std.ArrayList(Line) = .empty,
+    lock: std.atomic.Mutex = .unlocked,
+
+    pub const Line = struct { level: std.log.Level, text: []const u8 };
+
+    pub fn take(self: *Capture, comptime level: std.log.Level, comptime format: []const u8, args: anytype) bool {
+        const text = std.fmt.allocPrint(self.arena, format, args) catch return false;
+        while (!self.lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.lock.unlock();
+        self.lines.append(self.arena, .{ .level = level, .text = text }) catch return false;
+        return true;
+    }
+
+    fn errors(self: *const Capture, a: Allocator) ![]const u8 {
+        var out: std.Io.Writer.Allocating = .init(a);
+        for (self.lines.items) |l| if (l.level == .err) {
+            if (out.written().len > 0) try out.writer.writeAll("; ");
+            try out.writer.writeAll(l.text);
+        };
+        return out.written();
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Reading the checkpoint
+// ---------------------------------------------------------------------------
+
+const SmallFile = struct { name: []const u8, bytes: []const u8 };
+
+const Shard = struct {
+    name: []const u8,
+    /// The 8-byte length and the JSON header, as stored.
+    head: []const u8,
+    /// Bytes of tensor data after the header.
+    data_len: u64,
+};
+
+const Tensor = struct {
+    name: []const u8,
+    dtype: []const u8,
+    shape: []const usize,
+
+    fn is(self: Tensor, shape: []const usize) bool {
+        return std.mem.eql(usize, self.shape, shape);
+    }
+};
+
+const Checkpoint = struct {
+    source: []const u8,
+    small: []const SmallFile,
+    shards: []const Shard,
+    tensors: []const Tensor,
+
+    fn file(self: *const Checkpoint, name: []const u8) ?[]const u8 {
+        for (self.small) |f| if (std.mem.eql(u8, f.name, name)) return f.bytes;
+        return null;
+    }
+
+    fn find(self: *const Checkpoint, name: []const u8) ?Tensor {
+        for (self.tensors) |t| if (std.mem.eql(u8, t.name, name)) return t;
+        return null;
+    }
+};
+
+const small_names = [_][]const u8{
+    "config.json",     "generation_config.json", "tokenizer.json",          "tokenizer_config.json",        "tiktoken.model",
+    "tokenizer.model", "chat_template.jinja",    "special_tokens_map.json", "model.safetensors.index.json", "chat_template.json",
+};
+
+/// Shard file names from an index's `weight_map` (sorted, unique).
+fn shardsFromIndex(a: Allocator, text: []const u8) ![]const []const u8 {
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
+    const wm = if (v == .object) v.object.get("weight_map") else null;
+    if (wm == null or wm.? != .object) return error.InvalidIndex;
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = wm.?.object.iterator();
+    while (it.next()) |kv| {
+        if (kv.value_ptr.* != .string) continue;
+        const n = kv.value_ptr.string;
+        for (names.items) |x| {
+            if (std.mem.eql(u8, x, n)) break;
+        } else try names.append(a, n);
+    }
+    sortStrings(names.items);
+    return names.items;
+}
+
+fn sortStrings(items: [][]const u8) void {
+    std.mem.sort([]const u8, items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+}
+
+/// Parses a shard's header into tensors; returns the data length.
+fn parseHeader(a: Allocator, header: []const u8, out: *std.ArrayList(Tensor)) !u64 {
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, a, header, .{});
+    if (v != .object) return error.InvalidSafetensors;
+    var end: u64 = 0;
+    var it = v.object.iterator();
+    while (it.next()) |kv| {
+        if (std.mem.eql(u8, kv.key_ptr.*, "__metadata__")) continue;
+        const t = kv.value_ptr.*;
+        if (t != .object) return error.InvalidSafetensors;
+        const dt = t.object.get("dtype") orelse return error.InvalidSafetensors;
+        const sh = t.object.get("shape") orelse return error.InvalidSafetensors;
+        const offs = t.object.get("data_offsets") orelse return error.InvalidSafetensors;
+        if (dt != .string or sh != .array or offs != .array or offs.array.items.len != 2) return error.InvalidSafetensors;
+        const shape = try a.alloc(usize, sh.array.items.len);
+        for (sh.array.items, shape) |d, *s| s.* = if (d == .integer and d.integer >= 0) @intCast(d.integer) else return error.InvalidSafetensors;
+        if (offs.array.items[1] != .integer) return error.InvalidSafetensors;
+        end = @max(end, @as(u64, @intCast(@max(0, offs.array.items[1].integer))));
+        try out.append(a, .{ .name = kv.key_ptr.*, .dtype = dt.string, .shape = shape });
+    }
+    return end;
+}
+
+fn addShard(a: Allocator, name: []const u8, head: []const u8, shards: *std.ArrayList(Shard), tensors: *std.ArrayList(Tensor)) !void {
+    const n = std.mem.readInt(u64, head[0..8], .little);
+    const data_len = try parseHeader(a, head[8..][0..@intCast(n)], tensors);
+    try shards.append(a, .{ .name = name, .head = head, .data_len = data_len });
+}
+
+/// A checkpoint in a local directory: the small files and the shard headers.
+fn readLocal(ctx: Ctx, path: []const u8) !Checkpoint {
+    const a = ctx.arena;
+    const io = ctx.io;
+    var dir = try Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+    defer dir.close(io);
+    var small: std.ArrayList(SmallFile) = .empty;
+    for (small_names) |n| {
+        const bytes = dir.readFileAlloc(io, n, a, .limited(1 << 30)) catch continue;
+        try small.append(a, .{ .name = n, .bytes = bytes });
+    }
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = dir.iterate();
+    while (try it.next(io)) |e| {
+        if (std.mem.endsWith(u8, e.name, ".safetensors") and !std.mem.startsWith(u8, e.name, "consolidated")) try names.append(a, try a.dupe(u8, e.name));
+    }
+    sortStrings(names.items);
+    var shards: std.ArrayList(Shard) = .empty;
+    var tensors: std.ArrayList(Tensor) = .empty;
+    for (names.items) |n| {
+        var f = try dir.openFile(io, n, .{});
+        defer f.close(io);
+        var len_buf: [8]u8 = undefined;
+        if (try f.readPositionalAll(io, &len_buf, 0) != 8) return error.InvalidSafetensors;
+        const hl = std.mem.readInt(u64, &len_buf, .little);
+        if (hl == 0 or hl > 1 << 30) return error.InvalidSafetensors;
+        const head = try a.alloc(u8, 8 + @as(usize, @intCast(hl)));
+        if (try f.readPositionalAll(io, head, 0) != head.len) return error.InvalidSafetensors;
+        try addShard(a, n, head, &shards, &tensors);
+    }
+    return .{ .source = path, .small = small.items, .shards = shards.items, .tensors = tensors.items };
+}
+
+/// A checkpoint on the Hub (or any server of model files): the small files,
+/// then each shard's header through two range requests.
+fn readRemote(ctx: Ctx, model: []const u8, out: *Io.Writer) !Checkpoint {
+    const a = ctx.arena;
+    const http = ctx.http;
+    const rev = ctx.settings.model_commit orelse "main";
+    var base: []const u8 = undefined;
+    var listed: ?[]const []const u8 = null;
+    if (std.mem.startsWith(u8, model, "http://") or std.mem.startsWith(u8, model, "https://")) {
+        base = if (std.mem.endsWith(u8, model, "/")) model else try std.fmt.allocPrint(a, "{s}/", .{model});
+    } else {
+        const id = remote.hubId(model);
+        if (std.mem.indexOfScalar(u8, id, '/') == null) {
+            std.log.err("not a local directory, and not a Hub id (owner/name): {s}", .{model});
+            return error.ModelNotFound;
+        }
+        base = try std.fmt.allocPrint(a, "https://huggingface.co/{s}/resolve/{s}/", .{ id, rev });
+        // The repository listing, so that absent files are not requested.
+        const api = try std.fmt.allocPrint(a, "https://huggingface.co/api/models/{s}/revision/{s}", .{ id, rev });
+        const text = http.get(api) catch |err| switch (err) {
+            error.NotFound => {
+                std.log.err("{s} is not on the Hub (revision {s})", .{ id, rev });
+                return error.ModelNotFound;
+            },
+            error.Forbidden => {
+                std.log.err("access to {s} denied: a gated model needs HF_TOKEN", .{id});
+                return error.ModelNotFound;
+            },
+            else => return err,
+        };
+        const v = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
+        var names: std.ArrayList([]const u8) = .empty;
+        if (v == .object) if (v.object.get("siblings")) |sib| if (sib == .array) for (sib.array.items) |s| {
+            if (s != .object) continue;
+            const f = s.object.get("rfilename") orelse continue;
+            if (f == .string) try names.append(a, f.string);
+        };
+        listed = names.items;
+    }
+    try out.print("* Reading the config, tokenizer and safetensors headers of {s}\n", .{base});
+    try out.flush();
+    var small: std.ArrayList(SmallFile) = .empty;
+    for (small_names) |n| {
+        if (listed) |l| if (!contains(l, n)) continue;
+        const url = try std.fmt.allocPrint(a, "{s}{s}", .{ base, n });
+        const bytes = http.get(url) catch |err| switch (err) {
+            error.NotFound => continue,
+            else => return err,
+        };
+        try small.append(a, .{ .name = n, .bytes = try a.dupe(u8, bytes) });
+        ctx.gpa.free(bytes);
+    }
+    var shard_names: []const []const u8 = &.{};
+    for (small.items) |f| if (std.mem.eql(u8, f.name, "model.safetensors.index.json")) {
+        shard_names = try shardsFromIndex(a, f.bytes);
+    };
+    if (shard_names.len == 0) {
+        var names: std.ArrayList([]const u8) = .empty;
+        if (listed) |l| {
+            for (l) |n| if (std.mem.endsWith(u8, n, ".safetensors") and std.mem.indexOfScalar(u8, n, '/') == null and !std.mem.startsWith(u8, n, "consolidated")) try names.append(a, n);
+        } else try names.append(a, "model.safetensors");
+        sortStrings(names.items);
+        shard_names = names.items;
+    }
+    var shards: std.ArrayList(Shard) = .empty;
+    var tensors: std.ArrayList(Tensor) = .empty;
+    for (shard_names) |n| {
+        const url = try std.fmt.allocPrint(a, "{s}{s}", .{ base, n });
+        const len_bytes = try http.getRange(url, 0, 7);
+        defer ctx.gpa.free(len_bytes);
+        if (len_bytes.len != 8) return error.InvalidSafetensors;
+        const hl = std.mem.readInt(u64, len_bytes[0..8], .little);
+        if (hl == 0 or hl > 1 << 30) return error.InvalidSafetensors;
+        const header = try http.getRange(url, 8, 8 + hl - 1);
+        defer ctx.gpa.free(header);
+        const head = try a.alloc(u8, 8 + header.len);
+        @memcpy(head[0..8], len_bytes[0..8]);
+        @memcpy(head[8..], header);
+        try addShard(a, n, head, &shards, &tensors);
+    }
+    return .{ .source = base, .small = small.items, .shards = shards.items, .tensors = tensors.items };
+}
+
+fn contains(list: []const []const u8, s: []const u8) bool {
+    for (list) |x| if (std.mem.eql(u8, x, s)) return true;
+    return false;
+}
+
+/// Writes the shape-only copy into `dir`: the small files (config.json as
+/// given) and every shard as a sparse file.
+fn writeCopy(ctx: Ctx, ck: *const Checkpoint, dir_path: []const u8) !void {
+    const io = ctx.io;
+    const cwd = Io.Dir.cwd();
+    cwd.deleteTree(io, dir_path) catch {};
+    try cwd.createDirPath(io, dir_path);
+    var dir = try cwd.openDir(io, dir_path, .{});
+    defer dir.close(io);
+    // config.json and the shard index only: the trial loads read a stand-in
+    // tokenizer (the real one is checked once, see `checkTokenizer`), so a
+    // tokenizer ditch cannot read does not hide the layout.
+    for (ck.small) |f| if (std.mem.eql(u8, f.name, "config.json") or std.mem.eql(u8, f.name, "model.safetensors.index.json")) {
+        try dir.writeFile(io, .{ .sub_path = f.name, .data = f.bytes });
+    };
+    try dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = stand_in_tokenizer });
+    for (ck.shards) |s| {
+        var f = try dir.createFile(io, s.name, .{});
+        defer f.close(io);
+        try f.writePositionalAll(io, s.head, 0);
+        try f.setLength(io, s.head.len + s.data_len);
+    }
+}
+
+/// A one-token byte-level BPE vocabulary: enough for the loader.
+const stand_in_tokenizer =
+    \\{"version":"1.0","added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true},"post_processor":null,"decoder":{"type":"ByteLevel"},"model":{"type":"BPE","vocab":{"a":0},"merges":[]}}
+;
+
+/// Whether ditch reads the checkpoint's own tokenizer: null when it does,
+/// else what went wrong.
+fn checkTokenizer(ctx: Ctx, ck: *const Checkpoint, dir_path: []const u8) !?[]const u8 {
+    const a = ctx.arena;
+    const io = ctx.io;
+    const cwd = Io.Dir.cwd();
+    cwd.deleteTree(io, dir_path) catch {};
+    try cwd.createDirPath(io, dir_path);
+    var dir = try cwd.openDir(io, dir_path, .{});
+    defer dir.close(io);
+    for (ck.small) |f| try dir.writeFile(io, .{ .sub_path = f.name, .data = f.bytes });
+    var cap: Capture = .{ .arena = a };
+    capture = &cap;
+    const loaded = tokenizer_mod.Tokenizer.loadDir(ctx.gpa, io, a, dir, dir_path, ck.file("tokenizer_config.json"));
+    capture = null;
+    var t = loaded catch |err| {
+        const msg = try cap.errors(a);
+        return if (msg.len > 0) msg else @errorName(err);
+    };
+    t.tokenizer.deinit();
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// Trial loads
+// ---------------------------------------------------------------------------
+
+const Trial = struct {
+    family: *const Arch,
+    /// The family as loaded (with the overrides applied).
+    used: *const Arch,
+    /// Templates of `used` that name no tensor of the checkpoint (a tighter
+    /// fit has fewer), and the tie-breaker of `affinity`.
+    absent: usize = 0,
+    /// config.json keys the family leaves unread (fewer explains more).
+    keys_unread: usize = 0,
+    affinity: f64 = 0,
+    /// Name overrides tried on top of the family (`names` field -> template).
+    overrides: []const Override,
+    ok: bool,
+    /// What the loader said when it refused (empty when it loaded).
+    why: []const u8,
+    missing: ?[]const u8,
+    /// Checkpoint tensors the loader never looked up.
+    unread: []const []const u8,
+};
+
+/// A change to the base family: a `names` field (`top = false`) or a layout
+/// field of the family itself (`mlp = "gated_fused"`).
+const Override = struct { field: []const u8, value: []const u8, why: []const u8, top: bool = false };
+
+/// config.json with the model_type (and a wrapper's text_config model_type) replaced.
+fn retype(a: Allocator, config_text: []const u8, model_type: []const u8) ![]const u8 {
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, a, try arch.sanitizeJson(a, config_text), .{});
+    if (v != .object) return error.InvalidConfig;
+    var obj = try v.object.clone(a);
+    try obj.put(a, "model_type", .{ .string = model_type });
+    _ = obj.orderedRemove("architectures");
+    if (obj.get("text_config")) |tc| if (tc == .object) {
+        var inner = try tc.object.clone(a);
+        try inner.put(a, "model_type", .{ .string = model_type });
+        try obj.put(a, "text_config", .{ .object = inner });
+    };
+    return std.json.Stringify.valueAlloc(a, std.json.Value{ .object = obj }, .{ .whitespace = .indent_2 });
+}
+
+/// A family `base`d on `f` under `name`, with `overrides` applied, as Lua source.
+fn familySource(a: Allocator, name: []const u8, f: *const Arch, overrides: []const Override) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(a);
+    const w = &out.writer;
+    try w.print("return {{\n  model_type = \"{s}\",\n  base = \"{s}\",\n", .{ name, f.model_type });
+    for (overrides) |o| if (o.top) try w.print("  {s} = {s},\n", .{ o.field, o.value });
+    if (namesOverrides(overrides) > 0) {
+        try w.writeAll("  names = {\n");
+        for (overrides) |o| if (!o.top) try w.print("    {s} = {s},\n", .{ o.field, o.value });
+        try w.writeAll("  },\n");
+    }
+    try w.writeAll("}\n");
+    return out.written();
+}
+
+/// The first layer where a slot is used (null: none, or a slot whose shape
+/// is not checked): attention slots on a full-attention layer (not with
+/// MLA, whose projections are low-rank), dense MLP slots on a dense layer,
+/// the router on an MoE layer.
+fn slotLayer(c: *const arch.Config, field: []const u8) ?usize {
+    const attn = [_][]const u8{ "q", "k", "v", "o", "q_norm", "k_norm" };
+    const dense = [_][]const u8{ "gate", "up", "down", "gate_up" };
+    if (contains(&attn, field)) {
+        if (c.mla != null) return null;
+        for (c.attn_layers, 0..) |on, i| if (on) return i;
+        return null;
+    }
+    if (contains(&dense, field)) {
+        for (c.mlp_layers, c.moe_layers, 0..) |mlp, moe, i| if (mlp and !moe) return i;
+        return null;
+    }
+    if (std.mem.eql(u8, field, "router")) {
+        for (c.moe_layers, 0..) |moe, i| if (moe) return i;
+        return null;
+    }
+    return 0;
+}
+
+/// The first slot whose tensor does not have the shape the family's
+/// reading of config.json implies, at a layer where the slot is used.
+fn shapeMismatch(a: Allocator, ck: *const Checkpoint, f: *const Arch, c: *const arch.Config) !?[]const u8 {
+    @setEvalBranchQuota(20000);
+    const names = &f.names;
+    const prefix = try modelPrefix(a, ck, names);
+    inline for (@typeInfo(Names).@"struct".fields) |nf| {
+        const T = nf.type;
+        if (comptime (T == []const u8 or T == ?[]const u8 or T == []const []const u8) and !std.mem.eql(u8, nf.name, "prefixes") and !std.mem.eql(u8, nf.name, "layer") and !std.mem.eql(u8, nf.name, "expert") and !std.mem.startsWith(u8, nf.name, "expert_") and !std.mem.startsWith(u8, nf.name, "shared_")) {
+            if (slotLayer(c, nf.name)) |li| if (try expectedShape(a, c, nf.name, li)) |want| {
+                const v = @field(names.*, nf.name);
+                var list: []const []const u8 = &.{};
+                if (T == []const u8) list = &.{v} else if (T == ?[]const u8) {
+                    if (v) |x| list = &.{x};
+                } else list = v;
+                const model_level = contains(&model_fields, nf.name);
+                for (list) |tpl| {
+                    const full = if (std.mem.indexOf(u8, tpl, "{p}") != null or model_level) try expand(a, tpl, prefix, li, null) else try std.fmt.allocPrint(a, "{s}{s}", .{ try expand(a, names.layer, prefix, li, null), tpl });
+                    if (ck.find(full)) |t| {
+                        // A Conv1D family stores [in][out]; either orientation is its own.
+                        const ok = t.is(want) or (f.conv1d and want.len == 2 and t.is(&.{ want[1], want[0] }));
+                        if (!ok and !(std.mem.eql(u8, nf.name, "lm_head") or std.mem.eql(u8, nf.name, "embed"))) {
+                            return try std.fmt.allocPrint(a, "{s} is {s} where {s} expects {s}", .{ full, try fmtShape(a, t.shape), nf.name, try fmtShape(a, want) });
+                        }
+                    }
+                }
+            };
+        }
+    }
+    return null;
+}
+
+fn namesOverrides(overrides: []const Override) usize {
+    var n: usize = 0;
+    for (overrides) |o| {
+        if (!o.top) n += 1;
+    }
+    return n;
+}
+
+/// Loads the shape-only copy as `f` (with `overrides`) and records what the loader did.
+fn tryLoad(ctx: Ctx, ck: *const Checkpoint, dir_path: []const u8, f: *const Arch, overrides: []const Override, trial_type: []const u8) !Trial {
+    const a = ctx.arena;
+    var result: Trial = .{ .family = f, .used = f, .overrides = overrides, .ok = false, .why = "", .missing = null, .unread = &.{} };
+    var family = f;
+    if (overrides.len > 0) {
+        var diag: models.Diagnostic = .{};
+        const src = try familySource(a, trial_type, f, overrides);
+        const got = models.parseSource(src, "trial.lua", &diag) catch {
+            result.why = diag.message orelse "the overrides do not load";
+            return result;
+        };
+        family = got[0];
+        result.used = family;
+        _ = try models.loadSource(src, "trial.lua", &diag);
+    }
+    const cfg_text = try retype(a, ck.file("config.json").?, if (overrides.len > 0) trial_type else f.model_type);
+    {
+        var dir = try Io.Dir.cwd().openDir(ctx.io, dir_path, .{});
+        defer dir.close(ctx.io);
+        try dir.writeFile(ctx.io, .{ .sub_path = "config.json", .data = cfg_text });
+    }
+    var cap: Capture = .{ .arena = a };
+    var log: safetensors.LookupLog = .{ .arena = .init(ctx.gpa) };
+    defer log.arena.deinit();
+    capture = &cap;
+    safetensors.lookup_log = &log;
+    const loaded = model_mod.Model.loadWithOptions(ctx.gpa, ctx.io, ctx.pool, dir_path, .{ .store = .streamed, .prefetch = false, .expert_cache = 0 });
+    safetensors.lookup_log = null;
+    capture = null;
+    const model = loaded catch |err| {
+        result.why = try cap.errors(a);
+        if (result.why.len == 0) result.why = @errorName(err);
+        // "missing tensor: NAME", "missing router tensor NAME", ...
+        for (cap.lines.items) |l| if (l.level == .err and std.mem.startsWith(u8, l.text, "missing ")) {
+            var it = std.mem.tokenizeScalar(u8, l.text, ' ');
+            while (it.next()) |tok| if (std.mem.indexOfScalar(u8, tok, '.') != null and !std.mem.endsWith(u8, tok, ":")) {
+                result.missing = tok;
+            };
+        };
+        return result;
+    };
+    defer model.deinit();
+    result.ok = true;
+    var unread: std.ArrayList([]const u8) = .empty;
+    for (model.files) |file| {
+        var it = file.tensors.iterator();
+        while (it.next()) |kv| if (!log.names.contains(kv.key_ptr.*)) try unread.append(a, try a.dupe(u8, kv.key_ptr.*));
+    }
+    sortStrings(unread.items);
+    result.unread = unread.items;
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Tensor names and roles
+// ---------------------------------------------------------------------------
+
+/// Tensors that are not part of the text model a definition describes.
+fn outsideTextModel(name: []const u8) ?[]const u8 {
+    const parts = [_]struct { []const u8, []const u8 }{
+        .{ "vision", "vision tower" },               .{ "visual", "vision tower" },                        .{ "image", "vision tower" },
+        .{ "vit.", "vision tower" },                 .{ "patch_embed", "vision tower" },                   .{ "multi_modal_projector", "multimodal projector" },
+        .{ "mm_projector", "multimodal projector" }, .{ "audio", "audio tower" },                          .{ "speech", "audio tower" },
+        .{ "talker", "speech decoder" },             .{ "token2wav", "speech decoder" },                   .{ "mtp", "multi-token prediction head" },
+        .{ "nextn", "multi-token prediction head" }, .{ "rotary_emb.inv_freq", "precomputed RoPE table" },
+    };
+    for (parts) |p| if (std.mem.indexOf(u8, name, p[0]) != null) return p[1];
+    // A layer past num_hidden_layers (DeepSeek V3's layer 61) is a
+    // multi-token prediction module the text model never runs.
+    if (layerIndex(name)) |i| if (i >= text_layers) return "multi-token prediction layer past num_hidden_layers";
+    // Quantisation scales, zero points and packed codes belong to a weight
+    // (dequant.zig turns them into it).
+    if (quantised) for (quant_aux) |suffix| if (std.mem.endsWith(u8, name, suffix)) return "quantisation data of a weight";
+    return null;
+}
+
+/// Why the families refused the config.json (see `match`).
+var refusals: std.ArrayList([]const u8) = .empty;
+
+/// num_hidden_layers of the checkpoint being drafted, and whether it names
+/// a quantization_config (see `outsideTextModel`).
+var text_layers: usize = std.math.maxInt(usize);
+var quantised = true;
+
+const quant_aux = [_][]const u8{ "_scale_inv", ".weight_scale", ".weight_zero_point", ".weight_shape", ".weight_g_idx", ".input_scale", ".input_zero_point", ".weight_global_scale", ".input_global_scale", "_scales", ".qzeros", ".g_idx", ".scale" };
+
+/// The number after a `layers.` (or `h.`, `blocks.`) path segment.
+fn layerIndex(name: []const u8) ?usize {
+    for ([_][]const u8{ "layers.", "h.", "blocks.", "block." }) |key| {
+        var start: usize = 0;
+        while (std.mem.indexOfPos(u8, name, start, key)) |k| {
+            start = k + 1;
+            if (k > 0 and name[k - 1] != '.') continue;
+            const rest = name[k + key.len ..];
+            const end = std.mem.indexOfScalar(u8, rest, '.') orelse continue;
+            return std.fmt.parseInt(usize, rest[0..end], 10) catch continue;
+        }
+    }
+    return null;
+}
+
+/// `name` with every numeric path segment replaced by `{n}`, and the numbers.
+fn pattern(a: Allocator, name: []const u8) !struct { pat: []const u8, nums: []const usize } {
+    var out: std.ArrayList(u8) = .empty;
+    var nums: std.ArrayList(usize) = .empty;
+    var it = std.mem.splitScalar(u8, name, '.');
+    var first = true;
+    while (it.next()) |seg| {
+        if (!first) try out.append(a, '.');
+        first = false;
+        if (seg.len > 0 and std.ascii.isDigit(seg[0]) and (std.fmt.parseInt(usize, seg, 10) catch null) != null) {
+            try out.appendSlice(a, "{n}");
+            try nums.append(a, std.fmt.parseInt(usize, seg, 10) catch 0);
+        } else try out.appendSlice(a, seg);
+    }
+    return .{ .pat = out.items, .nums = nums.items };
+}
+
+const Group = struct { pat: []const u8, count: usize, first: []const u8, shape: []const usize, dtype: []const u8, why: ?[]const u8 };
+
+/// Groups tensor names by pattern (layer and expert indices folded).
+fn groupNames(a: Allocator, ck: *const Checkpoint, names: []const []const u8) ![]Group {
+    var groups: std.ArrayList(Group) = .empty;
+    for (names) |n| {
+        const p = try pattern(a, n);
+        for (groups.items) |*g| {
+            if (std.mem.eql(u8, g.pat, p.pat)) {
+                g.count += 1;
+                break;
+            }
+        } else {
+            const t = ck.find(n);
+            try groups.append(a, .{ .pat = p.pat, .count = 1, .first = n, .shape = if (t) |x| x.shape else &.{}, .dtype = if (t) |x| x.dtype else "?", .why = outsideTextModel(n) });
+        }
+    }
+    return groups.items;
+}
+
+fn fmtShape(a: Allocator, shape: []const usize) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(a);
+    try out.writer.writeByte('[');
+    for (shape, 0..) |d, i| {
+        if (i > 0) try out.writer.writeAll(", ");
+        try out.writer.print("{d}", .{d});
+    }
+    try out.writer.writeByte(']');
+    return out.written();
+}
+
+/// Where a tensor name sits: the model prefix, the layer (and its prefix),
+/// the expert, and the rest relative to them.
+const Place = struct {
+    prefix: []const u8,
+    layer: ?usize = null,
+    layer_prefix: []const u8 = "",
+    expert: ?usize = null,
+    expert_prefix: []const u8 = "",
+    rel: []const u8,
+};
+
+fn expand(a: Allocator, template: []const u8, prefix: []const u8, i: ?usize, e: ?usize) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var k: usize = 0;
+    while (k < template.len) {
+        if (std.mem.startsWith(u8, template[k..], "{p}")) {
+            try out.appendSlice(a, prefix);
+            k += 3;
+        } else if (std.mem.startsWith(u8, template[k..], "{i}")) {
+            try out.print(a, "{d}", .{i orelse 0});
+            k += 3;
+        } else if (std.mem.startsWith(u8, template[k..], "{e}")) {
+            try out.print(a, "{d}", .{e orelse 0});
+            k += 3;
+        } else {
+            try out.append(a, template[k]);
+            k += 1;
+        }
+    }
+    return out.items;
+}
+
+/// The model prefix the loader would pick: the first of `prefixes` under
+/// which the embedding exists (else the first one).
+fn modelPrefix(a: Allocator, ck: *const Checkpoint, names: *const Names) ![]const u8 {
+    for (names.prefixes) |p| if (ck.find(try expand(a, names.embed, p, null, null)) != null) return p;
+    for (names.prefixes) |p| {
+        const lp = try expand(a, names.layer, p, 0, null);
+        for (ck.tensors) |t| if (std.mem.startsWith(u8, t.name, lp)) return p;
+    }
+    return names.prefixes[0];
+}
+
+const Match = struct { len: usize, i: ?usize = null, e: ?usize = null };
+
+/// Matches template `t` (`{p}` the model prefix, `{i}` and `{e}` numbers)
+/// against the start of `s`, without allocating.
+fn matchTemplate(t: []const u8, prefix: []const u8, s: []const u8) ?Match {
+    var m: Match = .{ .len = 0 };
+    var k: usize = 0;
+    var j: usize = 0;
+    while (k < t.len) {
+        if (std.mem.startsWith(u8, t[k..], "{p}")) {
+            if (!std.mem.startsWith(u8, s[j..], prefix)) return null;
+            j += prefix.len;
+            k += 3;
+        } else if (std.mem.startsWith(u8, t[k..], "{i}") or std.mem.startsWith(u8, t[k..], "{e}")) {
+            const start = j;
+            while (j < s.len and std.ascii.isDigit(s[j])) j += 1;
+            if (j == start) return null;
+            const n = std.fmt.parseInt(usize, s[start..j], 10) catch return null;
+            if (t[k + 1] == 'i') m.i = n else m.e = n;
+            k += 3;
+        } else {
+            if (j >= s.len or s[j] != t[k]) return null;
+            j += 1;
+            k += 1;
+        }
+    }
+    m.len = j;
+    return m;
+}
+
+fn locate(names: *const Names, prefix: []const u8, layers: usize, experts: usize, name: []const u8) Place {
+    var place: Place = .{ .prefix = prefix, .rel = name };
+    const lm = matchTemplate(names.layer, prefix, name) orelse return place;
+    const li = lm.i orelse return place;
+    if (li >= layers) return place;
+    place.layer = li;
+    place.layer_prefix = name[0..lm.len];
+    place.rel = name[lm.len..];
+    if (experts > 0) if (matchTemplate(names.expert, prefix, place.rel)) |em| if (em.e) |e| if (e < experts) {
+        place.expert = e;
+        place.expert_prefix = place.rel[0..em.len];
+        place.rel = place.rel[em.len..];
+    };
+    return place;
+}
+
+/// The `names` field whose template produced `rel` at `place` (a model-level
+/// template is matched with its prefix expanded).
+fn fieldOf(names: *const Names, place: Place, full: []const u8) ?[]const u8 {
+    @setEvalBranchQuota(20000);
+    inline for (@typeInfo(Names).@"struct".fields) |f| {
+        const skip = comptime std.mem.eql(u8, f.name, "prefixes") or std.mem.eql(u8, f.name, "layer") or std.mem.eql(u8, f.name, "expert");
+        if (!skip) {
+            const v = @field(names.*, f.name);
+            const T = @TypeOf(v);
+            if (T == []const u8 or T == ?[]const u8) {
+                if (@as(?[]const u8, v)) |t| if (templateIs(t, place, full)) return f.name;
+            } else if (T == []const []const u8) {
+                for (v) |t| if (templateIs(t, place, full)) return f.name;
+            }
+        }
+    }
+    return null;
+}
+
+fn templateIs(t: []const u8, place: Place, full: []const u8) bool {
+    if (std.mem.indexOf(u8, t, "{p}") != null) {
+        const m = matchTemplate(t, place.prefix, full) orelse return false;
+        if (m.len != full.len) return false;
+        if (m.i != null and (place.layer == null or m.i.? != place.layer.?)) return false;
+        if (m.e != null and (place.expert == null or m.e.? != place.expert.?)) return false;
+        return true;
+    }
+    return std.mem.eql(u8, t, place.rel);
+}
+
+/// Words that name a slot in the checkpoints ditch has met, for telling
+/// apart two unread tensors of the same shape.
+const role_words = [_]struct { field: []const u8, words: []const []const u8 }{
+    .{ .field = "q", .words = &.{ "q_proj", "wq", "query", ".q." } },
+    .{ .field = "k", .words = &.{ "k_proj", "wk", "key", ".k." } },
+    .{ .field = "v", .words = &.{ "v_proj", "wv", "value", ".v." } },
+    .{ .field = "o", .words = &.{ "o_proj", "wo", "out_proj", "dense", "c_proj", "proj" } },
+    .{ .field = "gate", .words = &.{ "gate", "w1", "wi_0", "fc1" } },
+    .{ .field = "up", .words = &.{ "up", "w3", "wi_1", "fc_in" } },
+    .{ .field = "down", .words = &.{ "down", "w2", "wo", "fc2", "fc_out" } },
+    .{ .field = "expert_gate", .words = &.{ "gate", "w1" } },
+    .{ .field = "expert_up", .words = &.{ "up", "w3" } },
+    .{ .field = "expert_down", .words = &.{ "down", "w2" } },
+    .{ .field = "input_norm", .words = &.{ "input", "attn_norm", "attention_norm", "ln_1", "pre_attn", "norm1" } },
+    .{ .field = "pre_ff_norm", .words = &.{ "post_attention", "ffn_norm", "mlp_norm", "ln_2", "pre_mlp", "norm2" } },
+    .{ .field = "post_attn_norm", .words = &.{ "post_attn", "post_attention" } },
+    .{ .field = "post_ff_norm", .words = &.{ "post_ff", "post_mlp", "post_feedforward" } },
+    .{ .field = "q_norm", .words = &.{ "q_norm", "q_layernorm", "query_norm" } },
+    .{ .field = "k_norm", .words = &.{ "k_norm", "k_layernorm", "key_norm" } },
+    .{ .field = "router", .words = &.{ "gate", "router" } },
+    .{ .field = "embed", .words = &.{ "embed", "wte", "tok" } },
+    .{ .field = "final_norm", .words = &.{ "norm", "ln_f", "final", "out" } },
+    .{ .field = "lm_head", .words = &.{ "lm_head", "output", "head" } },
+};
+
+/// Whether `name` says another slot's role more than `field`'s.
+fn roleConflict(field: []const u8, name: []const u8) bool {
+    const own = roleScore(field, name);
+    for (role_words) |r| {
+        if (std.mem.eql(u8, r.field, field)) continue;
+        // Expert and dense twins share their words.
+        if (std.mem.endsWith(u8, r.field, field) or std.mem.endsWith(u8, field, r.field)) continue;
+        if (roleScore(r.field, name) > own) return true;
+    }
+    return false;
+}
+
+fn roleScore(field: []const u8, name: []const u8) usize {
+    for (role_words) |r| if (std.mem.eql(u8, r.field, field)) {
+        var s: usize = 0;
+        for (r.words) |w| {
+            if (std.mem.indexOf(u8, name, w) != null) s += 1;
+        }
+        return s;
+    };
+    return 0;
+}
+
+/// The shape ditch expects in `field`, from the parsed configuration (null
+/// when the slot has no simple expected shape).
+fn expectedShape(a: Allocator, c: *const arch.Config, field: []const u8, li: usize) !?[]const usize {
+    const H = c.hidden_size;
+    const hd = if (li < c.layer_head_dim.len) c.layer_head_dim[li] else c.head_dim;
+    const nh = if (li < c.layer_heads.len) c.layer_heads[li] else c.num_heads;
+    const kvh = if (li < c.layer_kv_heads.len) c.layer_kv_heads[li] else c.num_kv_heads;
+    const I = c.intermediate_size;
+    const Im = c.moe_intermediate_size;
+    const table = [_]struct { []const u8, [2]usize }{
+        .{ "embed", .{ c.vocab_size, H } },      .{ "lm_head", .{ c.vocab_size, H } },
+        .{ "q", .{ nh * hd, H } },               .{ "k", .{ kvh * hd, H } },
+        .{ "v", .{ kvh * c.layerVDim(li), H } }, .{ "o", .{ H, nh * c.layerVDim(li) } },
+        .{ "gate", .{ I, H } },                  .{ "up", .{ I, H } },
+        .{ "down", .{ H, I } },                  .{ "gate_up", .{ 2 * I, H } },
+        .{ "router", .{ c.num_experts, H } },    .{ "expert_gate", .{ Im, H } },
+        .{ "expert_up", .{ Im, H } },            .{ "expert_down", .{ H, Im } },
+    };
+    for (table) |e| if (std.mem.eql(u8, e[0], field)) return try a.dupe(usize, &e[1]);
+    const vectors = [_]struct { []const u8, usize }{
+        .{ "final_norm", H },   .{ "embed_norm", H }, .{ "input_norm", H }, .{ "pre_ff_norm", H }, .{ "post_attn_norm", H },
+        .{ "post_ff_norm", H }, .{ "mlp_norm", H },
+    };
+    for (vectors) |e| if (std.mem.eql(u8, e[0], field)) return try a.dupe(usize, &.{e[1]});
+    if (std.mem.eql(u8, field, "router_correction_bias")) return try a.dupe(usize, &.{c.num_experts});
+    // q/k norms: one weight per head, or one per projection row.
+    const q = std.mem.eql(u8, field, "q_norm");
+    if (q or std.mem.eql(u8, field, "k_norm")) return switch (c.qk_norm) {
+        .head => try a.dupe(usize, &.{hd}),
+        .heads, .full => try a.dupe(usize, &.{(if (q) nh else kvh) * hd}),
+        else => null,
+    };
+    return null;
+}
+
+/// For a tensor the family needs and the checkpoint lacks, an unread tensor
+/// of the same place with the expected shape (and, among several, the one
+/// whose name says the role): the name override to try next.
+fn proposeRename(a: Allocator, ck: *const Checkpoint, f: *const Arch, c: *const arch.Config, missing: []const u8, unread: []const []const u8) !?Override {
+    const names = &f.names;
+    const prefix = try modelPrefix(a, ck, names);
+    const place = locate(names, prefix, c.num_layers, c.num_experts, missing);
+    const field = (fieldOf(names, place, missing)) orelse return null;
+    const want = try expectedShape(a, c, field, place.layer orelse 0);
+    var best: ?[]const u8 = null;
+    var best_score: usize = 0;
+    var ties: usize = 0;
+    for (unread) |n| {
+        const p = locate(names, prefix, c.num_layers, c.num_experts, n);
+        if ((p.layer == null) != (place.layer == null) or (p.layer != null and p.layer.? != place.layer.?)) continue;
+        if ((p.expert == null) != (place.expert == null) or (p.expert != null and p.expert.? != place.expert.?)) continue;
+        const t = ck.find(n) orelse continue;
+        if (want) |w| if (!t.is(w)) continue;
+        if (want == null and !std.mem.eql(u8, std.fs.path.extension(n), std.fs.path.extension(missing))) continue;
+        // A name that says another role (`dense` for q) is not this one.
+        if (roleConflict(field, p.rel)) continue;
+        const s = roleScore(field, p.rel) + 1;
+        if (s > best_score) {
+            best = n;
+            best_score = s;
+            ties = 1;
+        } else if (s == best_score) ties += 1;
+    }
+    const chosen = best orelse return null;
+    if (ties > 1) return null;
+    const p = locate(names, prefix, c.num_layers, c.num_experts, chosen);
+    // The new template, in the form the field takes.
+    var template: []const u8 = p.rel;
+    if (place.layer == null) template = if (std.mem.startsWith(u8, chosen, prefix)) try std.fmt.allocPrint(a, "{{p}}{s}", .{chosen[prefix.len..]}) else chosen;
+    const is_list = inline for (@typeInfo(Names).@"struct".fields) |nf| {
+        if (std.mem.eql(u8, nf.name, field)) break nf.type == []const []const u8;
+    } else false;
+    const t = ck.find(chosen).?;
+    const value = if (is_list) try std.fmt.allocPrint(a, "{{ \"{s}\" }}", .{template}) else try std.fmt.allocPrint(a, "\"{s}\"", .{template});
+    const why = try std.fmt.allocPrint(a, "guess: `{s}` {s} is the {s} tensor of this place with the shape ditch expects in {s} (the base family names it {s})", .{
+        chosen, try fmtShape(a, t.shape), if (ties == 1 and best_score > 1) "one" else "only unread", field, missing,
+    });
+    return .{ .field = field, .value = value, .why = why };
+}
+
+/// The renames a family needs before a load can even start: an embedding
+/// under none of its prefixes, and layers under another path
+/// (`blocks.{i}.` for `model.layers.{i}.`).
+fn structuralOverrides(a: Allocator, ck: *const Checkpoint, f: *const Arch, c: *const arch.Config) ![]Override {
+    var out: std.ArrayList(Override) = .empty;
+    const names = &f.names;
+    var prefix: ?[]const u8 = null;
+    for (names.prefixes) |p| if (ck.find(try expand(a, names.embed, p, null, null)) != null) {
+        prefix = p;
+        break;
+    };
+    if (prefix == null) {
+        // The best-named unindexed [vocab][hidden] tensor.
+        var best: ?[]const u8 = null;
+        var best_score: usize = 0;
+        var ties: usize = 0;
+        for (ck.tensors) |t| {
+            if (layerIndex(t.name) != null or outsideTextModel(t.name) != null or !t.is(&.{ c.vocab_size, c.hidden_size })) continue;
+            const sc = roleScore("embed", t.name) + 1;
+            if (sc > best_score) {
+                best = t.name;
+                best_score = sc;
+                ties = 1;
+            } else if (sc == best_score) ties += 1;
+        }
+        const chosen = best orelse return out.items;
+        if (ties > 1) return out.items;
+        var longest: []const u8 = "";
+        for (names.prefixes) |p| if (std.mem.startsWith(u8, chosen, p) and p.len >= longest.len) {
+            longest = p;
+        };
+        prefix = longest;
+        try out.append(a, .{ .field = "embed", .value = try std.fmt.allocPrint(a, "\"{{p}}{s}\"", .{chosen[longest.len..]}), .why = try std.fmt.allocPrint(a, "guess: `{s}` is the {s} unindexed tensor of shape [vocab, hidden]", .{ chosen, if (best_score > 1) "best-named" else "only" }) });
+    }
+    const pfx = prefix.?;
+    const lp0 = try expand(a, names.layer, pfx, 0, null);
+    for (ck.tensors) |t| if (std.mem.startsWith(u8, t.name, lp0)) {
+        try expertPath(a, ck, names, pfx, c, &out);
+        return out.items;
+    };
+    // Another path with exactly num_hidden_layers indices.
+    var paths: std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(usize, void)) = .{};
+    for (ck.tensors) |t| {
+        if (outsideTextModel(t.name) != null) continue;
+        var it = std.mem.splitScalar(u8, t.name, '.');
+        var pos: usize = 0;
+        while (it.next()) |seg| : (pos += seg.len + 1) {
+            const n = std.fmt.parseInt(usize, seg, 10) catch continue;
+            const gop = try paths.getOrPut(a, t.name[0..pos]);
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            try gop.value_ptr.put(a, n, {});
+            break;
+        }
+    }
+    var found: ?[]const u8 = null;
+    var pit = paths.iterator();
+    while (pit.next()) |kv| if (kv.value_ptr.count() == c.num_layers) {
+        if (found != null) return out.items;
+        found = kv.key_ptr.*;
+    };
+    const path = found orelse return out.items;
+    const rel = if (std.mem.startsWith(u8, path, pfx)) path[pfx.len..] else path;
+    try out.append(a, .{ .field = "layer", .value = try std.fmt.allocPrint(a, "\"{{p}}{s}{{i}}.\"", .{rel}), .why = try std.fmt.allocPrint(a, "guess: `{s}N.` is the one path numbered 0..{d}, one per layer", .{ path, c.num_layers - 1 }) });
+    return out.items;
+}
+
+/// Routed experts under another path within the layer (`feed_forward.experts.{e}.`
+/// for `mlp.experts.{e}.`): the one path of the first MoE layer numbered
+/// 0..num_experts-1. Stacked experts (one tensor per layer) need none.
+fn expertPath(a: Allocator, ck: *const Checkpoint, names: *const Names, pfx: []const u8, c: *const arch.Config, out: *std.ArrayList(Override)) !void {
+    if (c.num_experts == 0) return;
+    const li = for (c.moe_layers, 0..) |m, i| {
+        if (m) break i;
+    } else return;
+    const lp = try expand(a, names.layer, pfx, li, null);
+    const ep = try std.fmt.allocPrint(a, "{s}{s}", .{ lp, try expand(a, names.expert, pfx, li, 0) });
+    var paths: std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(usize, void)) = .{};
+    for (ck.tensors) |t| {
+        if (std.mem.startsWith(u8, t.name, ep)) return;
+        if (!std.mem.startsWith(u8, t.name, lp)) continue;
+        const rel = t.name[lp.len..];
+        var it = std.mem.splitScalar(u8, rel, '.');
+        var pos: usize = 0;
+        while (it.next()) |seg| : (pos += seg.len + 1) {
+            const n = std.fmt.parseInt(usize, seg, 10) catch continue;
+            const gop = try paths.getOrPut(a, rel[0..pos]);
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            try gop.value_ptr.put(a, n, {});
+            break;
+        }
+    }
+    var found: ?[]const u8 = null;
+    var it = paths.iterator();
+    while (it.next()) |kv| if (kv.value_ptr.count() == c.num_experts) {
+        if (found != null) return;
+        found = kv.key_ptr.*;
+    };
+    const path = found orelse return;
+    try out.append(a, .{ .field = "expert", .value = try std.fmt.allocPrint(a, "\"{s}{{e}}.\"", .{path}), .why = try std.fmt.allocPrint(a, "guess: `{s}N.` is the one path of an MoE layer numbered 0..{d}, one per expert", .{ path, c.num_experts - 1 }) });
+}
+
+/// Fields read at model level (the others are relative to a layer).
+const model_fields = [_][]const u8{ "embed", "pos_embed", "embed_norm", "final_norm", "lm_head", "ple_embed", "ple_proj", "ple_proj_norm", "altup_proj", "altup_unembed", "output_res_norm", "output_res_proj" };
+
+/// For a family that loads but leaves tensors unread: an unread tensor
+/// with the shape one of the family's empty slots expects at its place (an
+/// untied `lm_head`, an embedding norm), the best-named if several.
+fn proposeForUnread(a: Allocator, ck: *const Checkpoint, f: *const Arch, c: *const arch.Config, unread: []const []const u8) !?Override {
+    @setEvalBranchQuota(20000);
+    const names = &f.names;
+    const prefix = try modelPrefix(a, ck, names);
+    var best: ?Override = null;
+    var best_score: usize = 0;
+    var ties: usize = 0;
+    for (unread) |u| {
+        if (outsideTextModel(u) != null) continue;
+        const t = ck.find(u) orelse continue;
+        const p = locate(names, prefix, c.num_layers, c.num_experts, u);
+        if (p.expert != null) continue;
+        inline for (@typeInfo(Names).@"struct".fields) |nf| {
+            const T = nf.type;
+            if (comptime (T == []const u8 or T == ?[]const u8 or T == []const []const u8) and !std.mem.eql(u8, nf.name, "prefixes") and !std.mem.eql(u8, nf.name, "layer") and !std.mem.eql(u8, nf.name, "expert")) {
+                const model_level = contains(&model_fields, nf.name);
+                if (model_level == (p.layer == null)) {
+                    // Empty: none of the field's templates names a tensor here.
+                    const v = @field(names.*, nf.name);
+                    var list: []const []const u8 = &.{};
+                    if (T == []const u8) list = &.{v} else if (T == ?[]const u8) {
+                        if (v) |x| list = &.{x};
+                    } else list = v;
+                    var filled = false;
+                    for (list) |tpl| {
+                        const full = if (std.mem.indexOf(u8, tpl, "{p}") != null or model_level) try expand(a, tpl, prefix, p.layer, null) else try std.fmt.allocPrint(a, "{s}{s}", .{ p.layer_prefix, tpl });
+                        if (ck.find(full) != null) filled = true;
+                    }
+                    const want = try expectedShape(a, c, nf.name, p.layer orelse 0);
+                    if (!filled and want != null and t.is(want.?)) {
+                        const score = roleScore(nf.name, u) + 1;
+                        if (score > best_score) {
+                            best_score = score;
+                            ties = 1;
+                            const template = if (model_level) (if (prefix.len > 0 and std.mem.startsWith(u8, u, prefix)) try std.fmt.allocPrint(a, "{{p}}{s}", .{u[prefix.len..]}) else u) else p.rel;
+                            best = .{
+                                .field = nf.name,
+                                .value = if (T == []const []const u8) try std.fmt.allocPrint(a, "{{ \"{s}\" }}", .{template}) else try std.fmt.allocPrint(a, "\"{s}\"", .{template}),
+                                .why = try std.fmt.allocPrint(a, "guess: `{s}` {s} was left unread, and {s} named nothing in this checkpoint", .{ u, try fmtShape(a, t.shape), nf.name }),
+                            };
+                        } else if (score == best_score) ties += 1;
+                    }
+                }
+            }
+        }
+    }
+    return if (ties == 1) best else null;
+}
+
+/// A gate (or up) projection the checkpoint lacks, when the layer has an
+/// unread `[2I][H]` tensor instead: the fused layout, `mlp = "gated_fused"`.
+fn proposeFused(a: Allocator, ck: *const Checkpoint, f: *const Arch, c: *const arch.Config, missing: []const u8, unread: []const []const u8) !?[2]Override {
+    const names = &f.names;
+    const prefix = try modelPrefix(a, ck, names);
+    const place = locate(names, prefix, c.num_layers, c.num_experts, missing);
+    const field = fieldOf(names, place, missing) orelse return null;
+    if (!std.mem.eql(u8, field, "gate") and !std.mem.eql(u8, field, "up")) return null;
+    var chosen: ?[]const u8 = null;
+    for (unread) |n| {
+        const p = locate(names, prefix, c.num_layers, c.num_experts, n);
+        if (p.layer == null or place.layer == null or p.layer.? != place.layer.? or p.expert != null) continue;
+        const t = ck.find(n) orelse continue;
+        if (!t.is(&.{ 2 * c.intermediate_size, c.hidden_size })) continue;
+        if (chosen != null) return null;
+        chosen = n;
+    }
+    const n = chosen orelse return null;
+    const p = locate(names, prefix, c.num_layers, c.num_experts, n);
+    return .{
+        .{ .field = "mlp", .value = "\"gated_fused\"", .top = true, .why = try std.fmt.allocPrint(a, "guess: the layer has no {s} projection but one [2 x intermediate, hidden] tensor, `{s}`", .{ field, n }) },
+        .{ .field = "gate_up", .value = try std.fmt.allocPrint(a, "\"{s}\"", .{p.rel}), .why = "guess: gate rows then up rows, the order ditch reads a fused gate/up in; check it (some releases interleave them)" },
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Candidates
+// ---------------------------------------------------------------------------
+
+const Candidate = struct {
+    family: *const Arch,
+    score: f64,
+    cfg: arch.Config,
+    /// Fields and tensor names that differ from the schema defaults: among
+    /// equally covered families the plainest is tried first.
+    plainness: usize,
+};
+
+fn plainness(f: *const Arch) usize {
+    @setEvalBranchQuota(20000);
+    const default: Arch = .{ .model_type = "", .llama_cpp = null };
+    var n: usize = 0;
+    inline for (@typeInfo(Arch).@"struct".fields) |af| {
+        const skip = comptime std.mem.eql(u8, af.name, "model_type") or std.mem.eql(u8, af.name, "aliases") or std.mem.eql(u8, af.name, "llama_cpp") or
+            std.mem.eql(u8, af.name, "chat") or std.mem.eql(u8, af.name, "verified") or std.mem.eql(u8, af.name, "notes") or std.mem.eql(u8, af.name, "names") or std.mem.eql(u8, af.name, "script");
+        if (!skip and !std.meta.eql(@field(f.*, af.name), @field(default, af.name))) n += 1;
+    }
+    // A hook or a config function reads keys of its own.
+    if (f.extra != null) n += 3;
+    if (f.script != null) n += 3;
+    const dn: Names = .{};
+    inline for (@typeInfo(Names).@"struct".fields) |nf| {
+        const v = @field(f.names, nf.name);
+        const d = @field(dn, nf.name);
+        const T = @TypeOf(v);
+        if (T == []const u8) {
+            if (!std.mem.eql(u8, v, d)) n += 1;
+        } else if (T == ?[]const u8) {
+            if ((v == null) != (d == null) or (v != null and !std.mem.eql(u8, v.?, d.?))) n += 1;
+        } else if (T == []const []const u8) {
+            var same = v.len == d.len;
+            if (same) for (v, d) |x, y| {
+                same = same and std.mem.eql(u8, x, y);
+            };
+            if (!same) n += 1;
+        } else if (!std.meta.eql(v, d)) n += 1;
+    }
+    return n;
+}
+
+/// One tensor of each name pattern (layer and expert indices folded), with
+/// how many tensors share it: what the families are ranked on.
+const Rep = struct { name: []const u8, count: usize };
+
+fn representatives(a: Allocator, ck: *const Checkpoint) ![]const Rep {
+    var reps: std.ArrayList(Rep) = .empty;
+    var index: std.StringHashMapUnmanaged(usize) = .{};
+    for (ck.tensors) |t| {
+        if (outsideTextModel(t.name) != null) continue;
+        const p = try pattern(a, t.name);
+        const gop = try index.getOrPut(a, p.pat);
+        if (gop.found_existing) {
+            reps.items[gop.value_ptr.*].count += 1;
+        } else {
+            gop.value_ptr.* = reps.items.len;
+            try reps.append(a, .{ .name = t.name, .count = 1 });
+        }
+    }
+    return reps.items;
+}
+
+/// The share of the checkpoint's tensors (of the text model) that some
+/// template of the family names: a first, cheap ranking.
+fn coverage(a: Allocator, ck: *const Checkpoint, f: *const Arch, c: *const arch.Config, reps: []const Rep) !f64 {
+    const prefix = try modelPrefix(a, ck, &f.names);
+    var known: usize = 0;
+    var total: usize = 0;
+    for (reps) |r| {
+        total += r.count;
+        const full = if (std.mem.endsWith(u8, r.name, ".bias")) try std.fmt.allocPrint(a, "{s}.weight", .{r.name[0 .. r.name.len - ".bias".len]}) else r.name;
+        const p = locate(&f.names, prefix, c.num_layers, c.num_experts, full);
+        if (fieldOf(&f.names, p, full) != null) known += r.count;
+    }
+    return if (total == 0) 0 else @as(f64, @floatFromInt(known)) / @as(f64, @floatFromInt(total));
+}
+
+/// A tie-breaker between families that read the same tensors: the one the
+/// config's `architectures` class names (`Qwen2ForCausalLM` is `qwen2`),
+/// then one whose name shares the model_type's stem (`qwen2_foo`, `qwen`).
+fn affinity(a: Allocator, config_text: []const u8, own_type: []const u8, f: *const Arch) f64 {
+    var bonus: f64 = 0;
+    const v = std.json.parseFromSliceLeaky(std.json.Value, a, config_text, .{}) catch return 0;
+    if (v == .object) if (v.object.get("architectures")) |archs| if (archs == .array and archs.array.items.len > 0 and archs.array.items[0] == .string) {
+        const cls = archs.array.items[0].string;
+        for ([_][]const u8{ "ForCausalLM", "LMHeadModel", "ForConditionalGeneration" }) |suffix| {
+            if (!std.mem.endsWith(u8, cls, suffix)) continue;
+            const lower = std.ascii.allocLowerString(a, cls[0 .. cls.len - suffix.len]) catch return 0;
+            if (std.mem.eql(u8, lower, f.model_type) or contains(f.aliases, lower)) bonus += 0.2;
+        }
+    };
+    const stem = std.mem.trimEnd(u8, own_type[0 .. std.mem.indexOfAny(u8, own_type, "_-") orelse own_type.len], "0123456789.");
+    if (stem.len >= 3 and std.mem.startsWith(u8, f.model_type, stem)) bonus += 0.1;
+    if (std.mem.startsWith(u8, own_type, f.model_type)) bonus += 0.05;
+    // Between a dense family and its MoE twin (qwen3, qwen3_moe: the same
+    // layout, a different GGUF architecture), the one the experts call for.
+    const says_moe = std.mem.indexOf(u8, f.model_type, "moe") != null or (if (f.llama_cpp) |l| std.mem.indexOf(u8, l, "moe") != null else false);
+    const has_experts = if (v == .object) blk: {
+        const o = if (v.object.get("text_config")) |tc| (if (tc == .object) tc.object else v.object) else v.object;
+        for ([_][]const u8{ "num_experts", "num_local_experts", "n_routed_experts" }) |k| if (arch.getNum(o, k)) |n| if (n > 0) break :blk true;
+        break :blk false;
+    } else false;
+    if (says_moe == has_experts) bonus += 0.01;
+    return bonus;
+}
+
+// ---------------------------------------------------------------------------
+// Config keys
+// ---------------------------------------------------------------------------
+
+/// Keys that do not describe the computation (generation defaults, token
+/// ids, training settings, bookkeeping).
+const ignorable_keys = [_][]const u8{
+    "architectures",         "auto_map",             "model_type",                   "torch_dtype",             "dtype",                  "transformers_version",
+    "_name_or_path",         "bos_token_id",         "eos_token_id",                 "pad_token_id",            "sep_token_id",           "decoder_start_token_id",
+    "use_cache",             "initializer_range",    "attention_dropout",            "hidden_dropout",          "dropout",                "embd_pdrop",
+    "resid_pdrop",           "attn_pdrop",           "summary_type",                 "summary_use_proj",        "summary_activation",     "summary_proj_to_labels",
+    "summary_first_dropout", "output_attentions",    "output_hidden_states",         "return_dict",             "pretraining_tp",         "is_decoder",
+    "is_encoder_decoder",    "tokenizer_class",      "router_aux_loss_coef",         "output_router_logits",    "router_z_loss_coef",     "aux_loss_alpha",
+    "seq_aux",               "use_flash_attn",       "_attn_implementation",         "attn_implementation",     "image_token_id",         "video_token_id",
+    "vision_start_token_id", "vision_end_token_id",  "vision_token_id",              "chunk_size_feed_forward", "gradient_checkpointing", "num_nextn_predict_layers",
+    "mtp_num_layers",        "task_specific_params", "id2label",                     "label2id",                "problem_type",           "use_return_dict",
+    "ffn_dropout",           "hidden_dropout_prob",  "attention_probs_dropout_prob", "classifier_dropout",      "layerdrop",              "mlp_dropout",
+    "quantization_config",   "vision_config",        "audio_config",                 "text_config",             "thinker_config",         "talker_config",
+};
+
+const KeyReport = struct { unread: []const []const u8, read: usize };
+
+fn dumpConfig(a: Allocator, text: []const u8) []const u8 {
+    return dumpConfigAs(a, text, null);
+}
+
+fn dumpConfigAs(a: Allocator, text: []const u8, family: ?*const Arch) []const u8 {
+    const cfg = arch.parseConfigAs(a, text, family) catch |err| return @errorName(err);
+    var out: std.Io.Writer.Allocating = .init(a);
+    models.dump(arch.Config, &out.writer, cfg, "") catch return "?";
+    return out.written();
+}
+
+/// The keys of the (text) config that no part of the definition reads:
+/// neither removing them nor changing their value changes the parse.
+fn classifyKeys(a: Allocator, config_text: []const u8) !KeyReport {
+    var quiet: Capture = .{ .arena = a };
+    capture = &quiet;
+    defer capture = null;
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a, try arch.sanitizeJson(a, config_text), .{});
+    if (root != .object) return error.InvalidConfig;
+    const nested = if (root.object.get("text_config")) |tc| (if (tc == .object) tc.object else null) else null;
+    const obj = nested orelse root.object;
+
+    // A key can matter only when another is set (Qwen's max_window_layers
+    // once use_sliding_window is true and sliding_window is not null), so
+    // each key is also tried with every boolean flipped and every null set,
+    // one at a time and all together.
+    var contexts: std.ArrayList(std.json.ObjectMap) = .empty;
+    try contexts.append(a, obj);
+    var all = try obj.clone(a);
+    var it = obj.iterator();
+    while (it.next()) |kv| {
+        if (contains(&ignorable_keys, kv.key_ptr.*)) continue;
+        const changed: ?std.json.Value = switch (kv.value_ptr.*) {
+            .bool => |b| .{ .bool = !b },
+            .null => .{ .integer = 1 },
+            else => null,
+        };
+        if (changed) |v| {
+            var o = try obj.clone(a);
+            try o.put(a, kv.key_ptr.*, v);
+            try contexts.append(a, o);
+            try all.put(a, kv.key_ptr.*, v);
+        }
+    }
+    if (contexts.items.len > 2) try contexts.append(a, all);
+
+    var read_set: std.StringHashMapUnmanaged(void) = .{};
+    for (contexts.items) |ctx_obj| {
+        const base = dumpConfig(a, try withText(a, root.object, nested != null, ctx_obj));
+        if (std.mem.indexOfScalar(u8, base, '\n') == null) continue; // the context itself is refused
+        var kit = ctx_obj.iterator();
+        while (kit.next()) |kv| {
+            const key = kv.key_ptr.*;
+            if (contains(&ignorable_keys, key) or read_set.contains(key)) continue;
+            for (0..1 + variantCount(kv.value_ptr.*)) |variant| {
+                var o = try ctx_obj.clone(a);
+                if (variant == 0) {
+                    _ = o.orderedRemove(key);
+                } else try o.put(a, key, perturb(a, kv.value_ptr.*, variant - 1));
+                if (!std.mem.eql(u8, dumpConfig(a, try withText(a, root.object, nested != null, o)), base)) {
+                    try read_set.put(a, key, {});
+                    break;
+                }
+            }
+        }
+    }
+    var unread: std.ArrayList([]const u8) = .empty;
+    it = obj.iterator();
+    while (it.next()) |kv| {
+        if (!contains(&ignorable_keys, kv.key_ptr.*) and !read_set.contains(kv.key_ptr.*)) try unread.append(a, kv.key_ptr.*);
+    }
+    sortStrings(unread.items);
+    return .{ .unread = unread.items, .read = read_set.count() };
+}
+
+/// config.json text with `obj` as the (text) config.
+fn withText(a: Allocator, root: std.json.ObjectMap, nested: bool, obj: std.json.ObjectMap) ![]const u8 {
+    var r = obj;
+    if (nested) {
+        r = try root.clone(a);
+        try r.put(a, "text_config", .{ .object = obj });
+    }
+    return std.json.Stringify.valueAlloc(a, std.json.Value{ .object = r }, .{});
+}
+
+fn variantCount(v: std.json.Value) usize {
+    return switch (v) {
+        .string => perturbations.len,
+        .integer, .float => 2,
+        else => 1,
+    };
+}
+
+/// String values a key may take that ditch knows (activations, rope and
+/// layer types, router scores): a changed value is only noticed when the
+/// parser accepts it.
+const perturbations = [_][]const u8{ "gelu", "relu", "sigmoid", "yarn", "linear", "layer_norm", "ditch_probe_value" };
+
+fn perturb(a: Allocator, v: std.json.Value, k: usize) std.json.Value {
+    return switch (v) {
+        .integer => |n| .{ .integer = if (n == 0) 3 + @as(i64, @intCast(k)) else n * 2 + 1 + @as(i64, @intCast(k)) },
+        .float => |f| .{ .float = f * 1.5 + 0.25 + @as(f64, @floatFromInt(k)) },
+        .bool => |b| .{ .bool = !b },
+        .string => |s| .{ .string = if (std.mem.eql(u8, s, perturbations[k])) "ditch_probe_value" else perturbations[k] },
+        .array => |arr| blk: {
+            var copy = std.json.Array.init(a);
+            if (arr.items.len > 1) copy.appendSlice(arr.items[0 .. arr.items.len - 1]) catch {};
+            break :blk .{ .array = copy };
+        },
+        .object => .{ .object = .empty },
+        else => .{ .integer = 1 },
+    };
+}
+
+// ---------------------------------------------------------------------------
+// The command
+// ---------------------------------------------------------------------------
+
+fn configType(a: Allocator, text: []const u8) !struct { top: ?[]const u8, text: ?[]const u8 } {
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, a, try arch.sanitizeJson(a, text), .{});
+    if (v != .object) return error.InvalidConfig;
+    const top = arch.getStr(v.object, "model_type");
+    var inner: ?[]const u8 = null;
+    if (v.object.get("text_config")) |tc| if (tc == .object) {
+        inner = arch.getStr(tc.object, "model_type");
+    };
+    return .{ .top = top, .text = inner };
+}
+
+fn textLayers(a: Allocator, text: []const u8) usize {
+    const v = std.json.parseFromSliceLeaky(std.json.Value, a, arch.sanitizeJson(a, text) catch return std.math.maxInt(usize), .{}) catch return std.math.maxInt(usize);
+    if (v != .object) return std.math.maxInt(usize);
+    const o = if (v.object.get("text_config")) |tc| (if (tc == .object) tc.object else v.object) else v.object;
+    for ([_][]const u8{ "num_hidden_layers", "n_layer", "n_layers", "num_layers" }) |k| if (arch.getNum(o, k)) |n| if (n > 0) return @intFromFloat(n);
+    return std.math.maxInt(usize);
+}
+
+fn userModelsDir(ctx: Ctx) ![]const u8 {
+    if (ctx.settings.models_dir) |d| return d;
+    const base = (try config.configDir(ctx.arena, ctx.env)) orelse {
+        std.log.err("no configuration directory (set XDG_CONFIG_HOME or HOME, or pass --models-dir)", .{});
+        return error.NoConfigDir;
+    };
+    return std.fs.path.join(ctx.arena, &.{ base, "models" });
+}
+
+pub fn run(ctx: Ctx) !u8 {
+    const a = ctx.arena;
+    const io = ctx.io;
+    const out = ctx.out;
+    const model = ctx.settings.model;
+    if (model.len == 0) {
+        try out.writeAll("Usage: ditch add-model MODEL [--models-dir DIR] [--force] [--dry-run]\n\nMODEL is a Hub id (owner/name), hf://owner/name, an http(s) URL of the model files or a local directory.\n");
+        return 2;
+    }
+    if (try gguf_model.locate(io, a, model)) |path| return describeGguf(ctx, path);
+
+    // 1. Read.
+    const ck = if (hf.isLocalDir(io, model)) try readLocal(ctx, model) else try readRemote(ctx, model, out);
+    const original_config = ck.file("config.json");
+    var config_text = ck.file("config.json") orelse {
+        std.log.err("{s} has no config.json", .{model});
+        return 1;
+    };
+    // The family the checkpoint really is, when ditch knows it and the
+    // draft is made under another name (`--model-type`): the draft is
+    // compared with it.
+    var really: ?*const Arch = null;
+    if (ctx.settings.add_model_type) |t| {
+        const orig = try configType(a, config_text);
+        really = if (orig.text) |x| models.lookup(x) else null;
+        if (really == null) if (orig.top) |x| {
+            really = models.lookup(x);
+        };
+        // As if the checkpoint were an unknown family called `t`: no
+        // `architectures` class to go by either.
+        config_text = try retype(a, config_text, t);
+        for (@constCast(ck.small)) |*f| if (std.mem.eql(u8, f.name, "config.json")) {
+            f.bytes = config_text;
+        };
+    }
+    if (ck.tensors.len == 0) {
+        std.log.err("{s} has no safetensors weights (add-model needs their headers)", .{model});
+        return 1;
+    }
+    const types = try configType(a, config_text);
+    const own_type = types.text orelse types.top orelse {
+        std.log.err("config.json names no model_type", .{});
+        return 1;
+    };
+    text_layers = textLayers(a, config_text);
+    quantised = std.mem.indexOf(u8, config_text, "\"quantization_config\"") != null;
+    try out.print("* config.json: model_type {s}{s}{s}; {d} tensors in {d} safetensors file(s)\n", .{ own_type, if (types.text != null) " (text config of " else "", if (types.text != null) try std.fmt.allocPrint(a, "{s})", .{types.top orelse "?"}) else "", ck.tensors.len, ck.shards.len });
+    const known = models.lookup(own_type) orelse if (types.top) |t| models.lookup(t) else null;
+    if (known) |k| try out.print("* {s} is already defined ({s}, {s}): the draft is compared with it\n", .{ own_type, k.model_type, models.origin(k) });
+
+    // 2. The shape-only copy.
+    var name_buf: std.ArrayList(u8) = .empty;
+    for (model) |ch| try name_buf.append(a, if (std.ascii.isAlphanumeric(ch) or ch == '.' or ch == '-') ch else '_');
+    const work = try std.fs.path.join(a, &.{ ctx.cache_root, "add-model", name_buf.items });
+    try writeCopy(ctx, &ck, work);
+    try out.print("* Shape-only copy (headers and holes, no weights) in {s}\n", .{work});
+    try out.flush();
+
+    // 3. Match.
+    const chosen = (try match(ctx, &ck, work, own_type, config_text)) orelse {
+        std.log.err("no known family reads this config.json; a new family needs a definition written by hand (docs/models.md). What the families said:", .{});
+        for (refusals.items) |r| std.log.err("  {s}", .{r});
+        return 1;
+    };
+
+    // 4. Config keys, as the chosen family reads them.
+    var keys: KeyReport = .{ .unread = &.{}, .read = 0 };
+    if (chosen.ok) keys = classifyKeys(a, try retype(a, config_text, chosen.family.model_type)) catch keys;
+
+    // 5. The draft.
+    const tokenizer_problem = try checkTokenizer(ctx, &ck, try std.fs.path.join(a, &.{ work, "tokenizer" }));
+    const draft = try writeDraft(ctx, &ck, own_type, chosen, keys, known, tokenizer_problem);
+    const dir_path = try userModelsDir(ctx);
+    const file_name = try std.fmt.allocPrint(a, "{s}.lua", .{own_type});
+    const path = try std.fs.path.join(a, &.{ dir_path, file_name });
+    try out.writeAll("\n");
+    try out.flush();
+    try ctx.result.writeAll(draft);
+    try ctx.result.flush();
+    const exists = if (Io.Dir.cwd().access(io, path, .{})) |_| true else |_| false;
+    if ((exists or known != null) and !ctx.settings.force) {
+        try out.print("\n{s} not written: {s}; --force writes it anyway\n", .{ path, if (exists) "the file exists" else "the model_type is already defined, and the draft would shadow that definition" });
+        return if (chosen.ok) 0 else 1;
+    }
+    try Io.Dir.cwd().createDirPath(io, dir_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = draft });
+    try out.print("\nWrote {s}\n", .{path});
+
+    // The draft loads as a definition, and parses as the family it names.
+    var diag: models.Diagnostic = .{};
+    _ = models.loadSource(draft, path, &diag) catch |err| {
+        std.log.err("the draft does not load: {s}", .{diag.message orelse @errorName(err)});
+        return 1;
+    };
+    if (known orelse really) |k| try compareWithKnown(ctx, config_text, original_config.?, own_type, k);
+    if (!chosen.ok) {
+        try out.writeAll("The draft does not load this checkpoint yet (see its comments); edit it, then run ditch verify.\n");
+        return 1;
+    }
+    if (ctx.settings.dry_run) {
+        try out.print("Dry run: not checking; run ditch verify {s} to compare it with the official implementation.\n", .{model});
+        return 0;
+    }
+    try out.print("\nChecking the draft: ditch verify {s}\n", .{model});
+    try out.flush();
+    try ctx.env.put("DITCH_MODELS_DIR", dir_path);
+    const verify_args = [_][]const u8{model};
+    return verify.run(ctx.gpa, ctx.arena, io, ctx.env, &verify_args, out, ctx.result);
+}
+
+/// Ranks the known families by how well they read the checkpoint (see
+/// the module comment) and returns the best trial load, or null when no
+/// family reads its config.json.
+fn match(ctx: Ctx, ck: *const Checkpoint, work: []const u8, own_type: []const u8, config_text: []const u8) !?Trial {
+    const a = ctx.arena;
+    const out = ctx.out;
+    // Rank the families whose reading of config.json succeeds.
+    var candidates: std.ArrayList(Candidate) = .empty;
+    const reps = try representatives(a, ck);
+    var quiet: Capture = .{ .arena = a };
+    capture = &quiet;
+    for (models.families()) |f| {
+        if (f.inherits != null or std.mem.startsWith(u8, f.model_type, "add_model_trial")) continue;
+        for (candidates.items) |cand| {
+            if (cand.family == f) break;
+        } else {
+            const text = try retype(a, config_text, f.model_type);
+            const cfg = arch.parseConfig(a, text) catch continue;
+            const score = try coverage(a, ck, f, &cfg, reps) + affinity(a, config_text, own_type, f);
+            try candidates.append(a, .{ .family = f, .score = score, .cfg = cfg, .plainness = plainness(f) });
+        }
+    }
+    capture = null;
+    // The distinct reasons, for a checkpoint no family reads.
+    refusals.clearRetainingCapacity();
+    for (quiet.lines.items) |l| if (l.level == .err and !contains(refusals.items, l.text) and refusals.items.len < 6) try refusals.append(a, l.text);
+    std.mem.sort(Candidate, candidates.items, {}, struct {
+        fn gt(_: void, x: Candidate, y: Candidate) bool {
+            if (x.score != y.score) return x.score > y.score;
+            return x.plainness < y.plainness;
+        }
+    }.gt);
+    if (candidates.items.len == 0) return null;
+    try out.print("* {d} families read config.json; by tensor-name coverage:", .{candidates.items.len});
+    for (candidates.items[0..@min(5, candidates.items.len)]) |cand| try out.print(" {s} {d:.0}%", .{ cand.family.model_type, @min(cand.score, 1.0) * 100 });
+    try out.writeAll("\n");
+    try out.flush();
+
+    // Trial loads: the best-covered families as they are, then with the
+    // renames the loader's complaints suggest. Among those that read every
+    // tensor, the fewest renames, then the tightest fit, then the affinity.
+    var best: ?Trial = null;
+    var trial_no: usize = 0;
+    for (candidates.items[0..@min(10, candidates.items.len)]) |cand| {
+        var overrides: std.ArrayList(Override) = .empty;
+        try overrides.appendSlice(a, try structuralOverrides(a, ck, cand.family, &cand.cfg));
+        var round: usize = 0;
+        while (round < 24) : (round += 1) {
+            trial_no += 1;
+            const trial_type = try std.fmt.allocPrint(a, "add_model_trial_{d}", .{trial_no});
+            const started = Io.Timestamp.now(ctx.io, .awake);
+            const t = try tryLoad(ctx, ck, work, cand.family, overrides.items, trial_type);
+            const secs = @as(f64, @floatFromInt(started.durationTo(Io.Timestamp.now(ctx.io, .awake)).nanoseconds)) / 1e9;
+            if (t.ok) {
+                // A family that loads may still leave tensors unread because
+                // one of its optional slots (an untied lm_head, an embedding
+                // norm) is named otherwise: fill such slots while that
+                // leaves fewer tensors unread.
+                var cur = t;
+                var tries: usize = 0;
+                while (tries < 8 and countText(cur.unread) > 0) : (tries += 1) {
+                    const prop = (try proposeForUnread(a, ck, cur.used, &cand.cfg, cur.unread)) orelse break;
+                    try overrides.append(a, prop);
+                    trial_no += 1;
+                    const next = try tryLoad(ctx, ck, work, cand.family, overrides.items, try std.fmt.allocPrint(a, "add_model_trial_{d}", .{trial_no}));
+                    if (!next.ok or countText(next.unread) >= countText(cur.unread)) {
+                        _ = overrides.pop();
+                        break;
+                    }
+                    cur = next;
+                }
+                var trial = cur;
+                trial.overrides = try a.dupe(Override, cur.overrides);
+                if (try shapeMismatch(a, ck, trial.used, &cand.cfg)) |why| {
+                    // The loader takes some small tensors without checking
+                    // their shape (a per-head q/k norm read where the
+                    // checkpoint has one per row): not a match.
+                    trial.ok = false;
+                    trial.why = why;
+                    try out.print("  {s}: loads, but {s}\n", .{ cand.family.model_type, why });
+                    if (best == null or better(trial, best.?)) best = trial;
+                    break;
+                }
+                trial.absent = try absentTemplates(a, ck, trial.used, &cand.cfg);
+                trial.keys_unread = if (classifyKeys(a, try retype(a, config_text, trial.used.model_type))) |k| k.unread.len else |_| std.math.maxInt(usize);
+                trial.affinity = affinity(a, config_text, own_type, cand.family);
+                try out.print("  {s}{s}: loads ({d:.1}s); {d} tensor(s) of the text model unread, {d} of its names absent, {d} config key(s) unread\n", .{ cand.family.model_type, if (overrides.items.len > 0) " (renamed)" else "", secs, countText(trial.unread), trial.absent, trial.keys_unread });
+                if (best == null or better(trial, best.?)) best = trial;
+                break;
+            }
+            const missing = t.missing orelse {
+                try out.print("  {s}: refused: {s}\n", .{ cand.family.model_type, t.why });
+                const failed = try failedTrial(a, ck, t, &cand.cfg);
+                if (best == null or better(failed, best.?)) best = failed;
+                break;
+            };
+            const all = try allNames(a, ck);
+            const prop = try proposeRename(a, ck, t.used, &cand.cfg, missing, try unreadExcept(a, all, ck, t.used, &cand.cfg, overrides.items));
+            if (prop == null) if (try proposeFused(a, ck, t.used, &cand.cfg, missing, try unreadExcept(a, all, ck, t.used, &cand.cfg, overrides.items))) |two| {
+                try overrides.appendSlice(a, &two);
+                continue;
+            };
+            if (prop == null) {
+                try out.print("  {s}: needs {s}, which the checkpoint lacks\n", .{ cand.family.model_type, missing });
+                const failed = try failedTrial(a, ck, t, &cand.cfg);
+                if (best == null or better(failed, best.?)) best = failed;
+                break;
+            }
+            try overrides.append(a, prop.?);
+        }
+    }
+    return best;
+}
+
+/// A trial that did not load, with the tensors its family's names do not
+/// name as its "unread" ones: the closest of them has the fewest.
+fn failedTrial(a: Allocator, ck: *const Checkpoint, t: Trial, c: *const arch.Config) !Trial {
+    var out = t;
+    out.overrides = try a.dupe(Override, t.overrides);
+    out.unread = try unreadExcept(a, try allNames(a, ck), ck, t.used, c, t.overrides);
+    return out;
+}
+
+fn better(x: Trial, y: Trial) bool {
+    if (x.ok != y.ok) return x.ok;
+    const xu = countText(x.unread);
+    const yu = countText(y.unread);
+    if (xu != yu) return xu < yu;
+    if (x.overrides.len != y.overrides.len) return x.overrides.len < y.overrides.len;
+    if (x.absent != y.absent) return x.absent < y.absent;
+    if (x.keys_unread != y.keys_unread) return x.keys_unread < y.keys_unread;
+    if (x.affinity != y.affinity) return x.affinity > y.affinity;
+    return x.family.verified and !y.family.verified;
+}
+
+/// How many of a family's tensor templates name nothing in the checkpoint
+/// (checked at layer 0 and expert 0): a family with optional tensors the
+/// checkpoint lacks (BitNet's sub-norms for a Llama checkpoint) fits less
+/// tightly than one without them.
+fn absentTemplates(a: Allocator, ck: *const Checkpoint, f: *const Arch, c: *const arch.Config) !usize {
+    @setEvalBranchQuota(20000);
+    const names = &f.names;
+    const prefix = try modelPrefix(a, ck, names);
+    const lp = try expand(a, names.layer, prefix, 0, null);
+    const ep = try expand(a, names.expert, prefix, 0, 0);
+    var absent: usize = 0;
+    inline for (@typeInfo(Names).@"struct".fields) |nf| {
+        const skip = comptime std.mem.eql(u8, nf.name, "prefixes") or std.mem.eql(u8, nf.name, "layer") or std.mem.eql(u8, nf.name, "expert") or
+            std.mem.eql(u8, nf.name, "hc_attn") or std.mem.eql(u8, nf.name, "hc_ffn") or std.mem.eql(u8, nf.name, "hc_attn_flat") or std.mem.eql(u8, nf.name, "hc_ffn_flat");
+        if (!skip) {
+            const v = @field(names.*, nf.name);
+            const T = @TypeOf(v);
+            const expert_field = comptime std.mem.startsWith(u8, nf.name, "expert_");
+            var list: []const []const u8 = &.{};
+            if (T == []const u8) list = &.{v} else if (T == ?[]const u8) {
+                if (v) |x| list = &.{x};
+            } else if (T == []const []const u8) list = v;
+            if (list.len > 0 and !(expert_field and c.num_experts == 0)) {
+                var found = false;
+                for (list) |t| {
+                    const full = if (std.mem.indexOf(u8, t, "{p}") != null) try expand(a, t, prefix, 0, 0) else try std.fmt.allocPrint(a, "{s}{s}{s}", .{ lp, if (expert_field) ep else "", t });
+                    if (ck.find(full) != null) found = true;
+                    if (!found and std.mem.endsWith(u8, full, ".weight")) {
+                        if (ck.find(try std.fmt.allocPrint(a, "{s}.bias", .{full[0 .. full.len - ".weight".len]})) != null) found = true;
+                    }
+                }
+                if (!found) absent += 1;
+            }
+        }
+    }
+    return absent;
+}
+
+/// A GGUF file needs no definition, or cannot use one: ditch reads GGUF
+/// tensors through a fixed mapping of llama.cpp names for a few families
+/// (gguf_model.zig). Says which case this file is.
+fn describeGguf(ctx: Ctx, path: []const u8) !u8 {
+    const out = ctx.out;
+    const f = try gguf.File.openOptions(ctx.gpa, ctx.io, Io.Dir.cwd(), path, .{ .map = false });
+    defer f.close(ctx.gpa, ctx.io);
+    const name = if (f.get("general.architecture")) |v| v.asString() orelse "?" else "?";
+    var has_experts = false;
+    var it = f.tensors.iterator();
+    while (it.next()) |kv| if (std.mem.indexOf(u8, kv.key_ptr.*, "_exps") != null) {
+        has_experts = true;
+    };
+    try out.print("* GGUF file {s}: llama.cpp architecture {s}, {d} tensors\n", .{ path, name, f.tensors.count() });
+    if (gguf_model.archFromGguf(name, has_experts)) |fam| {
+        try out.print("ditch reads this file as its {s} family; no definition is needed.\n", .{fam.model_type});
+        return 0;
+    }
+    try out.print("ditch reads GGUF tensors through a fixed mapping of llama.cpp names, for the families {s}; a Lua definition cannot extend it. Run ditch add-model on the model's Hugging Face (safetensors) release instead, and use that, or a GGUF of a supported family.\n", .{try std.mem.join(ctx.arena, ", ", &gguf_model.gguf_families)});
+    return 1;
+}
+
+fn countText(names: []const []const u8) usize {
+    var n: usize = 0;
+    for (names) |x| {
+        if (outsideTextModel(x) == null) n += 1;
+    }
+    return n;
+}
+
+fn allNames(a: Allocator, ck: *const Checkpoint) ![]const []const u8 {
+    const names = try a.alloc([]const u8, ck.tensors.len);
+    for (ck.tensors, names) |t, *n| n.* = t.name;
+    return names;
+}
+
+/// Tensors a family's templates do not name (with the overrides already
+/// chosen), as candidates for a rename.
+fn unreadExcept(a: Allocator, all: []const []const u8, ck: *const Checkpoint, f: *const Arch, c: *const arch.Config, overrides: []const Override) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    const prefix = try modelPrefix(a, ck, &f.names);
+    outer: for (all) |n| {
+        if (outsideTextModel(n) != null) continue;
+        const p = locate(&f.names, prefix, c.num_layers, c.num_experts, n);
+        if (fieldOf(&f.names, p, n) != null) continue;
+        for (overrides) |o| if (std.mem.indexOf(u8, o.value, p.rel) != null and p.rel.len > 0) continue :outer;
+        try out.append(a, n);
+    }
+    return out.items;
+}
+
+/// Parses the config with the draft and with the definition ditch already
+/// has for its model_type, and says whether they agree.
+/// `original` is config.json as the checkpoint has it (before
+/// `--model-type`): the known family parses that one.
+fn compareWithKnown(ctx: Ctx, config_text: []const u8, original: []const u8, own_type: []const u8, known: *const Arch) !void {
+    const a = ctx.arena;
+    const draft_family = models.lookup(own_type).?;
+    var quiet: Capture = .{ .arena = a };
+    capture = &quiet;
+    // The family itself and the config's own model_type are the names that differ.
+    const as_draft = try withoutNames(a, dumpConfigAs(a, config_text, draft_family));
+    const as_known = try withoutNames(a, dumpConfigAs(a, original, known));
+    capture = null;
+    if (std.mem.eql(u8, as_draft, as_known)) {
+        try ctx.out.print("* The draft parses this config.json exactly as the built-in {s} does.\n", .{known.model_type});
+        return;
+    }
+    try ctx.out.print("* The draft parses this config.json differently from the built-in {s}:\n", .{known.model_type});
+    var da = std.mem.splitScalar(u8, as_draft, '\n');
+    var ka = std.mem.splitScalar(u8, as_known, '\n');
+    var shown: usize = 0;
+    while (da.next()) |x| {
+        const y = ka.next() orelse "";
+        if (!std.mem.eql(u8, x, y) and shown < 20) {
+            try ctx.out.print("    draft {s}\n    known {s}\n", .{ x, y });
+            shown += 1;
+        }
+    }
+}
+
+fn withoutNames(a: Allocator, dump: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var it = std.mem.splitScalar(u8, dump, '\n');
+    while (it.next()) |line| {
+        if (std.mem.startsWith(u8, line, "arch = ") or std.mem.startsWith(u8, line, "model_type = ")) continue;
+        try out.appendSlice(a, line);
+        try out.append(a, '\n');
+    }
+    return out.items;
+}
+
+fn writeDraft(ctx: Ctx, ck: *const Checkpoint, own_type: []const u8, t: Trial, keys: KeyReport, known: ?*const Arch, tokenizer_problem: ?[]const u8) ![]const u8 {
+    const a = ctx.arena;
+    var out: std.Io.Writer.Allocating = .init(a);
+    const w = &out.writer;
+    const f = t.family;
+    try w.print("-- {s}: drafted by `ditch add-model {s}`\n", .{ own_type, ctx.settings.model });
+    try w.print("-- from {s} ({d} tensors in {d} safetensors file(s)).\n", .{ ck.source, ck.tensors.len, ck.shards.len });
+    if (known) |k| try w.print("-- ditch already defines {s} ({s} in {s}).\n", .{ own_type, k.model_type, models.origin(k) });
+    try w.writeAll("--\n");
+    if (t.ok) {
+        const text_unread = countText(t.unread);
+        try w.print("-- Match: ditch's loader reads this checkpoint as `{s}`{s}", .{ f.model_type, if (t.overrides.len > 0) " with the renamed tensors below" else "" });
+        if (text_unread == 0) try w.writeAll(", and every tensor of the text model is read.\n") else try w.print("; {d} tensor(s) of the text model are left unread (listed at the end).\n", .{text_unread});
+        try w.print("-- `{s}`: {s}\n", .{ f.model_type, if (f.verified) "verified against a reference forward pass" else "not yet verified" });
+    } else {
+        try w.print("-- No match: the closest family, `{s}`, does not load this checkpoint:\n--   {s}\n", .{ f.model_type, t.why });
+    }
+    try writeTargets(a, w, ck, t.used);
+    if (ck.file("config.json")) |cfg_text| {
+        if (std.json.parseFromSliceLeaky(std.json.Value, a, try arch.sanitizeJson(a, cfg_text), .{})) |v| {
+            if (v == .object) {
+                const qc = if (v.object.get("quantization_config")) |q| (if (q == .object) q.object else null) else null;
+                if (dequant.parseQuantConfig(qc)) |q| {
+                    if (q.method != .none) try w.print("-- Weights: {s}, dequantised on load.\n", .{q.label});
+                } else |_| try w.writeAll("-- Weights: a quantization_config ditch cannot decode (see the error of a run).\n");
+            }
+        } else |_| {}
+    }
+    if (f.llama_cpp) |l| try w.print("-- GGUF export writes llama.cpp architecture `{s}` (from the base).\n", .{l});
+    if (tokenizer_problem) |why| try w.print("-- Tokenizer: ditch cannot read this checkpoint's tokenizer, so it cannot run it yet: {s}\n", .{why});
+    try w.writeAll("return {\n");
+    try w.print("  model_type = \"{s}\",\n", .{own_type});
+    try w.print("  base = \"{s}\",", .{f.model_type});
+    if (!t.ok) try w.writeAll(" -- guess: the closest family, see above") else if (t.overrides.len > 0) try w.writeAll(" -- the layout that reads the checkpoint once the tensors below are renamed");
+    try w.writeAll("\n");
+    // Chat template: the checkpoint's own, when ditch can render it.
+    const tokenizer_config = ck.file("tokenizer_config.json");
+    const template = try chat.pickTemplate(a, tokenizer_config, ck.file("chat_template.jinja"), ck.file("chat_template.json"));
+    if (template) |tpl| {
+        var format = try chat.Format.init(a, tpl, try chat.specialTokens(a, tokenizer_config, ck.file("special_tokens_map.json")), .raw);
+        defer format.deinit();
+        if (format.template != null) {
+            try w.writeAll("  -- chat: the checkpoint's own chat template is used, rendered as transformers renders it; `chat` only matters without it.\n");
+        } else {
+            try w.print("  chat = \"{s}\", -- guess: ditch cannot render the checkpoint's chat template (see the warning above); this is {s}'s fallback. Check the prompt ditch verify renders.\n", .{ f.chat, f.model_type });
+        }
+    } else try w.print("  -- chat: the checkpoint has no chat template; ditch uses {s}'s fallback `{s}`.\n", .{ f.model_type, f.chat });
+    try w.print("  notes = \"Drafted by ditch add-model from {s}; not yet verified.\",\n", .{ctx.settings.model});
+    for (t.overrides) |o| if (o.top) try w.print("  {s} = {s}, -- {s}\n", .{ o.field, o.value, o.why });
+    if (namesOverrides(t.overrides) > 0) {
+        try w.writeAll("  names = {\n");
+        for (t.overrides) |o| if (!o.top) try w.print("    {s} = {s}, -- {s}\n", .{ o.field, o.value, o.why });
+        try w.writeAll("  },\n");
+    }
+    try w.writeAll("}\n");
+
+    // What is left.
+    const groups = try groupNames(a, ck, t.unread);
+    var text_groups: usize = 0;
+    for (groups) |g| {
+        if (g.why == null) text_groups += 1;
+    }
+    if (text_groups > 0) {
+        try w.writeAll(if (t.ok) "\n-- Tensors of the text model ditch does not read with this definition\n-- (`{n}` stands for layer and expert indices):\n" else "\n-- Tensors of the text model the base family does not name\n-- (`{n}` stands for layer and expert indices):\n");
+        for (groups) |g| if (g.why == null) {
+            try w.print("--   {s} {s} {s} ({d}x)", .{ g.pat, g.dtype, try fmtShape(a, g.shape), g.count });
+            if (try slotElsewhere(a, g.first)) |hint| try w.print(": {s}", .{hint});
+            try w.writeAll("\n");
+        };
+    }
+    var outside: usize = 0;
+    for (groups) |g| {
+        if (g.why != null) outside += g.count;
+    }
+    if (outside > 0) {
+        try w.writeAll("\n-- Not part of the text model, left unread:\n");
+        for (groups) |*g| if (g.why) |why| try w.print("--   {s} ({d}x): {s}\n", .{ g.pat, g.count, why });
+    }
+    if (keys.unread.len > 0) {
+        try w.writeAll("\n-- config.json keys no part of this definition reads (changing them changes nothing);\n-- check that none of them changes the computation:\n--  ");
+        var col: usize = 3;
+        for (keys.unread) |k| {
+            if (col + k.len + 1 > 78) {
+                try w.writeAll("\n--  ");
+                col = 3;
+            }
+            try w.print(" {s}", .{k});
+            col += k.len + 1;
+        }
+        try w.writeAll("\n");
+    }
+    return out.written();
+}
+
+/// Which matrices abliteration edits in this checkpoint: the ones that
+/// write into the residual stream, as the family names them (docs/models.md,
+/// "What abliteration edits"), those the checkpoint has.
+fn writeTargets(a: Allocator, w: *std.Io.Writer, ck: *const Checkpoint, f: *const Arch) !void {
+    const names = &f.names;
+    const prefix = try modelPrefix(a, ck, names);
+    const Slot = struct { component: []const u8, template: ?[]const u8, expert: bool = false };
+    var ssm_out: ?[]const u8 = null;
+    if (names.ssm) |p| ssm_out = try std.fmt.allocPrint(a, "{s}out_proj.weight", .{p});
+    var shared_down: ?[]const u8 = null;
+    if (names.shared_expert) |p| shared_down = try std.fmt.allocPrint(a, "{s}{s}", .{ p, names.shared_down orelse names.expert_down });
+    const slots = [_]Slot{
+        .{ .component = "attn.o_proj", .template = names.o },
+        .{ .component = "attn.o_proj", .template = names.lin_out },
+        .{ .component = "attn.o_proj", .template = names.light_out },
+        .{ .component = "attn.o_proj", .template = names.conv_out },
+        .{ .component = "attn.o_proj", .template = ssm_out },
+        .{ .component = "mlp.down_proj", .template = names.down },
+        .{ .component = "mlp.down_proj", .template = names.expert_down, .expert = true },
+        .{ .component = "mlp.down_proj", .template = shared_down },
+        .{ .component = "mlp.down_proj", .template = names.latent_up },
+    };
+    var found: std.ArrayList([]const u8) = .empty;
+    for (slots) |slot| {
+        const t = slot.template orelse continue;
+        var layers: usize = 0;
+        var i: usize = 0;
+        while (i < 1024) : (i += 1) {
+            const lp = try expand(a, names.layer, prefix, i, null);
+            const ep = if (slot.expert) try expand(a, names.expert, prefix, i, 0) else "";
+            const full = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ lp, ep, t });
+            var here = ck.find(full) != null;
+            // Stacked experts: one fused tensor per layer.
+            if (slot.expert and !here) for (names.fused_down) |fd| {
+                if (ck.find(try std.fmt.allocPrint(a, "{s}{s}", .{ lp, fd })) != null) here = true;
+            };
+            if (here) layers += 1;
+            if (i > 8 and layers == 0) break;
+        }
+        if (layers > 0) try found.append(a, try std.fmt.allocPrint(a, "{s}{s} ({s}, {d} layer{s})", .{ if (slot.expert) names.expert else "", t, slot.component, layers, if (layers == 1) "" else "s" }));
+    }
+    if (found.items.len == 0) return;
+    try w.writeAll("-- Abliteration edits the matrices that write into the residual stream:\n");
+    for (found.items) |x| try w.print("--   {s}\n", .{x});
+}
+
+/// The building block a tensor name fills in another family, if any: the
+/// name is a template (relative to a layer) of some family's `names`.
+fn slotElsewhere(a: Allocator, full: []const u8) !?[]const u8 {
+    const p = try pattern(a, full);
+    // Relative part after the last `{n}.` segment.
+    const idx = std.mem.lastIndexOf(u8, p.pat, "{n}.") orelse return null;
+    const rel = p.pat[idx + 4 ..];
+    for (models.builtins()) |f| {
+        inline for (@typeInfo(Names).@"struct".fields) |nf| {
+            const v = @field(f.names, nf.name);
+            const T = @TypeOf(v);
+            var hit = false;
+            if (T == []const u8 or T == ?[]const u8) {
+                if (@as(?[]const u8, v)) |x| hit = std.mem.eql(u8, x, rel);
+            } else if (T == []const []const u8) {
+                for (v) |x| hit = hit or std.mem.eql(u8, x, rel);
+            }
+            if (hit) return try std.fmt.allocPrint(a, "`names.{s}` of {s} reads this name", .{ nf.name, f.model_type });
+        }
+    }
+    return null;
+}
+
+/// A fixture read as add-model reads a checkpoint, with its model_type
+/// replaced and tensor names renamed (`renames` pairs of substrings).
+fn testCheckpoint(ctx: Ctx, fixture: []const u8, model_type: []const u8, renames: []const [2][]const u8) !Checkpoint {
+    const a = ctx.arena;
+    const ck = try readLocal(ctx, fixture);
+    var small: std.ArrayList(SmallFile) = .empty;
+    for (ck.small) |f| {
+        if (std.mem.eql(u8, f.name, "model.safetensors.index.json")) continue;
+        try small.append(a, if (std.mem.eql(u8, f.name, "config.json")) .{ .name = f.name, .bytes = try retype(a, f.bytes, model_type) } else f);
+    }
+    var shards: std.ArrayList(Shard) = .empty;
+    var tensors: std.ArrayList(Tensor) = .empty;
+    for (ck.shards) |sh| {
+        var header: []const u8 = sh.head[8..];
+        for (renames) |r| header = try std.mem.replaceOwned(u8, a, header, r[0], r[1]);
+        const head = try a.alloc(u8, 8 + header.len);
+        std.mem.writeInt(u64, head[0..8], header.len, .little);
+        @memcpy(head[8..], header);
+        try addShard(a, sh.name, head, &shards, &tensors);
+    }
+    return .{ .source = fixture, .small = small.items, .shards = shards.items, .tensors = tensors.items };
+}
+
+test "add-model reads a known family under a new model_type, and renames tensors by place and shape" {
+    // Only loads that succeed run here: a refused trial load logs its
+    // error, which the test runner counts as a failure (the binary collects
+    // it instead); tests/e2e.sh runs the whole command.
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const io = std.testing.io;
+    const pool = tensor.Pool.init(io, 2);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    var discard_buf: [256]u8 = undefined;
+    var discard: Io.Writer.Discarding = .init(&discard_buf);
+    const ctx: Ctx = .{ .gpa = gpa, .arena = a, .io = io, .env = undefined, .settings = undefined, .http = undefined, .cache_root = tmp_path, .pool = &pool, .out = &discard.writer, .result = &discard.writer };
+
+    // Qwen3 under another name loads as qwen3 with every tensor read.
+    {
+        const ck = try testCheckpoint(ctx, "tests/fixtures/qwen3", "qwen_renamed_family", &.{});
+        const work = try std.fs.path.join(a, &.{ tmp_path, "qwen3" });
+        try writeCopy(ctx, &ck, work);
+        const qwen3 = models.lookup("qwen3").?;
+        const t = try tryLoad(ctx, &ck, work, qwen3, &.{}, "add_model_trial_test_1");
+        try std.testing.expect(t.ok);
+        try std.testing.expectEqual(@as(usize, 0), countText(t.unread));
+    }
+    // Llama with its MLP renamed w1/w3/w2: each missing name is matched to
+    // the unread tensor of its layer with the expected shape and role, and
+    // the renamed family reads everything.
+    {
+        const ck = try testCheckpoint(ctx, "tests/fixtures/llama", "llama_renamed_mlp", &.{ .{ "mlp.gate_proj", "mlp.w1" }, .{ "mlp.up_proj", "mlp.w3" }, .{ "mlp.down_proj", "mlp.w2" } });
+        const work = try std.fs.path.join(a, &.{ tmp_path, "llama" });
+        try writeCopy(ctx, &ck, work);
+        const llama = models.lookup("llama").?;
+        const cfg = try arch.parseConfig(a, try retype(a, ck.file("config.json").?, "llama"));
+        const all = try allNames(a, &ck);
+        var overrides: std.ArrayList(Override) = .empty;
+        for ([_][2][]const u8{ .{ "gate_proj", "\"mlp.w1.weight\"" }, .{ "up_proj", "\"mlp.w3.weight\"" }, .{ "down_proj", "\"mlp.w2.weight\"" } }) |want| {
+            const missing = try std.fmt.allocPrint(a, "model.layers.1.mlp.{s}.weight", .{want[0]});
+            const o = (try proposeRename(a, &ck, llama, &cfg, missing, try unreadExcept(a, all, &ck, llama, &cfg, overrides.items))).?;
+            try std.testing.expectEqualStrings(want[1], o.value);
+            try overrides.append(a, o);
+        }
+        const t = try tryLoad(ctx, &ck, work, llama, overrides.items, "add_model_trial_test_2");
+        try std.testing.expect(t.ok);
+        try std.testing.expectEqual(@as(usize, 0), countText(t.unread));
+    }
+}

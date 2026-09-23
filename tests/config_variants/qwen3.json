@@ -1,22 +1,5 @@
 [
  {
-  "attention_bias": false
- },
- {
-  "attention_bias": "$delete"
- },
- {
-  "model_type": "qwen2_5_vl"
- },
- {
-  "model_type": "qwen2_vl_text",
-  "attention_bias": false
- },
- {
-  "model_type": "$delete",
-  "attention_bias": false
- },
- {
   "sliding_window": 16,
   "use_sliding_window": false,
   "max_window_layers": 1

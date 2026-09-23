@@ -10,4 +10,5 @@ return {
     q_norm = "self_attn.q_norm.weight",
     k_norm = "self_attn.k_norm.weight",
   },
+  config = require("qwen").sliding,
 }

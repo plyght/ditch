@@ -1,8 +1,9 @@
 //! Transformer model loading and inference for decoder-only Hugging Face
 //! checkpoints. The family-specific knowledge (tensor names, norm and
 //! residual layout, attention/MLP layouts, positional encoding, MoE routing)
-//! lives in the architecture registry (`arch.zig`); this module is the
-//! generic loader and forward pass driven by a `Config`.
+//! lives in the model definitions (`src/models/*.lua`, read into an
+//! `arch.Arch` by models.zig); this module is the generic loader and forward
+//! pass driven by a `Config`.
 //!
 //! Weights are accessed through a `stream.WeightStore`: memory-mapped by
 //! default, or streamed layer by layer from disk under a memory budget
@@ -857,6 +858,8 @@ pub const Model = struct {
             return error.IncompleteModel;
         } else |_| {}
         self.dequantised = 0;
+        // `self.* = undefined` above drops field defaults; a GGUF has no special_tokens_map.json.
+        self.special_tokens_map_json = null;
         if (gguf_path) |p| {
             try gguf_model.attach(self, p, opts.store == .mapped, .{ .ignore_embedded = opts.gguf_ignore_embedded });
             self.export_config_json = self.config_json;

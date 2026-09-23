@@ -2,9 +2,9 @@
 //! routed forward pass, per-expert abliteration deltas, expert ranking and
 //! expert-selective abliteration.
 //!
-//! Tensor names and routing rules come from the architecture registry
-//! (`arch.zig`): Qwen2/3-MoE, Mixtral, DeepSeek V2/V3 (sigmoid or softmax
-//! scoring, group-limited top-k, correction bias, shared experts), Llama 4
+//! Tensor names and routing rules come from the model definitions
+//! (`src/models/*.lua`): Qwen2/3-MoE, Mixtral, DeepSeek V2/V3 (sigmoid or
+//! softmax scoring, group-limited top-k, correction bias, shared experts), Llama 4
 //! (top-1 routing scaling the expert input) and gpt-oss (interleaved fused
 //! experts with biases, clamped swiglu). Every expert's down projection is
 //! exposed as a `tensor.Weight` view regardless of the on-disk layout, so the

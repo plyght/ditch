@@ -171,6 +171,63 @@ fn copyIfExists(io: Io, src: Io.Dir, dst: Io.Dir, name: []const u8) void {
     src.copyFile(name, dst, name, io, .{}) catch {};
 }
 
+/// The files beside the weights that the export needs to load the way the
+/// source did: tokenizer and processor files, a tiktoken vocabulary (with the
+/// tokenizer.json synthesised from it), and every top-level `*.py`, which is
+/// the code a `trust_remote_code` config's `auto_map` names (configuration,
+/// modeling, tokenization) and the modules it imports. `src` must be opened
+/// with `.iterate = true`.
+fn copySideFiles(io: Io, src: Io.Dir, dst: Io.Dir, tiktoken: bool) void {
+    copyIfExists(io, src, dst, "special_tokens_map.json");
+    copyIfExists(io, src, dst, "chat_template.jinja");
+    copyIfExists(io, src, dst, "chat_template.json");
+    copyIfExists(io, src, dst, "added_tokens.json");
+    copyIfExists(io, src, dst, "preprocessor_config.json");
+    if (tiktoken) {
+        copyIfExists(io, src, dst, "tiktoken.model");
+        copyIfExists(io, src, dst, "tokenizer.model");
+    }
+    var it = src.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".py")) copyIfExists(io, src, dst, entry.name);
+    }
+}
+
+test "saveModel carries the remote code" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "src");
+    var fixture = try Io.Dir.cwd().openDir(io, "tests/fixtures/qwen2", .{});
+    defer fixture.close(io);
+    var src = try tmp.dir.openDir(io, "src", .{});
+    defer src.close(io);
+    for ([_][]const u8{ "config.json", "generation_config.json", "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors", "model.safetensors.index.json", "tokenizer.json", "tokenizer_config.json" }) |name| {
+        try fixture.copyFile(name, src, name, io, .{});
+    }
+    for ([_][]const u8{ "modeling_kimi_k3.py", "configuration_kimi_k3.py", "tokenization_kimi.py", "media_utils.py", "chat_template.jinja" }) |name| {
+        try src.writeFile(io, .{ .sub_path = name, .data = name });
+    }
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path_buf);
+    const src_dir = try std.fs.path.join(gpa, &.{ path_buf[0..n], "src" });
+    defer gpa.free(src_dir);
+    const out_dir = try std.fs.path.join(gpa, &.{ path_buf[0..n], "out" });
+    defer gpa.free(out_dir);
+    const pool = tensor.Pool.init(io, 1);
+    const model = try Model.load(gpa, io, &pool, src_dir);
+    defer model.deinit();
+    var sink: Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try saveModel(gpa, io, model, out_dir, .{}, &sink.writer);
+    var out = try Io.Dir.cwd().openDir(io, out_dir, .{});
+    defer out.close(io);
+    for ([_][]const u8{ "modeling_kimi_k3.py", "configuration_kimi_k3.py", "tokenization_kimi.py", "media_utils.py", "chat_template.jinja" }) |name| {
+        try out.access(io, name, .{});
+    }
+}
+
 pub const SaveOptions = struct {
     max_shard_size: u64 = 5 * 1024 * 1024 * 1024,
     export_dtype: ?tensor.DType = null,
@@ -255,26 +312,10 @@ fn saveModelInner(gpa: Allocator, io: Io, model: *const Model, dir: Io.Dir, opts
     try dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = model.tokenizer_json });
     if (model.generation_config_json) |g| try dir.writeFile(io, .{ .sub_path = "generation_config.json", .data = g });
     if (model.tokenizer_config_json) |t| try dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = t });
-    var src = cwd.openDir(io, model.source_dir, .{}) catch null;
+    var src = cwd.openDir(io, model.source_dir, .{ .iterate = true }) catch null;
     if (src) |*s| {
         defer s.close(io);
-        copyIfExists(io, s.*, dir, "special_tokens_map.json");
-        copyIfExists(io, s.*, dir, "chat_template.jinja");
-        copyIfExists(io, s.*, dir, "chat_template.json");
-        copyIfExists(io, s.*, dir, "added_tokens.json");
-        copyIfExists(io, s.*, dir, "preprocessor_config.json");
-        // A tiktoken vocabulary (and the tokenizer code that reads it) travels with the
-        // tokenizer.json synthesised from it, so the export loads either way.
-        if (model.tokenizer.tiktoken_kind != null) {
-            copyIfExists(io, s.*, dir, "tiktoken.model");
-            copyIfExists(io, s.*, dir, "tokenizer.model");
-            var it = s.iterate();
-            while (it.next(io) catch null) |entry| {
-                if (entry.kind == .file and std.mem.startsWith(u8, entry.name, "tokenization_") and std.mem.endsWith(u8, entry.name, ".py")) {
-                    copyIfExists(io, s.*, dir, entry.name);
-                }
-            }
-        }
+        copySideFiles(io, s.*, dir, model.tokenizer.tiktoken_kind != null);
     }
     if (opts.readme_body) |body| try dir.writeFile(io, .{ .sub_path = "README.md", .data = body });
 }

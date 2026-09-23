@@ -4362,3 +4362,466 @@ template has no such branch: its generation prompt is the model turn alone.
 contain the empty thought block's literal; tests cover both detections and the
 render. The trial above was calibrated with the old prompt, which changes its
 directions, not the arithmetic this section checks.
+
+## Abliteration: Mistral Small 4 (`mistral4`), FP8 MLA + MoE
+
+`mistralai/Mistral-Small-4-119B-2603`, first 2 layers, the first 8 of its 128
+routed experts (`tools/truncate_checkpoint.py --experts 8`, new: per-expert
+tensors of the others left out, the stacked expert tensors, the router and its
+bias cut to their first 8 rows, the config's expert count and top-k
+following). FP8 with a scale per tensor and, for the stacked experts, per
+expert (`[E, 1, 1]`).
+
+* **Edited set:** `self_attn.o_proj` (MLA's output projection), the stacked
+  `mlp.experts.down_proj` (all 8) and `mlp.shared_experts.down_proj`, in both
+  layers; the MLA projections, `gate_up_proj`, the router and the norms
+  untouched.
+* **Arithmetic, f32 export:** every matrix within 1.0e-06 of the rank-3
+  optimum, on the FP8 values dequantised with their per-tensor / per-expert
+  scales (and rounded to bf16, as ditch does on load).
+* **bf16 export:** 99.89-99.92% of the elements bit-equal to `bf16(W + D₃)`,
+  the rest rounding ties; reload validation 0.017 (bf16) and 0.0000 (f32).
+* **Export:** transformers on the f32 export against `ditch probe` on it:
+  residuals within 5.6e-07, logits 1.5e-06, ids equal after bug 70.
+
+### Bug 70 — Mistral Small 4 was prompted without its model-settings block (fixed)
+
+**Symptom.** transformers' ids on the export had 13 more tokens:
+`[MODEL_SETTINGS]{"reasoning_effort": "none"}[/MODEL_SETTINGS]` before the
+first `[INST]`.
+
+**Cause.** Mistral Small 4's template emits the model settings (with
+`reasoning_effort` defaulting to `"none"`) once, before the first user
+message; ditch rendered it as the plain `mistral_v7` format.
+
+**Fix.** A `mistral_v7_settings` template, detected by `[MODEL_SETTINGS]` in
+the release's template; its render is checked against transformers' own for a
+four-message conversation.
+# Chat templates rendered by ditch
+
+Until now ditch did not run a model's chat template. It shipped a few dozen
+template families and matched the model's `chat_template` against each by
+marker strings, and that matching was behind many of the bugs above (12, 26,
+32, 34, 35, 36, 48, 50, 61, 63, 69, F10). A wrong prompt is a silent error:
+the directions are measured on text the model was never trained to read.
+
+Now each model is prompted with its own template. `src/jinja.zig` is a
+Jinja2 interpreter covering what Hugging Face chat templates use, with the
+semantics transformers renders them with:
+
+* jinja2's `ImmutableSandboxedEnvironment` with `trim_blocks` and
+  `lstrip_blocks`, loop controls, the `{% generation %}` tag,
+  `raise_exception`, `strftime_now` and a `json.dumps` `tojson`
+  (`ensure_ascii=False`, `indent`, `separators`, `sort_keys`);
+* `keep_trailing_newline=False`;
+* Python's rules for values: `str()` / `repr()`, float formatting, `/` and
+  `//`, slices, code-point indexing, string and dict methods;
+* jinja2's rules for undefined names and attributes, and for one-shot
+  generators from `map` / `select` / `selectattr` / `reverse` / `items`;
+* macros with `caller()`, `*args` / `**kwargs`, namespaces, and a
+  separate scope for each loop iteration.
+
+`chat.Format` picks the template the way transformers does
+(`chat_template.jinja`, then `tokenizer_config.json` or the `default` of
+its list, then a processor's `chat_template.json`). It passes the
+tokenizer's named special tokens, as `special_tokens_map` does, with
+`tools` / `documents` set to none, and encodes the result without the
+tokenizer's special tokens, as `apply_chat_template(tokenize=True)` does.
+The BOS is therefore exactly where the template writes one, and bug 38's
+heuristics no longer apply to these prompts.
+
+Before prompting, `chat.Format` renders the system + user conversation a
+study uses:
+
+* **Refuses a system message:** Gemma 2 raises "System role not supported"
+  and starcoder2-instruct raises "System messages are not allowed". The
+  system prompt then opens the first user message, followed by a blank line,
+  as Gemma 3's own template does. ditch prints a warning.
+* **Takes content only as a list of parts:** MiniMax-Text-01 and M1 fail on a
+  plain string (`'str object' has no attribute 'text'`, in transformers
+  too). Each content is then wrapped as `[{"type": "text", "text": ...}]`,
+  as a processor would send it.
+* **Neither fix works, or no template:** the family `chat.detect` picks is
+  used, with a warning saying why. Such a family can also be forced with
+  `chat_template`. `"model"` names the model's own template, and the
+  reproducibility manifest records it.
+
+## Method
+
+`tools/chat_template_check.py` downloads only the tokenizer and template
+files (no weights) of 153 releases, with at least one release for each of the
+93 `model_type`s in the registry, including every generation of the
+families whose format has changed. Each release is checked on the following
+conversations:
+
+* system + user, which is what a study renders;
+* user only;
+* system, user, assistant, user;
+* system + user without the generation prompt;
+* a system prompt with surrounding spaces and a trailing newline, then a user
+  message with non-ASCII text, quotes, braces and a fenced code block;
+* for templates that read them: `enable_thinking` true and false,
+  `thinking`, and the lowest and highest `reasoning_effort` the template
+  names.
+
+The reference is transformers 5.17.0: `apply_chat_template(tokenize=False)`
+for the text and `tokenize=True` for the ids, with tiktoken, sentencepiece
+and sacremoses installed so that every tokenizer loads. The other side is
+`ditch render-template DIR CASES.json`, a command left out of the help. It
+builds the same `chat.Format` a study does and encodes each case with the
+engine's rules. With `--family` it renders with the family `chat.detect`
+picks instead, which is how ditch prompted models before this change.
+
+For the two adjustments above, the reference renders the same folded or
+wrapped conversation. `tools/make_template_fixtures.py` copies 30 of these
+templates, with transformers' renderings, into
+`tests/fixtures/chat_templates` for `src/jinja.zig`'s tests. A second test
+checks 86 expressions and statements against jinja2's output.
+
+## Results
+
+**Text: 718 of 718 cases** equal transformers' on the 128 releases that ship
+a template. The other 25 releases ship none (base models, and DeepSeek V3.2 /
+V4 / V4.1 and Kimi K3, whose formats live in Python files) and use their
+family.
+
+**Ids: 681 of 708 cases** equal `apply_chat_template(tokenize=True)`. The
+27 differences are all in the tokenizer, not the template:
+
+* **21 cases on 5 releases where transformers 5 rebuilds the tokenizer from
+  its Python class** (`LlamaTokenizer`, `GPT2Tokenizer`) instead of reading
+  `tokenizer.json`. These are unsloth/llama-2-7b-chat,
+  DeepSeek-R1-Distill-Llama-8B, MiniCPM-2B-sft (1 case), MiniMax-M1-40k and
+  MiniMax-Text-01-hf. On each, ditch's ids equal the release's
+  `tokenizer.json` as the `tokenizers` package encodes it. For Llama 2 the
+  only difference is `[INST]` after `<s>` (`▁[` in transformers 5, `[` in
+  `tokenizer.json`). For R1-Distill-Llama, transformers 5 gives ids that do
+  not spell the prompt in Llama 3's vocabulary at all.
+* **6 cases on 2 releases whose pre-tokenizer regex ditch does not
+  recognise.** On load ditch warns and falls back to GPT-2's split:
+  * vinai/PhoGPT-4B-Chat (`mpt`), 5 cases: the regex
+    ` ?[^(\s|[.,!?…。，、।۔،])]+` keeps `hỏi:` whole, where ditch splits
+    off the colon.
+  * the Jais-2 re-upload, 1 case: its regex groups a run of spaces into
+    chunks of 512, 256, …, 4, then 1-2, so the indentation of a code block
+    splits differently.
+
+  These are tokenizer entries still to add, not template differences.
+
+## What the old detection got wrong
+
+The same 124 releases rendered with `--family`, on the system + user
+prompt a study uses, compared as token ids (they include the old BOS
+handling). 95 were prompted exactly as their template prompts them. The 29
+below were not; the columns show the text around the first difference:
+
+| release | family detected | its own template | the family |
+| --- | --- | --- | --- |
+| HeshamSA/jais-2-8b-chat-mxfp4-msa | `llama3` | `tem<\|end_header_id\|>You are a helpful assistant.<\|eot_id\|><\|` | `tem<\|end_header_id\|>\n\nYou are a helpful assistant.<\|eot_id\|>` |
+| MiniMaxAI/MiniMax-M3 | `minimax_m2` | `]~!b[]~b]system\nYour model version is MiniMax-M3, developed` | `]~!b[]~b]system\nYou are a helpful assistant.[e~[\n]~b]user\nW` |
+| Qwen/Qwen3-4B-Thinking-2507 | `chatml` | `im_start\|>assistant\n<think>\n` | `im_start\|>assistant\n` |
+| Qwen/Qwen3-Next-80B-A3B-Thinking | `chatml` | `im_start\|>assistant\n<think>\n` | `im_start\|>assistant\n` |
+| Qwen/Qwen3.5-0.8B | `qwen3_5` | `\|>assistant\n<think>\n\n</think>\n\n` | `\|>assistant\n<think>\n` |
+| Qwen/Qwen3.8-27B | `qwen3_5` | `<\|im_start\|>system\nReasoning effort is set to xhigh. Please` | `<\|im_start\|>system\nYou are a helpful assistant.<\|im_end\|>\n<` |
+| Qwen/Qwen3.8-Flash-Next | `qwen3_5` | `<\|im_start\|>system\nReasoning effort is set to xhigh. Please` | `<\|im_start\|>system\nYou are a helpful assistant.<\|im_end\|>\n<` |
+| THUDM/chatglm3-6b | `glm4` | `[gMASK]sop<\|system\|>\n You are a helpful assista` | `[gMASK]<sop><\|system\|>\nYou are a helpful assist` |
+| XiaomiMiMo/MiMo-V2.5 | `mimo` | `im_start\|>assistant\n` | `im_start\|>assistant\n<think></think>` |
+| allenai/OLMo-7B-0724-Instruct-hf | `olmo` | `<\|endoftext\|><\|user\|>\nWhat is the capital ` | `<\|system\|>\nYou are a helpful assistant.\n<\|` |
+| allenai/Olmo-3-7B-Think | `chatml` | `a helpful assistant. You do not currently have access to any` | `a helpful assistant.<\|im_end\|>\n<\|im_start\|>user\nWhat is the ` |
+| deepseek-ai/DeepSeek-R1-Distill-Llama-8B | `deepseek` | `France?<｜Assistant｜><think>\n` | `France?<｜Assistant｜>` |
+| deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B | `deepseek` | `France?<｜Assistant｜><think>\n` | `France?<｜Assistant｜>` |
+| estrogen/c4ai-command-r7b-12-2024 | `cohere_response` | `<\|START_OF_TURN_TOKEN\|><\|SYSTEM_TOKEN\|>Yo` | `<BOS_TOKEN><\|START_OF_TURN_TOKEN\|><\|SYSTE` |
+| internlm/internlm2_5-1_8b-chat | `chatml` | `<s><\|im_start\|>system\nYou are a helpful a` | `<\|im_start\|>system\nYou are a helpful assi` |
+| microsoft/Phi-4-mini-reasoning | `phi4_mini` | `<\|system\|>Your name is Phi, an AI math expert develop` | `<\|system\|>You are a helpful assistant.<\|end\|><\|user\|>` |
+| microsoft/bitnet-b1.58-2B-4T | `chatml` | `System: You are a helpful assistant.<\|eo` | `<\|im_start\|>system\nYou are a helpful ass` |
+| mistralai/Ministral-8B-Instruct-2410 | `mistral` | `<s>[INST]You are a helpful assistant.\n\nWhat is th` | `<s>[INST] You are a helpful assistant.\n\nWhat is t` |
+| mistralai/Mistral-Nemo-Instruct-2407 | `mistral` | `<s>[INST]You are a helpful assistant.\n\nWhat is th` | `<s>[INST] You are a helpful assistant.\n\nWhat is t` |
+| mistralai/Mistral-Small-4-119B-2603 | `mistral_v7` | `nt.[/SYSTEM_PROMPT][MODEL_SETTINGS]{"reasoning_effort": "non` | `nt.[/SYSTEM_PROMPT][INST]What is the capital of France?[/INS` |
+| moonshotai/Kimi-K2.5 | `kimi` | `sistant<\|im_middle\|><think>` | `sistant<\|im_middle\|>` |
+| nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16 | `mimo` | `assistant.<\|im_end\|>\n<\|im_start\|>user\nWhat is the capital of` | `assistant.<\|im_end\|><\|im_start\|>user\nWhat is the capital of ` |
+| openbmb/MiniCPM-2B-sft-bf16 | `raw` | `a helpful assistant.<用户>What is the capital of France?<AI>` | `a helpful assistant.\n\nUser: What is the capital of France?\nA` |
+| poolside/Laguna-XS-2.1 | `laguna` | `〈\|EOS\|〉<system>You are a helpful assistant.</system>\n<u` | `〈\|EOS\|〉<system>\n\nYou are a helpful assistant.\n</system>` |
+| tencent/Hy3-preview | `hunyuan` | `helpful assistant.<｜reasoning_mode｜>reasoning_effort:no_thin` | `helpful assistant.<｜hy_place▁holder▁no▁3｜><｜hy_User｜>What is` |
+| vinai/PhoGPT-4B-Chat | `raw` | `\n### Câu hỏi: What is the capital of Fra` | `You are a helpful assistant.\n\nUser: What` |
+| zai-org/GLM-5.2 | `glm47` | `MASK]<sop><\|system\|>Reasoning Effort: Max<\|system\|>You are a` | `MASK]<sop><\|system\|>You are a helpful assistant.<\|user\|>What` |
+| zai-org/GLM-5.3-Flash | `glm4` | `MASK]<sop><\|system\|>Reasoning Effort: Max<\|system\|>You are a` | `MASK]<sop><\|system\|>\nYou are a helpful assistant.<\|user\|>\nWh` |
+| zai-org/GLM-5.3 | `glm4` | `MASK]<sop><\|system\|>Reasoning Effort: Max<\|system\|>You are a` | `MASK]<sop><\|system\|>\nYou are a helpful assistant.<\|user\|>\nWh` |
+
+These include:
+
+* the thinking releases (Qwen3-Thinking, Qwen3-Next-Thinking, Kimi K2.5,
+  the R1 distills), whose templates open `<think>`, which ditch's
+  chain-of-thought handling closes;
+* default system text: Phi-4-mini-reasoning's identity, Olmo 3 Think's
+  note on functions, MiniMax-M3's model version, and the reasoning-effort
+  blocks of GLM-5.x, Qwen3.8, Mistral Small 4 and Hy3;
+* spacing and BOS details: Mistral Nemo / Ministral 8B's `[INST]` without a
+  space, Jais-2's header without a blank line, ChatGLM3's `sop`, InternLM's
+  and Command R7B's BOS;
+* releases whose template matched no family: MiniCPM and PhoGPT were
+  prompted with \`raw\`, and bitnet with its registry's ChatML.
+
+Each would have been the next bug in the list above.
+
+## Remaining limits
+
+* `strftime_now` formats the UTC date; transformers uses the local one.
+  They differ only on a machine whose local date is not the UTC date. Nine
+  of the releases write the date: Llama 3.2, gpt-oss, SmolLM3, Solar Open,
+  Granite 3.1 and 3.3, Mistral Small 3 and 3.1, and Apertus.
+* Case mapping (`upper`, `lower`, `title`, `capitalize`) covers ASCII,
+  Latin-1, Latin Extended-A, Greek and Cyrillic. Templates apply it to role
+  names.
+* `recursive` loops, `{% include %}` / `{% extends %}` and a few filters no
+  chat template uses (`groupby`, `truncate`, `wordwrap`, `urlize`, …) are
+  not implemented. A template using them fails to parse and gets its family,
+  with a warning.
+
+## The releases
+
+| release | model_type | text | ids | notes |
+| --- | --- | ---: | ---: | --- |
+| unsloth/llama-2-7b-chat | `llama` | 5/5 | 0/5 | Llama 2 [INST]; tokenizer_config.json |
+| unsloth/llama-3-8b-Instruct | `llama` | 5/5 | 5/5 | Llama 3; tokenizer_config.json |
+| unsloth/Meta-Llama-3.1-8B-Instruct | `llama` | 5/5 | 5/5 | Llama 3.1 dated system block; tokenizer_config.json |
+| unsloth/Llama-3.2-1B-Instruct | `llama` | 5/5 | 5/5 | Llama 3.2; chat_template.jinja |
+| unsloth/Llama-3.3-70B-Instruct | `llama` | 5/5 | 5/5 | Llama 3.3; chat_template.jinja |
+| HuggingFaceTB/SmolLM2-1.7B-Instruct | `llama` | 5/5 | 5/5 | SmolLM2 ChatML; tokenizer_config.json |
+| tiiuae/Falcon3-1B-Instruct | `llama` | 5/5 | 5/5 | Falcon 3; tokenizer_config.json |
+| nvidia/Llama-3.1-Nemotron-Nano-8B-v1 | `llama` | 5/5 | 5/5 | Nemotron Nano, detailed thinking; tokenizer_config.json |
+| deepseek-ai/DeepSeek-R1-Distill-Llama-8B | `llama` | 5/5 | 0/5 | R1 distill; tokenizer_config.json |
+| mistralai/Mistral-Small-3.1-24B-Instruct-2503 | `llama` | 5/5 | 5/5 | mistral3 (mistral3_text) V7-tekken; chat_template.json; template passed explicitly |
+| mistralai/Mistral-7B-Instruct-v0.1 | `mistral` | 5/5 | 5/5 | v0.1; tokenizer_config.json |
+| mistralai/Mistral-7B-Instruct-v0.3 | `mistral` | 5/5 | 5/5 | v0.3; tokenizer_config.json |
+| mistralai/Mistral-Nemo-Instruct-2407 | `mistral` | 5/5 | 5/5 | Nemo tekken; tokenizer_config.json |
+| mistralai/Mistral-Small-24B-Instruct-2501 | `mistral` | 5/5 | 5/5 | V7-tekken; tokenizer_config.json |
+| mistralai/Ministral-8B-Instruct-2410 | `mistral` | 5/5 | 5/5 | ministral; tokenizer_config.json |
+| mistralai/Ministral-3-3B-Instruct-2512 | `ministral3` | 5/5 | 5/5 | chat_template.jinja |
+| mistralai/Mistral-Small-4-119B-2603 | `mistral4` | 7/7 | 7/7 | chat_template.jinja |
+| mistralai/Mixtral-8x7B-Instruct-v0.1 | `mixtral` | 5/5 | 5/5 | tokenizer_config.json |
+| Qwen/Qwen2-0.5B-Instruct | `qwen2` | 5/5 | 5/5 | Qwen2; tokenizer_config.json |
+| Qwen/Qwen2.5-0.5B-Instruct | `qwen2` | 5/5 | 5/5 | Qwen2.5; tokenizer_config.json |
+| Qwen/Qwen2.5-VL-3B-Instruct | `qwen2` | 5/5 | 5/5 | qwen2_5_vl, processor template; tokenizer_config.json |
+| deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B | `qwen2` | 5/5 | 5/5 | R1 distill; tokenizer_config.json |
+| Qwen/Qwen3-0.6B | `qwen3` | 7/7 | 7/7 | Qwen3 hybrid thinking; tokenizer_config.json |
+| Qwen/Qwen3-4B-Instruct-2507 | `qwen3` | 5/5 | 5/5 | Qwen3 2507 instruct; tokenizer_config.json |
+| Qwen/Qwen3-4B-Thinking-2507 | `qwen3` | 5/5 | 5/5 | Qwen3 2507 thinking; tokenizer_config.json |
+| Qwen/Qwen3-VL-2B-Instruct | `qwen3` | 5/5 | 5/5 | qwen3_vl; tokenizer_config.json |
+| Qwen/Qwen1.5-MoE-A2.7B-Chat | `qwen2_moe` | 5/5 | 5/5 | tokenizer_config.json |
+| Qwen/Qwen3-30B-A3B | `qwen3_moe` | 7/7 | 7/7 | tokenizer_config.json |
+| Qwen/Qwen3-30B-A3B-Instruct-2507 | `qwen3_moe` | 5/5 | 5/5 | 2507; tokenizer_config.json |
+| Qwen/Qwen3-Next-80B-A3B-Instruct | `qwen3_next` | 5/5 | 5/5 | tokenizer_config.json |
+| Qwen/Qwen3-Next-80B-A3B-Thinking | `qwen3_next` | 5/5 | 5/5 | thinking; tokenizer_config.json |
+| Qwen/Qwen3.5-0.8B | `qwen3_5` | 7/7 | 7/7 | Qwen3.5; chat_template.jinja |
+| Qwen/Qwen3.8-27B | `qwen3_5` | 9/9 | 9/9 | Qwen3.8; chat_template.jinja |
+| Qwen/Qwen3.5-35B-A3B | `qwen3_5_moe` | 7/7 | 7/7 | chat_template.jinja |
+| Qwen/Qwen3.5-397B-A17B | `qwen3_5_moe` | 7/7 | 7/7 | chat_template.jinja |
+| Qwen/Qwen3.8-Flash-Next | `qwen4_exp` | 9/9 | 9/9 | chat_template.jinja |
+| unsloth/gemma-2-2b-it | `gemma2` | 5/5 | 5/5 | tokenizer_config.json; system prompt folded into the user message (reference adjusted alike) |
+| unsloth/gemma-3-1b-it | `gemma3` | 5/5 | 5/5 | text only; chat_template.jinja |
+| unsloth/gemma-3-4b-it | `gemma3` | 5/5 | 5/5 | multimodal; chat_template.jinja |
+| unsloth/gemma-3n-E2B-it | `gemma3n` | 5/5 | 5/5 | chat_template.jinja |
+| google/gemma-4-E2B-it | `gemma4` | 7/7 | 7/7 | chat_template.jinja |
+| google/gemma-4-12B-it | `gemma4` | 7/7 | 7/7 | gemma4_unified; chat_template.jinja |
+| microsoft/phi-2 | `phi` | n/a | n/a | base; no template; fallback `raw` |
+| microsoft/Phi-3-mini-4k-instruct | `phi3` | 5/5 | 5/5 | Phi-3; tokenizer_config.json |
+| microsoft/Phi-3.5-mini-instruct | `phi3` | 5/5 | 5/5 | Phi-3.5; tokenizer_config.json |
+| microsoft/phi-4 | `phi3` | 5/5 | 5/5 | Phi-4 im_sep; tokenizer_config.json |
+| microsoft/Phi-4-mini-instruct | `phi3` | 5/5 | 5/5 | Phi-4-mini; tokenizer_config.json |
+| microsoft/Phi-4-mini-reasoning | `phi3` | 5/5 | 5/5 | Phi-4-mini reasoning; tokenizer_config.json |
+| EleutherAI/pythia-160m | `gpt_neox` | n/a | n/a | no template; fallback `raw` |
+| openai-community/gpt2 | `gpt2` | n/a | n/a | no template; fallback `raw` |
+| tiiuae/falcon-7b-instruct | `falcon` | 5/5 | 5/5 | tokenizer_config.json |
+| stabilityai/stablelm-2-1_6b-chat | `stablelm` | 5/5 | 5/5 | tokenizer_config.json |
+| stabilityai/stablelm-zephyr-3b | `stablelm` | 5/5 | 5/5 | Zephyr; tokenizer_config.json |
+| internlm/internlm2_5-1_8b-chat | `internlm2` | 5/5 | n/a | tokenizer_config.json |
+| allenai/OLMo-2-0425-1B-Instruct | `olmo2` | 5/5 | 5/5 | OLMo 2; tokenizer_config.json |
+| allenai/Olmo-3-7B-Instruct | `olmo2` | 5/5 | 5/5 | olmo3; chat_template.jinja |
+| allenai/Olmo-3-7B-Think | `olmo2` | 5/5 | 5/5 | olmo3 think; chat_template.jinja |
+| allenai/OLMo-1B-hf | `olmo` | n/a | n/a | no template; fallback `olmo` |
+| allenai/OLMo-7B-0724-Instruct-hf | `olmo` | 5/5 | 5/5 | instruct; tokenizer_config.json |
+| adamo1139/aya-expanse-8b-ungated | `cohere` | 5/5 | 5/5 | Aya Expanse (Command R format); tokenizer_config.json[default] |
+| Cossale/aya-expanse-8b-formal | `cohere` | 5/5 | 5/5 | Aya Expanse fine-tune; tokenizer_config.json[default] |
+| estrogen/c4ai-command-r7b-12-2024 | `cohere` | 5/5 | 5/5 | Command R7B (cohere2); tokenizer_config.json[default] |
+| THUDM/glm-4-9b-chat-hf | `glm4` | 5/5 | 5/5 | glm (GLM-4 HF port); tokenizer_config.json |
+| zai-org/GLM-4-9B-0414 | `glm4` | 5/5 | 5/5 | GLM-4 0414; chat_template.jinja |
+| THUDM/glm-4-9b-chat | `chatglm` | 5/5 | 5/5 | remote code; tokenizer_config.json |
+| THUDM/chatglm3-6b | `chatglm` | 5/5 | n/a | ChatGLM3; tokenizer_config.json |
+| zai-org/GLM-4.5-Air | `glm4_moe` | 7/7 | 7/7 | GLM-4.5; chat_template.jinja |
+| zai-org/GLM-4.6 | `glm4_moe` | 7/7 | 7/7 | GLM-4.6; chat_template.jinja |
+| zai-org/GLM-4.7 | `glm4_moe` | 7/7 | 7/7 | GLM-4.7; chat_template.jinja |
+| zai-org/GLM-4.7-Flash | `glm4_moe_lite` | 7/7 | 7/7 | chat_template.jinja |
+| zai-org/GLM-5.2 | `glm_moe_dsa` | 9/9 | 9/9 | GLM-5.2; chat_template.jinja |
+| zai-org/GLM-5.3 | `glm_moe_dsa` | 7/7 | 7/7 | GLM-5.3; chat_template.jinja |
+| zai-org/GLM-5.3-Flash | `glm5_next` | 7/7 | 7/7 | chat_template.jinja |
+| ibm-granite/granite-3.1-2b-instruct | `granite` | 5/5 | 5/5 | Granite 3.1; tokenizer_config.json |
+| ibm-granite/granite-3.3-2b-instruct | `granite` | 5/5 | 5/5 | Granite 3.3; tokenizer_config.json |
+| ibm-granite/granite-4.1-3b | `granite` | 5/5 | 5/5 | Granite 4.1; chat_template.jinja |
+| ibm-granite/granite-3.0-1b-a400m-instruct | `granitemoe` | 5/5 | 5/5 | tokenizer_config.json |
+| ibm-granite/granite-4.0-h-350m | `granitemoehybrid` | 5/5 | 5/5 | Granite 4 H; chat_template.jinja |
+| ibm-granite/granite-4.0-micro | `granitemoehybrid` | 5/5 | 5/5 | Granite 4 micro; chat_template.jinja |
+| ibm-granite/granite-swash-2b | `granite_swa` | n/a | n/a | no template; fallback `granite` |
+| deepseek-ai/DeepSeek-V2-Lite-Chat | `deepseek_v2` | 5/5 | 5/5 | tokenizer_config.json |
+| deepseek-ai/DeepSeek-V3 | `deepseek_v3` | 5/5 | 5/5 | V3; tokenizer_config.json |
+| deepseek-ai/DeepSeek-R1-0528 | `deepseek_v3` | 5/5 | 5/5 | R1 0528; tokenizer_config.json |
+| deepseek-ai/DeepSeek-V3.1 | `deepseek_v3` | 7/7 | 7/7 | V3.1 thinking kwarg; tokenizer_config.json |
+| moonshotai/Kimi-K2-Instruct-0905 | `deepseek_v3` | 5/5 | 5/5 | Kimi K2 (model_type kimi_k2); chat_template.jinja |
+| deepseek-ai/DeepSeek-V3.2-Exp | `deepseek_v32` | 7/7 | 7/7 | tokenizer_config.json |
+| deepseek-ai/DeepSeek-V3.2 | `deepseek_v32` | n/a | n/a | V3.2; no template; fallback `deepseek` |
+| deepseek-ai/DeepSeek-V4-Flash | `deepseek_v4` | n/a | n/a | no template; fallback `deepseek` |
+| deepseek-ai/DeepSeek-V4.1-Flash | `deepseek_v41` | n/a | n/a | no template; fallback `deepseek` |
+| unsloth/Llama-4-Scout-17B-16E-Instruct | `llama4` | 5/5 | 5/5 | chat_template.jinja |
+| openai/gpt-oss-20b | `gpt_oss` | 7/7 | 7/7 | harmony; chat_template.jinja |
+| openbmb/MiniCPM-2B-sft-bf16 | `minicpm` | 5/5 | 4/5 | tokenizer_config.json |
+| openbmb/MiniCPM4-0.5B | `minicpm` | 5/5 | 5/5 | MiniCPM4; tokenizer_config.json |
+| LGAI-EXAONE/EXAONE-3.5-2.4B-Instruct | `exaone` | 5/5 | 5/5 | EXAONE 3.5; tokenizer_config.json |
+| LGAI-EXAONE/EXAONE-4.0-1.2B | `exaone4` | 7/7 | 7/7 | EXAONE 4; chat_template.jinja |
+| LGAI-EXAONE/EXAONE-4.0.1-32B | `exaone4` | 7/7 | 7/7 | EXAONE 4.0.1; chat_template.jinja |
+| LGAI-EXAONE/K-EXAONE-236B-A23B | `exaone_moe` | 7/7 | 7/7 | chat_template.jinja |
+| nvidia/Nemotron-Mini-4B-Instruct | `nemotron` | 5/5 | 5/5 | tokenizer_config.json |
+| nvidia/Minitron-4B-Base | `nemotron` | n/a | n/a | base; no template; fallback `raw` |
+| HuggingFaceTB/SmolLM3-3B | `smollm3` | 7/7 | 7/7 | chat_template.jinja |
+| bigscience/bloomz-560m | `bloom` | n/a | n/a | no template; fallback `raw` |
+| facebook/opt-125m | `opt` | n/a | n/a | no template; fallback `raw` |
+| vinai/PhoGPT-4B-Chat | `mpt` | 5/5 | 0/5 | PhoGPT; mosaicml/mpt-* are gone; tokenizer_config.json |
+| bigcode/starcoder2-3b | `starcoder2` | n/a | n/a | base; no template; fallback `raw` |
+| bigcode/starcoder2-15b-instruct-v0.1 | `starcoder2` | 5/5 | 5/5 | instruct; tokenizer_config.json; system prompt folded into the user message (reference adjusted alike) |
+| bigcode/tiny_starcoder_py | `gpt_bigcode` | n/a | n/a | base; no template; fallback `raw` |
+| HuggingFaceH4/starchat-beta | `gpt_bigcode` | n/a | n/a | StarChat; no template; fallback `raw` |
+| baichuan-inc/Baichuan2-7B-Chat | `baichuan` | n/a | n/a | remote code; no template; fallback `raw` |
+| AntonV/mamba2-130m-hf | `mamba2` | n/a | n/a | no template; fallback `raw` |
+| nvidia/NVIDIA-Nemotron-Nano-9B-v2 | `nemotron_h` | 7/7 | 7/7 | Nemotron Nano 2; tokenizer_config.json |
+| nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16 | `nemotron_h` | 7/7 | 7/7 | Nemotron 3 Nano; chat_template.jinja |
+| tiiuae/Falcon-H1-0.5B-Instruct | `falcon_h1` | 5/5 | 5/5 | chat_template.jinja |
+| ai21labs/Jamba-tiny-dev | `jamba` | 5/5 | 5/5 | tokenizer_config.json |
+| ai21labs/AI21-Jamba-Reasoning-3B | `jamba` | 5/5 | 5/5 | reasoning; tokenizer_config.json |
+| MiniMaxAI/MiniMax-M2 | `minimax_m2` | 5/5 | 5/5 | chat_template.jinja |
+| MiniMaxAI/MiniMax-M1-40k | `minimax` | 5/5 | 0/5 | M1; tokenizer_config.json; contents as text parts (reference adjusted alike) |
+| MiniMaxAI/MiniMax-Text-01-hf | `minimax` | 5/5 | 0/5 | Text-01; tokenizer_config.json; contents as text parts (reference adjusted alike) |
+| MiniMaxAI/MiniMax-M3 | `minimax_m3_vl_text` | 7/7 | 7/7 | chat_template.jinja |
+| baidu/ERNIE-4.5-21B-A3B-PT | `ernie4_5_moe` | 5/5 | 5/5 | chat_template.jinja |
+| baidu/ERNIE-4.5-0.3B-PT | `ernie4_5` | 5/5 | 5/5 | chat_template.jinja |
+| tencent/Hunyuan-A13B-Instruct | `hunyuan_v1_moe` | 5/5 | 5/5 | tokenizer_config.json |
+| tencent/Hunyuan-0.5B-Instruct | `hunyuan_v1_dense` | 7/7 | 7/7 | tokenizer_config.json |
+| tencent/Hunyuan-7B-Instruct | `hunyuan_v1_dense` | 5/5 | 5/5 | 7B; tokenizer_config.json |
+| tencent/Hy3-preview | `hy_v3` | 7/7 | 7/7 | chat_template.jinja |
+| moonshotai/Kimi-Linear-48B-A3B-Instruct | `kimi_linear` | 5/5 | 5/5 | chat_template.jinja |
+| moonshotai/Kimi-K2.5 | `kimi_k25` | 7/7 | 7/7 | chat_template.jinja |
+| moonshotai/Kimi-K3 | `kimi_k3` | n/a | n/a | no template; no transformers tokenizer; fallback `kimi_k3` |
+| XiaomiMiMo/MiMo-V2-Flash | `mimo_v2_flash` | 7/7 | 7/7 | tokenizer_config.json |
+| XiaomiMiMo/MiMo-V2.5 | `mimo_v2_flash` | 7/7 | 7/7 | mimo_v2; tokenizer_config.json |
+| arcee-ai/AFM-4.5B | `arcee` | 5/5 | 5/5 | tokenizer_config.json |
+| swiss-ai/Apertus-8B-Instruct-2509 | `apertus` | 7/7 | 7/7 | chat_template.jinja |
+| microsoft/bitnet-b1.58-2B-4T | `bitnet` | 5/5 | 5/5 | tokenizer_config.json |
+| kyutai/helium-1-preview-2b | `helium` | n/a | n/a | no template; fallback `chatml` |
+| ByteDance-Seed/Seed-OSS-36B-Instruct | `seed_oss` | 5/5 | 5/5 | chat_template.jinja |
+| LiquidAI/LFM2-350M | `lfm2` | 5/5 | 5/5 | chat_template.jinja |
+| HeshamSA/jais-2-8b-chat-mxfp4-msa | `jais2` | 5/5 | 4/5 | quantised re-upload; inception42/Jais-2-8B-Chat is gated; chat_template.jinja |
+| nanochat-students/nanochat-d20 | `nanochat` | 5/5 | 5/5 | chat_template.jinja |
+| pankajmathur/nanochat-d34-sft-hf | `nanochat` | n/a | n/a | HF port; no template; fallback `nanochat` |
+| adept/persimmon-8b-chat | `persimmon` | n/a | n/a | no template; fallback `raw` |
+| EleutherAI/gpt-j-6b | `gptj` | n/a | n/a | no template; fallback `raw` |
+| Salesforce/codegen-350M-mono | `codegen` | n/a | n/a | no template; fallback `raw` |
+| EleutherAI/gpt-neo-125m | `gpt_neo` | n/a | n/a | no template; fallback `raw` |
+| facebook/xglm-564M | `xglm` | n/a | n/a | no template; fallback `raw` |
+| microsoft/biogpt | `biogpt` | n/a | n/a | no template; fallback `raw` |
+| allenai/OLMoE-1B-7B-0924-Instruct | `olmoe` | 5/5 | 5/5 | tokenizer_config.json |
+| allenai/OLMoE-1B-7B-0125-Instruct | `olmoe` | 5/5 | 5/5 | 0125; tokenizer_config.json |
+| allenai/FlexOlmo-7x7B-1T-RT | `flex_olmo` | 5/5 | 5/5 | tokenizer_config.json |
+| rednote-hilab/dots.llm1.inst | `dots1` | 5/5 | 5/5 | tokenizer_config.json |
+| upstage/Solar-Open-100B | `solar_open` | 7/7 | 7/7 | chat_template.jinja |
+| arcee-ai/Trinity-Nano-Preview | `afmoe` | 5/5 | 5/5 | chat_template.jinja |
+| JetBrains/Mellum2-12B-A2.5B-Instruct | `mellum` | 5/5 | 5/5 | chat_template.jinja |
+| poolside/Laguna-XS.2 | `laguna` | 7/7 | 7/7 | chat_template.jinja |
+| poolside/Laguna-XS-2.1 | `laguna` | 7/7 | 7/7 | 2.1; chat_template.jinja |
+
+## Abliteration: Llama 4 (`llama4`), stacked experts with a shared expert
+
+`unsloth/Llama-4-Scout-17B-16E-Instruct`, layers 0 and 3 (a chunked RoPE
+layer and a NoPE layer), the first 4 of 16 experts (`--experts 4`); bf16
+export only (an f32 export of this cut, 4 GB of which is the embedding, does
+not fit on the disk).
+
+* **Edited set:** `self_attn.o_proj`, the stacked `feed_forward.experts.down_proj`
+  (stored `[E, in, out]`, all 4) and `feed_forward.shared_expert.down_proj`, in
+  both layers; `gate_up_proj`, the router and the norms untouched.
+* **bf16 export:** 99.89-99.98% of the elements bit-equal to `bf16(W + D₃)`.
+  Against the exact edit the export's error is 7.7-8.8e-02 where the best
+  rank-3 delta's is 2-8e-02; that gap is the bf16 rounding of the merged
+  weights, not the delta: `bf16(W + D₃)` itself sits at 8.6e-02 on the same
+  matrix, and the export equals it on 99.95% of the elements. The checker now
+  reports that rounded floor for bf16 exports. Reload validation 0.0115.
+* **Export:** transformers against `ditch probe` on the export: residuals
+  within 3.1e-07, logits 5.3e-07, ids equal. A float32 reference of this cut
+  does not fit in 15 GiB either; `tools/ref_f32_but_embed.py` loads it in bf16
+  and moves everything but the input embedding (a lookup of bf16 values,
+  exact either way) to float32.
+
+## Abliteration: Kimi-Linear (`kimi_linear`), KDA and MLA layers with per-expert tensors
+
+`moonshotai/Kimi-Linear-48B-A3B-Instruct`, first 4 layers (layer 0 KDA with
+the dense MLP, layers 1-2 KDA with the MoE, layer 3 MLA with the MoE), the
+first 8 of 256 experts (`--experts 8`); float32 export.
+
+* **Edited set:** `self_attn.o_proj` (the KDA output projection in layers 1-2,
+  the MLA one in layer 3), every routed expert's `w2` (all 8) and
+  `shared_experts.down_proj`, in layers 1-3. Layer 0 is untouched, and should
+  be: its distance from the trial's peaks (2.39 for attention, 2.30 for the
+  MLP) is beyond both `min_weight_distance`s (1.47, 1.77). The KDA gates and
+  projections (`f_a/f_b/g_a/g_b/b_proj`, `q/k/v_proj`, the convolutions,
+  `A_log`, `dt_bias`, `o_norm`), `w1`/`w3`, the router and its correction
+  bias are all untouched.
+* **Maths:** all 30 edited matrices within 1.2e-06 of the best rank-3
+  approximation of the exact edit (λ 1.08-1.24 per layer).
+* **Export:** ditch's reload check 0.0000 over 4 prompts. transformers'
+  `modeling_kimi_linear.py` (its torch KDA fallback) against `ditch probe` on
+  the export: residuals within 2.95e-06, logits 9.3e-07 of range, argmax and
+  top-5 equal on both prompts.
+
+## Exact ranges for scattered experts: gpt-oss-20b with a cache below its experts
+
+After the account of gpt-oss-120b's decode above (whole 8 MB chunks per
+expert piece), the ranges a MoE layer's routed experts need are merged per
+shard, and a chunk a merged range covers less than half of is fetched as the
+exact range into a bounded RAM store (512 MB) that the reads consult; a
+chunk covered more is fetched whole into the chunk cache as before. This
+applies only when the plan says the routed experts do not fit the cache
+beside the trunk: a model that fits keeps whole chunks, so that a later run
+reads everything from disk. Measured on gpt-oss-20b with `--remote-cache-size
+4500MB` (the trunk's 3.35 GB and 82 of its 768 experts), cold, ReleaseFast,
+"What is the capital of France?" (87 chat tokens), 16 greedy tokens, each
+run alone:
+
+| | fetched | exact ranges | chunks evicted | first token | 16 tokens | link |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| whole chunks | 4931 ranges, 38.47 GB | - | 4369 | 407.3 s | 1852.1 s (0.010 tokens/s after the first) | ~20.8 MB/s |
+| exact ranges | 5544 ranges, 19.82 GB | 3697 (5.39 GB), 6592 reads served | 1285 | 460.5 s | 1826.1 s (0.011 tokens/s after the first) | ~10.9 MB/s |
+
+Both print `<|channel|>analysis<|message|>We need to answer: "What is the
+capital of France?"`, with the same expert-cache counts (1456 misses, 56 a
+decode step). Half the bytes, and a third of the evictions, for the same
+wall time: this run met a slower link (TLS resets from the Hub during it),
+and a decode step is bound less by bytes than by the largest piece each
+layer waits for at the per-connection rate (~1-3 MB/s here), which the
+exact ranges do not shorten. They matter where a step is bandwidth-bound
+(gpt-oss-120b's ~6.3 GB a step) and for the Hub's request and byte budget.
+
+## Bug 71 — exports left out the remote code (fixed)
+
+**Symptom.** The abliterated export of a `trust_remote_code` model did not
+load: Kimi K3's export kept `auto_map` in `config.json`, but
+`configuration_kimi_k3.py`, `modeling_kimi_k3.py`, `modeling_kimi_linear.py`,
+`tokenization_kimi.py` and the modules they import were not in it
+(`OSError: out-k3 does not appear to have a file named tokenization_kimi.py`).
+
+**Cause.** Only `tokenization_*.py` was meant to be copied, and only for
+tiktoken vocabularies; even that never ran. The source directory was opened
+without `.iterate = true`, so iterating it failed (EBADF on the O_PATH
+descriptor), which the loop took as the end of the listing. A debug build
+panics there; a release build copied nothing.
+
+**Fix.** `saveModel` opens the source for iteration, and `copySideFiles`
+copies every top-level `*.py` beside the tokenizer and processor files: the
+modules `auto_map` names and the ones they import, as transformers'
+`save_pretrained` does for remote code. Test: `saveModel carries the remote
+code` exports the qwen2 fixture with Kimi K3's file names beside it.

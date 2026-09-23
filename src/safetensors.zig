@@ -104,6 +104,25 @@ pub fn llamaPermutedRow(hf_row: usize, head_dim: usize) usize {
     return h * head_dim + 2 * (r % half) + (r / half);
 }
 
+/// While set, every tensor name looked up through `File.get` is recorded:
+/// `ditch add-model` finds the tensors a model definition leaves unread.
+pub var lookup_log: ?*LookupLog = null;
+
+pub const LookupLog = struct {
+    arena: std.heap.ArenaAllocator,
+    names: std.StringHashMapUnmanaged(void) = .{},
+    lock: std.atomic.Mutex = .unlocked,
+
+    pub fn record(self: *LookupLog, name: []const u8) void {
+        while (!self.lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.lock.unlock();
+        if (self.names.contains(name)) return;
+        const a = self.arena.allocator();
+        const copy = a.dupe(u8, name) catch return;
+        self.names.put(a, copy, {}) catch {};
+    }
+};
+
 pub const File = struct {
     path: []const u8,
     source: Source,
@@ -424,6 +443,7 @@ pub const File = struct {
     }
 
     pub fn get(self: *const File, name: []const u8) ?TensorInfo {
+        if (lookup_log) |log| log.record(name);
         return self.tensors.get(name);
     }
 

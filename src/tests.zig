@@ -29,6 +29,7 @@ comptime {
     _ = @import("search.zig");
     _ = @import("lua.zig");
     _ = @import("models.zig");
+    _ = @import("add_model.zig");
     _ = @import("budget.zig");
     _ = @import("stream.zig");
     _ = @import("stream_test.zig");
@@ -47,4 +48,6 @@ comptime {
     _ = @import("remote_test.zig");
     _ = @import("truncate.zig");
     _ = @import("truncate_test.zig");
+    _ = @import("push.zig");
+    _ = @import("push_test.zig");
 }

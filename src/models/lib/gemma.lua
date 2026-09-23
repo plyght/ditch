@@ -103,9 +103,12 @@ end
 function M.config_gemma(cfg, c)
   default_activation(cfg, c)
   if type(cfg.sliding_window_pattern) ~= "number" and cfg.layer_types == nil and c.sliding_window then
-    -- Gemma 3 defaults to a pattern of 6 (5 local, 1 global); Gemma 2 alternates.
+    -- Gemma 3 defaults to a pattern of 6 (5 local, 1 global); Gemma 2
+    -- alternates, its even layers local.
     if is_gemma3(c) then
       each_layer(c.sliding_layers, function(i) return (i + 1) % 6 ~= 0 end)
+    else
+      each_layer(c.sliding_layers, function(i) return i % 2 == 0 end)
     end
   end
   if is_gemma3(c) then M.rope(cfg, c, c.head_dim, c.head_dim) end

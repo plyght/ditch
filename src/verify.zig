@@ -307,7 +307,7 @@ const Verify = struct {
         for (argv) |a| try self.out.print(" {s}", .{a});
         try self.out.writeAll("\n");
         try self.out.flush();
-        var ch = std.process.spawn(self.io, .{ .argv = argv, .stdin = .ignore, .stdout = .{ .file = so }, .stderr = .{ .file = se }, .cwd = .{ .path = self.work } }) catch |err| {
+        var ch = std.process.spawn(self.io, .{ .argv = argv, .stdin = .ignore, .stdout = .{ .file = so }, .stderr = .{ .file = se }, .cwd = .{ .path = self.work }, .environ_map = self.env }) catch |err| {
             try self.out.print("[{s}] could not start {s}: {s}\n", .{ name, argv[0], @errorName(err) });
             return 127;
         };

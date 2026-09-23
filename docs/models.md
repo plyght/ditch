@@ -336,7 +336,7 @@ Nine families have a GGUF path, for reading a `.gguf` model and for
 `gemma2`, `gemma3`.
 
 Every other family loads from safetensors only; `--export-format gguf` on one
-of them is an error. The registry carries the llama.cpp architecture name of
+of them is an error. Each definition carries the llama.cpp architecture name of
 each family regardless, so adding a family to the GGUF path is a matter of
 tensor-name mapping.
 
@@ -465,7 +465,7 @@ every fourth layer attends globally while the others use a sliding window:
 return {
   model_type = "acme_lm",
   base = "qwen3", -- start from the Qwen3 definition
-  chat = "chatml", -- used when the model's own template is not recognised
+  chat = "chatml", -- used when the model ships no chat template
   notes = "Acme LM: Qwen3 layout, renamed MLP, residual scale, 3:1 local/global.",
   names = {
     gate = "mlp.w1.weight",
@@ -491,6 +491,81 @@ inherited. With the file in place, `ditch <acme checkpoint>` runs, and `ditch
 A family that is an existing one under a new name needs only the first
 two lines: `return { model_type = "acme_lm", base = "qwen3" }`.
 
+### Drafting a definition: `ditch add-model`
+
+```sh
+ditch add-model owner/name            # a Hub id, hf://owner/name, an http(s) URL or a directory
+ditch add-model owner/name --dry-run  # draft only, no check
+```
+
+`add-model` reads what describes a checkpoint without its weights:
+config.json, the tokenizer files and chat template, and every safetensors
+header (two range requests per shard; a few MB in all, whatever the model's
+size). It builds a *shape-only copy* of the checkpoint, the real headers in
+front of sparse files that read as zeros, and loads that copy with ditch's
+own loader as each plausible known family:
+
+* Families are ranked by how many of the checkpoint's tensor names their
+  templates explain, then by the `architectures` class and the model_type's
+  stem, then by plainness.
+* Before loading, a family whose embedding or layer path names nothing in
+  the checkpoint is given the best-named unindexed `[vocab, hidden]` tensor
+  and the one path numbered `0 .. num_hidden_layers - 1` (`blocks.{i}.`);
+  routed experts under another path are found the same way.
+* A trial load names the first tensor a family needs that the checkpoint
+  lacks, and records which checkpoint tensors it never read. A missing
+  tensor is matched to an unread one at the same place (model, layer,
+  expert) with the shape ditch expects in that slot and a name that says
+  the same role (`w1` for `gate`, `attn_norm` for `input_norm`, …; never a
+  name that says another role, such as `dense` for `q`); the load is
+  retried with the new name, until it loads. A missing gate projection
+  beside one `[2 x intermediate, hidden]` tensor becomes `mlp =
+  "gated_fused"`.
+* A family that loads is also given, one at a time, unread tensors for its
+  empty optional slots (an untied output head, which the loader would
+  otherwise replace by the embedding), kept only when fewer tensors stay
+  unread; and every slot's shape is checked against the family's reading of
+  the config (the loader does not check every small tensor).
+* Among the families that load and read every tensor of the text model, the
+  one with the fewest renames, then the tightest fit (fewest of its own
+  templates absent from the checkpoint), then the one leaving the fewest
+  config.json keys unread, is the match.
+* Trial loads use a stand-in tokenizer; the checkpoint's own is checked
+  once and a tokenizer ditch cannot read is reported in the draft.
+* A config.json key is *read* when changing or removing it changes the
+  parsed configuration; the keys nothing reads, less those that never
+  matter to a forward pass (token ids, dropout, `torch_dtype`, …), are
+  listed for review.
+
+The draft is written to `$XDG_CONFIG_HOME/ditch/models/<model_type>.lua`
+(or `--models-dir`). Its header says which family it is based on and how
+well it fits, which matrices abliteration will edit in this checkpoint, the
+weight format and the GGUF architecture; the definition has a comment on
+every guess (each rename says which
+tensor it took and why) and, at the end, everything it could not map: the
+unread tensors of the text model (grouped by pattern with their dtype,
+shape and count, and the family whose `names` would read them, if any),
+the tensors outside the text model (vision and audio towers, multi-token
+prediction heads), and the unread config keys. It is also printed on
+stdout. For a model_type ditch already knows, the draft is compared with the
+definition it has (and only written with `--force`). `--model-type NAME`
+drafts as if the checkpoint called itself NAME and named no `architectures`
+class, which is how add-model is checked on the built-in families: the
+draft for a renamed checkpoint of a known family must parse its config.json
+exactly as that family does.
+
+Then `ditch verify` runs on the model with the draft: a cut of real layers,
+ditch's forward pass, the comparison with the official implementation when
+Python with transformers is available, and a two-trial abliteration.
+
+For a checkpoint that is an existing family under a new model_type name,
+the draft is two lines, `model_type` and `base`, and needs no edit.
+
+A GGUF file is described rather than drafted: ditch reads GGUF tensors
+through a fixed mapping of llama.cpp names for the families listed under
+[GGUF per family](#gguf-per-family), so add-model says which family reads
+the file, or that the model's safetensors release is the one to add.
+
 ### Family fields
 
 Every field is optional except `model_type`. Enumerations are strings.
@@ -501,7 +576,7 @@ Every field is optional except `model_type`. Enumerations are strings.
 | `aliases` | Other `model_type` spellings of the same layout, e.g. multimodal wrappers' text configs. |
 | `base` | A known `model_type` to start from (built-in definitions and earlier files). |
 | `llama_cpp` | llama.cpp architecture name, used by the GGUF writer and to recognise GGUF input (nil: no GGUF path). |
-| `chat` | Template family used when the model's own chat template is not recognised: one of the names in `src/chat.zig` (`chatml`, `llama3`, `gemma`, `mistral`, …; `raw` = no template). A recognised template in the checkpoint always wins. |
+| `chat` | Template family used when the model ships no chat template, or one ditch cannot render: one of the names in `src/chat.zig` (`chatml`, `llama3`, `gemma`, `mistral`, …; `raw` = no template). A template in the checkpoint always wins: ditch renders it as transformers does (`src/jinja.zig`). |
 | `verified`, `notes` | Whether a reference forward pass checks the family, and what it covers. |
 | `norm` | `rms`, `rms_gemma` (`(1 + w)` scale), `layer`, `layer_1p` (Nemotron), `none` (weightless LayerNorm), `rms_none` (weightless RMSNorm). (`rms`) |
 | `default_norm_eps`, `default_rope_theta` | Values when config.json has none (1e-6 for RMS norms, else 1e-5; 10000). |
@@ -609,25 +684,18 @@ Helpers every definition sees:
 
 ### Zig building blocks
 
-A layout or a computation Lua cannot express (a new kind of layer math, a
-routing rule, a recurrence) is implemented in Zig and exposed to definitions
-two ways: as a value of a layout field (`norm`, `qkv`, `mlp`, `qk_norm`,
-`ssm`, `linear`, `positional`, …) that the forward pass switches on, and as a
-named **hook** for config.json keys whose reading is entangled with that math
-(`hooks` in `src/arch.zig`). The hooks are:
-`afmoe`, `baichuan`, `biogpt`, `chatglm`, `codegen`, `cohere`, `deepseek`,
-`deepseek_v32`, `deepseek_v4`, `deepseek_v41`, `dense_mlp`, `dots1`,
-`ernie`, `ernie_moe`, `exaone4`, `exaone_moe`, `falcon`, `falcon_h1`,
-`gemma`, `gemma3n`, `gemma4`, `glm4`, `glm4_moe`, `glm4_moe_lite`,
-`glm5_next`, `glm_moe_dsa`, `gpt_bigcode`, `gpt_neo`, `gpt_oss`, `gptj`,
-`granite`, `granite_hybrid`, `granite_moe`, `granite_moe_swa`,
-`granite_swa`, `hunyuan_dense`, `hunyuan_moe`, `hy_v3`, `jamba`,
-`kimi_linear`, `laguna`, `lfm2`, `llama4`, `mamba2`, `mellum`, `mimo_v2`,
-`minicpm`, `minimax`, `minimax_m2`, `minimax_m3`, `ministral3`,
-`mistral4`, `mixtral`, `mpt`, `nanochat`, `nemotron`, `nemotron_h`, `neox`,
-`olmo2`, `olmoe`, `opt`, `persimmon`, `phi`, `phi3`, `qwen4_exp`,
-`qwen_hybrid`, `qwen_vl`, `smollm3`, `solar_open`, `stablelm`,
-`starcoder2`, `xglm`, `axk1`.
+What a definition cannot express in Lua is implemented in Zig and exposed
+to definitions by name: a new kind of layer math, a routing rule or a
+recurrence becomes a value of a layout field (`norm`, `qkv`, `mlp`,
+`qk_norm`, `ssm`, `linear`, `positional`, …) that the forward pass switches
+on, or a setting of `Config` that a config function sets (`c.moe.scoring`,
+`c.hyper`, `c.mla`, …). For config.json keys whose reading Lua cannot
+express, a definition can also name a Zig **hook** (`hooks` in
+`src/arch.zig`), which runs after the generic parser and before the config
+function. Every built-in family reads its keys in Lua, so no hook exists
+today; the shared readers of several families are Lua libraries in
+`src/models/lib/` (DeepSeek-style routers, Gemma's RoPE tables, Mamba
+dimensions, …), loaded with `require`.
 
 A new family whose layers are all made of existing blocks needs no Zig. One
 that needs new maths gets a new layout value or hook in Zig and a

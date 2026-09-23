@@ -27,7 +27,10 @@ SentencePiece or tiktoken tokenizer whose package is missing, say), the
 template is rendered with transformers' own `render_jinja_template` and the
 special tokens transformers would pass, and the ids are marked unavailable.
 A template that raises is recorded as that error; ditch then reports an
-error or its fallback rendering, and both are shown.
+error or its fallback rendering, and both are shown. When ditch adapts the
+conversation to the template (a system prompt folded into the first user
+message, contents wrapped as text parts; see `chat.Format`), the reference
+renders the same adapted conversation (`reference_adjusted.json`).
 
 `--reference-only` runs only the transformers half. Reference outputs are
 cached as `reference.json` next to the downloaded files, keyed by the files,
@@ -469,9 +472,30 @@ def reference_key(d, files, cases, template):
     return h.hexdigest()
 
 
-def cached_reference(d, files, cases, template):
+def adjust(cases, fold_system, content_parts):
+    """The conversations as ditch hands them to a template that refuses a
+    system message (folded into the first user message) or reads contents
+    only as lists of parts."""
+    out = []
+    for c in cases:
+        msgs = [dict(m) for m in c["messages"]]
+        if fold_system and msgs and msgs[0]["role"] == "system":
+            system = msgs.pop(0)["content"]
+            for m in msgs:
+                if m["role"] == "user":
+                    m["content"] = f"{system}\n\n{m['content']}" if system else m["content"]
+                    break
+        if content_parts:
+            for m in msgs:
+                if isinstance(m.get("content"), str):
+                    m["content"] = [{"type": "text", "text": m["content"]}]
+        out.append({**c, "messages": msgs})
+    return out
+
+
+def cached_reference(d, files, cases, template, name="reference.json"):
     key = reference_key(d, files, cases, template)
-    path = os.path.join(d, "reference.json")
+    path = os.path.join(d, name)
     old = read_json(path)
     if old and old.get("key") == key:
         return old, True
@@ -600,7 +624,15 @@ def main():
                 extra.append(f"transformers errors {len(errs)}: {errs[0][:120]}")
             row = {"text": "-", "ids": "-", "notes": extra}
         else:
-            row = compare(repo, family, cases, ref, run_ditch(args.ditch, d, cases_path), report)
+            out = run_ditch(args.ditch, d, cases_path)
+            if out.get("fold_system") or out.get("content_parts"):
+                # ditch adjusts the conversation for this template; the reference renders the same one.
+                how = [w for w, on in (("system prompt folded into the user message", out.get("fold_system")),
+                                       ("contents as text parts", out.get("content_parts"))) if on]
+                extra.append("; ".join(how) + " (reference adjusted alike)")
+                ref, _ = cached_reference(d, files, adjust(cases, out.get("fold_system"), out.get("content_parts")),
+                                          template, "reference_adjusted.json")
+            row = compare(repo, family, cases, ref, out, report)
             row["notes"] = extra + row["notes"]
         row["n"] = len(cases)
         rows.append((repo, family, row))
