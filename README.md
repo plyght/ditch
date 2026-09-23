@@ -80,10 +80,20 @@ Families are described by an architecture registry (`src/arch.zig`), one entry
 per Hugging Face `model_type`. **93 families** are registered, from GPT-2,
 GPT-NeoX and BLOOM to Llama, Qwen, Gemma, Phi, GLM, Mistral, Granite, Kimi K3
 and DeepSeek V4.1 — dense and mixture-of-experts, Mamba and linear-attention
-hybrids, and quantised checkpoints; every one of them is verified against a
-NumPy reference forward pass (`tools/make_fixture.py`).
+hybrids, and quantised checkpoints. Every one has a fixture test against a
+NumPy reference forward pass (`tools/make_fixture.py`). **80** are also
+verified on a released checkpoint (whole, or cut to its first layers) against
+transformers or the release's own code in float32; 2 more (`internlm2`,
+`minicpm`) on real weights against a re-implementation of their own code; the
+remaining 11 (`baichuan`, `bitnet`, `deepseek_v3`, `granite_swa`, `hy_v3`,
+`jais2`, `laguna`, `minimax`, `minimax_m2`, `mpt`, `persimmon`) only on a
+random-weight stub: their releases are gated, lack a usable tokenizer, are
+refused by design or were never published, except `deepseek_v3`, `minimax` and
+`minimax_m2`, whose releases have only been config-checked so far.
 **[docs/models.md](docs/models.md) is the full list**:
-every `model_type`, its aliases, what each fixture covers, and every caveat.
+every `model_type`, its aliases, what each fixture covers, which checkpoint
+verifies it on real weights, and every caveat; the numbers are in
+[`tools/real-model-validation.md`](tools/real-model-validation.md).
 
 The caveats worth knowing up front: image, video and audio models run through
 their text config, so the towers are never executed and pass through exports

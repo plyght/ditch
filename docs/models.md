@@ -20,9 +20,27 @@ How a checkpoint is matched:
   layer types, quantisation formats and activations are errors too, never
   silent fallbacks.
 
-**Verified** means the family's forward pass is checked against a NumPy
-reference built from the Hugging Face implementation (`tools/make_fixture.py`,
-`src/model_test.zig`). All 93 entries have such a fixture.
+Two kinds of evidence, in two columns:
+
+* **Fixture**: the family's forward pass is checked against a NumPy reference
+  built from the Hugging Face implementation (`tools/make_fixture.py`,
+  `src/model_test.zig`). All 93 entries have one. A fixture is written from a
+  reading of the implementation, so it can share a misreading with the code;
+  several families passed their fixture and still failed on real weights.
+* **Real weights**: a released checkpoint, whole or cut to its first layers
+  (`tools/truncate_checkpoint.py`), compared layer by layer in float32 with
+  transformers or the release's own code (`ditch probe --residuals` against
+  `tools/probe_reference.py`); details and every number are in
+  [`tools/real-model-validation.md`](../tools/real-model-validation.md).
+  **80** families are verified this way. **2** (`internlm2`, `minicpm`) are
+  checked on real weights against a float32 re-implementation of the release's
+  own code, because that code no longer runs under transformers 5. **11** have
+  only a random-weight stub compared with transformers (the stub has the
+  family's real layout but meaningless weights): their releases are gated,
+  ship `.bin` without a usable tokenizer, are refused by design or were never
+  published, except `deepseek_v3`, `minimax` and `minimax_m2`, whose releases
+  have only been config-checked (`--dry-run`) so far. A cut checks the kept
+  layers, not the full depth.
 
 | Group | Families |
 | --- | ---: |
@@ -39,102 +57,102 @@ reference built from the Hugging Face implementation (`tools/make_fixture.py`,
 
 Pre-norm attention with a gated (or relu²) MLP and llama-style tensor names.
 
-| `model_type` | Also matches | Fixture | What it covers / caveats |
-| --- | --- | :---: | --- |
-| `llama` | `mistral3_text`, `smollm`, `cwm`, `emu3_text_model`, `emu3` | yes | GQA, llama3 rope scaling, untied `lm_head`, byte-level BPE. Yi, SOLAR, TinyLlama, SmolLM 1/2 and Mistral 3 text configs are plain llama. |
-| `mistral` | `ministral` | yes | llama layout with a sliding window on every layer (the fixture window is shorter than the prompt, so the local mask bites) and an explicit `head_dim` that is not `hidden_size / num_attention_heads`. |
-| `ministral3` | — | yes | Ministral 3 query scaling on every layer, optional sliding window. |
-| `qwen2` | `qwen2_vl(_text)`, `qwen2_5_vl(_text)`, `qwen2_5_omni(_thinker/_text)` | yes | q/k/v biases, tied embeddings. The VL and Omni text configs take the same path. |
-| `qwen3` | `qwen3_vl`, `qwen3_vl_text` | yes | per-head q/k RMSNorm. Qwen3-VL text config uses the same path. |
-| `seed_oss` | — | yes | q/k/v biases with an unbiased `o_proj` (`attention_out_bias`), explicit `head_dim`. Seed-OSS 36B. |
-| `smollm3` | — | yes | llama layout with `no_rope_layers`. |
-| `granite` | — | yes | embedding, attention and residual multipliers, logits scaling. Granite 3.x dense. |
-| `granite_swa` | — | yes | Granite multipliers plus per-head attention sinks and sliding layers with their own rope base (`layer_rope_theta`). Granite 4 SWA dense. |
-| `minicpm` | — | yes | `scale_emb`, `scale_depth` residual scaling, `dim_model_base` logit scaling. MiniCPM 1/2 (MiniCPM3 is unsupported). |
-| `baichuan` | — | yes | fused `W_pack` (7B, RoPE). The 13B ALiBi variant (detected by `model_max_length`) is unverified. Needs a converted `tokenizer.json`. |
-| `exaone` | — | yes | EXAONE 3.x tensor names (`transformer.h`, `attn.attention`, `c_fc_0`/`c_fc_1`). |
-| `exaone4` | — | yes | post-norms, per-head q/k norm, hybrid sliding layers with RoPE and global layers without. |
-| `internlm2` | — | yes | grouped `wqkv`, `attention.wo`, `feed_forward.w1/w2/w3`, `output.weight`. |
-| `olmo` | — | yes | non-parametric LayerNorm, `clip_qkv`. |
-| `olmo2` | `olmo3` | yes | post-norms on the sublayer outputs (no input norm), q/k RMSNorm over the full projection. |
-| `cohere` | `cohere2` | yes | LayerNorm without bias, parallel residual, `logit_scale`, tied embeddings, per-head q/k LayerNorm. `cohere2` (Command R7B) is unverified. |
-| `stablelm` | — | yes | LayerNorm with biases, partial rotary, qkv biases. Parallel residual and `qk_layernorm` (StableLM 2 12B) are unverified. |
-| `starcoder2` | — | yes | LayerNorm with biases, biased projections, `c_fc`/`c_proj` dense MLP, sliding window. |
-| `nemotron` | — | yes | LayerNorm1p with bias, relu² dense MLP, partial rotary. |
-| `arcee` | — | yes | llama attention with the two-projection relu² MLP (no gate), `mlp_bias`. AFM / Arcee. |
-| `apertus` | — | yes | attention/feedforward norm names, per-head q/k RMSNorm, two-projection xIELU MLP. Apertus (Swiss AI). |
-| `bitnet` | — | yes | sub-layer RMSNorms on the attention output and the gated MLP intermediate, relu². BitNet b1.58 (released unpacked, as bf16). |
-| `helium` | — | yes | llama layout with mlp/attention biases and Helium's rotary pairing. Helium 1 (Kyutai). |
-| `jais2` | — | yes | LayerNorm with biases, biased projections, two-projection relu² MLP. Jais 2. |
-| `nanochat` | — | yes | non-parametric RMSNorm everywhere, weightless per-head q/k norm after RoPE, `fc1`/`fc2` relu² MLP, final logit softcapping. |
-| `hunyuan_v1_dense` | `hunyuan_vl`, `hunyuan_vl_text` | yes | per-head q/k RMSNorm after RoPE, NTK-alpha dynamic rope base. Hunyuan dense and the HunYuan-VL text config. |
-| `ernie4_5` | `paddleocr_vl_text` | yes | interleaved rotary, `use_bias` projections. ERNIE 4.5 dense and the PaddleOCR-VL text config. |
-| `phi3` | `phi4` | yes | fused `qkv_proj` and `gate_up_proj`, longrope (short factors + attention factor). Phi-3 / 3.5 / 4-mini. |
+| `model_type` | Also matches | Fixture | Real weights | What it covers / caveats |
+| --- | --- | :---: | --- | --- |
+| `llama` | `mistral3_text`, `smollm`, `cwm`, `emu3_text_model`, `emu3` | yes | yes: Llama-3.2-1B-Instruct, whole | GQA, llama3 rope scaling, untied `lm_head`, byte-level BPE. Yi, SOLAR, TinyLlama, SmolLM 1/2 and Mistral 3 text configs are plain llama. |
+| `mistral` | `ministral` | yes | yes: Mistral-7B-Instruct-v0.3, 3 layers | llama layout with a sliding window on every layer (the fixture window is shorter than the prompt, so the local mask bites) and an explicit `head_dim` that is not `hidden_size / num_attention_heads`. |
+| `ministral3` | — | yes | yes: Ministral-3-3B-Base-2512, 4 layers | Ministral 3 query scaling on every layer, optional sliding window. |
+| `qwen2` | `qwen2_vl(_text)`, `qwen2_5_vl(_text)`, `qwen2_5_omni(_thinker/_text)` | yes | yes: Qwen2.5-0.5B-Instruct, whole (also FP8 and INT4) | q/k/v biases, tied embeddings. The VL and Omni text configs take the same path. |
+| `qwen3` | `qwen3_vl`, `qwen3_vl_text` | yes | yes: Qwen3-0.6B, whole | per-head q/k RMSNorm. Qwen3-VL text config uses the same path. |
+| `seed_oss` | — | yes | yes: Seed-OSS-36B-Instruct, 2 layers | q/k/v biases with an unbiased `o_proj` (`attention_out_bias`), explicit `head_dim`. Seed-OSS 36B. |
+| `smollm3` | — | yes | yes: SmolLM3-3B, 4 layers | llama layout with `no_rope_layers`. |
+| `granite` | — | yes | yes: granite-3.3-2b-instruct, 4 layers | embedding, attention and residual multipliers, logits scaling. Granite 3.x dense. |
+| `granite_swa` | — | yes | stub only (no release) | Granite multipliers plus per-head attention sinks and sliding layers with their own rope base (`layer_rope_theta`). Granite 4 SWA dense. |
+| `minicpm` | — | yes | by hand: MiniCPM4-0.5B, layer 0, against a re-implementation of its own code | `scale_emb`, `scale_depth` residual scaling, `dim_model_base` logit scaling. MiniCPM 1/2 (MiniCPM3 is unsupported). |
+| `baichuan` | — | yes | stub only, against a re-implementation of its own code; no faithful `tokenizer.json` can be produced | fused `W_pack` (7B, RoPE). The 13B ALiBi variant (detected by `model_max_length`) is unverified. Needs a converted `tokenizer.json`. |
+| `exaone` | — | yes | yes: EXAONE-3.5-2.4B-Instruct, whole | EXAONE 3.x tensor names (`transformer.h`, `attn.attention`, `c_fc_0`/`c_fc_1`). |
+| `exaone4` | — | yes | yes: EXAONE-4.0.1-32B, 4 layers | post-norms, per-head q/k norm, hybrid sliding layers with RoPE and global layers without. |
+| `internlm2` | — | yes | by hand: internlm2_5-1_8b-chat, 4 layers, against a re-implementation of its own code (its remote code does not run under transformers 5); needs a converted `tokenizer.json` | grouped `wqkv`, `attention.wo`, `feed_forward.w1/w2/w3`, `output.weight`. |
+| `olmo` | — | yes | yes: OLMo-1B-hf, whole | non-parametric LayerNorm, `clip_qkv`. |
+| `olmo2` | `olmo3` | yes | yes: OLMo-2-0425-1B-Instruct, whole | post-norms on the sublayer outputs (no input norm), q/k RMSNorm over the full projection. |
+| `cohere` | `cohere2` | yes | yes: Aya Expanse 8B and Command R7B cuts | LayerNorm without bias, parallel residual, `logit_scale`, tied embeddings, per-head q/k LayerNorm. `cohere2` (Command R7B) is unverified. |
+| `stablelm` | — | yes | yes: stablelm-2-1_6b-chat, whole | LayerNorm with biases, partial rotary, qkv biases. Parallel residual and `qk_layernorm` (StableLM 2 12B) are unverified. |
+| `starcoder2` | — | yes | yes: starcoder2-3b, 3 layers | LayerNorm with biases, biased projections, `c_fc`/`c_proj` dense MLP, sliding window. |
+| `nemotron` | — | yes | yes: Minitron-4B-Base, 3 layers (converted from `.bin`) | LayerNorm1p with bias, relu² dense MLP, partial rotary. |
+| `arcee` | — | yes | yes: AFM-4.5B, 3 layers | llama attention with the two-projection relu² MLP (no gate), `mlp_bias`. AFM / Arcee. |
+| `apertus` | — | yes | yes: Apertus-8B-Instruct-2509, 3 layers | attention/feedforward norm names, per-head q/k RMSNorm, two-projection xIELU MLP. Apertus (Swiss AI). |
+| `bitnet` | — | yes | stub only (plain weights); the releases are refused | sub-layer RMSNorms on the attention output and the gated MLP intermediate, relu². BitNet b1.58 (released unpacked, as bf16). |
+| `helium` | — | yes | yes: helium-1-preview-2b, whole | llama layout with mlp/attention biases and Helium's rotary pairing. Helium 1 (Kyutai). |
+| `jais2` | — | yes | stub only; the releases are gated | LayerNorm with biases, biased projections, two-projection relu² MLP. Jais 2. |
+| `nanochat` | — | yes | yes: nanochat-d20, whole | non-parametric RMSNorm everywhere, weightless per-head q/k norm after RoPE, `fc1`/`fc2` relu² MLP, final logit softcapping. |
+| `hunyuan_v1_dense` | `hunyuan_vl`, `hunyuan_vl_text` | yes | yes: Hunyuan-0.5B-Instruct, whole | per-head q/k RMSNorm after RoPE, NTK-alpha dynamic rope base. Hunyuan dense and the HunYuan-VL text config. |
+| `ernie4_5` | `paddleocr_vl_text` | yes | yes: ERNIE-4.5-0.3B-PT, whole | interleaved rotary, `use_bias` projections. ERNIE 4.5 dense and the PaddleOCR-VL text config. |
+| `phi3` | `phi4` | yes | yes: Phi-3.5-mini-instruct, 3 layers | fused `qkv_proj` and `gate_up_proj`, longrope (short factors + attention factor). Phi-3 / 3.5 / 4-mini. |
 
 ## Gemma, GLM and ChatGLM
 
-| `model_type` | Also matches | Fixture | What it covers / caveats |
-| --- | --- | :---: | --- |
-| `gemma2` | — | yes | (1+w) norms, pre/post feedforward norms, alternating local (sliding) and global layers, `query_pre_attn_scalar`, sqrt(H) embedding scale, `tanh` softcapping on the attention logits and on the output logits. |
-| `gemma3` | `gemma3_text` | yes | (1+w) norms, pre/post norms, per-head (1+w) q/k norms, sqrt(H) embedding scale, sliding layers with a local rope base, `query_pre_attn_scalar`, linear rope scaling. |
-| `gemma3n` | `gemma3n_text` | yes | AltUp residual streams, Laurel blocks, per-layer input embeddings, KV-shared layers, weightless value norm, gaussian-top-k gate sparsity, final logit softcapping. |
-| `gemma4` | `gemma4_text`, `gemma4_unified`, `gemma4_unified_text` | yes | global layers with their own head size and KV heads, proportional rope on global layers, keys reused as values (`attention_k_eq_v`), KV-shared layers, per-layer inputs, `layer_scalar`, double-wide MLPs on shared layers. The MoE block of gemma-4-26B-A4B (`enable_moe_block`) is not implemented. |
-| `glm4` | `glm`, `glm4v`, `glm4v_text` | yes | `post_self_attn`/`post_mlp` norms, fused `gate_up_proj`, interleaved half rotary, q/k/v biases. GLM-4 (0414) and the GLM-4-9B HF port. |
-| `chatglm` | — | yes | ChatGLM3 / GLM-4 remote-code layout: concatenated `query_key_value` with bias, fused `dense_h_to_4h`, interleaved half rotary with `rope_ratio`, `output_layer`. |
+| `model_type` | Also matches | Fixture | Real weights | What it covers / caveats |
+| --- | --- | :---: | --- | --- |
+| `gemma2` | — | yes | yes: gemma-2-2b-it, 4 layers | (1+w) norms, pre/post feedforward norms, alternating local (sliding) and global layers, `query_pre_attn_scalar`, sqrt(H) embedding scale, `tanh` softcapping on the attention logits and on the output logits. |
+| `gemma3` | `gemma3_text` | yes | yes: gemma-3-1b-it, 8 layers | (1+w) norms, pre/post norms, per-head (1+w) q/k norms, sqrt(H) embedding scale, sliding layers with a local rope base, `query_pre_attn_scalar`, linear rope scaling. |
+| `gemma3n` | `gemma3n_text` | yes | yes: gemma-3n-E2B-it, 5 layers, and a KV-sharing cut | AltUp residual streams, Laurel blocks, per-layer input embeddings, KV-shared layers, weightless value norm, gaussian-top-k gate sparsity, final logit softcapping. |
+| `gemma4` | `gemma4_text`, `gemma4_unified`, `gemma4_unified_text` | yes | yes: Gemma 4 E2B and 12B cuts | global layers with their own head size and KV heads, proportional rope on global layers, keys reused as values (`attention_k_eq_v`), KV-shared layers, per-layer inputs, `layer_scalar`, double-wide MLPs on shared layers. The MoE block of gemma-4-26B-A4B (`enable_moe_block`) is not implemented. |
+| `glm4` | `glm`, `glm4v`, `glm4v_text` | yes | yes: GLM-4-9B-0414, 3 layers | `post_self_attn`/`post_mlp` norms, fused `gate_up_proj`, interleaved half rotary, q/k/v biases. GLM-4 (0414) and the GLM-4-9B HF port. |
+| `chatglm` | — | yes | yes: glm-4-9b-chat, 3 layers (reference: the converted `-hf` release, with its RoPE base corrected) | ChatGLM3 / GLM-4 remote-code layout: concatenated `query_key_value` with bias, fused `dense_h_to_4h`, interleaved half rotary with `rope_ratio`, `output_layer`. |
 
 ## GPT-era and other legacy decoders
 
-| `model_type` | Also matches | Fixture | What it covers / caveats |
-| --- | --- | :---: | --- |
-| `gpt2` | — | yes | Conv1D (`[in][out]`) weights transposed on load and export, learned positions, fused `c_attn`, `gelu_new`, tied `lm_head`. |
-| `gpt_neox` | — | yes | head-interleaved `query_key_value`, parallel residual, `rotary_pct`, LayerNorm biases, `embed_out`. Pythia / GPT-NeoX. |
-| `gpt_bigcode` | — | yes | multi-query `c_attn`, learned positions, LayerNorm biases. StarCoder 1 / SantaCoder. |
-| `gpt_neo` | — | yes | learned positions, unscaled attention logits, alternating global and `window_size` local layers. GPT-Neo 1.3B/2.7B. |
-| `gptj` | — | yes | parallel residual with one LayerNorm, interleaved rotary over an absolute `rotary_dim`, `fc_in`/`fc_out` with biases. GPT-J 6B. |
-| `codegen` | — | yes | the GPT-J layout with a fused `qkv_proj` in four tensor-parallel `[q \| v \| k]` blocks. CodeGen / CodeGen 2. |
-| `falcon` | `RefinedWebModel` | yes | multi-query fused qkv (7B layout), parallel attention with one LayerNorm. The 40B/180B grouped layout (`ln_attn`/`ln_mlp`) and the ALiBi variant are unverified. |
-| `bloom` | — | yes | ALiBi, embedding LayerNorm, head-interleaved fused qkv with biases. |
-| `opt` | — | yes | learned positions with offset 2, ReLU, LayerNorm biases. Pre-norm variants only (OPT-350m's projection layers are unsupported). |
-| `mpt` | — | yes | ALiBi (`alibi_bias_max`), concatenated `Wqkv`, LayerNorm without bias, `expansion_ratio`. |
-| `persimmon` | — | yes | head-interleaved `query_key_value` with bias, per-head q/k LayerNorm, partial rotary, relu² MLP. Persimmon 8B and Fuyu's text tower. |
-| `xglm` | — | yes | fairseq sinusoidal positions with offset 2, sqrt(hidden) embedding scale, LayerNorm biases. |
-| `biogpt` | — | yes | learned positions with offset 2, sqrt(hidden) embedding scale, `output_projection` head. |
-| `phi` | — | yes | LayerNorm with biases, parallel residual, partial rotary, `fc1`/`fc2` with biases, `lm_head` bias. Phi-1 / 1.5 / 2. |
+| `model_type` | Also matches | Fixture | Real weights | What it covers / caveats |
+| --- | --- | :---: | --- | --- |
+| `gpt2` | — | yes | yes: gpt2, whole | Conv1D (`[in][out]`) weights transposed on load and export, learned positions, fused `c_attn`, `gelu_new`, tied `lm_head`. |
+| `gpt_neox` | — | yes | yes: pythia-160m, whole | head-interleaved `query_key_value`, parallel residual, `rotary_pct`, LayerNorm biases, `embed_out`. Pythia / GPT-NeoX. |
+| `gpt_bigcode` | — | yes | yes: tiny_starcoder_py, whole | multi-query `c_attn`, learned positions, LayerNorm biases. StarCoder 1 / SantaCoder. |
+| `gpt_neo` | — | yes | yes: gpt-neo-125m, whole | learned positions, unscaled attention logits, alternating global and `window_size` local layers. GPT-Neo 1.3B/2.7B. |
+| `gptj` | — | yes | yes: gpt-j-6b, 3 layers (converted from `.bin`) | parallel residual with one LayerNorm, interleaved rotary over an absolute `rotary_dim`, `fc_in`/`fc_out` with biases. GPT-J 6B. |
+| `codegen` | — | yes | yes: codegen-350M-mono, whole (converted from `.bin`) | the GPT-J layout with a fused `qkv_proj` in four tensor-parallel `[q \| v \| k]` blocks. CodeGen / CodeGen 2. |
+| `falcon` | `RefinedWebModel` | yes | yes: falcon-7b-instruct, 2 layers; falcon-rw-1b, whole (converted from `.bin`) | multi-query fused qkv (7B layout), parallel attention with one LayerNorm. The 40B/180B grouped layout (`ln_attn`/`ln_mlp`) and the ALiBi variant are unverified. |
+| `bloom` | — | yes | yes: bloomz-560m, whole | ALiBi, embedding LayerNorm, head-interleaved fused qkv with biases. |
+| `opt` | — | yes | yes: opt-125m, whole (converted from `.bin`) | learned positions with offset 2, ReLU, LayerNorm biases. Pre-norm variants only (OPT-350m's projection layers are unsupported). |
+| `mpt` | — | yes | stub only (no release reachable) | ALiBi (`alibi_bias_max`), concatenated `Wqkv`, LayerNorm without bias, `expansion_ratio`. |
+| `persimmon` | — | yes | stub only; the releases ship `.bin` and no `tokenizer.json` | head-interleaved `query_key_value` with bias, per-head q/k LayerNorm, partial rotary, relu² MLP. Persimmon 8B and Fuyu's text tower. |
+| `xglm` | — | yes | yes: xglm-564M, whole | fairseq sinusoidal positions with offset 2, sqrt(hidden) embedding scale, LayerNorm biases. |
+| `biogpt` | — | yes | yes: biogpt, whole (converted; hand-built `tokenizer.json`) | learned positions with offset 2, sqrt(hidden) embedding scale, `output_projection` head. |
+| `phi` | — | yes | yes: phi-2, 4 layers | LayerNorm with biases, parallel residual, partial rotary, `fc1`/`fc2` with biases, `lm_head` bias. Phi-1 / 1.5 / 2. |
 
 ## Mixture of experts
 
 Dense attention with routed experts. Experts are edited per expert; see
 "Expert-selective abliteration" in the README.
 
-| `model_type` | Also matches | Fixture | What it covers / caveats |
-| --- | --- | :---: | --- |
-| `mixtral` | — | yes | softmax top-k renormalised routing over the separate per-expert tensors released Mixtral checkpoints store (`block_sparse_moe.experts.{e}.w1` / `w2` / `w3`). |
-| `qwen2_moe` | — | yes | softmax top-k routing over experts of `moe_intermediate_size` plus a shared expert of `shared_expert_intermediate_size` behind a sigmoid `shared_expert_gate`, both different from the dense `intermediate_size` an `mlp_only_layers` layer keeps; `decoder_sparse_step` picks the routed layers. |
-| `qwen3_moe` | `qwen3_vl_moe(_text)`, `qwen3_omni_moe(_thinker/_text)` | yes | softmax top-k with renormalisation, dense layers via `mlp_only_layers`, separate / fused / transposed-fused expert tensors. |
-| `deepseek_v2` | `deepseek_ocr2`, `deepseek_ocr2_text`, `youtu` | yes | MLA with and without `q_lora_rank`, softmax group-limited top-k, shared experts, `first_k_dense_replace`, yarn with mscale. BF16/F16 and FP8 block-quantised checkpoints. |
-| `deepseek_v3` | — | yes | MLA, sigmoid routing with `e_score_correction_bias`, group-limited (`noaux_tc`) top-k, `routed_scaling_factor`, shared experts. BF16/F16 and FP8 checkpoints. |
-| `deepseek_v32` | — | yes | DeepSeek V3.2-Exp: the V3 layout whose `indexed_attention` layers run as dense attention (see [exactness bounds](#sparse-indexer-exactness-bounds)). The fixture checks that dense equivalence inside `index_topk` and that the lightning indexer's own tensors are never read and pass through exports untouched. |
-| `kimi_k25` | — | yes | the Kimi K2.5 / K2.6 image-video wrapper around a DeepSeek V3 text config (`kimi_k2` or `deepseek_v3` under `text_config`), `language_model` prefix. Vision tower and projector pass through exports untouched. |
-| `llama4` | `llama4_text` | yes | top-1 sigmoid routing scaling the expert input, shared expert, transposed fused experts, `no_rope_layers` with attention temperature tuning, L2 qk norm. Chunked attention runs as full attention. |
-| `gpt_oss` | — | yes | attention sinks, alternating sliding layers, yarn, router bias with top-k softmax, interleaved fused experts with biases and the clamped swiglu. BF16 and MXFP4 checkpoints. |
-| `mistral4` | `mistral4_text` | yes | Mistral Small 4 text config: MLA with interleaved rotary, yarn, `llama_4_scaling_beta` query scaling, softmax group-limited top-k, fused `[E][2I][H]` experts, shared experts. |
-| `ernie4_5_moe` | — | yes | interleaved rotary, softmax routing with the `moe_statics` correction bias, shared experts, `moe_layer_start_index`/interval. ERNIE 4.5 MoE (PT checkpoints). |
-| `hunyuan_v1_moe` | `hunyuan` | yes | per-head q/k RMSNorm after RoPE, NTK-alpha dynamic rope base, softmax top-k renormalised, shared MLP. Hunyuan-A13B. |
-| `hy_v3` | — | yes | sigmoid routing with correction bias, renormalisation and router scaling, shared MLP, dense/sparse `mlp_layer_types`. Hunyuan V3 (released checkpoints and the transformers module layout). |
-| `granitemoe` | `granitemoeshared` | yes | Granite multipliers, fused `input_linear`/`output_linear` experts, top-k softmax routing. GraniteMoeShared adds the fused `shared_mlp`. |
-| `olmoe` | — | yes | q/k RMSNorm over the full projection, `clip_qkv`, softmax top-k routing over separate or fused experts. |
-| `flex_olmo` | — | yes | the OLMo 2 post-norm layout with OLMoE's routing. FlexOlmo. |
-| `dots1` | — | yes | per-head q/k norm, DeepSeek-V3 routing, shared experts, `first_k_dense_replace`. dots.llm1. |
-| `exaone_moe` | — | yes | per-head q/k norm, `sliding_window_pattern` local layers, DeepSeek-V3 routing, dense/sparse `mlp_layer_types`. EXAONE 4 MoE. |
-| `solar_open` | — | yes | partial rotary, DeepSeek-V3 routing with shared experts on every layer. Solar Open (Upstage). |
-| `afmoe` | — | yes | norms on both sublayer inputs and outputs, a sigmoid gate on the attention output, sliding layers every n, sigmoid routing with a selection bias, shared experts, dense first layers. AFM (Arcee) MoE. |
-| `mellum` | — | yes | per-head q/k norm, per-layer-type rope parameters, softmax top-k routing renormalised over fused experts. Mellum (JetBrains). |
-| `laguna` | — | yes | a softplus gate on the attention output, sigmoid routing with a tanh softcap on the router logits and a correction bias, shared experts. |
-| `minimax_m2` | — | yes | q/k RMSNorm over the whole projection, partial rotary, sigmoid routing with correction bias, Mixtral-style expert tensors. |
-| `minimax_m3_vl_text` | `minimax_m3_vl`, `minimax_m3` | yes | (1+w) norms, per-head (1+w) q/k norm, partial rotary, clamped swiglu, sigmoid MoE with a fused shared expert; `minimax_m3_sparse` layers run as dense attention (see [exactness bounds](#sparse-indexer-exactness-bounds)). The image tower is never executed. |
-| `glm4_moe` | `glm4v_moe_text` | yes | dense attention with per-head q/k norms, partial rotary, sigmoid MoE with correction bias and shared experts. The `glm4v_moe` image/video wrapper runs its text config. |
-| `glm4_moe_lite` | `glm_moe_lite` | yes | GLM-4.7-Flash: DeepSeek V3 MLA with interleaved partial rotary, sigmoid MoE with correction bias, top-2 group scores, floored renormalisation, stacked expert tensors, dense first layer. |
-| `mimo_v2_flash` | `mimo_v2` | yes | Xiaomi MiMo V2: hybrid full / sliding-window (128) attention with sinks and doubled kv heads, `v_head_dim < head_dim` with `attention_value_scale`, partial rotary with one base per layer type, a dense first layer then sigmoid MoE with group-limited top-k. Both the transformers spelling and the hub checkpoint spelling of MiMo-V2-Flash / V2.5 / V2.6 (including the Pro layout's fused `qkv_proj`). MTP, vision and audio tensors pass through untouched. What is verified is the transcription: the fixtures follow the transformers module and the vLLM / SGLang / llama.cpp loaders, not a released checkpoint. |
+| `model_type` | Also matches | Fixture | Real weights | What it covers / caveats |
+| --- | --- | :---: | --- | --- |
+| `mixtral` | — | yes | yes: Mixtral-8x7B-Instruct-v0.1, 1 layer | softmax top-k renormalised routing over the separate per-expert tensors released Mixtral checkpoints store (`block_sparse_moe.experts.{e}.w1` / `w2` / `w3`). |
+| `qwen2_moe` | — | yes | yes: Qwen1.5-MoE-A2.7B-Chat, 2 layers | softmax top-k routing over experts of `moe_intermediate_size` plus a shared expert of `shared_expert_intermediate_size` behind a sigmoid `shared_expert_gate`, both different from the dense `intermediate_size` an `mlp_only_layers` layer keeps; `decoder_sparse_step` picks the routed layers. |
+| `qwen3_moe` | `qwen3_vl_moe(_text)`, `qwen3_omni_moe(_thinker/_text)` | yes | yes: Qwen3-30B-A3B, 2 layers | softmax top-k with renormalisation, dense layers via `mlp_only_layers`, separate / fused / transposed-fused expert tensors. |
+| `deepseek_v2` | `deepseek_ocr2`, `deepseek_ocr2_text`, `youtu` | yes | yes: DeepSeek-V2-Lite-Chat, 2 layers | MLA with and without `q_lora_rank`, softmax group-limited top-k, shared experts, `first_k_dense_replace`, yarn with mscale. BF16/F16 and FP8 block-quantised checkpoints. |
+| `deepseek_v3` | — | yes | stub only (no release run as `deepseek_v3`); the same layout runs in the verified Kimi K2.5 and DeepSeek V3.2 cuts | MLA, sigmoid routing with `e_score_correction_bias`, group-limited (`noaux_tc`) top-k, `routed_scaling_factor`, shared experts. BF16/F16 and FP8 checkpoints. |
+| `deepseek_v32` | — | yes | yes: DeepSeek-V3.2-Exp, layers 0 and 3 | DeepSeek V3.2-Exp: the V3 layout whose `indexed_attention` layers run as dense attention (see [exactness bounds](#sparse-indexer-exactness-bounds)). The fixture checks that dense equivalence inside `index_topk` and that the lightning indexer's own tensors are never read and pass through exports untouched. |
+| `kimi_k25` | — | yes | yes: Kimi-K2.5, 2 layers | the Kimi K2.5 / K2.6 image-video wrapper around a DeepSeek V3 text config (`kimi_k2` or `deepseek_v3` under `text_config`), `language_model` prefix. Vision tower and projector pass through exports untouched. |
+| `llama4` | `llama4_text` | yes | yes: Llama 4 Scout and Maverick cuts | top-1 sigmoid routing scaling the expert input, shared expert, transposed fused experts, `no_rope_layers` with attention temperature tuning, L2 qk norm. Chunked attention runs as full attention. |
+| `gpt_oss` | — | yes | yes: gpt-oss-120b cut; gpt-oss-20b at full depth | attention sinks, alternating sliding layers, yarn, router bias with top-k softmax, interleaved fused experts with biases and the clamped swiglu. BF16 and MXFP4 checkpoints. |
+| `mistral4` | `mistral4_text` | yes | yes: Mistral Small 4 cut | Mistral Small 4 text config: MLA with interleaved rotary, yarn, `llama_4_scaling_beta` query scaling, softmax group-limited top-k, fused `[E][2I][H]` experts, shared experts. |
+| `ernie4_5_moe` | — | yes | yes: ERNIE-4.5-21B-A3B-PT, 3 layers | interleaved rotary, softmax routing with the `moe_statics` correction bias, shared experts, `moe_layer_start_index`/interval. ERNIE 4.5 MoE (PT checkpoints). |
+| `hunyuan_v1_moe` | `hunyuan` | yes | yes: Hunyuan-A13B-Instruct, 2 layers | per-head q/k RMSNorm after RoPE, NTK-alpha dynamic rope base, softmax top-k renormalised, shared MLP. Hunyuan-A13B. |
+| `hy_v3` | — | yes | stub only (no text release) | sigmoid routing with correction bias, renormalisation and router scaling, shared MLP, dense/sparse `mlp_layer_types`. Hunyuan V3 (released checkpoints and the transformers module layout). |
+| `granitemoe` | `granitemoeshared` | yes | yes: granite-3.0-1b-a400m-instruct, whole | Granite multipliers, fused `input_linear`/`output_linear` experts, top-k softmax routing. GraniteMoeShared adds the fused `shared_mlp`. |
+| `olmoe` | — | yes | yes: OLMoE-1B-7B-0924-Instruct, 2 layers | q/k RMSNorm over the full projection, `clip_qkv`, softmax top-k routing over separate or fused experts. |
+| `flex_olmo` | — | yes | yes: FlexOlmo-7x7B-1T, 2 layers | the OLMo 2 post-norm layout with OLMoE's routing. FlexOlmo. |
+| `dots1` | — | yes | yes: dots.llm1.inst, 2 layers | per-head q/k norm, DeepSeek-V3 routing, shared experts, `first_k_dense_replace`. dots.llm1. |
+| `exaone_moe` | — | yes | yes: K-EXAONE-236B-A23B, layers 0 and 3 | per-head q/k norm, `sliding_window_pattern` local layers, DeepSeek-V3 routing, dense/sparse `mlp_layer_types`. EXAONE 4 MoE. |
+| `solar_open` | — | yes | yes: Solar-Open-100B, 2 layers | partial rotary, DeepSeek-V3 routing with shared experts on every layer. Solar Open (Upstage). |
+| `afmoe` | — | yes | yes: Trinity-Nano-Preview, 4 layers | norms on both sublayer inputs and outputs, a sigmoid gate on the attention output, sliding layers every n, sigmoid routing with a selection bias, shared experts, dense first layers. AFM (Arcee) MoE. |
+| `mellum` | — | yes | yes: Mellum2-12B-A2.5B-Instruct, 4 layers (16 of 64 experts) | per-head q/k norm, per-layer-type rope parameters, softmax top-k routing renormalised over fused experts. Mellum (JetBrains). |
+| `laguna` | — | yes | stub only (a random-weight model built by transformers); the releases config-checked (`--dry-run`) | a softplus gate on the attention output, sigmoid routing with a tanh softcap on the router logits and a correction bias, shared experts. |
+| `minimax_m2` | — | yes | stub only; the release config-checked (`--dry-run`) | q/k RMSNorm over the whole projection, partial rotary, sigmoid routing with correction bias, Mixtral-style expert tensors. |
+| `minimax_m3_vl_text` | `minimax_m3_vl`, `minimax_m3` | yes | yes: MiniMax M3 cut | (1+w) norms, per-head (1+w) q/k norm, partial rotary, clamped swiglu, sigmoid MoE with a fused shared expert; `minimax_m3_sparse` layers run as dense attention (see [exactness bounds](#sparse-indexer-exactness-bounds)). The image tower is never executed. |
+| `glm4_moe` | `glm4v_moe_text` | yes | yes: GLM-4.5-Air, 2 layers | dense attention with per-head q/k norms, partial rotary, sigmoid MoE with correction bias and shared experts. The `glm4v_moe` image/video wrapper runs its text config. |
+| `glm4_moe_lite` | `glm_moe_lite` | yes | yes: GLM-4.7-Flash, 3 layers | GLM-4.7-Flash: DeepSeek V3 MLA with interleaved partial rotary, sigmoid MoE with correction bias, top-2 group scores, floored renormalisation, stacked expert tensors, dense first layer. |
+| `mimo_v2_flash` | `mimo_v2` | yes | yes: MiMo-V2-Flash and MiMo V2.6 cuts | Xiaomi MiMo V2: hybrid full / sliding-window (128) attention with sinks and doubled kv heads, `v_head_dim < head_dim` with `attention_value_scale`, partial rotary with one base per layer type, a dense first layer then sigmoid MoE with group-limited top-k. Both the transformers spelling and the hub checkpoint spelling of MiMo-V2-Flash / V2.5 / V2.6 (including the Pro layout's fused `qkv_proj`). MTP, vision and audio tensors pass through untouched. What is verified is the transcription: the fixtures follow the transformers module and the vLLM / SGLang / llama.cpp loaders, not a released checkpoint. |
 
 ## Linear-attention and convolution hybrids
 
@@ -143,17 +161,17 @@ attention, gated short convolutions) interleaved with softmax attention. The
 recurrences run sequentially, one token at a time, so long prefills are slower
 than on dense models.
 
-| `model_type` | Also matches | Fixture | What it covers / caveats |
-| --- | --- | :---: | --- |
-| `lfm2` | — | yes | LFM2 / LFM2.5 dense: gated short-convolution layers (in_proj B/C/x split, depthwise causal conv with `conv_L_cache` taps) mixed with attention layers carrying per-head q/k norms, `embedding_norm` as the final norm. `lfm2_moe` is unsupported. |
-| `qwen3_next` | — | yes | Gated DeltaNet linear layers (fused projections, `full_attention_interval`), sigmoid-gated full attention with per-head q/k norms, partial rotary, softmax MoE with shared expert. Qwen3-Next, Qwen3-Coder-Next. |
-| `qwen3_5` | `qwen3_5_text` | yes | Qwen3.5 / Qwen3.8 dense: Gated DeltaNet with split projections and explicit `layer_types`, gated full attention, partial rotary. Multimodal wrappers keep the text config nested; vision weights pass through. |
-| `qwen3_5_moe` | `qwen3_5_moe_text` | yes | split-projection linear layers with a swish output gate, fused softmax MoE with shared expert. |
-| `qwen4_exp` | `qwen4_exp_text` | yes | Qwen3.8-Flash-Next text config: gated hyper-connections over `hc_count` residual streams, Gated DeltaNet layers, sigmoid-gated full attention behind a QSA indexer (see [exactness bounds](#sparse-indexer-exactness-bounds)), per-layer n-gram embeddings (PLE, sharded tables read one row at a time), fused softmax MoE with a gated shared expert on every layer. |
-| `minimax` | `minimax_text_01`, `minimax_m1`, `MiniMaxText01`, `MiniMaxM1` | yes | lightning attention layers (silu qkv, per-head decay recurrence, sigmoid output gate) alternating with softmax attention, the renormalised residual layout with α/β scales, softmax top-k MoE. |
-| `kimi_linear` | — | yes | Kimi-Linear-48B-A3B: Kimi Delta Attention with per-channel decay from a low-rank forget gate and q/k/v short convolution, 3:1 with MLA layers without RoPE, DeepSeek-V3-style sigmoid MoE with shared experts. Both the original checkpoint layout and the transformers module layout. |
-| `glm5_next` | `glm5_next_text` | yes | GLM-5.3-Flash text config: manifold-constrained hyper-connections collapsed by an unweighted mean, KDA layers with the safe lower-bound forget gate, NoPE MLA layers behind a k-pool DSA indexer (see [exactness bounds](#sparse-indexer-exactness-bounds)), sigmoid MoE with top-2 group scores and floored renormalisation, clamped SwiGLU. |
-| `kimi_k3` | `kimi_k3_text` | yes | Kimi K3: the image-video wrapper around a `kimi_linear` text config with [Attention Residual](#attention-residual-kimi-k3), KDA layers with the full-rank output gate and the safe forget gate, MLA layers with a sigmoid output gate, latent MoE with 896 experts, SiTU activation, two shared experts. bf16 or the released compressed-tensors MXFP4 experts. |
+| `model_type` | Also matches | Fixture | Real weights | What it covers / caveats |
+| --- | --- | :---: | --- | --- |
+| `lfm2` | — | yes | yes: LFM2-350M, whole | LFM2 / LFM2.5 dense: gated short-convolution layers (in_proj B/C/x split, depthwise causal conv with `conv_L_cache` taps) mixed with attention layers carrying per-head q/k norms, `embedding_norm` as the final norm. `lfm2_moe` is unsupported. |
+| `qwen3_next` | — | yes | yes: Qwen3-Next-80B-A3B-Instruct, 4 layers | Gated DeltaNet linear layers (fused projections, `full_attention_interval`), sigmoid-gated full attention with per-head q/k norms, partial rotary, softmax MoE with shared expert. Qwen3-Next, Qwen3-Coder-Next. |
+| `qwen3_5` | `qwen3_5_text` | yes | yes: Qwen3.5-0.8B, whole | Qwen3.5 / Qwen3.8 dense: Gated DeltaNet with split projections and explicit `layer_types`, gated full attention, partial rotary. Multimodal wrappers keep the text config nested; vision weights pass through. |
+| `qwen3_5_moe` | `qwen3_5_moe_text` | yes | yes: Qwen3.5-35B-A3B, 4 layers (64 of 256 experts); Qwen3.8-2.4T cut | split-projection linear layers with a swish output gate, fused softmax MoE with shared expert. |
+| `qwen4_exp` | `qwen4_exp_text` | yes | yes: Qwen3.8-Flash-Next cut | Qwen3.8-Flash-Next text config: gated hyper-connections over `hc_count` residual streams, Gated DeltaNet layers, sigmoid-gated full attention behind a QSA indexer (see [exactness bounds](#sparse-indexer-exactness-bounds)), per-layer n-gram embeddings (PLE, sharded tables read one row at a time), fused softmax MoE with a gated shared expert on every layer. |
+| `minimax` | `minimax_text_01`, `minimax_m1`, `MiniMaxText01`, `MiniMaxM1` | yes | stub only; MiniMax-Text-01 and M1 config-checked (`--dry-run`) | lightning attention layers (silu qkv, per-head decay recurrence, sigmoid output gate) alternating with softmax attention, the renormalised residual layout with α/β scales, softmax top-k MoE. |
+| `kimi_linear` | — | yes | yes: Kimi-Linear-48B-A3B-Instruct, 4 layers | Kimi-Linear-48B-A3B: Kimi Delta Attention with per-channel decay from a low-rank forget gate and q/k/v short convolution, 3:1 with MLA layers without RoPE, DeepSeek-V3-style sigmoid MoE with shared experts. Both the original checkpoint layout and the transformers module layout. |
+| `glm5_next` | `glm5_next_text` | yes | yes: GLM-5.3-Flash cut | GLM-5.3-Flash text config: manifold-constrained hyper-connections collapsed by an unweighted mean, KDA layers with the safe lower-bound forget gate, NoPE MLA layers behind a k-pool DSA indexer (see [exactness bounds](#sparse-indexer-exactness-bounds)), sigmoid MoE with top-2 group scores and floored renormalisation, clamped SwiGLU. |
+| `kimi_k3` | `kimi_k3_text` | yes | yes: Kimi-K3 cut (against its own code) | Kimi K3: the image-video wrapper around a `kimi_linear` text config with [Attention Residual](#attention-residual-kimi-k3), KDA layers with the full-rank output gate and the safe forget gate, MLA layers with a sigmoid output gate, latent MoE with 896 experts, SiTU activation, two shared experts. bf16 or the released compressed-tensors MXFP4 experts. |
 
 ## State-space (Mamba) hybrids
 
@@ -162,21 +180,21 @@ and its state is kept per sequence through prefill and decoding like the KV
 cache. A Mamba block's `out_proj` is abliterated like an attention output
 projection.
 
-| `model_type` | Also matches | Fixture | What it covers / caveats |
-| --- | --- | :---: | --- |
-| `mamba2` | — | yes | pure Mamba2 (SSD) blocks: in_proj split into gate / conv channels / dt, biased causal conv1d, grouped B/C, per-head decay, D skip, gated RMSNorm; no attention, no MLP. Mamba-Codestral, `state-spaces/mamba2-*-hf`. |
-| `nemotron_h` | — | yes | one block per layer from `hybrid_override_pattern` / `layers_block_type` (Mamba2, attention without positional encoding, relu² MLP, non-gated experts with sigmoid group-limited routing). Nemotron-H, Nemotron 3 Nano. |
-| `falcon_h1` | — | yes | Mamba2 and attention in parallel on one input norm with the muP multipliers, grouped gated RMSNorm with either gate order, and the norm-free variant. Both out projections are abliterated. |
-| `jamba` | — | yes | Mamba1 layers with the RMS-normalised dt/B/C path at `attn_layer_period`/offset, attention without positional encoding, softmax MoE at `expert_layer_period`/offset, dense MLPs. |
-| `granitemoehybrid` | — | yes | Granite 4.0 H (tiny, small): Mamba2 and attention layers from `layer_types`, Granite multipliers, fused routed experts plus the fused `shared_mlp`, optional RoPE. |
+| `model_type` | Also matches | Fixture | Real weights | What it covers / caveats |
+| --- | --- | :---: | --- | --- |
+| `mamba2` | — | yes | yes: mamba2-130m-hf, whole | pure Mamba2 (SSD) blocks: in_proj split into gate / conv channels / dt, biased causal conv1d, grouped B/C, per-head decay, D skip, gated RMSNorm; no attention, no MLP. Mamba-Codestral, `state-spaces/mamba2-*-hf`. |
+| `nemotron_h` | — | yes | yes: NVIDIA-Nemotron-Nano-9B-v2, layers 0, 1, 14 | one block per layer from `hybrid_override_pattern` / `layers_block_type` (Mamba2, attention without positional encoding, relu² MLP, non-gated experts with sigmoid group-limited routing). Nemotron-H, Nemotron 3 Nano. |
+| `falcon_h1` | — | yes | yes: Falcon-H1-0.5B-Instruct, whole | Mamba2 and attention in parallel on one input norm with the muP multipliers, grouped gated RMSNorm with either gate order, and the norm-free variant. Both out projections are abliterated. |
+| `jamba` | — | yes | yes: Jamba-tiny-dev, whole | Mamba1 layers with the RMS-normalised dt/B/C path at `attn_layer_period`/offset, attention without positional encoding, softmax MoE at `expert_layer_period`/offset, dense MLPs. |
+| `granitemoehybrid` | — | yes | yes: granite-4.0-h-350m, whole; granite-4.0-h-tiny, 6 layers | Granite 4.0 H (tiny, small): Mamba2 and attention layers from `layer_types`, Granite multipliers, fused routed experts plus the fused `shared_mlp`, optional RoPE. |
 
 ## Sparse-indexer and hyper-connection families
 
-| `model_type` | Also matches | Fixture | What it covers / caveats |
-| --- | --- | :---: | --- |
-| `glm_moe_dsa` | — | yes | GLM-5 family: MLA with a sparse indexer run as dense attention, sigmoid MoE with correction bias and shared experts. |
-| `deepseek_v4` | — | yes | hyper-connections (`hc_mult` streams, Sinkhorn-mixed), low-rank q with unweighted head norm, shared-KV sliding attention with sinks and inverse-roped output, grouped output projection, CSA (overlapping pooled windows) and HCA branches with their own rope, sqrtsoftplus routing with correction bias, hash-routed (`tid2eid`) layers, clamped SwiGLU, shared expert. MTP tensors pass through. |
-| `deepseek_v41` | `deepseek_v41_text` | yes | DeepSeek V4.1-Flash: single-pass hyper-connections, CSA2 shared compressed KV (`kv_source` groups), FP8/FP4 quantisation-aware rounding of the window KV and latents, engram n-gram hash layers (lazy table rows, tokenizer-derived compressed ids), `gate_temp` routing. Vision tensors pass through. |
+| `model_type` | Also matches | Fixture | Real weights | What it covers / caveats |
+| --- | --- | :---: | --- | --- |
+| `glm_moe_dsa` | — | yes | yes: GLM-5.3 and altar-1 cuts | GLM-5 family: MLA with a sparse indexer run as dense attention, sigmoid MoE with correction bias and shared experts. |
+| `deepseek_v4` | — | yes | yes: DeepSeek-V4-Flash, 4 layers | hyper-connections (`hc_mult` streams, Sinkhorn-mixed), low-rank q with unweighted head norm, shared-KV sliding attention with sinks and inverse-roped output, grouped output projection, CSA (overlapping pooled windows) and HCA branches with their own rope, sqrtsoftplus routing with correction bias, hash-routed (`tid2eid`) layers, clamped SwiGLU, shared expert. MTP tensors pass through. |
+| `deepseek_v41` | `deepseek_v41_text` | yes | yes: DeepSeek V4.1 cut (against its own code) | DeepSeek V4.1-Flash: single-pass hyper-connections, CSA2 shared compressed KV (`kv_source` groups), FP8/FP4 quantisation-aware rounding of the window KV and latents, engram n-gram hash layers (lazy table rows, tokenizer-derived compressed ids), `gate_temp` routing. Vision tensors pass through. |
 
 For these families the residual at layer L is the single mixed vector that
 enters layer L's attention block, and the last entry is the final collapse
@@ -193,13 +211,13 @@ prompts ditch scores are short, so in practice these families run exactly.
 
 | Family | Mechanism | Exact while | Beyond the bound |
 | --- | --- | --- | --- |
-| `deepseek_v32` | lightning indexer | prompt ≤ `index_topk` tokens | approximate |
-| `glm_moe_dsa` | sparse indexer | short contexts (the ones ditch scores) | approximate |
-| `minimax_m3_vl_text` | MiniMax Sparse Attention over key blocks | prompt ≤ `index_block_size × index_topk_blocks` tokens (2048 with the released config) | approximate |
-| `qwen4_exp` | QSA indexer | every complete key block fits `indexer_budget` | refused, not approximated |
-| `glm5_next` | k-pool DSA indexer | every complete pool fits `index_topk` | refused, not approximated |
-| `deepseek_v4` | Lightning Indexer over CSA/HCA entries | every reachable compressed entry fits `index_topk` | refused, not approximated |
-| `deepseek_v41` | Lightning Indexer over CSA2 entries | every reachable compressed entry fits `index_topk` | refused, not approximated |
+| `deepseek_v32` | lightning indexer | prompt ≤ `index_topk` tokens | yes: DeepSeek-V3.2-Exp, layers 0 and 3 | approximate |
+| `glm_moe_dsa` | sparse indexer | short contexts (the ones ditch scores) | yes: GLM-5.3 and altar-1 cuts | approximate |
+| `minimax_m3_vl_text` | MiniMax Sparse Attention over key blocks | prompt ≤ `index_block_size × index_topk_blocks` tokens (2048 with the released config) | yes: MiniMax M3 cut | approximate |
+| `qwen4_exp` | QSA indexer | every complete key block fits `indexer_budget` | yes: Qwen3.8-Flash-Next cut | refused, not approximated |
+| `glm5_next` | k-pool DSA indexer | every complete pool fits `index_topk` | yes: GLM-5.3-Flash cut | refused, not approximated |
+| `deepseek_v4` | Lightning Indexer over CSA/HCA entries | every reachable compressed entry fits `index_topk` | yes: DeepSeek-V4-Flash, 4 layers | refused, not approximated |
+| `deepseek_v41` | Lightning Indexer over CSA2 entries | every reachable compressed entry fits `index_topk` | yes: DeepSeek V4.1 cut (against its own code) | refused, not approximated |
 
 Indexer weights are never edited and pass through exports untouched.
 
