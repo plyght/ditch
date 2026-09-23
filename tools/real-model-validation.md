@@ -4006,3 +4006,36 @@ streams ~56 MB/s, 16 streams ~110 MB/s. ditch's `hf://` source fetched at
 ~15-19 MB/s in both runs, so a wider fetch is the obvious speedup for ditch's
 first pass.
 
+`ditch --dry-run hf://mistralai/Mistral-Small-4-119B-2603 --max-ram 10GB
+--remote-cache-size 18GB`:
+
+    weights total 222.40GB (36 layers), trunk per layer 102.5MB
+    routed expert 48.0MB decoded / 24.0MB stored (fp8), 4608 experts, 108GB stored
+    warp mode: min 6.61GB, with prefetch + expert cache + RAM caches 24.28GB
+    expert cache 5.75GB = 122 experts; trunk 4.62GB stored, stays cached; 558 experts fit beside it
+
+Not run: at top-4 of 128 experts in 36 layers, a short prompt's prefill
+routes to most of the 108 GB of experts and each generated token fetches
+~144 of them (~3.4 GB), which at the ~12-19 MB/s the Hub serves here is
+hours for the first pass, with the working set 6x the 18 GB of chunk cache
+this disk allows (the same limit as gpt-oss-120b). The RAM side fits (6.6 GB
+minimum). Its arithmetic is verified on the truncated cut above.
+
+## Gemma 4 12B at full depth over `hf://`: stopped in the first pass
+
+`google/gemma-4-12B-it` (dense, 48 layers, 22.28 GB stored, all of it trunk
+re-read by every forward pass), `ditch probe hf://google/gemma-4-12B-it
+--max-ram 10GB --remote-cache-size 20GB`, one prompt, 3 tokens.
+
+    dry run:  weights 22.28GB, mapped mode 27.01GB; disk: trunk 22.28GB of chunks,
+              "--remote-cache-size 23.00GB holds it" (20GB is what this disk allows)
+    measured: peak RSS 3.23GB; 21GB fetched in 33 min (~10.6 MB/s, 7 MB/s at
+              the start), then transfer failures from the Hub and retries;
+              stopped at 13:50 UTC with no token generated
+
+A dense model streams its trunk layer by layer, one range after another, so
+its first pass runs at the single-stream rate (7-11 MB/s here), where
+gpt-oss's experts load in parallel. With a cache smaller than the trunk
+(20 of 22.3 GB), every later token would fetch ~2.3 GB again; with 23 GB of
+cache disk the second pass would read only local chunks. The RAM side is
+small (3.2 GB). Its arithmetic is verified on the truncated cut above.
