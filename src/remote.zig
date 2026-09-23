@@ -37,6 +37,11 @@ const Allocator = std.mem.Allocator;
 const fmtBytes = budget_mod.fmtBytes;
 
 pub const default_chunk_size: u64 = 8 << 20;
+/// Concurrent range requests to the remote source (`--remote-connections`):
+/// one HTTP stream from the Hub runs at a fraction of the link (~40 MB/s
+/// measured against ~110 MB/s on 16 streams), so reads fetch their missing
+/// chunks in parallel up to this many at a time.
+pub const default_connections: u32 = 16;
 
 /// Upper end of the default chunk cache bound. Large enough for the trunk
 /// of today's biggest open mixture-of-experts checkpoints plus their hottest
@@ -134,7 +139,7 @@ pub const Source = struct {
     /// Safetensors shard names, sorted.
     shards: []const []const u8,
     files: std.ArrayList(*RemoteFile) = .empty,
-    max_in_flight: u32 = 4,
+    max_in_flight: u32 = default_connections,
     in_flight: std.atomic.Value(u32) = .init(0),
     ranges_fetched: std.atomic.Value(u64) = .init(0),
     bytes_fetched: std.atomic.Value(u64) = .init(0),
@@ -163,12 +168,23 @@ pub const Source = struct {
     /// chunk used in this run is more recent than the ones scanned at open.
     tick: u64 = 1 << 63,
     ram: [ram_slots]RamSlot = @splat(.{}),
+    /// Chunks queued by `RemoteFile.prefetchRange`, fetched in order by up to
+    /// `max_in_flight` workers into the chunk cache (guarded by `lock`).
+    prefetch_jobs: std.ArrayList(PrefetchJob) = .empty,
+    prefetch_head: usize = 0,
+    prefetch_workers: u32 = 0,
+    prefetch_group: Io.Group = .init,
+    chunks_prefetched: std.atomic.Value(u64) = .init(0),
+
+    const PrefetchJob = struct { file: *RemoteFile, index: u64 };
 
     pub const OpenOptions = struct {
         revision: ?[]const u8 = null,
         chunk_size: u64 = default_chunk_size,
         /// Bound of the chunk cache (null = `defaultCacheSize`, 0 = nothing on disk).
         cache_size: ?u64 = null,
+        /// Concurrent range requests (0 = `default_connections`).
+        connections: u32 = 0,
     };
 
     /// Resolves `model` to a base URL and cache directory, fetches the small
@@ -186,6 +202,7 @@ pub const Source = struct {
             .dir_path = undefined,
             .chunk_size = @max(opts.chunk_size, 4096),
             .shards = &.{},
+            .max_in_flight = if (opts.connections == 0) default_connections else opts.connections,
         };
         errdefer self.arena.deinit();
         errdefer {
@@ -285,6 +302,12 @@ pub const Source = struct {
     }
 
     pub fn deinit(self: *Source) void {
+        // Drop the queued prefetches and wait for the ones in flight.
+        self.lockAcquire();
+        self.prefetch_head = self.prefetch_jobs.items.len;
+        self.lockRelease();
+        self.prefetch_group.await(self.io) catch {};
+        self.prefetch_jobs.deinit(self.gpa);
         for (self.ram) |slot| if (slot.body.len > 0) self.gpa.free(slot.body);
         for (self.files.items) |f| f.deinit();
         self.files.deinit(self.gpa);
@@ -401,6 +424,28 @@ pub const Source = struct {
             .chunks_unpersisted = self.chunks_unpersisted.load(.monotonic),
             .chunks_invalid = self.chunks_invalid.load(.monotonic),
         };
+    }
+
+    /// Waits until the chunks queued by `RemoteFile.prefetchRange` are fetched.
+    pub fn awaitPrefetch(self: *Source) void {
+        self.prefetch_group.await(self.io) catch {};
+    }
+
+    fn prefetchWorker(self: *Source) Io.Cancelable!void {
+        while (true) {
+            self.lockAcquire();
+            if (self.prefetch_head >= self.prefetch_jobs.items.len) {
+                self.prefetch_jobs.clearRetainingCapacity();
+                self.prefetch_head = 0;
+                self.prefetch_workers -= 1;
+                self.lockRelease();
+                return;
+            }
+            const job = self.prefetch_jobs.items[self.prefetch_head];
+            self.prefetch_head += 1;
+            self.lockRelease();
+            job.file.prefetchChunk(job.index);
+        }
     }
 
     fn lockAcquire(self: *Source) void {
@@ -616,6 +661,75 @@ pub const RemoteFile = struct {
         Io.Dir.cwd().deleteFile(self.src.io, path) catch {};
     }
 
+    /// Queues the chunks of `[offset, offset + len)` that are not on disk
+    /// yet to be fetched in the background into the chunk cache, so that a
+    /// later `readRange` finds them there: the routed experts of a layer are
+    /// all known before the first of them runs, and fetching them over
+    /// `max_in_flight` connections while the others compute is what makes a
+    /// model bigger than RAM run at the link's speed. At most half the cache
+    /// bound is queued ahead (further hints are dropped, and the chunks are
+    /// fetched on demand); nothing is queued without a disk cache.
+    pub fn prefetchRange(self: *RemoteFile, offset: u64, len: u64) void {
+        if (len == 0) return;
+        const src = self.src;
+        const cs = src.chunk_size;
+        if (src.cache_limit == 0) return;
+        const ahead_max = @max(1, src.cache_limit / 2 / cs);
+        var spawn: u32 = 0;
+        src.lockAcquire();
+        var index = offset / cs;
+        const last = (offset + len - 1) / cs;
+        while (index <= last) : (index += 1) {
+            if (src.prefetch_jobs.items.len - src.prefetch_head >= ahead_max) break;
+            if (self.chunks.contains(index) or src.ramFind(self, index) != null) continue;
+            src.prefetch_jobs.append(src.gpa, .{ .file = self, .index = index }) catch break;
+        }
+        const queued = src.prefetch_jobs.items.len - src.prefetch_head;
+        while (src.prefetch_workers < src.max_in_flight and src.prefetch_workers < queued) {
+            src.prefetch_workers += 1;
+            spawn += 1;
+        }
+        src.lockRelease();
+        for (0..spawn) |_| src.prefetch_group.concurrent(src.io, Source.prefetchWorker, .{src}) catch {
+            src.lockAcquire();
+            src.prefetch_workers -= 1;
+            src.lockRelease();
+        };
+    }
+
+    /// Fetches chunk `index` into the cache unless it is there or on its way.
+    fn prefetchChunk(self: *RemoteFile, index: u64) void {
+        const src = self.src;
+        const io = src.io;
+        src.lockAcquire();
+        if (self.chunks.contains(index) or src.ramFind(self, index) != null) {
+            src.lockRelease();
+            return;
+        }
+        self.chunks.put(src.gpa, index, .{ .state = .fetching }) catch {
+            src.lockRelease();
+            return;
+        };
+        src.lockRelease();
+        var dir = Io.Dir.cwd().openDir(io, self.chunk_dir, .{}) catch {
+            self.abandon(index);
+            return;
+        };
+        defer dir.close(io);
+        const body = self.fetchChunk(io, index) catch {
+            self.abandon(index);
+            return;
+        };
+        if (body.len > src.chunk_size or body.len == 0) {
+            src.gpa.free(body);
+            self.abandon(index);
+            return;
+        }
+        var name_buf: [32]u8 = undefined;
+        self.keep(io, dir, index, chunkName(&name_buf, index), body);
+        _ = src.chunks_prefetched.fetchAdd(1, .monotonic);
+    }
+
     /// Reads `out.len` bytes at `offset`. Fails with `UnexpectedEndOfFile`
     /// past the end of the shard.
     pub fn readRange(self: *RemoteFile, io: Io, offset: u64, out: []u8) !void {
@@ -623,15 +737,41 @@ pub const RemoteFile = struct {
         const cs = self.src.chunk_size;
         var dir = try Io.Dir.cwd().openDir(io, self.chunk_dir, .{});
         defer dir.close(io);
-        var pos = offset;
         const end = offset + out.len;
+        if (offset / cs == (end - 1) / cs or self.src.max_in_flight <= 1) {
+            var pos = offset;
+            while (pos < end) {
+                const index = pos / cs;
+                const in_chunk = pos - index * cs;
+                const n: usize = @intCast(@min(cs - in_chunk, end - pos));
+                try self.readChunk(io, dir, index, in_chunk, out[@intCast(pos - offset)..][0..n]);
+                pos += n;
+            }
+            return;
+        }
+        // Several chunks: each on a task of its own, so the missing ones are
+        // fetched concurrently (`fetchChunk` bounds the requests in flight).
+        var group: Io.Group = .init;
+        var failed: std.atomic.Value(u16) = .init(0);
+        var pos = offset;
         while (pos < end) {
             const index = pos / cs;
             const in_chunk = pos - index * cs;
             const n: usize = @intCast(@min(cs - in_chunk, end - pos));
-            try self.readChunk(io, dir, index, in_chunk, out[@intCast(pos - offset)..][0..n]);
+            const dest = out[@intCast(pos - offset)..][0..n];
+            group.concurrent(io, chunkTask, .{ self, io, dir, index, in_chunk, dest, &failed }) catch
+                try chunkTask(self, io, dir, index, in_chunk, dest, &failed);
             pos += n;
         }
+        group.await(io) catch {};
+        const code = failed.load(.acquire);
+        if (code != 0) return @errorFromInt(code);
+    }
+
+    fn chunkTask(self: *RemoteFile, io: Io, dir: Io.Dir, index: u64, in_chunk: u64, dest: []u8, failed: *std.atomic.Value(u16)) Io.Cancelable!void {
+        self.readChunk(io, dir, index, in_chunk, dest) catch |err| {
+            _ = failed.cmpxchgStrong(0, @intFromError(err), .acq_rel, .monotonic);
+        };
     }
 
     /// Copies `dest.len` bytes at `in_chunk` of chunk `index` into `dest`:
@@ -830,6 +970,8 @@ pub const Footprint = struct {
     expert_bytes: u64 = 0,
     total_expert_bytes: u64 = 0,
     num_experts: u64 = 0,
+    /// Routed experts one token runs, over all its MoE layers (sum of top-k).
+    experts_per_token: u64 = 0,
     cache_limit: u64,
     cache_limit_default: bool,
     cache_bytes: u64,
@@ -863,6 +1005,35 @@ pub const Footprint = struct {
             const experts = if (self.expert_bytes == 0) 0 else room / self.expert_bytes;
             try w.print("  the trunk stays cached; room for {d} of {d} experts besides\n", .{ @min(experts, self.num_experts), self.num_experts });
         }
+        try self.printPerToken(w);
+    }
+
+    /// Link rate the per-token time estimate assumes: about what the Hub
+    /// serves to `default_connections` range requests at once.
+    pub const assumed_rate: u64 = 100 * 1000 * 1000;
+
+    /// Bytes one decoded token fetches in the steady state, when every
+    /// expert is equally likely: the trunk again unless the cache holds it,
+    /// plus the share of the routed experts the cache cannot hold.
+    pub fn bytesPerToken(self: Footprint) u64 {
+        var bytes: u64 = if (self.trunkFits()) 0 else self.trunk_chunk_bytes;
+        if (self.num_experts > 0 and self.expert_bytes > 0) {
+            const room = if (self.trunkFits()) self.cache_limit - self.trunk_chunk_bytes else 0;
+            const held = @min(self.num_experts, room / self.expert_bytes);
+            const routed = self.experts_per_token * self.expert_bytes;
+            bytes += @intCast(@as(u128, routed) * (self.num_experts - held) / self.num_experts);
+        }
+        return bytes;
+    }
+
+    fn printPerToken(self: Footprint, w: *Io.Writer) !void {
+        if (self.experts_per_token == 0 and self.trunkFits()) return;
+        const b = self.bytesPerToken();
+        const ms = b * 1000 / assumed_rate;
+        try w.print("  per decoded token        {f} fetched once warm (~{d}.{d:0>1} s at {f}/s)", .{ fmtBytes(b), ms / 1000, ms % 1000 / 100, fmtBytes(assumed_rate) });
+        if (self.experts_per_token > 0)
+            try w.print("; the first ones up to {f} ({d} routed experts)", .{ fmtBytes(self.experts_per_token * self.expert_bytes + if (self.trunkFits()) 0 else self.trunk_chunk_bytes), self.experts_per_token });
+        try w.writeAll("\n");
     }
 
     /// The startup note when the bound cannot hold the trunk.
@@ -913,6 +1084,9 @@ pub fn planModel(src: *Source, gpa: Allocator, model: *const model_mod.Model) !F
             gop.value_ptr.experts += 1;
         }
         fp.num_experts += 1;
+    };
+    for (model.layers) |*l| if (l.moe) |*m| {
+        fp.experts_per_token += m.top_k;
     };
     for (model.files) |f| {
         const rf = switch (f.source) {

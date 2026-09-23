@@ -432,7 +432,21 @@ pub const WeightStore = struct {
         }
         self.pending = .{ .key = key, .leases = leases, .group = .init };
         const p = &self.pending.?;
-        for (refs, 0..) |r, i| p.group.async(self.io, readTask, .{ self, r, leases[i].buf });
+        // Concurrent (a thread each, beyond the async pool's cores - 1): the
+        // reads block on the disk or the network, not the CPU.
+        for (refs, 0..) |r, i| p.group.concurrent(self.io, readTask, .{ self, r, leases[i].buf }) catch
+            p.group.async(self.io, readTask, .{ self, r, leases[i].buf });
+    }
+
+    /// Hints that `refs` will be acquired soon: remote shards start fetching
+    /// their bytes into the chunk cache in the background (over many
+    /// connections), without holding any budget; local files ignore it.
+    pub fn prefetchRemote(self: *WeightStore, refs: []const WeightRef) void {
+        if (self.mode != .streamed) return;
+        for (refs, 0..) |r, i| {
+            if (i > 0 and refs[i - 1].file == r.file and refs[i - 1].offset == r.offset) continue; // fused gate/up
+            self.files[r.file].prefetchRange(r.offset, r.byteLen());
+        }
     }
 
     fn discardPending(self: *WeightStore) void {

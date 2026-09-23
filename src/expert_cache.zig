@@ -308,6 +308,13 @@ pub const ExpertCache = struct {
         _ = @atomicRmw(u64, &self.bytes_read, .Add, e.bytes, .monotonic);
     }
 
+    /// Starts loading `e` on a thread of its own when one can be had (a
+    /// remote source's misses then fetch in parallel instead of three at a
+    /// time on the async pool), else on the async pool.
+    fn startLoad(self: *ExpertCache, group: *Io.Group, e: *Entry, ex: *const moe.Expert) void {
+        group.concurrent(self.io, loadTask, .{ self, e, ex }) catch group.async(self.io, loadTask, .{ self, e, ex });
+    }
+
     fn loadTask(self: *ExpertCache, e: *Entry, ex: *const moe.Expert) Io.Cancelable!void {
         self.loadEntry(e, ex) catch {
             e.failed.store(true, .release);
@@ -369,9 +376,16 @@ pub const ExpertCache = struct {
                 self.dropEntry(e);
                 break;
             };
-            pend.group.async(self.io, loadTask, .{ self, e, ex });
+            startLoad(self, &pend.group, e, ex);
         }
         if (pend.entries.items.len == 0) self.finishPending();
+    }
+
+    /// Whether expert `x` of layer `layer` is resident (or being loaded).
+    pub fn resident(self: *ExpertCache, layer: usize, x: usize) bool {
+        self.lockAcquire();
+        defer self.lockRelease();
+        return self.map.get(Key.init(layer, x).int()) != null;
     }
 
     /// Makes expert `x` of layer `layer` resident and pins it; `release` it
@@ -573,7 +587,7 @@ pub const ExpertCache = struct {
                 self.finishPending();
                 return err;
             };
-            pend.group.async(self.io, loadTask, .{ self, e, ex });
+            startLoad(self, &pend.group, e, ex);
             n += 1;
         }
         self.finishPending();

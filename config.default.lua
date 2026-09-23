@@ -363,6 +363,7 @@ return {
   -- GGUF model must be local.
   -- remote_weights = false,
   -- remote_chunk_size = "8MB",
+  -- remote_connections = 16,
   -- Disk bound of that chunk cache (per model and revision). When a new
   -- chunk would exceed it, least recently used chunks are evicted, chunks of
   -- the trunk (every tensor but the routed experts, re-read by every trial)

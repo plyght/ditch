@@ -1522,7 +1522,7 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         // mode, and `hf://` weights read through the chunk cache.
         var probe_src: ?*remote.Source = null;
         defer if (probe_src) |s| s.deinit();
-        if (is_remote) probe_src = try remote.Source.open(gpa, io, &http, cache_root, settings.model, .{ .revision = settings.model_commit, .chunk_size = settings.remote_chunk_size, .cache_size = settings.remote_cache_size }, out);
+        if (is_remote) probe_src = try remote.Source.open(gpa, io, &http, cache_root, settings.model, .{ .revision = settings.model_commit, .chunk_size = settings.remote_chunk_size, .cache_size = settings.remote_cache_size, .connections = settings.remote_connections }, out);
         try probe.run(gpa, arena, io, settings, &http, cache_root, pool, .{ .store = store_mode, .budget = &budget, .expert_cache = settings.expert_cache, .remote = probe_src }, if (probe_src) |s| s.dir_path else null, out, con.result);
         if (probe_src) |s| printRemoteStats(out, s);
         return;
@@ -1532,7 +1532,7 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     var remote_src: ?*remote.Source = null;
     defer if (remote_src) |s| s.deinit();
     const model_dir = if (is_remote) blk: {
-        remote_src = try remote.Source.open(gpa, io, &http, cache_root, settings.model, .{ .revision = settings.model_commit, .chunk_size = settings.remote_chunk_size, .cache_size = settings.remote_cache_size }, out);
+        remote_src = try remote.Source.open(gpa, io, &http, cache_root, settings.model, .{ .revision = settings.model_commit, .chunk_size = settings.remote_chunk_size, .cache_size = settings.remote_cache_size, .connections = settings.remote_connections }, out);
         break :blk remote_src.?.dir_path;
     } else try hf.resolveModel(arena, &http, cache_root, settings.model, settings.model_commit, out);
     const model = try Model.loadWithOptions(gpa, io, pool, model_dir, .{ .store = store_mode, .budget = &budget, .expert_cache = settings.expert_cache, .remote = remote_src });
