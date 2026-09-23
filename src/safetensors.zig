@@ -397,21 +397,24 @@ pub const File = struct {
         gpa.destroy(self);
     }
 
-    /// Hints that `[offset, offset + len)` will be read soon: a remote shard
-    /// starts fetching the bytes in the background (a dequantised tensor, its
-    /// source pieces); a local or mapped one ignores it.
-    pub fn prefetchRange(self: *const File, offset: u64, len: u64) void {
+    /// A stored byte range of a remote shard (see `rawRanges`).
+    pub const RawRange = struct { file: *remote.RemoteFile, offset: u64, len: u64 };
+
+    /// Appends the remote byte ranges behind `[offset, offset + len)` to
+    /// `out`: the range itself in a remote shard, the stored codes and
+    /// scales behind a dequantised tensor, nothing for a local file.
+    pub fn rawRanges(self: *const File, gpa: std.mem.Allocator, offset: u64, len: u64, out: *std.ArrayList(RawRange)) error{OutOfMemory}!void {
         if (len == 0) return;
         if (offset >= self.len) {
             const o = self.overlayAt(offset) orelse return;
             switch (o.kind) {
-                .dequant => |dq| dq.prefetch(offset - o.offset, len),
+                .dequant => |dq| try dq.rawRanges(gpa, offset - o.offset, len, out),
                 else => {},
             }
             return;
         }
         switch (self.source) {
-            .remote => |rf| rf.prefetchRange(offset, len),
+            .remote => |rf| try out.append(gpa, .{ .file = rf, .offset = offset, .len = len }),
             .local => {},
         }
     }

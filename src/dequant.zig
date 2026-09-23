@@ -384,10 +384,10 @@ pub const Dequant = struct {
         gpa.destroy(self);
     }
 
-    /// Starts fetching the source bytes behind `[rel, rel + len)` of the
-    /// virtual tensor (see `safetensors.File.prefetchRange`): the slabs it
-    /// covers of the data, scale and zero pieces, pro rata.
-    pub fn prefetch(self: *const Dequant, rel: u64, len: u64) void {
+    /// Appends the stored ranges behind `[rel, rel + len)` of the virtual
+    /// tensor (see `safetensors.File.rawRanges`): the slabs it covers of the
+    /// data, scale and zero pieces, pro rata.
+    pub fn rawRanges(self: *const Dequant, gpa: Allocator, rel: u64, len: u64, out: anytype) error{OutOfMemory}!void {
         if (self.materialized != null or len == 0) return;
         const sb: u64 = self.slabBytes();
         const first = rel / sb;
@@ -398,9 +398,9 @@ pub const Dequant = struct {
             const pc = maybe orelse continue;
             const per: u64 = pc.byte_len / self.slabs;
             if (self.slabs > 1 and per * self.slabs == pc.byte_len) {
-                pc.file.prefetchRange(pc.offset + first * per, (last - first) * per);
+                try pc.file.rawRanges(gpa, pc.offset + first * per, (last - first) * per, out);
             } else {
-                pc.file.prefetchRange(pc.offset, pc.byte_len);
+                try pc.file.rawRanges(gpa, pc.offset, pc.byte_len, out);
             }
         }
     }

@@ -831,21 +831,21 @@ pub fn runConfig(ref: c_int, cfg: *Config, arena: Allocator, obj: std.json.Objec
         const p = c.lua_tolstring(L, -1, &len);
         const msg: []const u8 = if (p) |m| m[0..len] else "unknown Lua error";
         if (std.mem.indexOf(u8, msg, unsupported_marker)) |k| {
-            std.log.err("unsupported model: {s}", .{msg[k + unsupported_marker.len ..]});
+            arch.logErr("unsupported model: {s}", .{msg[k + unsupported_marker.len ..]});
             return error.UnsupportedArchitecture;
         }
         if (std.mem.indexOf(u8, msg, invalid_marker)) |k| {
-            std.log.err("invalid config.json: {s}", .{msg[k + invalid_marker.len ..]});
+            arch.logErr("invalid config.json: {s}", .{msg[k + invalid_marker.len ..]});
             return error.InvalidConfig;
         }
-        std.log.err("{s}: config function failed: {s}", .{ cfg.arch.model_type, msg });
+        arch.logErr("{s}: config function failed: {s}", .{ cfg.arch.model_type, msg });
         return error.InvalidConfig;
     }
     var diag: Diagnostic = .{};
     var ctx = Ctx{ .L = L, .a = arena, .diag = &diag, .where = "config", .family = cfg.arch.model_type };
     const layers = cfg.num_layers;
     var out = readValue(Config, &ctx, t, cfg.*, .full) catch |err| {
-        std.log.err("{s}", .{diag.message orelse @errorName(err)});
+        arch.logErr("{s}", .{diag.message orelse @errorName(err)});
         return error.InvalidConfig;
     };
     out.arch = cfg.arch;
@@ -853,13 +853,13 @@ pub fn runConfig(ref: c_int, cfg: *Config, arena: Allocator, obj: std.json.Objec
     inline for (@typeInfo(Config).@"struct".fields) |f| {
         if (@typeInfo(f.type) == .pointer and @typeInfo(f.type).pointer.size == .slice and @typeInfo(f.type).pointer.child != u8) {
             if (@field(cfg.*, f.name).len == layers and @field(out, f.name).len != layers) {
-                std.log.err("{s}: config function changed the length of c.{s} ({d} layers)", .{ cfg.arch.model_type, f.name, layers });
+                arch.logErr("{s}: config function changed the length of c.{s} ({d} layers)", .{ cfg.arch.model_type, f.name, layers });
                 return error.InvalidConfig;
             }
         }
     }
     if (out.num_layers != layers) {
-        std.log.err("{s}: a config function cannot change num_layers", .{cfg.arch.model_type});
+        arch.logErr("{s}: a config function cannot change num_layers", .{cfg.arch.model_type});
         return error.InvalidConfig;
     }
     cfg.* = out;
