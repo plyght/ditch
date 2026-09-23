@@ -1176,7 +1176,10 @@ pub fn parseConfigAs(arena: Allocator, json_text: []const u8, family: ?*const Ar
     // A pure state-space model has no attention heads; the attention
     // dimensions are then placeholders (the KV cache stays empty).
     if (heads == 0 and arch.ssm != .none) heads = 1;
-    if (hidden == 0 or heads == 0 or layers == 0) return error.InvalidConfig;
+    if (hidden == 0 or heads == 0 or layers == 0) {
+        logErr("config.json names no {s} (or another spelling of it)", .{if (hidden == 0) "hidden_size" else if (heads == 0) "num_attention_heads" else "num_hidden_layers"});
+        return error.InvalidConfig;
+    }
     var kv_heads = getIntAny(obj, &.{ "num_key_value_heads", "num_kv_heads", "n_head_kv", "multi_query_group_num" }, heads);
     if (attn_cfg.get("kv_n_heads") != null) kv_heads = getInt(attn_cfg, "kv_n_heads", heads);
     if (getBool(obj, "multi_query", false)) kv_heads = 1;
@@ -1192,10 +1195,16 @@ pub fn parseConfigAs(arena: Allocator, json_text: []const u8, family: ?*const Ar
             .qk_rope_head_dim = getInt(obj, "qk_rope_head_dim", 0),
             .v_head_dim = getInt(obj, "v_head_dim", 0),
         };
-        if (m.q_lora_rank == 0) return error.InvalidConfig;
+        if (m.q_lora_rank == 0) {
+            logErr("multi-head latent attention with q_lora_rank 0", .{});
+            return error.InvalidConfig;
+        }
         head_dim = m.qk_nope_head_dim + m.qk_rope_head_dim;
         v_head_dim = m.v_head_dim;
-        if (v_head_dim > head_dim) return error.InvalidConfig;
+        if (v_head_dim > head_dim) {
+            logErr("multi-head latent attention with v_head_dim {d} above the query/key head size {d}", .{ v_head_dim, head_dim });
+            return error.InvalidConfig;
+        }
         kv_heads = heads;
         mla = m;
     }

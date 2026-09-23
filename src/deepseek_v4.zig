@@ -254,8 +254,9 @@ pub fn nativeName(arena: Allocator, name: []const u8) !?[]const u8 {
 /// transformers spelling the loader reads, in place in the files' indexes
 /// (float and raw alike, so the dequantiser pairs the renamed FP8 / FP4
 /// weights with their renamed `scale`). A checkpoint already in transformers
-/// naming is left alone. Returns the number of renamed tensors.
-pub fn renameNative(files: []const *safetensors.File) !usize {
+/// naming is left alone. Returns the number of renamed tensors. `native_names`
+/// gets each new name's checkpoint name, which exports write back.
+pub fn renameNative(files: []const *safetensors.File, gpa: Allocator, native_names: *std.StringHashMapUnmanaged([]const u8)) !usize {
     var native = false;
     for (files) |f| {
         if (f.tensors.contains("embed.weight") or f.raw.contains("layers.0.attn.wkv.weight") or f.tensors.contains("layers.0.attn_norm.weight")) native = true;
@@ -266,6 +267,7 @@ pub fn renameNative(files: []const *safetensors.File) !usize {
         const arena = f.arena.allocator();
         for (f.tensors.keys(), f.tensors.values()) |*k, *v| {
             if (try nativeName(arena, k.*)) |new| {
+                try native_names.put(gpa, new, k.*);
                 k.* = new;
                 v.name = new;
                 n += 1;
@@ -273,6 +275,7 @@ pub fn renameNative(files: []const *safetensors.File) !usize {
         }
         for (f.raw.keys(), f.raw.values()) |*k, *v| {
             if (try nativeName(arena, k.*)) |new| {
+                try native_names.put(gpa, new, k.*);
                 k.* = new;
                 v.name = new;
                 n += 1;

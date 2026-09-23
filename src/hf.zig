@@ -24,16 +24,24 @@ pub const Http = struct {
     environ: *std.process.Environ.Map,
     native_ok: bool = true,
     timeout_seconds: u64 = 30,
-    /// After a 429 (or 503): no request starts before this instant (awake
-    /// clock, nanoseconds), so the concurrent range readers back off
-    /// together instead of each spending its retries on the same limit.
+    /// After a transient failure: no request starts before this instant
+    /// (awake clock, nanoseconds), so the concurrent range readers back off
+    /// together instead of each hammering a server that is down or limiting.
     cooldown_until: std.atomic.Value(i64) = .init(0),
+    /// When the current outage began (awake ns; 0 when none), so the status
+    /// line can say how long it lasted once a request succeeds again.
+    outage_since: std.atomic.Value(i64) = .init(0),
+    /// Give up on a request that has failed transiently for this long
+    /// (`--remote-retry-timeout`); null waits for the network indefinitely.
+    retry_timeout_seconds: ?u64 = null,
 
     pub const Options = struct {
         /// File holding the Hugging Face token (overrides the environment).
         token_file: ?[]const u8 = null,
         /// Connect / stall timeout of transfers; transient failures are retried.
         timeout_seconds: u64 = 30,
+        /// See `Http.retry_timeout_seconds`.
+        retry_timeout_seconds: ?u64 = null,
     };
 
     pub fn init(gpa: Allocator, io: Io, arena: Allocator, environ: *std.process.Environ.Map) !Http {
@@ -68,36 +76,57 @@ pub const Http = struct {
         if (token) |t| if (t.len == 0) {
             token = null;
         };
-        return .{ .gpa = gpa, .io = io, .client = client, .token = token, .environ = environ, .timeout_seconds = opts.timeout_seconds };
+        return .{ .gpa = gpa, .io = io, .client = client, .token = token, .environ = environ, .timeout_seconds = opts.timeout_seconds, .retry_timeout_seconds = opts.retry_timeout_seconds };
     }
 
-    /// Transient failures (anything but 401/403/404 and out of memory) are
-    /// retried this many times with a growing pause.
-    const attempts = 3;
-    /// Retries of a rate-limited request, backing off 5, 10, 20, 40 and then
-    /// 60 s at a time (about 10 minutes in all): the Hub limits a client that
-    /// has made many requests in the last minutes, and waiting it out beats
-    /// failing a run that has already fetched tens of GB.
-    const rate_limited_attempts = 14;
-    /// Delay before the first retry of a rate-limited request, doubled up to `rate_limited_max`.
-    pub var rate_limited_base_ms: u64 = 5000;
-    const rate_limited_max_ms: u64 = 60_000;
+    /// A transient failure (anything but 404, 401/403, a server without range
+    /// support, out of memory or Ctrl+C: a timeout, a reset or refused
+    /// connection, a DNS failure, a 5xx, a 429, a truncated body) is retried
+    /// until it succeeds: backing off `retry_base_ms`, doubled per failure up
+    /// to `retry_max_ms`, each with up to a quarter of jitter. A run that
+    /// has fetched tens of GB is worth waiting for the network, and Ctrl+C
+    /// (or `--remote-retry-timeout`) still ends it.
+    pub var retry_base_ms: u64 = 2000;
+    pub var retry_max_ms: u64 = 180_000;
 
     fn transient(err: anyerror) bool {
         return switch (err) {
-            error.NotFound, error.Forbidden, error.OutOfMemory, error.RangeNotSupported, error.Interrupted => false,
+            error.NotFound, error.Forbidden, error.OutOfMemory, error.RangeNotSupported, error.Interrupted, error.RetryTimeout => false,
             else => true,
         };
     }
 
-    /// Holds every request back for `ms`; true when no back-off was running.
-    fn startCooldown(self: *Http, ms: u64) bool {
-        const now: i64 = @intCast(Io.Timestamp.now(self.io, .awake).nanoseconds);
+    fn nowNs(self: *Http) i64 {
+        return @intCast(Io.Timestamp.now(self.io, .awake).nanoseconds);
+    }
+
+    /// Holds every request back for `ms` after `err`. Reports it on one
+    /// status line when this extends the wait (not once per request).
+    fn startCooldown(self: *Http, ms: u64, err: anyerror) void {
+        const now = self.nowNs();
         const until = now + @as(i64, @intCast(ms)) * std.time.ns_per_ms;
+        _ = self.outage_since.cmpxchgStrong(0, now, .monotonic, .monotonic);
         var cur = self.cooldown_until.load(.monotonic);
-        const fresh = cur < now;
-        while (cur < until) cur = self.cooldown_until.cmpxchgWeak(cur, until, .monotonic, .monotonic) orelse break;
-        return fresh;
+        while (cur < until) {
+            cur = self.cooldown_until.cmpxchgWeak(cur, until, .monotonic, .monotonic) orelse {
+                const secs = (ms + 999) / 1000;
+                if (err == error.RateLimited) {
+                    std.log.warn("hf: rate limited by the server; retrying in {d} s, Ctrl+C to stop", .{secs});
+                } else {
+                    std.log.warn("hf: connection lost ({s}); retrying in {d} s, Ctrl+C to stop", .{ @errorName(err), secs });
+                }
+                return;
+            };
+        }
+    }
+
+    /// After a success: reports the end of an outage.
+    fn noteSuccess(self: *Http) void {
+        if (self.outage_since.load(.monotonic) == 0) return;
+        const since = self.outage_since.swap(0, .monotonic);
+        if (since == 0) return;
+        const secs = @divFloor(self.nowNs() - since, std.time.ns_per_s);
+        std.log.warn("hf: connection restored after {d} s; resuming", .{secs});
     }
 
     fn awaitCooldown(self: *Http) void {
@@ -108,10 +137,6 @@ pub const Http = struct {
             if (budget_mod.interrupted()) return;
             self.io.sleep(Io.Duration.fromNanoseconds(@intCast(@min(until - now, std.time.ns_per_s))), .awake) catch return;
         }
-    }
-
-    fn pause(self: *Http, attempt: usize) void {
-        self.io.sleep(Io.Duration.fromSeconds(@intCast(attempt * 2)), .awake) catch {};
     }
 
     /// Appends curl's connect timeout and the stall abort (< 1 B/s for that
@@ -144,42 +169,82 @@ pub const Http = struct {
         return self.getRangeOpt(url, .{ start, last });
     }
 
-    /// Retry state of one request: transient failures and rate limits are counted apart.
-    const Retry = struct {
-        attempt: usize = 1,
-        limited: usize = 0,
+    /// A response body, and the full length of the resource when a
+    /// `Content-Range` header gave it.
+    pub const Fetched = struct { body: []u8, total: ?u64 = null };
 
-        /// After `err`: waits and returns true to retry, or false to give up.
+    /// `bytes a-b/TOTAL` -> TOTAL.
+    fn parseContentRangeTotal(v: []const u8) ?u64 {
+        const slash = std.mem.lastIndexOfScalar(u8, v, '/') orelse return null;
+        return std.fmt.parseInt(u64, std.mem.trim(u8, v[slash + 1 ..], " \r\n"), 10) catch null;
+    }
+
+    /// Retry state of one request.
+    const Retry = struct {
+        failures: u32 = 0,
+        first: i64 = 0,
+
+        /// After `err`: schedules the shared back-off and returns true to
+        /// retry, or false to give up (a permanent error, Ctrl+C, or the
+        /// `--remote-retry-timeout` spent).
         fn again(r: *Retry, http: *Http, err: anyerror, what: []const u8) bool {
-            if (budget_mod.interrupted()) return false;
-            if (err == error.RateLimited) {
-                r.limited += 1;
-                if (r.limited >= rate_limited_attempts) return false;
-                const ms = @min(rate_limited_max_ms, rate_limited_base_ms << @intCast(@min(r.limited - 1, 16)));
-                if (http.startCooldown(ms)) std.log.warn("{s}: rate limited by the server; backing off", .{what});
-                return true;
-            }
-            if (r.attempt >= attempts or !transient(err)) return false;
-            r.attempt += 1;
-            std.log.warn("{s}: {s}; retrying ({d}/{d})", .{ what, @errorName(err), r.attempt, attempts });
-            http.pause(r.attempt - 1);
+            if (budget_mod.interrupted() or !transient(err)) return false;
+            const now = http.nowNs();
+            if (r.failures == 0) r.first = now;
+            if (http.retry_timeout_seconds) |t| if (now - r.first >= @as(i64, @intCast(t)) * std.time.ns_per_s) {
+                std.log.warn("{s}: still failing ({s}) after the --remote-retry-timeout of {d} s", .{ what, @errorName(err), t });
+                return false;
+            };
+            r.failures += 1;
+            const base = @min(retry_max_ms, retry_base_ms << @intCast(@min(r.failures - 1, 20)));
+            var prng = std.Random.DefaultPrng.init(@as(u64, @bitCast(now)) +% @intFromPtr(r));
+            const jitter = prng.random().uintLessThan(u64, base / 4 + 1);
+            std.log.debug("{s}: {s}; retry {d}", .{ what, @errorName(err), r.failures });
+            http.startCooldown(base + jitter, err);
             return true;
         }
     };
 
     fn getRangeOpt(self: *Http, url: []const u8, range: ?[2]u64) ![]u8 {
+        return (try self.fetchRetrying(url, range, null)).body;
+    }
+
+    /// Fetches with retries. With `known_len` (the length of the resource,
+    /// or null until a `Content-Range` gives it), a range body shorter than
+    /// the range clipped at that length is a transfer cut short, retried.
+    fn fetchRetrying(self: *Http, url: []const u8, range: ?[2]u64, known_len: ?u64) !Fetched {
         var retry: Retry = .{};
         while (true) {
             self.awaitCooldown();
-            return self.getRangeOnce(url, range) catch |err| {
-                if (budget_mod.interrupted()) return error.Interrupted;
+            if (budget_mod.interrupted()) return error.Interrupted;
+            const got = self.getRangeOnce(url, range) catch |err| {
                 if (retry.again(self, err, url)) continue;
+                if (budget_mod.interrupted()) return error.Interrupted;
                 return err;
             };
+            if (range) |r| {
+                const len = got.total orelse known_len;
+                const want: u64 = if (len) |l| (if (l > r[0]) @min(r[1] + 1, l) - r[0] else 0) else 0;
+                if (got.body.len > r[1] - r[0] + 1 or got.body.len < want) {
+                    self.gpa.free(got.body);
+                    if (retry.again(self, error.TruncatedBody, url)) continue;
+                    return error.TruncatedBody;
+                }
+            }
+            self.noteSuccess();
+            return got;
         }
     }
 
-    fn getRangeOnce(self: *Http, url: []const u8, range: ?[2]u64) ![]u8 {
+    /// `getRange` for a resource whose length is `known_len` (null when not
+    /// known yet): retried until the body is the whole range (clipped at the
+    /// end of the resource), and with the resource length when the server
+    /// sent it.
+    pub fn getRangeChecked(self: *Http, url: []const u8, start: u64, last: u64, known_len: ?u64) !Fetched {
+        return self.fetchRetrying(url, .{ start, last }, known_len);
+    }
+
+    fn getRangeOnce(self: *Http, url: []const u8, range: ?[2]u64) !Fetched {
         if (self.native_ok) {
             if (self.getNative(url, range)) |body| {
                 return body;
@@ -194,9 +259,7 @@ pub const Http = struct {
         return self.getCurl(url, range);
     }
 
-    fn getNative(self: *Http, url: []const u8, range: ?[2]u64) ![]u8 {
-        var body: Io.Writer.Allocating = .init(self.gpa);
-        errdefer body.deinit();
+    fn getNative(self: *Http, url: []const u8, range: ?[2]u64) !Fetched {
         var auth_buf: [512]u8 = undefined;
         var range_buf: [64]u8 = undefined;
         var headers: [1]std.http.Header = undefined;
@@ -216,32 +279,50 @@ pub const Http = struct {
             headers[n_headers] = .{ .name = "range", .value = try std.fmt.bufPrint(&range_buf, "bytes={d}-{d}", .{ r[0], r[1] }) };
             n_headers += 1;
         }
-        const res = try self.client.fetch(.{
-            .location = .{ .url = url },
-            .response_writer = &body.writer,
+        // `Client.fetch` without its convenience: the head is needed (the
+        // resource length in Content-Range), and a body shorter than its
+        // Content-Length (a connection cut mid-transfer) must be an error,
+        // where `fetch` returns what arrived.
+        var req = try self.client.request(.GET, try std.Uri.parse(url), .{
+            .redirect_behavior = @enumFromInt(3),
             .extra_headers = headers[0..n_headers],
             .privileged_headers = privileged[0..n_privileged],
         });
-        switch (res.status) {
-            .ok => {
-                if (range != null) return error.RangeNotSupported;
-                return body.toOwnedSlice();
-            },
-            .partial_content => {
-                if (range == null) return error.HttpError;
-                return body.toOwnedSlice();
-            },
+        defer req.deinit();
+        try req.sendBodiless();
+        var redirect_buf: [8 * 1024]u8 = undefined;
+        var response = try req.receiveHead(&redirect_buf);
+        const status = response.head.status;
+        const content_length = response.head.content_length;
+        var total: ?u64 = null;
+        var it = response.head.iterateHeaders();
+        while (it.next()) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "content-range")) total = parseContentRangeTotal(h.value);
+        }
+        switch (status) {
+            .ok => if (range != null) return error.RangeNotSupported,
+            .partial_content => if (range == null) return error.HttpError,
             .not_found => return error.NotFound,
             .unauthorized, .forbidden => return error.Forbidden,
             .too_many_requests, .service_unavailable => return error.RateLimited,
             else => return error.HttpError,
         }
+        var body: Io.Writer.Allocating = .init(self.gpa);
+        errdefer body.deinit();
+        var transfer_buf: [64]u8 = undefined;
+        const reader = response.reader(&transfer_buf);
+        _ = reader.streamRemaining(&body.writer) catch |err| switch (err) {
+            error.ReadFailed => return response.bodyErr() orelse error.HttpError,
+            else => |e| return e,
+        };
+        if (content_length) |n| if (body.written().len != n) return error.TruncatedBody;
+        return .{ .body = try body.toOwnedSlice(), .total = total };
     }
 
-    fn getCurl(self: *Http, url: []const u8, range: ?[2]u64) ![]u8 {
+    fn getCurl(self: *Http, url: []const u8, range: ?[2]u64) !Fetched {
         var argv = std.ArrayList([]const u8).empty;
         defer argv.deinit(self.gpa);
-        try argv.appendSlice(self.gpa, &.{ "curl", "-L", "-sS", "--fail-with-body", "-w", "\n%{http_code}" });
+        try argv.appendSlice(self.gpa, &.{ "curl", "-L", "-sS", "--fail-with-body", "-w", "\n%{http_code} %header{content-range}" });
         var tbuf: [32]u8 = undefined;
         try self.appendCurlTimeoutArgs(&argv, &tbuf);
         var range_buf: [64]u8 = undefined;
@@ -265,16 +346,26 @@ pub const Http = struct {
         defer self.gpa.free(result.stderr);
         defer self.gpa.free(result.stdout);
         const nl = std.mem.lastIndexOfScalar(u8, result.stdout, '\n') orelse return error.HttpError;
-        const code = std.fmt.parseInt(u16, std.mem.trim(u8, result.stdout[nl + 1 ..], " \r\n"), 10) catch 0;
+        // The -w line: "<status> <content-range or nothing>".
+        const tail = std.mem.trim(u8, result.stdout[nl + 1 ..], " \r\n");
+        const sp = std.mem.indexOfScalar(u8, tail, ' ') orelse tail.len;
+        const code = std.fmt.parseInt(u16, tail[0..sp], 10) catch 0;
+        const total = if (sp < tail.len) parseContentRangeTotal(tail[sp + 1 ..]) else null;
         if (code == 404) return error.NotFound;
         if (code == 401 or code == 403) return error.Forbidden;
         if (code == 429 or code == 503) return error.RateLimited;
         if (range != null and code == 200) return error.RangeNotSupported;
-        if (code != (if (range != null) @as(u16, 206) else @as(u16, 200))) {
-            std.log.err("curl failed for {s}: {s}", .{ url, std.mem.trim(u8, result.stderr, "\n") });
+        // A transfer cut short exits non-zero (18, 56, ...) after the status
+        // line: the body is incomplete even when the status is right.
+        const exited_ok = switch (result.term) {
+            .exited => |c| c == 0,
+            else => false,
+        };
+        if (!exited_ok or code != (if (range != null) @as(u16, 206) else @as(u16, 200))) {
+            std.log.debug("curl failed for {s} (status {d}): {s}", .{ url, code, std.mem.trim(u8, result.stderr, "\n") });
             return error.HttpError;
         }
-        return self.gpa.dupe(u8, result.stdout[0..nl]);
+        return .{ .body = try self.gpa.dupe(u8, result.stdout[0..nl]), .total = total };
     }
 
     /// Downloads `url` to `dir/sub_path`, writing to `<sub_path>.part` first.
@@ -287,10 +378,11 @@ pub const Http = struct {
         while (true) {
             self.awaitCooldown();
             self.downloadOnce(dir, tmp_name, url) catch |err| {
-                if (budget_mod.interrupted()) return error.Interrupted;
                 if (retry.again(self, err, url)) continue;
+                if (budget_mod.interrupted()) return error.Interrupted;
                 return err;
             };
+            self.noteSuccess();
             break;
         }
         if (expected_size) |sz| {
@@ -383,7 +475,7 @@ pub const Http = struct {
                     401, 403 => error.Forbidden,
                     429, 503 => error.RateLimited,
                     else => {
-                        std.log.err("curl failed for {s}: {s}", .{ url, std.mem.trim(u8, result.stderr, "\n") });
+                        std.log.debug("curl failed for {s} (status {d}): {s}", .{ url, status, std.mem.trim(u8, result.stderr, "\n") });
                         return error.HttpError;
                     },
                 };

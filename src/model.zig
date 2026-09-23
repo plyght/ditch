@@ -712,6 +712,9 @@ pub const Model = struct {
     export_config_json: []const u8,
     /// Tensors dequantised on load (see dequant.zig); 0 for plain checkpoints.
     dequantised: usize,
+    /// Loaded name -> checkpoint name, for tensors renamed on load (DeepSeek
+    /// V4's own naming): exports write the checkpoint's names back.
+    export_names: std.StringHashMapUnmanaged([]const u8) = .empty,
     tokenizer_json: []const u8,
     generation_config_json: ?[]const u8,
     tokenizer_config_json: ?[]const u8,
@@ -845,6 +848,7 @@ pub const Model = struct {
         self.arena = std.heap.ArenaAllocator.init(gpa);
         errdefer self.arena.deinit();
         const arena = self.arena.allocator();
+        self.export_names = .empty;
 
         self.scratch_dir = try arena.dupe(u8, opts.scratch_dir orelse (if (opts.budget) |b| b.scratch_dir else "scratch"));
         // A GGUF file (or a directory holding one) is loaded through gguf_model.zig.
@@ -858,6 +862,8 @@ pub const Model = struct {
             return error.IncompleteModel;
         } else |_| {}
         self.dequantised = 0;
+        // `self.* = undefined` above drops field defaults; a GGUF has no special_tokens_map.json.
+        self.special_tokens_map_json = null;
         if (gguf_path) |p| {
             try gguf_model.attach(self, p, opts.store == .mapped, .{ .ignore_embedded = opts.gguf_ignore_embedded });
             self.export_config_json = self.config_json;
@@ -2051,7 +2057,7 @@ pub const Model = struct {
         // becomes one virtual bf16 tensor; anything left over is skipped.
         // DeepSeek V4 / V4.1 as released: DeepSeek's own tensor names.
         if (self.config.dsv4 != null) {
-            const renamed = try @import("deepseek_v4.zig").renameNative(self.files);
+            const renamed = try @import("deepseek_v4.zig").renameNative(self.files, arena, &self.export_names);
             if (renamed > 0) std.log.info("read {d} tensors under DeepSeek's own names", .{renamed});
         }
         const reg = try dequant.register(gpa, io, self.files, self.config.quant);

@@ -276,8 +276,10 @@ def load(model_dir, dtype=torch.float32):
 
     # A view of the directory without the lazy file: transformers loads the trunk.
     view = tempfile.mkdtemp(prefix="ref_trunk_")
+    # A cut's index names the lazy file; a sharded export (no lazy file) needs its index.
+    has_lazy = os.path.exists(os.path.join(model_dir, "model-lazy.safetensors"))
     for fn in os.listdir(model_dir):
-        if fn in ("model-lazy.safetensors", "lazy.json", "model.safetensors.index.json") or fn.startswith("."):
+        if fn in ("model-lazy.safetensors", "lazy.json") or (has_lazy and fn == "model.safetensors.index.json") or fn.startswith("."):
             continue
         if fn == "config.json":
             # Quantised weights (routed experts and trunk alike) are

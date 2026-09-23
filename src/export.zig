@@ -73,7 +73,7 @@ pub fn peakBytes(model: *const Model, export_dtype: ?tensor.DType) u64 {
         while (it.next()) |kv| {
             const info = kv.value_ptr.*;
             const out_dtype = if (!info.dtype.isFloat() and !info.dtype.isQuantized()) info.dtype else export_dtype orelse hfDtype(info.dtype);
-            const e = Entry{ .name = info.name, .info = info, .ref = model.store.refFor(fi, info), .out_dtype = out_dtype, .byte_len = info.numel() * out_dtype.size(), .edit = modifiedDelta(model, info.name) };
+            const e = Entry{ .name = model.export_names.get(info.name) orelse info.name, .info = info, .ref = model.store.refFor(fi, info), .out_dtype = out_dtype, .byte_len = info.numel() * out_dtype.size(), .edit = modifiedDelta(model, info.name) };
             const rows = rowsPerChunk(model, e);
             const cols = e.ref.cols;
             peak = @max(peak, @as(u64, rows) * (e.ref.dtype.rowBytes(cols) + 4 * cols + out_dtype.rowBytes(cols)));
@@ -171,6 +171,175 @@ fn copyIfExists(io: Io, src: Io.Dir, dst: Io.Dir, name: []const u8) void {
     src.copyFile(name, dst, name, io, .{}) catch {};
 }
 
+/// The files beside the weights that the export needs to load the way the
+/// source did: tokenizer and processor files, a tiktoken vocabulary (with the
+/// tokenizer.json synthesised from it), and every top-level `*.py`, which is
+/// the code a `trust_remote_code` config's `auto_map` names (configuration,
+/// modeling, tokenization) and the modules it imports. `src` must be opened
+/// with `.iterate = true`.
+fn copySideFiles(io: Io, src: Io.Dir, dst: Io.Dir, tiktoken: bool) void {
+    copyIfExists(io, src, dst, "special_tokens_map.json");
+    copyIfExists(io, src, dst, "chat_template.jinja");
+    copyIfExists(io, src, dst, "chat_template.json");
+    copyIfExists(io, src, dst, "added_tokens.json");
+    copyIfExists(io, src, dst, "preprocessor_config.json");
+    if (tiktoken) {
+        copyIfExists(io, src, dst, "tiktoken.model");
+        copyIfExists(io, src, dst, "tokenizer.model");
+    }
+    var it = src.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".py")) copyIfExists(io, src, dst, entry.name);
+    }
+}
+
+test "saveModel carries the remote code and names the export dtype" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "src");
+    var fixture = try Io.Dir.cwd().openDir(io, "tests/fixtures/qwen2", .{});
+    defer fixture.close(io);
+    var src = try tmp.dir.openDir(io, "src", .{});
+    defer src.close(io);
+    for ([_][]const u8{ "config.json", "generation_config.json", "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors", "model.safetensors.index.json", "tokenizer.json", "tokenizer_config.json" }) |name| {
+        try fixture.copyFile(name, src, name, io, .{});
+    }
+    for ([_][]const u8{ "modeling_kimi_k3.py", "configuration_kimi_k3.py", "tokenization_kimi.py", "media_utils.py", "chat_template.jinja" }) |name| {
+        try src.writeFile(io, .{ .sub_path = name, .data = name });
+    }
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path_buf);
+    const src_dir = try std.fs.path.join(gpa, &.{ path_buf[0..n], "src" });
+    defer gpa.free(src_dir);
+    const out_dir = try std.fs.path.join(gpa, &.{ path_buf[0..n], "out" });
+    defer gpa.free(out_dir);
+    const pool = tensor.Pool.init(io, 1);
+    const model = try Model.load(gpa, io, &pool, src_dir);
+    defer model.deinit();
+    var sink: Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try saveModel(gpa, io, model, out_dir, .{ .export_dtype = .f32 }, &sink.writer);
+    var out = try Io.Dir.cwd().openDir(io, out_dir, .{});
+    defer out.close(io);
+    // The config names the dtype the weights were written in.
+    const config = try out.readFileAlloc(io, "config.json", gpa, .limited(1 << 20));
+    defer gpa.free(config);
+    try std.testing.expect(std.mem.indexOf(u8, config, "\"torch_dtype\": \"float32\"") != null);
+    for ([_][]const u8{ "modeling_kimi_k3.py", "configuration_kimi_k3.py", "tokenization_kimi.py", "media_utils.py", "chat_template.jinja" }) |name| {
+        try out.access(io, name, .{});
+    }
+}
+
+/// `config.json` with every floating-point `dtype` / `torch_dtype` (top level
+/// and nested text / vision configs) naming `dtype`: transformers loads with
+/// `dtype="auto"` from it, so a float32 export that still said bfloat16 would
+/// be rounded back to bf16 on load.
+fn withConfigDtype(gpa: Allocator, json: []const u8, dtype: tensor.DType) ![]u8 {
+    const name: []const u8 = switch (dtype) {
+        .f32 => "float32",
+        .f16 => "float16",
+        .bf16 => "bfloat16",
+        else => return gpa.dupe(u8, json),
+    };
+    var out: Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    var i: usize = 0;
+    while (i < json.len) {
+        const at = std.mem.indexOfScalarPos(u8, json, i, '"') orelse break;
+        const key_end = stringEnd(json, at) orelse break;
+        const key = json[at + 1 .. key_end];
+        var j = key_end + 1;
+        while (j < json.len and std.ascii.isWhitespace(json[j])) : (j += 1) {}
+        if (j < json.len and json[j] == ':' and (std.mem.eql(u8, key, "dtype") or std.mem.eql(u8, key, "torch_dtype"))) {
+            j += 1;
+            while (j < json.len and std.ascii.isWhitespace(json[j])) : (j += 1) {}
+            if (j < json.len and json[j] == '"') {
+                const v_end = stringEnd(json, j) orelse break;
+                const value = json[j + 1 .. v_end];
+                for ([_][]const u8{ "float32", "float16", "bfloat16" }) |f| {
+                    if (std.mem.eql(u8, value, f)) {
+                        try out.writer.writeAll(json[i .. j + 1]);
+                        try out.writer.writeAll(name);
+                        try out.writer.writeByte('"');
+                        i = v_end + 1;
+                        break;
+                    }
+                } else {
+                    try out.writer.writeAll(json[i .. v_end + 1]);
+                    i = v_end + 1;
+                }
+                continue;
+            }
+        }
+        // Not a dtype key: copy through the string (a key or a value).
+        try out.writer.writeAll(json[i .. key_end + 1]);
+        i = key_end + 1;
+    }
+    try out.writer.writeAll(json[i..]);
+    return out.toOwnedSlice();
+}
+
+/// The index of the quote closing the JSON string that opens at `start`.
+fn stringEnd(json: []const u8, start: usize) ?usize {
+    var k = start + 1;
+    while (k < json.len) : (k += 1) switch (json[k]) {
+        '\\' => k += 1,
+        '"' => return k,
+        else => {},
+    };
+    return null;
+}
+
+test "saveModel writes DeepSeek V4's own tensor names back" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const pool = tensor.Pool.init(io, 1);
+    const model = try Model.load(gpa, io, &pool, "tests/fixtures/deepseek_v4_native");
+    defer model.deinit();
+    try std.testing.expect(model.export_names.count() > 0);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path_buf);
+    const out_dir = try std.fs.path.join(gpa, &.{ path_buf[0..n], "out" });
+    defer gpa.free(out_dir);
+    var sink: Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try saveModel(gpa, io, model, out_dir, .{}, &sink.writer);
+    // The export is in the checkpoint's own naming (the FP8 weights now bf16,
+    // without their scales), and loads back to the same model.
+    const reloaded = try Model.load(gpa, io, &pool, out_dir);
+    defer reloaded.deinit();
+    // Loading the export renamed it again: it was written in DeepSeek's names.
+    try std.testing.expectEqualStrings("embed.weight", reloaded.export_names.get("model.embed_tokens.weight").?);
+    try std.testing.expectEqual(model.export_names.count() > 0, reloaded.export_names.count() > 0);
+    const w0 = model.componentWeight(0, .attn_o_proj);
+    const w1 = reloaded.componentWeight(0, .attn_o_proj);
+    const r0 = try gpa.alloc(f32, w0.cols);
+    defer gpa.free(r0);
+    const r1 = try gpa.alloc(f32, w1.cols);
+    defer gpa.free(r1);
+    w0.row(1, r0);
+    w1.row(1, r1);
+    try std.testing.expectEqualSlices(f32, r0, r1);
+}
+
+test "withConfigDtype names the export dtype" {
+    const gpa = std.testing.allocator;
+    const json =
+        \\{"dtype": "bfloat16", "text_config": {"torch_dtype":"bfloat16", "model_type": "x"},
+        \\ "quantization_config": {"dtype": "int8"}, "name": "dtype", "note": "a \"dtype\": \"bfloat16\" in a string"}
+    ;
+    const got = try withConfigDtype(gpa, json, .f32);
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings(
+        \\{"dtype": "float32", "text_config": {"torch_dtype":"float32", "model_type": "x"},
+        \\ "quantization_config": {"dtype": "int8"}, "name": "dtype", "note": "a \"dtype\": \"bfloat16\" in a string"}
+    , got);
+}
+
 pub const SaveOptions = struct {
     max_shard_size: u64 = 5 * 1024 * 1024 * 1024,
     export_dtype: ?tensor.DType = null,
@@ -203,7 +372,7 @@ fn saveModelInner(gpa: Allocator, io: Io, model: *const Model, dir: Io.Dir, opts
             // Integer tables (DeepSeek V4's `tid2eid`) are never converted.
             const out_dtype = if (!info.dtype.isFloat() and !info.dtype.isQuantized()) info.dtype else opts.export_dtype orelse hfDtype(info.dtype);
             const byte_len = info.numel() * out_dtype.size();
-            try entries.append(gpa, .{ .name = info.name, .info = info, .ref = model.store.refFor(fi, info), .out_dtype = out_dtype, .byte_len = byte_len, .edit = modifiedDelta(model, info.name) });
+            try entries.append(gpa, .{ .name = model.export_names.get(info.name) orelse info.name, .info = info, .ref = model.store.refFor(fi, info), .out_dtype = out_dtype, .byte_len = byte_len, .edit = modifiedDelta(model, info.name) });
             total += byte_len;
         }
     }
@@ -251,30 +420,18 @@ fn saveModelInner(gpa: Allocator, io: Io, model: *const Model, dir: Io.Dir, opts
     }
 
     // Config and tokenizer files.
-    try dir.writeFile(io, .{ .sub_path = "config.json", .data = model.export_config_json });
+    if (opts.export_dtype) |dt| {
+        const config = try withConfigDtype(gpa, model.export_config_json, dt);
+        defer gpa.free(config);
+        try dir.writeFile(io, .{ .sub_path = "config.json", .data = config });
+    } else try dir.writeFile(io, .{ .sub_path = "config.json", .data = model.export_config_json });
     try dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = model.tokenizer_json });
     if (model.generation_config_json) |g| try dir.writeFile(io, .{ .sub_path = "generation_config.json", .data = g });
     if (model.tokenizer_config_json) |t| try dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = t });
-    var src = cwd.openDir(io, model.source_dir, .{}) catch null;
+    var src = cwd.openDir(io, model.source_dir, .{ .iterate = true }) catch null;
     if (src) |*s| {
         defer s.close(io);
-        copyIfExists(io, s.*, dir, "special_tokens_map.json");
-        copyIfExists(io, s.*, dir, "chat_template.jinja");
-        copyIfExists(io, s.*, dir, "chat_template.json");
-        copyIfExists(io, s.*, dir, "added_tokens.json");
-        copyIfExists(io, s.*, dir, "preprocessor_config.json");
-        // A tiktoken vocabulary (and the tokenizer code that reads it) travels with the
-        // tokenizer.json synthesised from it, so the export loads either way.
-        if (model.tokenizer.tiktoken_kind != null) {
-            copyIfExists(io, s.*, dir, "tiktoken.model");
-            copyIfExists(io, s.*, dir, "tokenizer.model");
-            var it = s.iterate();
-            while (it.next(io) catch null) |entry| {
-                if (entry.kind == .file and std.mem.startsWith(u8, entry.name, "tokenization_") and std.mem.endsWith(u8, entry.name, ".py")) {
-                    copyIfExists(io, s.*, dir, entry.name);
-                }
-            }
-        }
+        copySideFiles(io, s.*, dir, model.tokenizer.tiktoken_kind != null);
     }
     if (opts.readme_body) |body| try dir.writeFile(io, .{ .sub_path = "README.md", .data = body });
 }

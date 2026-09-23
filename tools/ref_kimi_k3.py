@@ -38,6 +38,13 @@ from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lazy_checkpoint import LazyCheckpoint  # noqa: E402
+# ref_lazy_moe hides fla unless it is already imported; the release's modeling
+# file imports it at load (its entry points are replaced below), so import it
+# first (a factory that only borrows helpers from here may have hidden it already).
+try:
+    import fla  # noqa: E402,F401
+except ImportError:
+    pass
 from ref_lazy_moe import dequant_expert  # noqa: E402
 
 PREFIX = "language_model."
