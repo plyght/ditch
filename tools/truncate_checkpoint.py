@@ -14,8 +14,9 @@ cut small enough for the disk. Each kept layer still runs on its real weights
 and on the real output of the layer before it in the cut, which is all a
 layer-by-layer comparison needs.
 
-config.json gets num_hidden_layers = the kept count and every per-layer list
-cut to the kept layers (layer_types, mlp_layer_types, compress_ratios, ...);
+config.json gets num_hidden_layers = the kept count, every per-layer list
+cut to the kept layers (layer_types, mlp_layer_types, compress_ratios, ...) and
+first_k_dense_replace recounted over them;
 per-layer *id* lists (kv_source_layer_ids, index_source_layer_ids,
 engram_layer_ids, candidate_source_layer_id) keep the kept ids, renumbered,
 and a list paired with one of them (engram_num_embeddings) keeps the matching
@@ -74,7 +75,7 @@ for f in files:
 cfg = json.load(open(f"{out}/config.json"))
 tc = cfg.get('text_config', cfg)
 tc['num_hidden_layers'] = N
-for key in ('layer_types', 'mlp_layer_types', 'num_attention_heads_per_layer', 'compress_ratios'):
+for key in ('layer_types', 'mlp_layer_types', 'num_attention_heads_per_layer', 'compress_ratios', 'is_moe_layer', 'sliding_windows'):
     if isinstance(tc.get(key), list): tc[key] = [tc[key][j] for j in layers]
 paired = {'engram_layer_ids': ['engram_num_embeddings']}
 for key in ('kv_source_layer_ids', 'index_source_layer_ids', 'engram_layer_ids', 'dspark_target_layer_ids'):
@@ -89,6 +90,10 @@ if isinstance(lac, dict):
     for key in ('kda_layers', 'full_attn_layers'):
         if isinstance(lac.get(key), list):
             lac[key] = [new_id[x - 1] + 1 for x in lac[key] if x - 1 in new_id]
+# The dense-prefix count, for a cut that skips layers: the kept layers that
+# were dense (DeepSeek V3.2 --layers 0,3 keeps one dense layer, not three).
+if isinstance(tc.get('first_k_dense_replace'), int):
+    tc['first_k_dense_replace'] = sum(1 for j in layers if j < tc['first_k_dense_replace'])
 if 'candidate_source_layer_id' in tc:
     tc['candidate_source_layer_id'] = new_id.get(tc['candidate_source_layer_id'], -1)
 if any(d.startswith('mtp') for d in drop):
