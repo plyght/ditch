@@ -10,6 +10,7 @@ const Io = std.Io;
 const tensor = @import("tensor.zig");
 const remote = @import("remote.zig");
 const dequant = @import("dequant.zig");
+const compute = @import("compute.zig");
 const DType = tensor.DType;
 
 pub const TensorInfo = struct {
@@ -406,6 +407,9 @@ pub const File = struct {
     }
 
     pub fn close(self: *File, gpa: std.mem.Allocator, io: Io) void {
+        // A GPU may hold tiles keyed by addresses inside this mapping (and
+        // the decoded tensors), which the next mapping can reuse.
+        if (self.map != null) compute.forgetWeights();
         for (self.dequants.items) |dq| dq.deinit(self.gpa);
         if (self.map) |*m| m.destroy(io);
         switch (self.source) {

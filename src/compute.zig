@@ -89,6 +89,9 @@ pub const RopeStyle = enum(u32) { neox = 0, gptj = 1 };
 /// `error.Unsupported` for a shape or dtype it cannot take.
 pub const VTable = struct {
     deinit: ?*const fn (ctx: *anyopaque) void = null,
+    /// Drops every weight tile the backend keeps resident (see
+    /// `forgetWeights`).
+    forgetWeights: ?*const fn (ctx: *anyopaque) void = null,
 
     /// `out[n][w.rows] = x[n][w.cols] @ W^T`.
     matmulT: ?*const fn (ctx: *anyopaque, out: []f32, x: []const f32, n: usize, w: Weight) Error!void = null,
@@ -314,6 +317,13 @@ pub fn selectInto(gpa: Allocator, kind: Kind, opts: SelectOptions) !?[]const u8 
     const r = try select(gpa, kind, opts);
     active = r.device;
     return r.note;
+}
+
+/// Called when weights are unmapped (a model or file is closed): the host
+/// addresses the residency cache is keyed by may be handed out again, for
+/// other weights, by the next mapping.
+pub fn forgetWeights() void {
+    if (active.ctx) |c| if (active.vtable.forgetWeights) |f| f(c);
 }
 
 pub fn shutdown() void {
@@ -562,7 +572,11 @@ pub fn softcap(x: []f32, cap: f32) void {
 ///
 /// Keying by host address is only sound while those addresses stay valid and
 /// unique, i.e. in memory-mapped mode; `enabled` is false otherwise (see
-/// `weights_stable`).
+/// `weights_stable`). Closing a mapped file calls `forgetWeights`, which
+/// clears the cache, because the next mapping may reuse the addresses; and
+/// every entry also records a signature of sampled bytes of the tile, so a
+/// tile whose contents changed under the same address is a miss, never stale
+/// weights.
 pub const Residency = struct {
     budget: u64,
     used: u64 = 0,
@@ -578,6 +592,7 @@ pub const Residency = struct {
     pub const Entry = struct {
         addr: usize,
         len: usize,
+        sig: u64,
         bytes: u64,
         handle: *anyopaque,
         used_at: u64,
@@ -597,12 +612,34 @@ pub const Residency = struct {
         return self.budget > 0 and weights_stable;
     }
 
-    /// The cached buffer for `data`, marked as just used.
+    /// A hash of up to four 64-byte samples of `data` (start, two interior
+    /// points, end): cheap next to the product the tile is used for, and
+    /// different for different weights at the same address in practice.
+    pub fn signature(data: []const u8) u64 {
+        var h = std.hash.Wyhash.init(data.len);
+        const k = 64;
+        if (data.len <= 4 * k) {
+            h.update(data);
+        } else {
+            for ([_]usize{ 0, data.len / 3, 2 * (data.len / 3), data.len - k }) |at| h.update(data[at..][0..k]);
+        }
+        return h.final();
+    }
+
+    /// The cached buffer for `data`, marked as just used. An entry at the
+    /// same address whose contents no longer match is released: a miss.
     pub fn get(self: *Residency, data: []const u8) ?*anyopaque {
         if (!self.enabled()) return null;
         const addr = @intFromPtr(data.ptr);
-        for (self.entries.items) |*e| {
+        for (self.entries.items, 0..) |*e, i| {
             if (e.addr == addr and e.len == data.len) {
+                if (e.sig != signature(data)) {
+                    const stale = self.entries.swapRemove(i);
+                    self.used -= @min(self.used, stale.bytes);
+                    self.evictions += 1;
+                    self.release(self.release_ctx, stale.handle);
+                    break;
+                }
                 self.clock += 1;
                 e.used_at = self.clock;
                 self.hits += 1;
@@ -611,6 +648,13 @@ pub const Residency = struct {
         }
         self.misses += 1;
         return null;
+    }
+
+    /// Releases every entry (the budget stays).
+    pub fn clear(self: *Residency) void {
+        for (self.entries.items) |e| self.release(self.release_ctx, e.handle);
+        self.entries.clearRetainingCapacity();
+        self.used = 0;
     }
 
     /// Inserts `handle` for `data`, evicting least recently used entries first.
@@ -625,6 +669,7 @@ pub const Residency = struct {
         self.entries.append(self.gpa, .{
             .addr = @intFromPtr(data.ptr),
             .len = data.len,
+            .sig = signature(data),
             .bytes = bytes,
             .handle = handle,
             .used_at = self.clock,
@@ -822,6 +867,20 @@ test "residency keeps hot tiles and evicts the least recently used" {
     try testing.expect(res.get(c) != null);
     // An entry bigger than the whole budget is refused outright.
     try testing.expect(!res.put(b, 1000, &handles[1]));
+
+    // New contents at a cached address: a miss, and the stale buffer is
+    // released rather than handed back.
+    const released_before = fake.released;
+    storage[0][10] +%= 1;
+    try testing.expect(res.get(a) == null);
+    try testing.expectEqual(released_before + 1, fake.released);
+    try testing.expect(res.put(a, 100, &handles[0]));
+    try testing.expect(res.get(a) != null);
+
+    // Forgetting (a mapped file was closed) releases everything.
+    res.clear();
+    try testing.expect(res.get(a) == null and res.get(c) == null);
+    try testing.expectEqual(@as(u64, 0), res.used);
 
     // Without stable host weights nothing is cached at all.
     weights_stable = false;

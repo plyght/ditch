@@ -6,6 +6,7 @@
 const std = @import("std");
 const Io = std.Io;
 const tensor = @import("tensor.zig");
+const compute = @import("compute.zig");
 const DType = tensor.DType;
 
 const Allocator = std.mem.Allocator;
@@ -444,6 +445,8 @@ pub const File = struct {
     }
 
     pub fn close(self: *File, gpa: Allocator, io: Io) void {
+        // See safetensors.File.close: resident GPU tiles may point into this mapping.
+        if (self.map != null) compute.forgetWeights();
         if (self.map) |*m| m.destroy(io);
         self.file.close(io);
         self.arena.deinit();

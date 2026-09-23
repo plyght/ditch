@@ -445,8 +445,16 @@ fn deinit(ctx: *anyopaque) void {
     gpa.destroy(self);
 }
 
+fn forgetWeights(ctx: *anyopaque) void {
+    const self: *Backend = @ptrCast(@alignCast(ctx));
+    self.lock.lockUncancelable(self.io);
+    defer self.lock.unlock(self.io);
+    self.residency.clear();
+}
+
 const vtable = compute.VTable{
     .deinit = deinit,
+    .forgetWeights = forgetWeights,
     .matmulT = matmulT,
     .matvecTMulti = matvecTMulti,
     .rowNorms = rowNorms,
