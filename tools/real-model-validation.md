@@ -2921,3 +2921,13 @@ the block size from the config.
 bf16 (dequant.zig, as the Hugging Face integrations do when they dequantise
 to bf16), so against a float32 dequantisation layer 0 moves by 5.5e-04. The
 view rounds to bf16 as well, so the comparison measures the rest.
+
+**Result**, with the view's blocks taken from `weight_block_size`:
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (15) | all 3 agree, worst 1.51e-07 | 3.70e-07 | match |
+| "Explain how rainbows form, …" | match (20) | all 3 agree, worst 1.93e-07 | 3.69e-07 | match |
+
+(`tools/ref_lazy_moe.py` already takes the experts' block size from the config
+and rounds them to bf16, so the lazy experts were not affected.)
