@@ -300,7 +300,7 @@ pub const Settings = struct {
 /// headings in bold on a terminal.
 pub const HelpSection = struct { title: []const u8, body: []const u8 };
 
-pub const tagline = "ditch censorship: fully automatic refusal removal for open-weight language models, on a CPU.";
+pub const tagline = "Fully automatic refusal removal for open-weight language models, on a CPU.";
 pub const issues_url = "https://github.com/plyght/ditch/issues";
 
 pub const usage_text =
@@ -582,7 +582,7 @@ pub fn writeHelp(w: *std.Io.Writer, bold: bool) !void {
 
 /// The short help printed when ditch is run without arguments.
 pub fn writeConciseHelp(w: *std.Io.Writer, bold: bool) !void {
-    try w.print("ditch {s}: {s}\n\n", .{ version, tagline });
+    try w.print("ditch {s}: {c}{s}\n\n", .{ version, std.ascii.toLower(tagline[0]), tagline[1..] });
     try writeHeading(w, "Usage", bold);
     try w.writeAll(usage_text);
     try w.writeAll("\n");
