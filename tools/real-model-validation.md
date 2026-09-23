@@ -2730,3 +2730,20 @@ writes the release's spelling; before the fix its test fails (logits off by
 | --- | :---: | :---: | ---: | :---: |
 | "The capital of France is" | match (22) | all 3 agree, worst 1.23e-06 | 8.29e-07 | match |
 | "Explain how rainbows form, …" | match (26) | all 3 agree, worst 1.27e-06 | 6.65e-07 | match |
+
+## Qwen3.5-35B-A3B (`qwen3_5_moe`): verified
+
+`Qwen/Qwen3.5-35B-A3B`, first 4 layers (three gated DeltaNet layers, then
+gated full attention; every layer the MoE with a gated shared expert). This
+release stores each layer's experts as two stacked tensors, so they cannot be
+made lazy, and the 4-layer cut with the vision tower is 9.7 GB (19 GB in
+float32). It was rewritten as a text-only checkpoint
+(`Qwen3_5MoeForCausalLM`, `model.language_model.` → `model.`, vision tower and
+MTP dropped) keeping experts 0-63 of 256 with the matching router rows and
+`num_experts: 64`, as for Mellum: both sides run the same smaller model, with
+real weights in every tensor.
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (26) | all 5 agree, worst 5.19e-07 | 7.34e-07 | match |
+| "Explain how rainbows form, …" | match (32) | all 5 agree, worst 3.84e-07 | 6.78e-07 | match |
