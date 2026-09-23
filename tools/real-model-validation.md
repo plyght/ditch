@@ -4362,3 +4362,38 @@ template has no such branch: its generation prompt is the model turn alone.
 contain the empty thought block's literal; tests cover both detections and the
 render. The trial above was calibrated with the old prompt, which changes its
 directions, not the arithmetic this section checks.
+
+## Abliteration: Mistral Small 4 (`mistral4`), FP8 MLA + MoE
+
+`mistralai/Mistral-Small-4-119B-2603`, first 2 layers, the first 8 of its 128
+routed experts (`tools/truncate_checkpoint.py --experts 8`, new: per-expert
+tensors of the others left out, the stacked expert tensors, the router and its
+bias cut to their first 8 rows, the config's expert count and top-k
+following). FP8 with a scale per tensor and, for the stacked experts, per
+expert (`[E, 1, 1]`).
+
+* **Edited set:** `self_attn.o_proj` (MLA's output projection), the stacked
+  `mlp.experts.down_proj` (all 8) and `mlp.shared_experts.down_proj`, in both
+  layers; the MLA projections, `gate_up_proj`, the router and the norms
+  untouched.
+* **Arithmetic, f32 export:** every matrix within 1.0e-06 of the rank-3
+  optimum, on the FP8 values dequantised with their per-tensor / per-expert
+  scales (and rounded to bf16, as ditch does on load).
+* **bf16 export:** 99.89-99.92% of the elements bit-equal to `bf16(W + D₃)`,
+  the rest rounding ties; reload validation 0.017 (bf16) and 0.0000 (f32).
+* **Export:** transformers on the f32 export against `ditch probe` on it:
+  residuals within 5.6e-07, logits 1.5e-06, ids equal after bug 70.
+
+### Bug 70 — Mistral Small 4 was prompted without its model-settings block (fixed)
+
+**Symptom.** transformers' ids on the export had 13 more tokens:
+`[MODEL_SETTINGS]{"reasoning_effort": "none"}[/MODEL_SETTINGS]` before the
+first `[INST]`.
+
+**Cause.** Mistral Small 4's template emits the model settings (with
+`reasoning_effort` defaulting to `"none"`) once, before the first user
+message; ditch rendered it as the plain `mistral_v7` format.
+
+**Fix.** A `mistral_v7_settings` template, detected by `[MODEL_SETTINGS]` in
+the release's template; its render is checked against transformers' own for a
+four-message conversation.
