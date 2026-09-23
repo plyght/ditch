@@ -2931,3 +2931,20 @@ view rounds to bf16 as well, so the comparison measures the rest.
 
 (`tools/ref_lazy_moe.py` already takes the experts' block size from the config
 and rounds them to bf16, so the lazy experts were not affected.)
+## Qwen3.8-Flash-Next (`qwen4_exp`): verified on real weights
+
+`Qwen/Qwen3.8-Flash-Next`, first 4 layers: three Gated DeltaNet layers and one
+full-attention layer with the QSA indexer, 4 hyper-connection streams (hidden
+2560), every layer a 512-expert MoE with a shared expert, and the per-layer
+n-gram embedding (PLE) of layer 1: 128 shards of `[2500012, 160]`, 102 GB.
+Reference: transformers' `qwen4_exp` through `tools/ref_lazy_moe.py`, with the
+routed experts read one slab at a time and the n-gram table one row at a time
+(`LazyRows` in place of the concatenated `nn.Embedding`; 5 MB of it read over
+both prompts). `tools/probe_reference.py` now takes Qwen4-Exp's
+`attn_hyper_connection` collapse as each layer's residual and its
+`hyper_connection_mixer` as the final one (the model has no final norm).
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (5) | all 5 agree, worst 3.69e-06 | 7.17e-07 | match |
+| "Explain how rainbows form, …" | match (15) | all 5 agree, worst 1.66e-05 | 2.58e-06 | match |

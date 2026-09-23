@@ -58,7 +58,7 @@ def find_final_norm(model):
     for name, mod in model.named_modules():
         if any(part in "." + name + "." for part in LAYER_PARTS):
             continue
-        if "hc_head" in name:  # the hyper-connection head's own norm reads the streams
+        if "hc_head" in name or "hyper_connection_mixer" in name:  # the hyper-connection head's own norm reads the streams
             continue
         if "attn_res" in name:  # Attention Residual's scoring norm (Kimi K3), never called as a module
             continue
@@ -100,6 +100,9 @@ def install_remote_code_shims():
         DynamicCache.to_legacy_cache = lambda self: tuple((l.keys, l.values) for l in self.layers)
 
 
+PER_LAYER = False
+
+
 def compare_residuals(entry, out, pre_norm, tolerance, collapsed=None):
     """Compares ditch's per-layer residuals with transformers' hidden states.
 
@@ -133,6 +136,8 @@ def compare_residuals(entry, out, pre_norm, tolerance, collapsed=None):
         # Relative to the layer's own magnitude, so a bf16 reference (which a
         # model too big for a float32 one needs) is judged on the same scale.
         rel = float(np.abs(a - b).max()) / scale
+        if PER_LAYER:
+            print(f"    layer {i}: {rel:.2e}")
         if rel > worst:
             worst, worst_layer = rel, i
         if first_bad is None and rel > tolerance:
@@ -160,10 +165,13 @@ def main():
     ap.add_argument("--raw", action="store_true",
                     help="the probe was run with --raw: no chat template and no BOS")
     ap.add_argument("--factory", help="Python file whose load(model_dir, dtype) returns the reference model")
+    ap.add_argument("--per-layer", action="store_true", help="print every layer's relative residual difference")
     ap.add_argument("--residual-tolerance", type=float, default=1e-3,
                     help="max |difference| of a per-layer residual, relative to that layer's own"
                          " magnitude, before it counts as a mismatch")
     args = ap.parse_args()
+    global PER_LAYER
+    PER_LAYER = args.per_layer
 
     probe = json.load(open(args.probe_json))
     trc = args.trust_remote_code
@@ -190,11 +198,17 @@ def main():
     final_norm = find_final_norm(model)
     if final_norm is not None:
         final_norm.register_forward_pre_hook(lambda mod, inp: captured.__setitem__("pre_norm", inp[0]))
-    # Hyper-connection sites: `layers.N.attn_hc` returns (post, comb, collapsed).
-    hc_sites = [(int(n.split(".layers.")[-1].split(".")[0]), m) for n, m in model.named_modules()
-                if n.endswith(".attn_hc") and ".layers." in n]
-    for li, m in hc_sites:
-        m.register_forward_hook(lambda mod, inp, outp, li=li: captured.setdefault("hc", {}).__setitem__(li, outp[2]))
+    # Hyper-connection sites: `layers.N.attn_hc` returns (post, comb, collapsed);
+    # Qwen4-Exp's `layers.N.attn_hyper_connection` returns (collapsed, streams, weights).
+    hc_out = {".attn_hc": 2, ".attn_hyper_connection": 0}
+    hc_sites = [(int(n.split(".layers.")[-1].split(".")[0]), m, i) for n, m in model.named_modules()
+                for suffix, i in hc_out.items() if n.endswith(suffix) and ".layers." in n and "mtp" not in n]
+    for li, m, i in hc_sites:
+        m.register_forward_hook(lambda mod, inp, outp, li=li, i=i: captured.setdefault("hc", {}).__setitem__(li, outp[i]))
+    # Qwen4-Exp has no final norm: its hyper-connection mixer's collapse is what the LM head reads.
+    mixers = [m for n, m in model.named_modules() if n.endswith("hyper_connection_mixer") and "mtp" not in n]
+    if mixers:
+        mixers[-1].register_forward_hook(lambda mod, inp, outp: captured.__setitem__("pre_norm", outp))
     for entry in probe["prompts"]:
         messages = [{"role": "system", "content": args.system_prompt}, {"role": "user", "content": entry["user"]}]
         if args.raw:
