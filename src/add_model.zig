@@ -36,6 +36,7 @@ const tensor = @import("tensor.zig");
 const model_mod = @import("model.zig");
 const verify = @import("verify.zig");
 const gguf = @import("gguf.zig");
+const dequant = @import("dequant.zig");
 const gguf_model = @import("gguf_model.zig");
 
 const Allocator = std.mem.Allocator;
@@ -1330,6 +1331,18 @@ fn writeDraft(ctx: Ctx, ck: *const Checkpoint, own_type: []const u8, t: Trial, k
     } else {
         try w.print("-- No match: the closest family, `{s}`, does not load this checkpoint:\n--   {s}\n", .{ f.model_type, t.why });
     }
+    try writeTargets(a, w, ck, t.used);
+    if (ck.file("config.json")) |cfg_text| {
+        if (std.json.parseFromSliceLeaky(std.json.Value, a, try arch.sanitizeJson(a, cfg_text), .{})) |v| {
+            if (v == .object) {
+                const qc = if (v.object.get("quantization_config")) |q| (if (q == .object) q.object else null) else null;
+                if (dequant.parseQuantConfig(qc)) |q| {
+                    if (q.method != .none) try w.print("-- Weights: {s}, dequantised on load.\n", .{q.label});
+                } else |_| try w.writeAll("-- Weights: a quantization_config ditch cannot decode (see the error of a run).\n");
+            }
+        } else |_| {}
+    }
+    if (f.llama_cpp) |l| try w.print("-- GGUF export writes llama.cpp architecture `{s}` (from the base).\n", .{l});
     try w.writeAll("return {\n");
     try w.print("  model_type = \"{s}\",\n", .{own_type});
     try w.print("  base = \"{s}\",", .{f.model_type});
@@ -1391,6 +1404,52 @@ fn writeDraft(ctx: Ctx, ck: *const Checkpoint, own_type: []const u8, t: Trial, k
         try w.writeAll("\n");
     }
     return out.written();
+}
+
+/// Which matrices abliteration edits in this checkpoint: the ones that
+/// write into the residual stream, as the family names them (docs/models.md,
+/// "What abliteration edits"), those the checkpoint has.
+fn writeTargets(a: Allocator, w: *std.Io.Writer, ck: *const Checkpoint, f: *const Arch) !void {
+    const names = &f.names;
+    const prefix = try modelPrefix(a, ck, names);
+    const Slot = struct { component: []const u8, template: ?[]const u8, expert: bool = false };
+    var ssm_out: ?[]const u8 = null;
+    if (names.ssm) |p| ssm_out = try std.fmt.allocPrint(a, "{s}out_proj.weight", .{p});
+    var shared_down: ?[]const u8 = null;
+    if (names.shared_expert) |p| shared_down = try std.fmt.allocPrint(a, "{s}{s}", .{ p, names.shared_down orelse names.expert_down });
+    const slots = [_]Slot{
+        .{ .component = "attn.o_proj", .template = names.o },
+        .{ .component = "attn.o_proj", .template = names.lin_out },
+        .{ .component = "attn.o_proj", .template = names.light_out },
+        .{ .component = "attn.o_proj", .template = names.conv_out },
+        .{ .component = "attn.o_proj", .template = ssm_out },
+        .{ .component = "mlp.down_proj", .template = names.down },
+        .{ .component = "mlp.down_proj", .template = names.expert_down, .expert = true },
+        .{ .component = "mlp.down_proj", .template = shared_down },
+        .{ .component = "mlp.down_proj", .template = names.latent_up },
+    };
+    var found: std.ArrayList([]const u8) = .empty;
+    for (slots) |slot| {
+        const t = slot.template orelse continue;
+        var layers: usize = 0;
+        var i: usize = 0;
+        while (i < 1024) : (i += 1) {
+            const lp = try expand(a, names.layer, prefix, i, null);
+            const ep = if (slot.expert) try expand(a, names.expert, prefix, i, 0) else "";
+            const full = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ lp, ep, t });
+            var here = ck.find(full) != null;
+            // Stacked experts: one fused tensor per layer.
+            if (slot.expert and !here) for (names.fused_down) |fd| {
+                if (ck.find(try std.fmt.allocPrint(a, "{s}{s}", .{ lp, fd })) != null) here = true;
+            };
+            if (here) layers += 1;
+            if (i > 8 and layers == 0) break;
+        }
+        if (layers > 0) try found.append(a, try std.fmt.allocPrint(a, "{s}{s} ({s}, {d} layer{s})", .{ if (slot.expert) names.expert else "", t, slot.component, layers, if (layers == 1) "" else "s" }));
+    }
+    if (found.items.len == 0) return;
+    try w.writeAll("-- Abliteration edits the matrices that write into the residual stream:\n");
+    for (found.items) |x| try w.print("--   {s}\n", .{x});
 }
 
 /// The building block a tensor name fills in another family, if any: the
