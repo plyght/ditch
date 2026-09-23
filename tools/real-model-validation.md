@@ -4963,6 +4963,27 @@ for float32.
   prompt (64 chat tokens through the DeltaNet recurrence; the forward check's
   2-token prompt gave 2.7e-07), not to the edit.
 
+## Abliteration: MiniMax M3 (`minimax_m3_vl`), block-sparse attention with per-expert tensors
+
+`MiniMaxAI/MiniMax-M3`, layers 0 and 3 (dense with full attention, then the
+first MoE layer with the block-sparse attention and its index heads), the
+first 8 of 128 experts (`--experts 8`), no MTP (`--drop mtp.`); bf16 export
+(a float32 one fits on the disk but not, as a float32 reference, in memory).
+
+* **Edited set:** `self_attn.o_proj` in both layers, layer 0's dense
+  `mlp.down_proj`, every routed expert's `w2` and `shared_experts.down_proj`.
+  `w1`/`w3`, the router and its bias, the index heads and the q/k norms are
+  untouched.
+* **Maths (bf16 export):** 99.95% or more of the elements bit-equal to
+  `bf16(W + D₃)` in every matrix, the error against the exact edit at most
+  4.7e-07 over that rounded floor. Reload check 0.0121.
+* **Export:** transformers' `minimax_m3_vl` (`tools/ref_plain.py`,
+  `REF_F32_ARITH=1`) on the export against `ditch probe`: residuals within
+  3.1e-07, logits 4.8e-07 of range, argmax and top-5 equal. The export holds
+  exactly the cut's 98 tensors; transformers reports the vision encoder's
+  layers 2-31 missing because `truncate_checkpoint.py` cuts the encoder's
+  `layers.N` with the decoder's, which a text-only comparison never reads.
+
 ## Exact ranges for scattered experts: gpt-oss-20b with a cache below its experts
 
 After the account of gpt-oss-120b's decode above (whole 8 MB chunks per
