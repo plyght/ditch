@@ -543,6 +543,11 @@ Python with transformers is available, and a two-trial abliteration.
 For a checkpoint that is an existing family under a new model_type name,
 the draft is two lines, `model_type` and `base`, and needs no edit.
 
+A GGUF file is described rather than drafted: ditch reads GGUF tensors
+through a fixed mapping of llama.cpp names for the families listed under
+[GGUF per family](#gguf-per-family), so add-model says which family reads
+the file, or that the model's safetensors release is the one to add.
+
 ### Family fields
 
 Every field is optional except `model_type`. Enumerations are strings.

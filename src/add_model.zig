@@ -35,6 +35,8 @@ const safetensors = @import("safetensors.zig");
 const tensor = @import("tensor.zig");
 const model_mod = @import("model.zig");
 const verify = @import("verify.zig");
+const gguf = @import("gguf.zig");
+const gguf_model = @import("gguf_model.zig");
 
 const Allocator = std.mem.Allocator;
 const Arch = arch.Arch;
@@ -1001,10 +1003,7 @@ pub fn run(ctx: Ctx) !u8 {
         try out.writeAll("Usage: ditch add-model MODEL [--models-dir DIR] [--force] [--dry-run]\n\nMODEL is a Hub id (owner/name), hf://owner/name, an http(s) URL of the model files or a local directory.\n");
         return 2;
     }
-    if (std.mem.endsWith(u8, model, ".gguf")) {
-        std.log.err("add-model reads safetensors checkpoints: a GGUF file is loaded through ditch's GGUF path, which knows its architectures by name (see docs/models.md, GGUF per family)", .{});
-        return 2;
-    }
+    if (try gguf_model.locate(io, a, model)) |path| return describeGguf(ctx, path);
 
     // 1. Read.
     const ck = if (hf.isLocalDir(io, model)) try readLocal(ctx, model) else try readRemote(ctx, model, out);
@@ -1222,6 +1221,28 @@ fn absentTemplates(a: Allocator, ck: *const Checkpoint, f: *const Arch, c: *cons
         }
     }
     return absent;
+}
+
+/// A GGUF file needs no definition, or cannot use one: ditch reads GGUF
+/// tensors through a fixed mapping of llama.cpp names for a few families
+/// (gguf_model.zig). Says which case this file is.
+fn describeGguf(ctx: Ctx, path: []const u8) !u8 {
+    const out = ctx.out;
+    const f = try gguf.File.openOptions(ctx.gpa, ctx.io, Io.Dir.cwd(), path, .{ .map = false });
+    defer f.close(ctx.gpa, ctx.io);
+    const name = if (f.get("general.architecture")) |v| v.asString() orelse "?" else "?";
+    var has_experts = false;
+    var it = f.tensors.iterator();
+    while (it.next()) |kv| if (std.mem.indexOf(u8, kv.key_ptr.*, "_exps") != null) {
+        has_experts = true;
+    };
+    try out.print("* GGUF file {s}: llama.cpp architecture {s}, {d} tensors\n", .{ path, name, f.tensors.count() });
+    if (gguf_model.archFromGguf(name, has_experts)) |fam| {
+        try out.print("ditch reads this file as its {s} family; no definition is needed.\n", .{fam.model_type});
+        return 0;
+    }
+    try out.print("ditch reads GGUF tensors through a fixed mapping of llama.cpp names, for the families {s}; a Lua definition cannot extend it. Run ditch add-model on the model's Hugging Face (safetensors) release instead, and use that, or a GGUF of a supported family.\n", .{try std.mem.join(ctx.arena, ", ", &gguf_model.gguf_families)});
+    return 1;
 }
 
 fn countText(names: []const []const u8) usize {

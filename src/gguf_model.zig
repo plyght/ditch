@@ -111,7 +111,7 @@ pub fn locate(io: Io, arena: Allocator, path: []const u8) !?[]const u8 {
 
 /// The families whose tensors the GGUF reader and writer map (llama-style
 /// Hugging Face names; the registry's other families have no GGUF path).
-const gguf_families = [_][]const u8{ "llama", "mistral", "mixtral", "qwen2", "qwen3", "gemma2", "gemma3", "qwen2_moe", "qwen3_moe" };
+pub const gguf_families = [_][]const u8{ "llama", "mistral", "mixtral", "qwen2", "qwen3", "gemma2", "gemma3", "qwen2_moe", "qwen3_moe" };
 
 pub fn ggufSupported(a: *const arch.Arch) bool {
     for (gguf_families) |f| if (std.mem.eql(u8, a.model_type, f)) return true;
@@ -119,7 +119,7 @@ pub fn ggufSupported(a: *const arch.Arch) bool {
 }
 
 /// The registry entry for a `general.architecture` name (`llama` with experts is Mixtral).
-fn archFromGguf(name: []const u8, has_experts: bool) ?*const arch.Arch {
+pub fn archFromGguf(name: []const u8, has_experts: bool) ?*const arch.Arch {
     if (std.mem.eql(u8, name, "llama")) return arch.lookup(if (has_experts) "mixtral" else "llama");
     for (gguf_families) |f| {
         const a = arch.lookup(f) orelse continue;
