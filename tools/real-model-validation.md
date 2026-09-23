@@ -3564,3 +3564,22 @@ weighted `hc_head`. A unit test checks the small terms a long f32 sum drops.
 
 GLM-5.3-Flash now agrees to 1e-06 like every other family. DeepSeek V4's
 1.2e-05 (the other mHC family, above) likely had the same cause; not re-cut.
+
+## Short study on Llama-3.2-1B-Instruct (after bug 61)
+
+`unsloth/Llama-3.2-1B-Instruct`, whole model, prompted in its dated
+`llama32` template: 6 trials (4 random), `--max-response-length 40`.
+
+| Model | family | Baseline Refusals | Best trial | Best KL |
+| --- | --- | ---: | ---: | ---: |
+| unsloth/Llama-3.2-1B-Instruct | `llama` (`llama32` template) | 99/100 | 10/100 | 0.2373 |
+
+Front: 10/100@0.237, 44/100@0.194, 72/100@0.159, 90/100@0.023,
+92/100@0.023; one trial pruned by early stopping; 17 minutes.
+
+`ditch --reproduce` on the export's manifest re-derived the same trial and
+scores exactly (KL 0.2373, 10/100). The export's self-validation reported a
+max first-token logit difference of 0.0748 (argmax 100%) against the
+in-memory model: that is the bf16 rounding of the merged `W + ΔW` in the
+export, since the in-memory model keeps the delta in float32. The same trial
+exported with `--export-dtype f32` validates at 0.0000.
