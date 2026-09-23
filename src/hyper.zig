@@ -286,18 +286,27 @@ fn siteMix(model: *const Model, site: *const Site, x: []const f32, n: usize, out
     switch (site.*) {
         .mhc => |s| {
             const mix = (2 + hc) * hc;
-            // Unweighted RMSNorm over the whole flattened stream, then the projection.
+            // Unweighted RMSNorm over the whole flattened stream, then the
+            // projection, both accumulated in f64: the streams' magnitudes
+            // differ by orders of magnitude (GLM-5.3-Flash: 0.35 against
+            // 0.006) and `comb` / `pre` weight the large one into small
+            // results, so f32 sums over the `hc * hidden` coordinates cost
+            // 1e-5 of a collapsed residual. 24 dot products a token.
+            _ = tmp;
+            const inv = try gpa.alloc(f64, n);
+            defer gpa.free(inv);
             for (0..n) |t| {
                 const src = x[t * sw ..][0..sw];
-                const dst = tmp[t * sw ..][0..sw];
-                var ss: f32 = 0;
-                for (src) |v| ss += v * v;
-                const inv = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(sw)) + c.rms_norm_eps);
-                for (dst, 0..) |*o, i| o.* = src[i] * inv;
+                inv[t] = 1.0 / @sqrt(dot64(src, src) / @as(f64, @floatFromInt(sw)) + c.rms_norm_eps);
             }
             const proj = try gpa.alloc(f32, n * mix);
             defer gpa.free(proj);
-            try tensor.matmulT(model.pool, gpa, proj, tmp, n, s.fn_w, null);
+            const wrow = try gpa.alloc(f32, sw);
+            defer gpa.free(wrow);
+            for (0..mix) |r| {
+                s.fn_w.row(r, wrow);
+                for (0..n) |t| proj[t * mix + r] = @floatCast(dot64(x[t * sw ..][0..sw], wrow) * inv[t]);
+            }
             const eps = hy.eps;
             for (0..n) |t| {
                 const p = proj[t * mix ..][0..mix];
@@ -365,6 +374,22 @@ fn normColumns(m: []f32, hc: usize, eps: f32) void {
         const inv = 1.0 / (s + eps);
         for (0..hc) |j| m[j * hc + k] *= inv;
     }
+}
+
+/// `sum a[i] * b[i]` accumulated in f64 (each f32 product is exact in f64).
+fn dot64(a: []const f32, b: []const f32) f64 {
+    const L = 8;
+    const V = @Vector(L, f64);
+    var acc: V = @splat(0);
+    var i: usize = 0;
+    while (i + L <= a.len) : (i += L) {
+        const av: @Vector(L, f32) = a[i..][0..L].*;
+        const bv: @Vector(L, f32) = b[i..][0..L].*;
+        acc += @as(V, @floatCast(av)) * @as(V, @floatCast(bv));
+    }
+    var sum = @reduce(.Add, acc);
+    while (i < a.len) : (i += 1) sum += @as(f64, a[i]) * b[i];
+    return sum;
 }
 
 inline fn sigmoid(x: f32) f32 {
@@ -502,13 +527,10 @@ pub fn finalCollapse(model: *const Model, head: *const HeadLease, x: []const f32
         },
         .weighted => {
             const w = model.hyper_head.weighted;
-            var ss: f32 = 0;
-            for (x) |v| ss += v * v;
-            const inv = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(sw)) + c.rms_norm_eps);
+            // In f64, as the sites' mixes (see `siteMix`).
+            const inv = 1.0 / @sqrt(dot64(x, x) / @as(f64, @floatFromInt(sw)) + c.rms_norm_eps);
             for (0..hc) |j| {
-                var acc: f32 = 0;
-                const wr = w.fn_w[j * sw ..][0..sw];
-                for (x, 0..) |v, i| acc += v * inv * wr[i];
+                const acc: f32 = @floatCast(dot64(x, w.fn_w[j * sw ..][0..sw]) * inv);
                 const p = sigmoid(acc * w.scale + w.base[j]) + hy.eps;
                 tensor.axpy(out, p, x[j * hidden ..][0..hidden]);
             }
@@ -550,4 +572,21 @@ test "sinkhorn produces a doubly stochastic matrix" {
         try std.testing.expectApproxEqAbs(@as(f32, 1.0), rs, 1e-4);
         try std.testing.expectApproxEqAbs(@as(f32, 1.0), cs, 1e-4);
     }
+}
+
+test "dot64 keeps the small terms a long f32 sum drops" {
+    // One large coordinate and many small ones, as the mHC streams carry:
+    // the exact sum is 1 + 4096 * 2^-24; an f32 running sum stays at 1.
+    var a: [4097]f32 = undefined;
+    var b: [4097]f32 = undefined;
+    a[0] = 1;
+    b[0] = 1;
+    for (1..a.len) |i| {
+        a[i] = 0x1p-12;
+        b[i] = 0x1p-12;
+    }
+    var naive: f32 = 0;
+    for (a, b) |x, y| naive += x * y;
+    try std.testing.expectEqual(@as(f32, 1), naive);
+    try std.testing.expectEqual(@as(f64, 1 + 4096 * 0x1p-24), dot64(&a, &b));
 }

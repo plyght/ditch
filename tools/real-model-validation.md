@@ -3531,3 +3531,36 @@ from the stored rows (`Dequant.readMxfp4SourceRows`), halving the bytes an
 expert load moves (113 GB where 356 GB were read). Measured peak RSS 7.04 GB.
 The remaining limit is the cache holding decoded experts: 47.5 MB each, so a
 quarter of one layer's routing fits and three in four expert reads re-decode.
+
+## Bug F9 — the mHC mixing weights lost precision in f32 sums (fixed; closes GLM-5.3-Flash)
+
+**Symptom.** GLM-5.3-Flash's truncated check agreed only to 4.2e-05 (the
+item left open above). Bisected with dumps of every stage of layers 0-3
+against the reference's hooks: at the last token every stage of layers 0-2
+agreed to ~1e-06, then layer 3's collapsed input jumped to 3.65e-05.
+Recomputing layer 2 (and layer 3's collapse) in float64 from each side's own
+input: the float32 reference is within 3.5e-07 of it, ditch 3.6e-05 off,
+the input difference only 8e-07, so the error was ditch's own, in layer 2.
+The dense MLP was not it (ditch 6.8e-07 from float64, torch float32
+5.9e-07).
+
+**Cause.** The four residual streams differ by orders of magnitude (stream 0
+at 0.35, the others at 0.006), and the mHC weights mix the large stream into
+small results (layer 3's collapsed input is 0.0086): an error in `comb` or
+`pre` is multiplied by the large stream and divided by the small result.
+ditch computed those weights from a plain f32 running sum over the `hc *
+hidden` = 24576 coordinates (the unweighted RMS norm and the `fn`
+projection), where torch sums in blocks; `comb` came out 4.6e-06 off, 40x
+amplified at the collapse.
+
+**Fix.** The mixes' RMS and projection are accumulated in f64 (`dot64`: each
+f32 product is exact in f64; 24 dot products a token a site), and so is V4's
+weighted `hc_head`. A unit test checks the small terms a long f32 sum drops.
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (5) | all 5 agree, worst 1.19e-06 (was 2.48e-05) | 2.14e-07 (was 2.98e-06) | match |
+| "Explain how rainbows form, …" | match (15) | all 5 agree, worst 9.72e-07 (was 4.20e-05) | 4.12e-07 (was 1.67e-05) | match |
+
+GLM-5.3-Flash now agrees to 1e-06 like every other family. DeepSeek V4's
+1.2e-05 (the other mHC family, above) likely had the same cause; not re-cut.
