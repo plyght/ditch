@@ -130,6 +130,7 @@ const Checkpoint = struct {
 const small_names = [_][]const u8{
     "config.json",           "generation_config.json", "tokenizer.json",          "tokenizer_config.json", "tiktoken.model",
     "tokenizer.model",       "chat_template.jinja",    "special_tokens_map.json", "model.safetensors.index.json",
+    "chat_template.json",
 };
 
 /// Shard file names from an index's `weight_map` (sorted, unique).
@@ -1171,14 +1172,16 @@ fn writeDraft(ctx: Ctx, ck: *const Checkpoint, own_type: []const u8, t: Trial, k
     try w.print("  base = \"{s}\",", .{f.model_type});
     if (!t.ok) try w.writeAll(" -- guess: the closest family, see above") else if (t.overrides.len > 0) try w.writeAll(" -- the layout that reads the checkpoint once the tensors below are renamed");
     try w.writeAll("\n");
-    // Chat template: the checkpoint's own, if ditch recognises it.
-    const template = chatTemplate(a, ck);
+    // Chat template: the checkpoint's own, when ditch can render it.
+    const tokenizer_config = ck.file("tokenizer_config.json");
+    const template = try chat.pickTemplate(a, tokenizer_config, ck.file("chat_template.jinja"), ck.file("chat_template.json"));
     if (template) |tpl| {
-        const detected = chat.detect(tpl, "");
-        if (detected != .raw) {
-            try w.print("  -- chat: the checkpoint's own chat template is recognised as `{s}` and used; `chat` only matters without it.\n", .{@tagName(detected)});
+        var format = try chat.Format.init(a, tpl, try chat.specialTokens(a, tokenizer_config, ck.file("special_tokens_map.json")), .raw);
+        defer format.deinit();
+        if (format.template != null) {
+            try w.writeAll("  -- chat: the checkpoint's own chat template is used, rendered as transformers renders it; `chat` only matters without it.\n");
         } else {
-            try w.print("  chat = \"{s}\", -- guess: the checkpoint's chat template is not one ditch recognises; this is {s}'s fallback. Check the prompt ditch verify renders.\n", .{ f.chat, f.model_type });
+            try w.print("  chat = \"{s}\", -- guess: ditch cannot render the checkpoint's chat template (see the warning above); this is {s}'s fallback. Check the prompt ditch verify renders.\n", .{ f.chat, f.model_type });
         }
     } else try w.print("  -- chat: the checkpoint has no chat template; ditch uses {s}'s fallback `{s}`.\n", .{ f.model_type, f.chat });
     try w.print("  notes = \"Drafted by ditch add-model from {s}; not yet verified.\",\n", .{ctx.settings.model});
@@ -1225,20 +1228,6 @@ fn writeDraft(ctx: Ctx, ck: *const Checkpoint, own_type: []const u8, t: Trial, k
         try w.writeAll("\n");
     }
     return out.written();
-}
-
-fn chatTemplate(a: Allocator, ck: *const Checkpoint) ?[]const u8 {
-    if (ck.file("tokenizer_config.json")) |tc| {
-        const v = std.json.parseFromSliceLeaky(std.json.Value, a, tc, .{}) catch return null;
-        if (v == .object) if (v.object.get("chat_template")) |ct| switch (ct) {
-            .string => |s| return s,
-            .array => |arr| for (arr.items) |item| {
-                if (item == .object) if (item.object.get("template")) |t| if (t == .string) return t.string;
-            },
-            else => {},
-        };
-    }
-    return ck.file("chat_template.jinja");
 }
 
 /// The building block a tensor name fills in another family, if any: the
