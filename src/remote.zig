@@ -154,6 +154,9 @@ pub const Source = struct {
     chunks_unpersisted: std.atomic.Value(u64) = .init(0),
     chunks_invalid: std.atomic.Value(u64) = .init(0),
     write_failure_reported: std.atomic.Value(bool) = .init(false),
+    /// Bytes of `cache_bytes` reserved by `keep` for chunks still being
+    /// written: not on disk yet (guarded by `lock`).
+    writing_bytes: u64 = 0,
     /// Tests: the chunk cache's filesystem holds this many bytes of chunks
     /// (a write beyond it fails with `NoSpaceLeft`).
     test_disk_bytes: ?u64 = null,
@@ -512,6 +515,24 @@ pub const Source = struct {
         return true;
     }
 
+    /// Takes one of the `max_in_flight` connection slots. A chunk holds its
+    /// slot until it is written, so that at most `max_in_flight` chunks are
+    /// between the network and the disk at once.
+    fn slotAcquire(self: *Source, io: Io) !void {
+        while (true) {
+            const cur = self.in_flight.load(.monotonic);
+            if (cur < self.max_in_flight) {
+                if (self.in_flight.cmpxchgWeak(cur, cur + 1, .acquire, .monotonic) == null) return;
+                continue;
+            }
+            try io.sleep(Io.Duration.fromNanoseconds(2 * std.time.ns_per_ms), .awake);
+        }
+    }
+
+    fn slotRelease(self: *Source) void {
+        _ = self.in_flight.fetchSub(1, .release);
+    }
+
     fn lockAcquire(self: *Source) void {
         while (self.lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
     }
@@ -582,6 +603,7 @@ pub const Source = struct {
             self.lockAcquire();
             if (self.cache_bytes + size <= self.cache_limit) {
                 self.cache_bytes += size;
+                self.writing_bytes += size;
                 self.peak_cache_bytes = @max(self.peak_cache_bytes, self.cache_bytes);
                 f.chunks.getPtr(index).?.size = size;
                 self.lockRelease();
@@ -857,7 +879,12 @@ pub const RemoteFile = struct {
             return;
         };
         defer dir.close(io);
-        const body = self.fetchChunk(io, index) catch {
+        src.slotAcquire(io) catch {
+            self.abandon(index);
+            return;
+        };
+        defer src.slotRelease();
+        const body = self.fetchChunk(index) catch {
             self.abandon(index);
             return;
         };
@@ -944,7 +971,12 @@ pub const RemoteFile = struct {
                 return;
             },
             .fetch => {
-                const body = self.fetchChunk(io, index) catch |err| {
+                src.slotAcquire(io) catch |err| {
+                    self.abandon(index);
+                    return err;
+                };
+                defer src.slotRelease();
+                const body = self.fetchChunk(index) catch |err| {
                     self.abandon(index);
                     return err;
                 };
@@ -1045,9 +1077,14 @@ pub const RemoteFile = struct {
     fn keep(self: *RemoteFile, io: Io, dir: Io.Dir, index: u64, name: []const u8, body: []u8) void {
         const src = self.src;
         if (src.reserve(self, index, body.len)) {
-            const full = if (src.test_disk_bytes) |cap| src.cache_bytes > cap else false;
+            src.lockAcquire();
+            // The simulated filesystem holds what is on disk: the chunks
+            // written, not the ones other readers are still writing.
+            const full = if (src.test_disk_bytes) |cap| src.cache_bytes - src.writing_bytes + body.len > cap else false;
+            src.lockRelease();
             if (if (full) error.NoSpaceLeft else writeChunk(io, dir, name, body)) {
                 src.lockAcquire();
+                src.writing_bytes -= body.len;
                 const c = self.chunks.getPtr(index).?;
                 c.state = .present;
                 c.tick = src.nextTick();
@@ -1057,14 +1094,19 @@ pub const RemoteFile = struct {
                 return;
             } else |err| {
                 src.lockAcquire();
+                src.writing_bytes -= body.len;
                 src.cache_bytes -= body.len;
                 self.chunks.getPtr(index).?.size = 0;
                 // The filesystem is full below the bound: bound the cache at
-                // what it holds, so that later chunks evict older ones
-                // instead of each failing to be written (and a prefetched
-                // chunk being fetched again when it is read).
-                const shrunk = err == error.NoSpaceLeft and src.cache_bytes < src.cache_limit;
-                if (shrunk) src.cache_limit = src.cache_bytes;
+                // what is on disk (not counting the chunks other readers are
+                // still writing, which the full filesystem refuses too), so
+                // that later chunks evict older ones instead of each failing
+                // to be written (and a prefetched chunk being fetched again
+                // when it is read). At most the chunks in flight when it
+                // filled, one per connection, go unpersisted.
+                const on_disk = src.cache_bytes - src.writing_bytes;
+                const shrunk = err == error.NoSpaceLeft and on_disk < src.cache_limit;
+                if (shrunk) src.cache_limit = on_disk;
                 const limit = src.cache_limit;
                 src.lockRelease();
                 if (!src.write_failure_reported.swap(true, .monotonic)) {
@@ -1092,24 +1134,21 @@ pub const RemoteFile = struct {
         try dir.rename(tmp, dir, name, io);
     }
 
-    fn fetchChunk(self: *RemoteFile, io: Io, index: u64) ![]u8 {
+    /// Fetches chunk `index`; the caller holds a connection slot (`slotAcquire`).
+    fn fetchChunk(self: *RemoteFile, index: u64) ![]u8 {
         const start = index * self.src.chunk_size;
-        return self.fetchRange(io, start, start + self.src.chunk_size - 1);
+        return self.fetchHeld(start, start + self.src.chunk_size - 1);
     }
 
-    /// Fetches bytes `[start, last]` (inclusive) with one range request.
+    /// Fetches bytes `[start, last]` (inclusive) with one range request, in a connection slot of its own.
     fn fetchRange(self: *RemoteFile, io: Io, start: u64, last: u64) ![]u8 {
+        try self.src.slotAcquire(io);
+        defer self.src.slotRelease();
+        return self.fetchHeld(start, last);
+    }
+
+    fn fetchHeld(self: *RemoteFile, start: u64, last: u64) ![]u8 {
         const src = self.src;
-        // Bounded concurrency across all shards of the source.
-        while (true) {
-            const cur = src.in_flight.load(.monotonic);
-            if (cur < src.max_in_flight) {
-                if (src.in_flight.cmpxchgWeak(cur, cur + 1, .acquire, .monotonic) == null) break;
-                continue;
-            }
-            try io.sleep(Io.Duration.fromNanoseconds(2 * std.time.ns_per_ms), .awake);
-        }
-        defer _ = src.in_flight.fetchSub(1, .release);
         const body = try src.http.getRange(self.url, start, last);
         _ = src.ranges_fetched.fetchAdd(1, .monotonic);
         _ = src.bytes_fetched.fetchAdd(body.len, .monotonic);
