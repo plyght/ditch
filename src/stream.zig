@@ -289,6 +289,25 @@ pub const WeightStore = struct {
     pub fn acquireColumns(self: *WeightStore, ref: WeightRef, specs: []const ColumnSpec, out: []Lease) !void {
         std.debug.assert(out.len >= specs.len);
         if (ref.dtype.isQuantized()) return error.UnsupportedDType;
+        // A whole slab of a transposed MXFP4 tensor (gpt-oss's fused experts):
+        // the selected columns are rows of the stored matrix, decoded directly.
+        if (self.files[ref.file].dequantAt(ref.offset)) |v| {
+            const dq = v.dq;
+            if (dq.method == .mxfp4 and ref.rows == dq.rows and ref.cols == dq.cols and v.rel % dq.slabBytes() == 0) {
+                var done: usize = 0;
+                errdefer for (out[0..done]) |l| self.release(l);
+                for (specs) |spec| {
+                    std.debug.assert(spec.lo <= spec.hi and spec.hi <= ref.cols and spec.stride > 0);
+                    const n = (spec.hi - spec.lo + spec.stride - 1) / spec.stride;
+                    const buf = try self.allocBuf(n * ref.rows * 2);
+                    errdefer self.freeBuf(buf);
+                    try dq.readMxfp4SourceRows(self.io, @intCast(v.rel / dq.slabBytes()), spec.lo, spec.stride, n, buf);
+                    out[done] = .{ .weight = .{ .data = buf[0 .. n * ref.rows * 2], .dtype = ref.dtype, .rows = n, .cols = ref.rows }, .buf = buf };
+                    done += 1;
+                }
+                return;
+            }
+        }
         const block = try self.acquire(ref);
         defer self.release(block);
         const es = ref.dtype.size();

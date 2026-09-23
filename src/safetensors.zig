@@ -347,6 +347,17 @@ pub const File = struct {
         return off;
     }
 
+    /// The dequantised view that `offset` falls in, and the offset within it;
+    /// null for the file's own bytes and for the other overlays.
+    pub fn dequantAt(self: *const File, offset: u64) ?struct { dq: *dequant.Dequant, rel: u64 } {
+        if (offset < self.len) return null;
+        const o = self.overlayAt(offset) orelse return null;
+        return switch (o.kind) {
+            .dequant => |dq| .{ .dq = dq, .rel = offset - o.offset },
+            else => null,
+        };
+    }
+
     fn overlayAt(self: *const File, offset: u64) ?*const Overlay {
         // Overlays are registered in increasing offset order.
         var lo: usize = 0;

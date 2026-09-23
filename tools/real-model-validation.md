@@ -3520,7 +3520,14 @@ tiny nonzero numbers before):
 | --- | ---: | ---: | ---: |
 | before | 0.071 tokens/s (336.8 s) | 0.070 tokens/s (345.1 s) | 876 s |
 | after | 0.149 tokens/s (160.9 s) | 0.151 tokens/s (159.0 s) | 411 s |
+| + gate/up decoded as rows | 0.281 tokens/s (85.4 s) | 0.297 tokens/s (80.9 s) | 216 s |
 
-Same text, same cache statistics (the same work, done faster). The
-remaining limit is the cache holding decoded experts: 47.5 MB each, so a
+Same text, same cache statistics (the same work, done faster), and the third
+row's top-10 first-token logits are identical to the second's. The third row:
+the fused gate/up block is stored `[2I, H]` in MXFP4 and viewed `[H, 2I]`, so
+an expert was decoded into the view's layout and its gate and up halves (every
+second column) transposed back out; now those columns are decoded directly
+from the stored rows (`Dequant.readMxfp4SourceRows`), halving the bytes an
+expert load moves (113 GB where 356 GB were read). Measured peak RSS 7.04 GB.
+The remaining limit is the cache holding decoded experts: 47.5 MB each, so a
 quarter of one layer's routing fits and three in four expert reads re-decode.

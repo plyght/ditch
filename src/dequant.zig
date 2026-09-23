@@ -635,6 +635,37 @@ pub const Dequant = struct {
         }
     }
 
+    /// gpt-oss MXFP4 (stored as the transpose of the view): source rows
+    /// `lo, lo + stride, ...` (`n` of them) of slab `slab`, which are columns
+    /// of the view, decoded to `[n][rows]` bf16. A strided column selection
+    /// of the view (a fused expert's gate or up half) without decoding the
+    /// slab into the view's layout and transposing it back.
+    pub fn readMxfp4SourceRows(self: *Dequant, io: Io, slab: usize, lo: usize, stride: usize, n: usize, out: []u8) !void {
+        std.debug.assert(self.method == .mxfp4 and lo + (n - 1) * stride < self.src_rows);
+        const pa = std.heap.page_allocator;
+        const nblk = self.src_cols / 32;
+        const blk_bytes = self.src_rows * nblk * 16;
+        const raw = try pa.alloc(u8, blk_bytes + self.src_rows * nblk);
+        defer pa.free(raw);
+        const blocks = raw[0..blk_bytes];
+        const scales = raw[blk_bytes..];
+        try self.data.read(io, @as(u64, slab) * blk_bytes, blocks);
+        try self.scale.read(io, @as(u64, slab) * self.src_rows * nblk, scales);
+        const dst = std.mem.bytesAsSlice(u16, out[0 .. n * self.src_cols * 2]);
+        for (0..n) |j| {
+            const r = lo + j * stride;
+            const drow = dst[j * self.src_cols ..][0..self.src_cols];
+            for (0..nblk) |k| {
+                const b = blocks[(r * nblk + k) * 16 ..][0..16];
+                const sc = e8m0Scale(scales[r * nblk + k]);
+                for (0..16) |i| {
+                    drow[k * 32 + 2 * i] = tensor.f32ToBf16(e2m1_table[b[i] & 0x0f] * sc);
+                    drow[k * 32 + 2 * i + 1] = tensor.f32ToBf16(e2m1_table[b[i] >> 4] * sc);
+                }
+            }
+        }
+    }
+
     fn readMxfp4(self: *Dequant, io: Io, slab: usize, a: usize, n: usize, out: []u8) !void {
         if (a == 0 and n == self.rows) return self.decodeMxfp4Slab(io, slab, out);
         // A row range needs the whole slab (the source is the transpose): keep
