@@ -4200,7 +4200,7 @@ The forward pass of every family is checked above; this section checks the
 edit itself: which matrices a trial changes, whether the change is the
 orthogonalisation it should be, and whether the export carries it faithfully.
 
-## Method
+## Abliteration: method
 
 **One trial on a cut.** `ditch CUT --n-trials 1 --n-startup-trials 1` with 8
 harmful and 8 harmless prompts (also as the refusal and KL scorer prompts),
@@ -4238,7 +4238,7 @@ matrices changed, exactly the attention `o_proj` of layers 8-19 and the
 `down_proj` of 13-23 that the trial's two kernels reach; every one within
 2.5e-06 of the rank-3 optimum of the exact edit.
 
-## gpt-oss (`gpt_oss`): MXFP4 experts
+## Abliteration: gpt-oss (`gpt_oss`), MXFP4 experts
 
 `openai/gpt-oss-20b`, first layer, experts MXFP4.
 
@@ -4286,3 +4286,76 @@ decode step fetches its 144 experts layer by layer: the 4 experts of a layer
 are known only when its router has run, so each layer waits for a round of
 8 MB range requests (~2-3 s at the per-stream rate here) and the link idles
 between layers. That, not the bandwidth, is the ~263 s a token.
+
+## Bug F14 — a failed read at load was taken for a missing tensor (fixed)
+
+The dry run of `hf://Qwen/Qwen3.8-2.4T-A95B` during the rate-limited
+stretch (before F13) ended with `error: missing tensor:
+model.layers.62.post_attention_layernorm.weight`, a tensor the index lists
+(in shard 150, whose reads were answered 429). `Model.loadVecOpt`, which
+reads every norm, bias and small vector at load, returned null for a read
+that failed (`readVecF32(...) catch null`), the same as for a tensor the
+checkpoint does not have. A required norm then reported a missing tensor
+instead of the network error; an optional one (a projection or norm bias,
+attention sinks, a router bias, a shared-expert gate) was silently dropped,
+loading a different model from the one on the Hub. `loadVecOpt` now returns
+the read error, and its 42 callers pass it on. `tools/range_server.py`
+serves a `/failafter-<n>/` prefix that answers 404 to every range request
+after the first n. Regression test: "remote source: a read that fails while
+loading is reported, not taken for a missing tensor" (`src/remote_test.zig`;
+before the fix it fails with `MissingWeights`).
+
+## Bug F15 — a rate-limited small file was taken for a missing one, and remembered (fixed)
+
+The first dry run of `hf://MiniMaxAI/MiniMax-M3`, during the same
+rate-limited stretch, stopped with "no tokenizer.json, tiktoken.model or
+tokenizer.model", though the repository has `tokenizer.json`. The small
+files (config, tokenizer, templates, index) are fetched by `Http.download`,
+whose curl path mapped curl's exit code 22 to `NotFound`; with `--fail`
+curl exits 22 for any status from 400 up, a 429 included. A required file
+then failed the load, and an optional one (`chat_template.jinja`,
+`tokenizer_config.json`, `generation_config.json`) got a `.missing` marker
+that later runs trust, so a model could lose its chat template for good.
+curl now reports the status (`-w %{http_code}`), mapped as the range reads
+map it (404, 401/403, 429/503, anything else), the native client maps
+429/503 too, and `download` uses the same retry policy and shared back-off
+as the range reads (F13). `tools/range_server.py` serves a
+`/ratelimitall-<n>/` prefix whose first n requests of any kind get a 429.
+Regression test: "remote source: rate-limited small files are waited for,
+not taken for missing ones" (`src/remote_test.zig`, the native client and
+curl; it fails with the old mapping).
+## Abliteration: Gemma 4 (`gemma4`), dense, per-layer inputs, KV sharing
+
+`google/gemma-4-E2B-it`, layers 0-4, 15 and 19 (sliding, global and KV-shared),
+towers dropped, the per-layer input table cut to the kept layers.
+
+* **Edited set:** `self_attn.o_proj` of cut layers 2-6 and `mlp.down_proj` of
+  1-6, exactly the layers the trial's two kernels reach; the per-layer input
+  gate and projection, the norms (Gemma's post-attention and post-feedforward
+  norms follow the edited matrices) and the embedding tables untouched, as in
+  heretic.
+* **Arithmetic, f32 export of the trial:** all 11 matrices within 7.4e-08 of
+  the rank-3 optimum of the exact edit.
+* **bf16 export:** 99.87-99.94% of the elements equal `bf16(W + D₃)`; the rest
+  rounding ties. ditch's reload validation: max first-token logit difference
+  0.37 for the bf16 export (the rounding of the merged weights, which this
+  7-layer cut amplifies), 0.0002 for the f32 export.
+* **Export:** transformers (`tools/ref_lazy_moe.py`) on the f32 export against
+  `ditch probe` on it: residuals within 1.5e-06, logits 2.5e-06, ids equal
+  after bug 69.
+
+### Bug 69 — gemma-4-E2B-it was prompted with an empty thought block its template does not write (fixed)
+
+**Symptom.** On the export above, transformers' ids were 5 shorter: ditch
+ended the prompt `<|turn>model\n<|channel>thought\n<channel|>`, the release's
+template `<|turn>model\n`.
+
+**Cause.** Bug F10 took the Gemma 4 format from `gemma-4-12B-it`, whose
+template appends the empty thought block when thinking is off (`{%- if not
+enable_thinking -%}{{- '<|channel>thought\n<channel|>' -}}`). `gemma-4-E2B-it`'s
+template has no such branch: its generation prompt is the model turn alone.
+
+**Fix.** A `gemma4_plain` template, chosen when the release's template does not
+contain the empty thought block's literal; tests cover both detections and the
+render. The trial above was calibrated with the old prompt, which changes its
+directions, not the arithmetic this section checks.

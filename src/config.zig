@@ -304,13 +304,14 @@ pub const Settings = struct {
 /// headings in bold on a terminal.
 pub const HelpSection = struct { title: []const u8, body: []const u8 };
 
-pub const tagline = "ditch censorship: fully automatic refusal removal for open-weight language models, on a CPU.";
+pub const tagline = "Fully automatic refusal removal for open-weight language models, on a CPU.";
 pub const issues_url = "https://github.com/plyght/ditch/issues";
 
 pub const usage_text =
     \\  ditch [OPTIONS] <MODEL>          run the abliteration study on a model
     \\  ditch bench [OPTIONS] <MODEL>    measure throughput, timings and memory
     \\  ditch probe [OPTIONS] <MODEL> --prompt TEXT   show tokens, first-token logits, greedy reply
+    \\  ditch verify [OPTIONS] <MODEL>   check it against the official implementation (see ditch verify --help)
     \\  ditch selftest [--device D]      check a compute backend against the CPU reference kernels
     \\  ditch add-model <MODEL>          draft a Lua model definition for a model_type ditch does not know
     \\  ditch help [bench]               this help (or the benchmark options)
@@ -589,7 +590,7 @@ pub fn writeHelp(w: *std.Io.Writer, bold: bool) !void {
 
 /// The short help printed when ditch is run without arguments.
 pub fn writeConciseHelp(w: *std.Io.Writer, bold: bool) !void {
-    try w.print("ditch {s}: {s}\n\n", .{ version, tagline });
+    try w.print("ditch {s}: {c}{s}\n\n", .{ version, std.ascii.toLower(tagline[0]), tagline[1..] });
     try writeHeading(w, "Usage", bold);
     try w.writeAll(usage_text);
     try w.writeAll("\n");
@@ -697,7 +698,7 @@ fn applyConfigFile(gpa: Allocator, io: std.Io, a: Allocator, settings: *Settings
     return true;
 }
 
-pub const subcommands = [_][]const u8{ "bench", "probe", "selftest", "help", "add-model" };
+pub const subcommands = [_][]const u8{ "bench", "probe", "verify", "selftest", "help", "add-model" };
 
 /// Parses the configuration: the user file ($XDG_CONFIG_HOME/ditch/config.lua),
 /// the project file (./config.lua, ./config.toml or --config), the DITCH_*

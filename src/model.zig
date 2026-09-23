@@ -593,7 +593,7 @@ pub fn loadMatChecked(model: *Model, layer: *Layer, slot: Slot, name: []const u8
 
 /// Loads a vector of exactly `len` entries (norms, biases and scales).
 pub fn loadVecChecked(model: *Model, name: []const u8, len: usize) ![]const f32 {
-    const v = model.loadVecOpt(name) orelse {
+    const v = (try model.loadVecOpt(name)) orelse {
         std.log.err("missing tensor: {s}", .{name});
         return error.MissingWeights;
     };
@@ -1006,9 +1006,9 @@ pub const Model = struct {
         const in_name = try cat(arena, sp, "in_proj.weight");
         var s = SsmWeights{
             .in_proj = try self.loadMat(in_name),
-            .in_bias = self.loadVecOpt(try biasName(arena, in_name)),
+            .in_bias = (try self.loadVecOpt(try biasName(arena, in_name))),
             .conv = try self.loadVec(try cat(arena, sp, "conv1d.weight")),
-            .conv_bias = self.loadVecOpt(try cat(arena, sp, "conv1d.bias")),
+            .conv_bias = (try self.loadVecOpt(try cat(arena, sp, "conv1d.bias"))),
             .dt_bias = &.{},
             .a = &.{},
             .d = try self.loadVec(try cat(arena, sp, "D")),
@@ -1046,9 +1046,9 @@ pub const Model = struct {
                 layer.refs.add(.ssm_x, try self.ref(x_name), false);
                 layer.refs.add(.ssm_dt, try self.ref(dt_name), false);
                 s.dt_bias = try self.loadVec(try biasName(arena, dt_name));
-                s.dt_norm = self.loadVecOpt(try cat(arena, sp, "dt_layernorm.weight"));
-                s.b_norm = self.loadVecOpt(try cat(arena, sp, "b_layernorm.weight"));
-                s.c_norm = self.loadVecOpt(try cat(arena, sp, "c_layernorm.weight"));
+                s.dt_norm = (try self.loadVecOpt(try cat(arena, sp, "dt_layernorm.weight")));
+                s.b_norm = (try self.loadVecOpt(try cat(arena, sp, "b_layernorm.weight")));
+                s.c_norm = (try self.loadVecOpt(try cat(arena, sp, "c_layernorm.weight")));
                 if (s.x_proj.?.rows != d.dt_rank + 2 * d.state or s.x_proj.?.cols != d.inter or s.dt_proj.?.rows != d.inter or s.dt_proj.?.cols != d.dt_rank or s.dt_bias.len != d.inter or a_log.len != d.inter * d.state or s.d.len != d.inter) {
                     std.log.err("layer {d}: Mamba1 projections do not match inter {d}, state {d}, dt_rank {d}", .{ li, d.inter, d.state, d.dt_rank });
                     return error.InvalidConfig;
@@ -1067,11 +1067,11 @@ pub const Model = struct {
         }
         if (separate_out) {
             s.out = ow;
-            s.out_bias = self.loadVecOpt(try biasName(arena, o_name));
+            s.out_bias = (try self.loadVecOpt(try biasName(arena, o_name)));
             layer.refs.add(.ssm_out, try self.ref(o_name), false);
         } else {
             layer.o = ow;
-            layer.o_bias = self.loadVecOpt(try biasName(arena, o_name));
+            layer.o_bias = (try self.loadVecOpt(try biasName(arena, o_name)));
             layer.refs.add(.o, try self.ref(o_name), false);
         }
         layer.ssm = s;
@@ -1088,9 +1088,9 @@ pub const Model = struct {
         const out_name = try cat(arena, lp, names.conv_out orelse return error.InvalidConfig);
         const cw = ConvWeights{
             .in = try self.loadMat(in_name),
-            .in_bias = self.loadVecOpt(try biasName(arena, in_name)),
+            .in_bias = (try self.loadVecOpt(try biasName(arena, in_name))),
             .kernel = try self.loadMat(kernel_name),
-            .kernel_bias = self.loadVecOpt(try biasName(arena, kernel_name)),
+            .kernel_bias = (try self.loadVecOpt(try biasName(arena, kernel_name))),
         };
         layer.refs.add(.conv_in, try self.ref(in_name), false);
         layer.refs.add(.conv_kernel, try self.ref(kernel_name), false);
@@ -1105,7 +1105,7 @@ pub const Model = struct {
         if (cw.in_bias) |b| if (b.len != 3 * hidden) return error.InvalidConfig;
         if (cw.kernel_bias) |b| if (b.len != hidden) return error.InvalidConfig;
         layer.o = try self.loadMat(out_name);
-        layer.o_bias = self.loadVecOpt(try biasName(arena, out_name));
+        layer.o_bias = (try self.loadVecOpt(try biasName(arena, out_name)));
         layer.refs.add(.o, try self.ref(out_name), false);
         if (layer.o.rows != hidden or layer.o.cols != hidden) {
             std.log.err("layer {d}: conv out_proj is [{d}][{d}], expected [{d}][{d}]", .{ li, layer.o.rows, layer.o.cols, hidden, hidden });
@@ -1287,7 +1287,7 @@ pub const Model = struct {
         }
         const o_name = try cat(arena, lp, names.lin_out orelse return error.InvalidConfig);
         layer.o = try self.loadMat(o_name);
-        layer.o_bias = self.loadVecOpt(try biasName(arena, o_name));
+        layer.o_bias = (try self.loadVecOpt(try biasName(arena, o_name)));
         layer.refs.add(.o, try self.ref(o_name), false);
         if (layer.o.rows != hidden or layer.o.cols != dim) {
             std.log.err("layer {d}: linear output projection is [{d}][{d}], expected [{d}][{d}]", .{ li, layer.o.rows, layer.o.cols, hidden, dim });
@@ -1326,7 +1326,7 @@ pub const Model = struct {
         }
         const o_name = try cat(arena, lp, names.light_out orelse return error.InvalidConfig);
         layer.o = try self.loadMat(o_name);
-        layer.o_bias = self.loadVecOpt(try biasName(arena, o_name));
+        layer.o_bias = (try self.loadVecOpt(try biasName(arena, o_name)));
         layer.refs.add(.o, try self.ref(o_name), false);
         if (layer.o.rows != hidden or layer.o.cols != qd) {
             std.log.err("layer {d}: lightning output projection is [{d}][{d}], expected [{d}][{d}]", .{ li, layer.o.rows, layer.o.cols, hidden, qd });
@@ -1398,7 +1398,7 @@ pub const Model = struct {
             const n = try self.name(t);
             if (self.store.lookup(n)) |r| {
                 lm = r;
-                self.lm_head_bias = self.loadVecOpt(try biasName(arena, n));
+                self.lm_head_bias = (try self.loadVecOpt(try biasName(arena, n)));
                 break;
             }
         }
@@ -1485,7 +1485,7 @@ pub const Model = struct {
                 .v_bias = null,
                 .qkv_bias = null,
                 .o_bias = null,
-                .sinks = if (names.sinks) |t| (self.loadVecOpt(try cat(arena, lp, t)) orelse if (names.sinks_alt) |alt| self.loadVecOpt(try cat(arena, lp, alt)) else null) else null,
+                .sinks = if (names.sinks) |t| ((try self.loadVecOpt(try cat(arena, lp, t))) orelse if (names.sinks_alt) |alt| (try self.loadVecOpt(try cat(arena, lp, alt))) else null) else null,
                 .mla = null,
                 .gate = null,
                 .up = null,
@@ -1597,7 +1597,7 @@ pub const Model = struct {
             } else if (c.qkv_layout != .separate or (c.qkv_alt != null and names.qkv != null and names.q != null and self.find(try cat(arena, lp, names.q.?)) == null and self.find(try cat(arena, lp, names.qkv.?)) != null)) {
                 const qkv_name = try cat(arena, lp, names.qkv orelse return error.InvalidConfig);
                 layer.qkv = try self.loadMatT(qkv_name, c.arch.conv1d);
-                layer.qkv_bias = self.loadVecOpt(try biasName(arena, qkv_name));
+                layer.qkv_bias = (try self.loadVecOpt(try biasName(arena, qkv_name)));
                 layer.refs.add(.qkv, try self.ref(qkv_name), c.arch.conv1d);
                 const want = c.layer_heads[i] * hd + nkv * (hd + c.layerVDim(i));
                 if (layer.qkv.?.rows != want or layer.qkv.?.cols != c.hidden_size) {
@@ -1611,7 +1611,7 @@ pub const Model = struct {
             } else {
                 const q_name = try cat(arena, lp, names.q orelse return error.InvalidConfig);
                 layer.q = try self.loadMat(q_name);
-                layer.q_bias = self.loadVecOpt(try biasName(arena, q_name));
+                layer.q_bias = (try self.loadVecOpt(try biasName(arena, q_name)));
                 layer.refs.add(.q, try self.ref(q_name), false);
                 const nh = c.layer_heads[i];
                 const qwant = if (c.gated_attention) 2 * nh * hd else nh * hd;
@@ -1624,14 +1624,14 @@ pub const Model = struct {
                     const k_name = try cat(arena, lp, names.k orelse return error.InvalidConfig);
                     const v_name = try cat(arena, lp, names.v orelse return error.InvalidConfig);
                     layer.k = try self.loadMat(k_name);
-                    layer.k_bias = self.loadVecOpt(try biasName(arena, k_name));
+                    layer.k_bias = (try self.loadVecOpt(try biasName(arena, k_name)));
                     layer.refs.add(.k, try self.ref(k_name), false);
                     if (c.k_eq_v and self.store.lookup(v_name) == null) {
                         // Keys double as values (Gemma 4 global layers).
                         layer.v = null;
                     } else {
                         layer.v = try self.loadMat(v_name);
-                        layer.v_bias = self.loadVecOpt(try biasName(arena, v_name));
+                        layer.v_bias = (try self.loadVecOpt(try biasName(arena, v_name)));
                         layer.refs.add(.v, try self.ref(v_name), false);
                         if (layer.v.?.rows != nkv * c.layerVDim(i) or layer.v.?.cols != c.hidden_size) {
                             std.log.err("layer {d}: v projection is [{d}][{d}], expected [{d}][{d}]", .{ i, layer.v.?.rows, layer.v.?.cols, nkv * c.layerVDim(i), c.hidden_size });
@@ -1685,7 +1685,7 @@ pub const Model = struct {
             if (c.attn_layers[i] and c.dsv4 == null) {
                 const o_name = try cat(arena, lp, names.o);
                 layer.o = try self.loadMatT(o_name, c.arch.conv1d);
-                layer.o_bias = self.loadVecOpt(try biasName(arena, o_name));
+                layer.o_bias = (try self.loadVecOpt(try biasName(arena, o_name)));
                 layer.refs.add(.o, try self.ref(o_name), c.arch.conv1d);
                 const owant = c.layer_heads[i] * c.layerVDim(i);
                 if (layer.o.rows != c.hidden_size or layer.o.cols != owant) {
@@ -1697,7 +1697,7 @@ pub const Model = struct {
             if (c.ple_dim > 0) try self.loadPle(layer, arena, i, lp);
             if (c.altup_inputs > 0) try self.loadAltUp(layer, arena, i, lp);
             if (names.layer_scale) |t| {
-                if (self.loadVecOpt(try cat(arena, lp, t))) |s| {
+                if ((try self.loadVecOpt(try cat(arena, lp, t)))) |s| {
                     if (s.len != 1) return error.InvalidConfig;
                     layer.layer_scale = s[0];
                 }
@@ -1717,8 +1717,8 @@ pub const Model = struct {
                         const up_name = try cat(arena, lp, names.up orelse return error.InvalidConfig);
                         layer.gate = try self.loadMat(gate_name);
                         layer.up = try self.loadMat(up_name);
-                        layer.gate_bias = self.loadVecOpt(try biasName(arena, gate_name));
-                        layer.up_bias = self.loadVecOpt(try biasName(arena, up_name));
+                        layer.gate_bias = (try self.loadVecOpt(try biasName(arena, gate_name)));
+                        layer.up_bias = (try self.loadVecOpt(try biasName(arena, up_name)));
                         layer.refs.add(.gate, try self.ref(gate_name), false);
                         layer.refs.add(.up, try self.ref(up_name), false);
                     },
@@ -1732,25 +1732,25 @@ pub const Model = struct {
                             const up_name = try cat(arena, lp, names.up.?);
                             layer.gate = try self.loadMat(gate_name);
                             layer.up = try self.loadMat(up_name);
-                            layer.gate_bias = self.loadVecOpt(try biasName(arena, gate_name));
-                            layer.up_bias = self.loadVecOpt(try biasName(arena, up_name));
+                            layer.gate_bias = (try self.loadVecOpt(try biasName(arena, gate_name)));
+                            layer.up_bias = (try self.loadVecOpt(try biasName(arena, up_name)));
                             layer.refs.add(.gate, try self.ref(gate_name), false);
                             layer.refs.add(.up, try self.ref(up_name), false);
                         } else {
                             layer.gate_up = try self.loadMat(gu_name);
-                            layer.up_bias = self.loadVecOpt(try biasName(arena, gu_name));
+                            layer.up_bias = (try self.loadVecOpt(try biasName(arena, gu_name)));
                             layer.refs.add(.gate_up, try self.ref(gu_name), false);
                         }
                     },
                     .dense => {
                         const up_name = try cat(arena, lp, names.up orelse return error.InvalidConfig);
                         layer.up = try self.loadMatT(up_name, c.arch.conv1d);
-                        layer.up_bias = self.loadVecOpt(try biasName(arena, up_name));
+                        layer.up_bias = (try self.loadVecOpt(try biasName(arena, up_name)));
                         layer.refs.add(.up, try self.ref(up_name), c.arch.conv1d);
                     },
                 }
                 layer.down = try self.loadMatT(down_name, c.arch.conv1d);
-                layer.down_bias = self.loadVecOpt(try biasName(arena, down_name));
+                layer.down_bias = (try self.loadVecOpt(try biasName(arena, down_name)));
                 layer.refs.add(.down, try self.ref(down_name), c.arch.conv1d);
                 const inter = if (layer.gate_up) |g| g.rows / 2 else layer.up.?.rows;
                 if (i == 0 and inter != c.intermediate_size and !c.intermediate_varies) {
@@ -2128,16 +2128,19 @@ pub const Model = struct {
     }
 
     fn loadVec(self: *Model, name_: []const u8) ![]f32 {
-        return self.loadVecOpt(name_) orelse {
+        return (try self.loadVecOpt(name_)) orelse {
             std.log.err("missing tensor: {s}", .{name_});
             return error.MissingWeights;
         };
     }
 
     /// Reads a small tensor as an f32 vector (null if absent).
-    pub fn loadVecOpt(self: *Model, name_: []const u8) ?[]f32 {
+    /// The vector `name_` as f32, or null when the checkpoint has no such
+    /// tensor. A failed read is an error, not an absent tensor: an optional
+    /// bias lost to a network error would otherwise load a different model.
+    pub fn loadVecOpt(self: *Model, name_: []const u8) !?[]f32 {
         const r = self.store.lookup(name_) orelse return null;
-        return self.store.readVecF32(self.arena.allocator(), r) catch null;
+        return try self.store.readVecF32(self.arena.allocator(), r);
     }
 
     /// A layer norm at `lp ++ template`: null when the family has no such
@@ -2151,8 +2154,8 @@ pub const Model = struct {
     }
 
     fn loadNormOpt(self: *Model, name_: []const u8) !?Norm {
-        const w = self.loadVecOpt(name_) orelse return null;
-        return Norm{ .w = w, .b = self.loadVecOpt(try biasName(self.arena.allocator(), name_)) };
+        const w = (try self.loadVecOpt(name_)) orelse return null;
+        return Norm{ .w = w, .b = (try self.loadVecOpt(try biasName(self.arena.allocator(), name_))) };
     }
 
     fn loadNorm(self: *Model, name_: []const u8) !Norm {

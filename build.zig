@@ -41,6 +41,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     addLua(b, root);
+    addHarness(b, root);
     root.addOptions("build_options", options);
     if (metal) addMetal(b, root);
 
@@ -62,6 +63,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     addLua(b, test_mod);
+    addHarness(b, test_mod);
     test_mod.addOptions("build_options", options);
     if (metal) addMetal(b, test_mod);
     // `-Dtest-filter=name`: run only the tests whose name contains it. Needed
@@ -97,6 +99,17 @@ pub fn build(b: *std.Build) void {
     const metal_obj = b.addObject(.{ .name = "ditch-metal-check", .root_module = metal_mod });
     const metal_check = b.step("metal-check", "Compile the Metal backend for aarch64-macos without linking");
     metal_check.dependOn(&metal_obj.step);
+}
+
+/// `ditch verify`'s reference harness: the Python files in tools/ that run a
+/// model's official implementation, embedded (`@embedFile("harness/<name>")`)
+/// so the binary carries the exact copies in the repository.
+fn addHarness(b: *std.Build, mod: *std.Build.Module) void {
+    const files = [_][]const u8{
+        "verify_reference.py", "probe_reference.py", "ref_stream.py",       "ref_lazy_moe.py",  "lazy_checkpoint.py",
+        "ref_deepseek_v4.py",  "ref_deepseek_v41.py", "ref_kimi_k3.py",     "ref_mimo_v2.py",   "check_abliteration.py",
+    };
+    for (files) |f| mod.addAnonymousImport(b.fmt("harness/{s}", .{f}), .{ .root_source_file = b.path(b.fmt("tools/{s}", .{f})) });
 }
 
 /// Compiles the Objective-C shim of the Metal backend and links the frameworks

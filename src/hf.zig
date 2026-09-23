@@ -144,25 +144,37 @@ pub const Http = struct {
         return self.getRangeOpt(url, .{ start, last });
     }
 
+    /// Retry state of one request: transient failures and rate limits are counted apart.
+    const Retry = struct {
+        attempt: usize = 1,
+        limited: usize = 0,
+
+        /// After `err`: waits and returns true to retry, or false to give up.
+        fn again(r: *Retry, http: *Http, err: anyerror, what: []const u8) bool {
+            if (budget_mod.interrupted()) return false;
+            if (err == error.RateLimited) {
+                r.limited += 1;
+                if (r.limited >= rate_limited_attempts) return false;
+                const ms = @min(rate_limited_max_ms, rate_limited_base_ms << @intCast(@min(r.limited - 1, 16)));
+                if (http.startCooldown(ms)) std.log.warn("{s}: rate limited by the server; backing off", .{what});
+                return true;
+            }
+            if (r.attempt >= attempts or !transient(err)) return false;
+            r.attempt += 1;
+            std.log.warn("{s}: {s}; retrying ({d}/{d})", .{ what, @errorName(err), r.attempt, attempts });
+            http.pause(r.attempt - 1);
+            return true;
+        }
+    };
+
     fn getRangeOpt(self: *Http, url: []const u8, range: ?[2]u64) ![]u8 {
-        var attempt: usize = 1;
-        var limited: usize = 0;
-        while (true) : (attempt += 1) {
+        var retry: Retry = .{};
+        while (true) {
             self.awaitCooldown();
             return self.getRangeOnce(url, range) catch |err| {
                 if (budget_mod.interrupted()) return error.Interrupted;
-                if (err == error.RateLimited) {
-                    limited += 1;
-                    if (limited >= rate_limited_attempts) return err;
-                    attempt -= 1; // does not count against the other retries
-                    const ms = @min(rate_limited_max_ms, rate_limited_base_ms << @intCast(@min(limited - 1, 16)));
-                    if (self.startCooldown(ms)) std.log.warn("{s}: rate limited by the server; backing off", .{url});
-                    continue;
-                }
-                if (attempt >= attempts or !transient(err)) return err;
-                std.log.warn("{s}: {s}; retrying ({d}/{d})", .{ url, @errorName(err), attempt + 1, attempts });
-                self.pause(attempt);
-                continue;
+                if (retry.again(self, err, url)) continue;
+                return err;
             };
         }
     }
@@ -271,14 +283,13 @@ pub const Http = struct {
     pub fn download(self: *Http, dir: Io.Dir, sub_path: []const u8, url: []const u8, expected_size: ?u64) !void {
         const tmp_name = try std.fmt.allocPrint(self.gpa, "{s}.part", .{sub_path});
         defer self.gpa.free(tmp_name);
-        var attempt: usize = 1;
-        while (true) : (attempt += 1) {
+        var retry: Retry = .{};
+        while (true) {
+            self.awaitCooldown();
             self.downloadOnce(dir, tmp_name, url) catch |err| {
                 if (budget_mod.interrupted()) return error.Interrupted;
-                if (attempt >= attempts or !transient(err)) return err;
-                std.log.warn("download of {s} failed: {s}; retrying ({d}/{d})", .{ sub_path, @errorName(err), attempt + 1, attempts });
-                self.pause(attempt);
-                continue;
+                if (retry.again(self, err, url)) continue;
+                return err;
             };
             break;
         }
@@ -299,7 +310,7 @@ pub const Http = struct {
             if (self.downloadNative(dir, tmp_name, url)) {
                 return;
             } else |err| switch (err) {
-                error.NotFound, error.Forbidden => return err,
+                error.NotFound, error.Forbidden, error.RateLimited => return err,
                 else => {
                     std.log.debug("native download failed ({s}); trying curl", .{@errorName(err)});
                     self.native_ok = false;
@@ -331,6 +342,7 @@ pub const Http = struct {
             .ok => {},
             .not_found => return error.NotFound,
             .unauthorized, .forbidden => return error.Forbidden,
+            .too_many_requests, .service_unavailable => return error.RateLimited,
             else => return error.HttpError,
         }
     }
@@ -342,7 +354,9 @@ pub const Http = struct {
         defer self.gpa.free(full);
         var argv = std.ArrayList([]const u8).empty;
         defer argv.deinit(self.gpa);
-        try argv.appendSlice(self.gpa, &.{ "curl", "-L", "-sS", "--fail", "-o", full });
+        // The body goes to the file; stdout carries the status code, so that
+        // a 404 is told apart from a 429 (curl's --fail exits 22 for both).
+        try argv.appendSlice(self.gpa, &.{ "curl", "-L", "-sS", "--fail", "-o", full, "-w", "%{http_code}" });
         var tbuf: [32]u8 = undefined;
         try self.appendCurlTimeoutArgs(&argv, &tbuf);
         if (continue_partial) try argv.appendSlice(self.gpa, &.{ "-C", "-" });
@@ -363,9 +377,16 @@ pub const Http = struct {
         defer self.gpa.free(result.stdout);
         switch (result.term) {
             .exited => |code| if (code != 0) {
-                std.log.err("curl failed for {s}: {s}", .{ url, std.mem.trim(u8, result.stderr, "\n") });
-                if (code == 22) return error.NotFound;
-                return error.HttpError;
+                const status = std.fmt.parseInt(u16, std.mem.trim(u8, result.stdout, " \r\n"), 10) catch 0;
+                return switch (status) {
+                    404 => error.NotFound,
+                    401, 403 => error.Forbidden,
+                    429, 503 => error.RateLimited,
+                    else => {
+                        std.log.err("curl failed for {s}: {s}", .{ url, std.mem.trim(u8, result.stderr, "\n") });
+                        return error.HttpError;
+                    },
+                };
             },
             else => return error.HttpError,
         }

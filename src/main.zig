@@ -30,6 +30,7 @@ const stream = @import("stream.zig");
 const reproduce = @import("reproduce.zig");
 const bench = @import("bench.zig");
 const probe = @import("probe.zig");
+const verify = @import("verify.zig");
 const compute = @import("compute.zig");
 const selftest = @import("selftest.zig");
 const directions = @import("directions.zig");
@@ -1370,6 +1371,13 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     const raw_args = try init.minimal.args.toSlice(arena);
     var args = try arena.alloc([]const u8, raw_args.len);
     for (raw_args, 0..) |a, i| args[i] = a;
+    // `ditch verify` has options of its own and runs ditch as child processes.
+    if (args.len > 1 and std.mem.eql(u8, args[1], "verify")) {
+        const code = try verify.run(gpa, arena, io, init.environ_map, args[2..], con.out, con.result);
+        con.out.flush() catch {};
+        con.result.flush() catch {};
+        std.process.exit(code);
+    }
     var loaded = try config.load(gpa, io, args, init.environ_map);
     defer loaded.deinit();
     const settings = &loaded.settings;

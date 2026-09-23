@@ -4,7 +4,7 @@ against heretic's norm-preserving orthogonalisation recomputed here, independent
     ditch CUT --n-trials 1 --n-startup-trials 1 --expert-selection broad \
         --dump-directions OUT.dirs.safetensors --trial-index 1 --model-action save \
         [--export-dtype f32] -o OUT ... > OUT.log
-    python3 tools/check_abliteration.py CUT OUT      # SAMPLE=4: four experts per stacked tensor
+    python3 tools/check_abliteration.py CUT OUT [--json FILE]   # SAMPLE=4: four experts per stacked tensor
 
 The trial's parameters are read from OUT.log (the printed min_weight is a fraction of
 max_weight, heretic's parameterisation), the directions from OUT.dirs.safetensors
@@ -15,11 +15,12 @@ difference, next to the best any rank-3 delta can do (ditch stores a rank-3 delt
 export is also compared bit for bit with bf16(W + D3), D3 the optimal rank-3 delta.
 """
 import json, re, sys, os, math, torch
-sys.path.insert(0, '/home/user/ditch/tools')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lazy_checkpoint import LazyCheckpoint
 from ref_lazy_moe import dequant_expert
 from safetensors import safe_open
 cut, out = sys.argv[1], sys.argv[2]
+json_out = sys.argv[sys.argv.index('--json') + 1] if '--json' in sys.argv else None
 log = open(out + '.log').read()
 # --- trial parameters (the "Restoring model from trial" block) ---
 blk = log[log.rindex('* Parameters:'):]
@@ -129,3 +130,11 @@ if EXP_BF16:
     print(f'bf16 export: worst share of elements equal to bf16(W + D3): {min(b[1] for b in bits) if bits else 1:.6f}; elements more than one bf16 step (and 1e-5 of mean |W|) apart: {sum(b[2][0] for b in bits) if bits else 0}; largest difference {max(b[2][1] for b in bits) if bits else 0:.1e} of mean |W|; over {len(bits)} matrices; (E-W) against the exact edit (rounding included): worst excess over the rank-3 optimum {worst:.2e}; scope {scope}')
 else:
     print(f'worst excess over the rank-3 optimum: {worst:.2e} over {len(checks)} matrices; scope {scope}')
+if json_out:
+    # For `ditch verify`: what changed, and each edit against its recomputation.
+    summary = dict(changed=changed, unchanged=unchanged, matrices=len(checks),
+                   unchecked=[c[0] for c in checks if c[4] is None], worst_excess=worst, scope=scope, bf16=bool(EXP_BF16))
+    if EXP_BF16 and bits:
+        summary.update(bits_equal_min=min(b[1] for b in bits), bits_far=sum(b[2][0] for b in bits),
+                       bits_max_rel=max(b[2][1] for b in bits))
+    json.dump(summary, open(json_out, 'w'), indent=1)
