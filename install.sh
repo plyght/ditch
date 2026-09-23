@@ -43,23 +43,28 @@ banner() {
 	else
 		W='' R='' Z=''
 	fi
-	# A terminal narrower than the art gets a one-line form instead of wrapped rows.
+	# The art is braille: a terminal that cannot show it (the Linux console, a
+	# locale that is not UTF-8) or is narrower than it gets the one-line form.
+	unicode=1
+	case "${TERM:-}" in linux | dumb) unicode=0 ;; esac
+	if [ "$(uname -s)" != Darwin ]; then
+		loc="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
+		case "$loc" in '' | *[Uu][Tt][Ff]-8* | *[Uu][Tt][Ff]8*) ;; *) unicode=0 ;; esac
+	fi
 	cols=$( (stty size </dev/tty) 2>/dev/null | cut -d ' ' -f 2)
 	case "$cols" in '' | *[!0-9]*) cols=${COLUMNS:-0} ;; esac
 	case "$cols" in '' | *[!0-9]*) cols=0 ;; esac
-	if [ "$cols" -gt 0 ] && [ "$cols" -le 66 ]; then
+	if [ "$unicode" = 0 ] || { [ "$cols" -gt 0 ] && [ "$cols" -le 54 ]; }; then
 		printf '  %sditch %s--.__.-'"'"'`%s\n' "$W" "$R" "$Z" >&2
 	else
 		sed -e "s/{W}/$W/g" -e "s/{R}/$R/g" -e "s/{0}/$Z/g" >&2 <<'LOGO'
-           {W}....   ..                  ....{0}
-          {W}.+@@+  +@@:                 :@@@{0}
-           {W}-@@+  .--   .+#.            %@@       {R}/`''`\       __-`{0}
-      {W}:+#+=*@@+ :+**: =#@@++. :+#++*+  %@@-+##*: {R}\\  //  ___-''{0}
-     {W}-@@+  -@@+  *@@-  #@@.  =@@=  .*  %@@  :@@#  {R}\-----`'{0}
-{R}_-------____{W}@@+{R}`-{W}*{R}_____--`''`{W}%@@{R}_____--```---___--`'{0}
-     {W}+@@-  -@@+  *@@-  #@@.  *@@:      %@@  .@@#{0}
-     {W}.*@%==+@@#::#@@+. +@@*=:.+%%+=== -@@@- =@@%:{0}
-        {W}... .........   ....    ....  ..... .....{0}
+        {W}⢀⣀⡀  ⣀⣀                 ⣀⣀{0}
+        {W}⣿⣿⡇ ⠸⠿⠿  ⢰⣶⣶            ⣿⣿⡇     {R}⢀⣠⠴⠶⢤⡀       ⣀{0}
+   {W}⢠⣴⣶⣶⣤⣿⣿⡇ ⢠⣶⣶ ⢰⣾⣿⣿⣶⣶⡆ ⣠⣴⣶⣶⣶⣦  ⣿⣿⣧⣶⣶⣶⣄ {R}⢾⡀   ⡽   ⣀⣠⠴⠋⠉{0}
+ {R}⢀⣀⣛⣛{W}⠋ ⠉⡿⣿⡇{R}⠤{W}⢸⣿⠿ ⠈⢹⠟{R}⣩⠥⠦⣅{W}⢰⣿⣿⠋ ⠈⠉{R}⢀⣠⠭⢭⣍⡁{W}⠉⣿⣿⡆ {R}⠙⢲⣦⠾⠷⠒⠚⠋⠉{0}
+{R}⠚⠉{W}⠡⣶⣌{R}⠳⣄⣀⡴{W}⣿⡇ ⢸⣿{R}⠳⣄⣀⣠⠞{W}⣡   ⢸⣿⣿ {R}⢀⡠⠖⠋ {W}⣾⣶⡆{R}⠉⠓⠦⠭⠥⠶⠚⠉{0}
+   {W}⠻⣿⣷⣦⡭⣴⣿⡇ ⢸⣿⣷ {R}⠉ {W}⢾⣿⣿⣿ ⠈⠻⣿⣿⣶⣶⣾  ⣿⣿⡇  ⣿⣿⡇{0}
+     {W}⠈                     ⠉{0}
 LOGO
 	fi
 	printf '\n  %sditch censorship.%s\n\n' "$DIM" "$RESET" >&2

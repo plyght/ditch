@@ -4286,3 +4286,41 @@ decode step fetches its 144 experts layer by layer: the 4 experts of a layer
 are known only when its router has run, so each layer waits for a round of
 8 MB range requests (~2-3 s at the per-stream rate here) and the link idles
 between layers. That, not the bandwidth, is the ~263 s a token.
+
+## Bug F14 — a failed read at load was taken for a missing tensor (fixed)
+
+The dry run of `hf://Qwen/Qwen3.8-2.4T-A95B` during the rate-limited
+stretch (before F13) ended with `error: missing tensor:
+model.layers.62.post_attention_layernorm.weight`, a tensor the index lists
+(in shard 150, whose reads were answered 429). `Model.loadVecOpt`, which
+reads every norm, bias and small vector at load, returned null for a read
+that failed (`readVecF32(...) catch null`), the same as for a tensor the
+checkpoint does not have. A required norm then reported a missing tensor
+instead of the network error; an optional one (a projection or norm bias,
+attention sinks, a router bias, a shared-expert gate) was silently dropped,
+loading a different model from the one on the Hub. `loadVecOpt` now returns
+the read error, and its 42 callers pass it on. `tools/range_server.py`
+serves a `/failafter-<n>/` prefix that answers 404 to every range request
+after the first n. Regression test: "remote source: a read that fails while
+loading is reported, not taken for a missing tensor" (`src/remote_test.zig`;
+before the fix it fails with `MissingWeights`).
+
+## Bug F15 — a rate-limited small file was taken for a missing one, and remembered (fixed)
+
+The first dry run of `hf://MiniMaxAI/MiniMax-M3`, during the same
+rate-limited stretch, stopped with "no tokenizer.json, tiktoken.model or
+tokenizer.model", though the repository has `tokenizer.json`. The small
+files (config, tokenizer, templates, index) are fetched by `Http.download`,
+whose curl path mapped curl's exit code 22 to `NotFound`; with `--fail`
+curl exits 22 for any status from 400 up, a 429 included. A required file
+then failed the load, and an optional one (`chat_template.jinja`,
+`tokenizer_config.json`, `generation_config.json`) got a `.missing` marker
+that later runs trust, so a model could lose its chat template for good.
+curl now reports the status (`-w %{http_code}`), mapped as the range reads
+map it (404, 401/403, 429/503, anything else), the native client maps
+429/503 too, and `download` uses the same retry policy and shared back-off
+as the range reads (F13). `tools/range_server.py` serves a
+`/ratelimitall-<n>/` prefix whose first n requests of any kind get a 429.
+Regression test: "remote source: rate-limited small files are waited for,
+not taken for missing ones" (`src/remote_test.zig`, the native client and
+curl; it fails with the old mapping).
