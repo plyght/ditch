@@ -3479,3 +3479,10 @@ and both attention kinds are.
 | --- | :---: | :---: | ---: | :---: |
 | "The capital of France is" | match (21) | all 6 agree, worst 7.04e-07 | 6.59e-07 | match |
 | "Explain how rainbows form, …" | match (25) | all 6 agree, worst 7.74e-07 | 6.14e-07 | match |
+
+KV sharing, separately: `--layers 0,18,19,20,24` with `num_kv_shared_layers: 2`
+keeps the release's own pairing (layer types sliding, sliding, full, sliding,
+full; original layer 20 reads layer 18's cache and 24 reads 19's, as in the
+whole model). All 6 residuals agree, worst 1.07e-06, logits 9.5e-07. The same
+reference with sharing turned off differs from ditch by 3.2e-02 from the first
+shared layer, so the check does exercise it.
