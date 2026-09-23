@@ -4777,3 +4777,31 @@ first 8 of 256 experts (`--experts 8`); float32 export.
   `modeling_kimi_linear.py` (its torch KDA fallback) against `ditch probe` on
   the export: residuals within 2.95e-06, logits 9.3e-07 of range, argmax and
   top-5 equal on both prompts.
+
+## Exact ranges for scattered experts: gpt-oss-20b with a cache below its experts
+
+After the account of gpt-oss-120b's decode above (whole 8 MB chunks per
+expert piece), the ranges a MoE layer's routed experts need are merged per
+shard, and a chunk a merged range covers less than half of is fetched as the
+exact range into a bounded RAM store (512 MB) that the reads consult; a
+chunk covered more is fetched whole into the chunk cache as before. This
+applies only when the plan says the routed experts do not fit the cache
+beside the trunk: a model that fits keeps whole chunks, so that a later run
+reads everything from disk. Measured on gpt-oss-20b with `--remote-cache-size
+4500MB` (the trunk's 3.35 GB and 82 of its 768 experts), cold, ReleaseFast,
+"What is the capital of France?" (87 chat tokens), 16 greedy tokens, each
+run alone:
+
+| | fetched | exact ranges | chunks evicted | first token | 16 tokens | link |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| whole chunks | 4931 ranges, 38.47 GB | - | 4369 | 407.3 s | 1852.1 s (0.010 tokens/s after the first) | ~20.8 MB/s |
+| exact ranges | 5544 ranges, 19.82 GB | 3697 (5.39 GB), 6592 reads served | 1285 | 460.5 s | 1826.1 s (0.011 tokens/s after the first) | ~10.9 MB/s |
+
+Both print `<|channel|>analysis<|message|>We need to answer: "What is the
+capital of France?"`, with the same expert-cache counts (1456 misses, 56 a
+decode step). Half the bytes, and a third of the evictions, for the same
+wall time: this run met a slower link (TLS resets from the Hub during it),
+and a decode step is bound less by bytes than by the largest piece each
+layer waits for at the per-connection rate (~1-3 MB/s here), which the
+exact ranges do not shorten. They matter where a step is bandwidth-bound
+(gpt-oss-120b's ~6.3 GB a step) and for the Hub's request and byte budget.

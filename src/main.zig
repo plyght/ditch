@@ -20,6 +20,7 @@ const chat = @import("chat.zig");
 const render_template = @import("render_template.zig");
 const hf = @import("hf.zig");
 const abliterate = @import("abliterate.zig");
+const push_mod = @import("push.zig");
 const search = @import("search.zig");
 const tpe = @import("tpe.zig");
 const study_mod = @import("study.zig");
@@ -289,6 +290,8 @@ const App = struct {
     bad_prompts: []const Prompt,
     /// Warm-start observations from a previous study (sampled from, never counted or shown).
     warm: []const tpe.Observation = &.{},
+    /// Where the trial of the current model menu was last saved (pushed from there).
+    saved_dir: ?[]const u8 = null,
 
     fn abliterateOptions(self: *App) abliterate.Options {
         return .{
@@ -642,31 +645,59 @@ const App = struct {
     /// The "what do you want to do with the model" loop. Returns true to go back to trial selection.
     fn modelLoop(self: *App, trial: *const study_mod.Trial) !bool {
         const out = self.con.out;
-        const options = [_][]const u8{ "Save the model to a local folder", "Chat with the model", "Return to the trial selection menu", "Exit" };
+        const options = [_][]const u8{ "Save the model to a local folder", "Push the model to the Hugging Face Hub", "Chat with the model", "Return to the trial selection menu", "Exit" };
+        self.saved_dir = null;
         var forced_done = false;
         while (true) {
             var action: usize = undefined;
             if (self.settings.model_action) |ma| {
                 if (forced_done) return false;
                 forced_done = true;
-                if (std.mem.eql(u8, ma, "save")) action = 0 else if (std.mem.eql(u8, ma, "chat")) action = 1 else if (std.mem.eql(u8, ma, "exit")) action = 3 else {
-                    std.log.err("unknown model action: {s} (expected save, chat or exit)", .{ma});
+                if (std.mem.eql(u8, ma, "save")) action = 0 else if (std.mem.eql(u8, ma, "push")) action = 1 else if (std.mem.eql(u8, ma, "chat")) action = 2 else if (std.mem.eql(u8, ma, "exit")) action = 4 else {
+                    std.log.err("unknown model action: {s} (expected save, push, chat or exit)", .{ma});
                     return error.InvalidModelAction;
                 }
             } else {
-                action = (try self.con.menu("What do you want to do with the decensored model?", &options, "--model-action save|chat|exit")) orelse return false;
+                action = (try self.con.menu("What do you want to do with the decensored model?", &options, "--model-action save|push|chat|exit")) orelse return false;
             }
             switch (action) {
-                0 => self.saveModel(trial) catch |err| {
-                    try out.print("Error while saving the model: {s}\n", .{@errorName(err)});
-                    if (err == error.TimeLimitExceeded) try out.print("The export directory is incomplete (it contains {s}) and will be refused on load.\n", .{model_mod.export_incomplete_marker});
-                    if (self.settings.model_action != null) return if (err == error.TimeLimitExceeded) error.ExportIncomplete else err;
+                0, 1 => {
+                    // With --push-to-hub, saving pushes too.
+                    const pushing = action == 1 or self.settings.push_to_hub != null;
+                    const result = if (pushing) self.pushModel(trial, action == 0) else self.saveModel(trial);
+                    result catch |err| {
+                        if (self.saved_dir) |d| if (pushing) {
+                            try out.print("Error while pushing the model: {s}. It is saved in {s}; retry with ditch push {s} <owner/name>.\n", .{ @errorName(err), d, d });
+                            if (self.settings.model_action != null) return err;
+                            continue;
+                        };
+                        try out.print("Error while saving the model: {s}\n", .{@errorName(err)});
+                        if (err == error.TimeLimitExceeded) try out.print("The export directory is incomplete (it contains {s}) and will be refused on load.\n", .{model_mod.export_incomplete_marker});
+                        if (self.settings.model_action != null) return if (err == error.TimeLimitExceeded) error.ExportIncomplete else err;
+                    };
                 },
-                1 => try self.chatLoop(),
-                2 => return true,
+                2 => try self.chatLoop(),
+                3 => return true,
                 else => return false,
             }
         }
+    }
+
+    /// Uploads the trial's export to the Hub, saving it first when `fresh`
+    /// or when it has not been saved from this menu yet.
+    fn pushModel(self: *App, trial: *const study_mod.Trial, fresh: bool) !void {
+        if (fresh or self.saved_dir == null) {
+            self.saved_dir = null;
+            try self.saveModel(trial);
+        }
+        const dir = self.saved_dir orelse return;
+        const repo = self.settings.push_to_hub orelse blk: {
+            const line = (try self.con.ask("Hub repository (owner/name):", "--push-to-hub <owner/name>")) orelse return;
+            const t = std.mem.trim(u8, line, " \t");
+            if (t.len == 0) return;
+            break :blk try self.arena.dupe(u8, t);
+        };
+        try push_mod.push(self.gpa, self.http, dir, repo, .{ .private = self.settings.private }, self.con.log);
     }
 
     const ExportFormat = enum { hf, gguf, both };
@@ -801,6 +832,7 @@ const App = struct {
         }
         try out.print("* Writing {s}...\n", .{reproduce.file_name});
         try reproduce.writeFile(self.gpa, self.io, &manifest, dir);
+        self.saved_dir = dir;
         try self.con.log.print("Model saved to {s}.\n", .{dir});
         try self.con.log.flush();
         try out.flush();
@@ -1295,7 +1327,8 @@ pub fn main(init: std.process.Init) !void {
             error.ExportIncomplete => std.log.err("the export was cut short (time limit); the output directory is marked {s}", .{model_mod.export_incomplete_marker}),
             error.BudgetTooSmall => std.log.err("memory budget too small (see above)", .{}),
             error.Interrupted => std.log.err("interrupted", .{}),
-            error.NoInput, error.DirectoryNotEmpty => {},
+            // Explained where they are raised.
+            error.NoInput, error.DirectoryNotEmpty, error.NoToken, error.InvalidRepoId, error.UnfinishedExport, error.NothingToPush, error.LfsRefused => {},
             error.UnknownModelType => std.log.err("add a definition for it: ditch add-model {s} drafts one from the checkpoint (see docs/models.md)", .{if (model_arg.len > 0) model_arg else "<model>"}),
             else => std.log.err("{s}", .{@errorName(err)}),
         }
@@ -1477,6 +1510,23 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         return;
     }
 
+    // `ditch push <dir> <owner/name>`: an exported directory to the Hub, no model run.
+    if (settings.push) {
+        const repo = settings.push_to_hub orelse {
+            std.log.err("usage: ditch push <DIR> <owner/name> [--private]", .{});
+            std.process.exit(2);
+        };
+        if (settings.model.len == 0 or !hf.isLocalDir(io, settings.model)) {
+            std.log.err("ditch push needs an exported model directory, got {s}", .{if (settings.model.len == 0) "nothing" else settings.model});
+            std.process.exit(2);
+        }
+        installSigint();
+        try out.flush();
+        var http = try hf.Http.initWithOptions(gpa, io, arena, init.environ_map, .{ .token_file = settings.token_file, .timeout_seconds = settings.http_timeout_seconds });
+        defer http.deinit();
+        try push_mod.push(gpa, &http, settings.model, repo, .{ .private = settings.private }, con.log);
+        return;
+    }
     // A reproducibility manifest replaces the recorded settings (model, seed, datasets, ...).
     var manifest: ?reproduce.Manifest = null;
     if (settings.reproduce) |path| {
@@ -1570,6 +1620,17 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     // Model.
     var http = try hf.Http.initWithOptions(gpa, io, arena, init.environ_map, .{ .token_file = settings.token_file, .timeout_seconds = settings.http_timeout_seconds });
     defer http.deinit();
+    // A push at the end of the run must not fail on what can be checked now.
+    if (settings.push_to_hub) |repo| {
+        if (!push_mod.validRepoId(repo)) {
+            std.log.err("invalid --push-to-hub {s}: expected owner/name", .{repo});
+            std.process.exit(2);
+        }
+        if (http.token == null) {
+            std.log.err("--push-to-hub needs a Hugging Face token with write access: set HF_TOKEN, run `hf auth login`, or pass --token-file <path>", .{});
+            std.process.exit(2);
+        }
+    }
     const cache_root = try hf.cacheDir(arena, settings, init.environ_map);
     if (settings.bench) {
         try bench.run(gpa, arena, io, settings, &http, cache_root, pool, out, con.result);

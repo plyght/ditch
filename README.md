@@ -74,8 +74,8 @@ like a subcommand must be given as a path, e.g. `./bench`). ditch loads the
 model, fetches the prompt sets, detects a batch size and response prefix,
 measures baseline scores, extracts refusal directions, runs the optimisation
 study (journaled to `checkpoints/`, so Ctrl+C is resumable), then shows the
-Pareto-optimal trials and lets you save the model, chat with it, or run more
-trials.
+Pareto-optimal trials and lets you save the model, push it to the Hugging Face
+Hub, chat with it, or run more trials.
 
 Useful flags (all also settable in `config.lua`; see `ditch --help`):
 
@@ -88,6 +88,7 @@ Useful flags (all also settable in `config.lua`; see `ditch --help`):
 | `--fast-search`, `--direction-method separating`, `--direction-range auto`, `--ablate-inputs`, `--kl-tokens T`, `--select auto` | algorithm options (see "How it works") |
 | `--export-format hf\|gguf\|both`, `--gguf-dtype f16\|q8_0\|...` | output format |
 | `--checkpoint-action`, `--trial-index`, `--model-action`, `--save-directory` | answer the menus non-interactively |
+| `--push-to-hub owner/name`, `--private`, `ditch push DIR owner/name` | upload to the Hub (see "Pushing to the Hub") |
 | `--evaluate-model DIR`, `--reproduce FILE`, `ditch bench MODEL` | evaluate, reproduce, measure |
 | `--device auto\|cpu\|metal`, `--gpu-memory 4GB`, `ditch selftest` | compute backend (see "GPU acceleration") |
 
@@ -260,6 +261,29 @@ is exported as plain bf16 instead, so pass `--gguf-dtype q8_0` when you want a
 smaller file. The writer follows the GGUF v3 spec and llama.cpp's conventions
 and is tested by round trip in ditch; it has not been run through llama.cpp
 itself.
+
+## Pushing to the Hub
+
+```sh
+ditch Qwen/Qwen2.5-0.5B-Instruct --trial-index 1 --model-action save -o out/ --push-to-hub me/qwen-ditched --private
+ditch push out/ me/qwen-ditched          # an export saved earlier
+```
+
+With `--push-to-hub` (or `push_to_hub` in `config.lua`), saving a model also
+uploads the whole export directory (weights, config, tokenizer, the README model
+card and `ditch-reproduce.lua`) to that model repository in one commit; the
+results menu offers the same as "Push the model to the Hugging Face Hub". The
+repository is created if it does not exist (`--private` makes a new one
+private). The token comes from `HF_TOKEN`, `hf auth login` or `--token-file` and
+needs write access; `HF_ENDPOINT` points ditch at another Hub.
+
+The upload is plain HTTP from ditch itself (no Python, no `huggingface-cli`):
+files are hashed and streamed from disk, large ones through Git LFS (in parts
+for big shards), small text files inline in the commit. The Hub keeps new
+repositories on Xet storage but accepts LFS uploads and converts them in the
+background. Failed requests are retried with backoff, a multipart upload
+retries only the part that failed, and running the push again skips every file
+the Hub already has.
 
 ## Reproducibility and benchmarks
 

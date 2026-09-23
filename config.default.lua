@@ -387,7 +387,7 @@ return {
   -- checkpoint_action = "continue",   -- or "restart"
   -- trial_index = 1,                  -- 1-based number shown in the results menu
   -- n_additional_trials = 20,         -- run more trials before showing results
-  -- model_action = "save",            -- "save", "chat" or "exit"
+  -- model_action = "save",            -- "save", "push", "chat" or "exit"
   -- save_directory = "out/my-model",
   -- export_dtype = "bf16",            -- "bf16", "f16" or "f32" (default: as source;
   --                                   -- a source dequantised on load exports as bf16)
@@ -403,6 +403,11 @@ return {
   -- and other 1-D tensors are always f32; the token embeddings and the output
   -- projection stay f16 when a quantised type is chosen.
   -- gguf_dtype = "q8_0",
+  -- Upload the saved directory to this Hugging Face model repository (created
+  -- if missing; needs a token with write access). `private` applies to a new
+  -- repository only. `ditch push <dir> <owner/name>` uploads an earlier export.
+  -- push_to_hub = "me/my-model-ditched",
+  -- private = false,
 
   -- -------------------------------------------------------------------------
   -- Reproducing and benchmarking

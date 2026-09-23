@@ -240,6 +240,12 @@ pub const Settings = struct {
     /// Storage type of the GGUF matrices: f16 (default for HF inputs), bf16,
     /// f32, q8_0, q4_0, q4_1, q5_0, q5_1 or "source" (default for GGUF inputs).
     gguf_dtype: ?[]const u8 = null,
+    /// Hub repository (owner/name) the saved model is uploaded to.
+    push_to_hub: ?[]const u8 = null,
+    /// Create that repository as private.
+    private: bool = false,
+    /// `ditch push <dir> <owner/name>`: upload an exported directory, no model run.
+    push: bool = false,
     config_path: ?[]const u8 = null,
     /// `--reproduce <manifest>`: re-derive an exported model from its ditch-reproduce.lua.
     reproduce: ?[]const u8 = null,
@@ -332,6 +338,7 @@ pub const usage_text =
     \\  ditch selftest [--device D]      check a compute backend against the CPU reference kernels
     \\  ditch truncate <MODEL> <K> <OUT> write a checkpoint of the first K decoder layers
     \\  ditch add-model <MODEL>          draft a Lua model definition for a model_type ditch does not know
+    \\  ditch push <DIR> <owner/name>    upload an exported model directory to the Hugging Face Hub
     \\  ditch help [bench]               this help (or the benchmark options)
     \\
     \\<MODEL> is a Hugging Face model id (Qwen/Qwen2.5-0.5B-Instruct), a local directory, a .gguf
@@ -347,6 +354,8 @@ pub const examples_text =
     \\      Non-interactive: 40 trials, save the best Pareto trial to out/.
     \\  ditch hf://Qwen/Qwen3-30B-A3B --max-ram 12GB --expert-cache 6GB --time-limit 4h
     \\      A model bigger than RAM: stream weights, keep a bounded expert cache, stop cleanly after 4 h.
+    \\  ditch Qwen/Qwen2.5-0.5B-Instruct --model-action save -o out/ --push-to-hub me/qwen-ditched
+    \\      Save the chosen trial to out/, then upload it to the Hub (needs a write token).
     \\  ditch bench Qwen/Qwen2.5-0.5B-Instruct --json > bench.json
     \\      Benchmark, machine-readable.
     \\
@@ -358,7 +367,7 @@ pub const help_sections = [_]HelpSection{
     \\  --batch-size <n>               Prompts per batch (0 = auto-detect, the default).
     \\  --max-ram <size>               Keep resident memory under this budget, e.g. 8GB.
     \\  -o, --output <path>            Where to save the model (= --save-directory).
-    \\  --trial-index <n>, --model-action <save|chat|exit>   Answer the result menus non-interactively.
+    \\  --trial-index <n>, --model-action <save|push|chat|exit>   Answer the result menus non-interactively.
     \\  -n, --dry-run                  Stop after loading the model and printing the memory estimate.
     \\  -q, --quiet                    Only trial results, scores and errors (no banner, no progress).
     \\  --json                         Results, evaluation or benchmark as one JSON document on stdout.
@@ -464,7 +473,8 @@ pub const help_sections = [_]HelpSection{
     },
     .{ .title = "Results (non-interactive use)", .body =
     \\  --trial-index <n>              Select this trial instead of asking.
-    \\  --model-action <save|chat|exit>  What to do with the selected trial.
+    \\  --model-action <save|push|chat|exit>  What to do with the selected trial (push = save, then
+    \\                                 upload to --push-to-hub).
     \\  --save-directory <path>        Where to save the model with --model-action save (also -o, --output).
     \\  -f, --force                    Overwrite a non-empty save directory without asking.
     \\  --export-dtype <bf16|f16|f32>  Storage dtype for exported weights (default: same as source).
@@ -473,6 +483,10 @@ pub const help_sections = [_]HelpSection{
     \\  --gguf-dtype <f16|bf16|f32|q8_0|q4_0|q4_1|q5_0|q5_1|source>
     \\                                 Storage type of the GGUF matrices (default: f16, or the
     \\                                 source types for a GGUF input). Norms stay f32.
+    \\  --push-to-hub <owner/name>     After saving, upload the directory to this Hub model repository
+    \\                                 (created if missing; needs a token with write access).
+    \\  --private                      Create that repository as private.
+    \\  ditch push <dir> <owner/name>  Upload an already exported directory the same way.
     \\  --n-additional-trials <n>      Run more trials after a finished study.
     \\
     },
@@ -536,6 +550,9 @@ pub const help_sections = [_]HelpSection{
     \\                                 flag value and never printed.
     \\  --http-timeout <duration>      Connect / stall timeout of downloads (default: 30s); transient
     \\                                 failures are retried three times and downloads resume .part files.
+    \\                                 Uploads retry each request up to eight times (honouring
+    \\                                 Retry-After); a rerun skips the files the Hub already has.
+    \\  HF_ENDPOINT                    Hub to download from and push to (default: https://huggingface.co).
     \\
     },
     .{ .title = "Configuration", .body =
@@ -803,7 +820,7 @@ pub fn configDir(a: Allocator, env: *const std.process.Environ.Map) !?[]const u8
     return try std.fs.path.join(a, &.{ home, ".config", "ditch" });
 }
 
-pub const subcommands = [_][]const u8{ "bench", "probe", "verify", "selftest", "truncate", "help", "add-model" };
+pub const subcommands = [_][]const u8{ "bench", "probe", "verify", "selftest", "truncate", "push", "help", "add-model" };
 
 /// Parses the configuration: the global config file (--config, else
 /// ~/.config/ditch/config.lua) with its general settings and then its
@@ -938,9 +955,18 @@ fn loadLayers(gpa: Allocator, io: std.Io, args: []const []const u8, environ: ?*s
                 settings.add_model = true;
                 continue;
             }
+            if (std.mem.eql(u8, arg, "push")) {
+                settings.push = true;
+                continue;
+            }
             if (std.mem.eql(u8, arg, "help")) {
                 settings.help = true;
                 expect_help_topic = true;
+                continue;
+            }
+            if (settings.model.len > 0 and settings.push and settings.push_to_hub == null) {
+                // `ditch push <dir> <owner/name>`: the second positional is the repository.
+                settings.push_to_hub = try a.dupe(u8, arg);
                 continue;
             }
             if (settings.model.len > 0) {
@@ -1017,7 +1043,7 @@ fn normalizeKey(a: Allocator, name: []const u8) ![]u8 {
 }
 
 fn isBoolKey(key: []const u8) bool {
-    const bools = [_][]const u8{ "print_debug_information", "print_residual_geometry", "orthogonalize_direction", "keyword_rate_print_responses", "ignore_mismatches", "early_stop", "no_early_stop", "visited_experts_only", "remote_weights", "hotlist", "no_hotlist", "ablate_inputs", "fast_search", "selftest", "kinds", "raw", "residuals", "kernels", "bench_kernels", "accelerate", "no_accelerate", "help", "version", "quiet", "dry_run", "no_input", "interactive", "force", "json", "plain", "no_color", "debug", "token" };
+    const bools = [_][]const u8{ "print_debug_information", "print_residual_geometry", "orthogonalize_direction", "keyword_rate_print_responses", "ignore_mismatches", "early_stop", "no_early_stop", "visited_experts_only", "remote_weights", "hotlist", "no_hotlist", "ablate_inputs", "fast_search", "selftest", "kinds", "raw", "residuals", "kernels", "bench_kernels", "accelerate", "no_accelerate", "help", "version", "quiet", "dry_run", "no_input", "interactive", "force", "json", "plain", "no_color", "debug", "token", "private" };
     for (bools) |b| if (std.mem.eql(u8, b, key)) return true;
     return false;
 }
@@ -1105,7 +1131,7 @@ fn applyOption(a: Allocator, s: *Settings, key: []const u8, value: []const u8) !
     } else if (eql(u8, key, "early_stop")) s.early_stop = try parseBool(value) else if (eql(u8, key, "no_early_stop")) s.early_stop = !(try parseBool(value)) else if (eql(u8, key, "warm_start")) s.warm_start = try a.dupe(u8, value) else if (eql(u8, key, "n_trials")) s.n_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_startup_trials")) s.n_startup_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "seed")) s.seed = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "study_checkpoint_dir")) s.study_checkpoint_dir = try a.dupe(u8, value) else if (eql(u8, key, "max_shard_size")) s.max_shard_size = try parseSize(value) else if (eql(u8, key, "max_ram")) s.max_ram = try parseSize(value) else if (eql(u8, key, "max_vram")) s.max_vram = try parseSize(value) else if (eql(u8, key, "device")) {
         if (compute.Kind.parse(value) == null) return error.InvalidEnum;
         s.device = try a.dupe(u8, value);
-    } else if (eql(u8, key, "gpu_memory")) s.gpu_memory = try parseSize(value) else if (eql(u8, key, "device_min_macs")) s.device_min_macs = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "selftest")) s.selftest = try parseBool(value) else if (eql(u8, key, "scratch_dir")) s.scratch_dir = try a.dupe(u8, value) else if (eql(u8, key, "time_limit")) s.time_limit_seconds = try parseDuration(value) else if (eql(u8, key, "time_limit_seconds")) s.time_limit_seconds = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "budget_headroom")) s.budget_headroom = try parseSize(value) else if (eql(u8, key, "expert_cache")) s.expert_cache = try parseSize(value) else if (eql(u8, key, "visited_experts_only")) s.visited_experts_only = try parseBool(value) else if (eql(u8, key, "remote_weights")) s.remote_weights = try parseBool(value) else if (eql(u8, key, "remote_chunk_size")) s.remote_chunk_size = try parseSize(value) else if (eql(u8, key, "remote_connections")) s.remote_connections = try std.fmt.parseInt(u32, value, 10) else if (eql(u8, key, "remote_cache_size")) s.remote_cache_size = try parseSize(value) else if (eql(u8, key, "hotlist")) s.hotlist = try parseBool(value) else if (eql(u8, key, "no_hotlist")) s.hotlist = !(try parseBool(value)) else if (eql(u8, key, "checkpoint_action")) s.checkpoint_action = try a.dupe(u8, value) else if (eql(u8, key, "trial_index")) s.trial_index = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_additional_trials")) s.n_additional_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "model_action")) s.model_action = try a.dupe(u8, value) else if (eql(u8, key, "save_directory")) s.save_directory = try a.dupe(u8, value) else if (eql(u8, key, "export_dtype")) s.export_dtype = try a.dupe(u8, value) else if (eql(u8, key, "export_format")) s.export_format = try a.dupe(u8, value) else if (eql(u8, key, "gguf_dtype")) s.gguf_dtype = try a.dupe(u8, value) else if (eql(u8, key, "config")) {
+    } else if (eql(u8, key, "gpu_memory")) s.gpu_memory = try parseSize(value) else if (eql(u8, key, "device_min_macs")) s.device_min_macs = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "selftest")) s.selftest = try parseBool(value) else if (eql(u8, key, "scratch_dir")) s.scratch_dir = try a.dupe(u8, value) else if (eql(u8, key, "time_limit")) s.time_limit_seconds = try parseDuration(value) else if (eql(u8, key, "time_limit_seconds")) s.time_limit_seconds = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "budget_headroom")) s.budget_headroom = try parseSize(value) else if (eql(u8, key, "expert_cache")) s.expert_cache = try parseSize(value) else if (eql(u8, key, "visited_experts_only")) s.visited_experts_only = try parseBool(value) else if (eql(u8, key, "remote_weights")) s.remote_weights = try parseBool(value) else if (eql(u8, key, "remote_chunk_size")) s.remote_chunk_size = try parseSize(value) else if (eql(u8, key, "remote_connections")) s.remote_connections = try std.fmt.parseInt(u32, value, 10) else if (eql(u8, key, "remote_cache_size")) s.remote_cache_size = try parseSize(value) else if (eql(u8, key, "hotlist")) s.hotlist = try parseBool(value) else if (eql(u8, key, "no_hotlist")) s.hotlist = !(try parseBool(value)) else if (eql(u8, key, "checkpoint_action")) s.checkpoint_action = try a.dupe(u8, value) else if (eql(u8, key, "trial_index")) s.trial_index = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_additional_trials")) s.n_additional_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "model_action")) s.model_action = try a.dupe(u8, value) else if (eql(u8, key, "save_directory")) s.save_directory = try a.dupe(u8, value) else if (eql(u8, key, "export_dtype")) s.export_dtype = try a.dupe(u8, value) else if (eql(u8, key, "export_format")) s.export_format = try a.dupe(u8, value) else if (eql(u8, key, "gguf_dtype")) s.gguf_dtype = try a.dupe(u8, value) else if (eql(u8, key, "push_to_hub")) s.push_to_hub = try a.dupe(u8, value) else if (eql(u8, key, "private")) s.private = try parseBool(value) else if (eql(u8, key, "config")) {
         // handled in the first pass
     } else if (eql(u8, key, "reproduce")) s.reproduce = try a.dupe(u8, value) else if (eql(u8, key, "ignore_mismatches")) s.ignore_mismatches = try parseBool(value) else if (eql(u8, key, "bench_prompts")) s.bench_prompts = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "bench_tokens")) s.bench_tokens = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "bench_output")) s.bench_output = try a.dupe(u8, value) else if (eql(u8, key, "bench_kernels") or eql(u8, key, "kernels")) s.bench_kernels = try parseBool(value) else if (eql(u8, key, "accelerate")) s.accelerate = try parseBool(value) else if (eql(u8, key, "no_accelerate")) s.accelerate = !(try parseBool(value)) else if (eql(u8, key, "prompt")) {
         const list = try a.alloc([]const u8, s.probe_prompts.len + 1);
@@ -1488,6 +1514,15 @@ test "cli aliases, subcommands, order and suggestions" {
     defer r6.deinit();
     try std.testing.expectEqual(@as(usize, 1), r6.errors.len);
     try std.testing.expect(std.mem.startsWith(u8, r6.errors[0], "unknown command bnech; did you mean bench?"));
+
+    // `ditch push <dir> <owner/name>`: the second positional is the repository.
+    const args7 = [_][]const u8{ "ditch", "push", "out/model", "me/model", "--private" };
+    var r7 = try load(gpa, std.testing.io, &args7, null);
+    defer r7.deinit();
+    try std.testing.expectEqual(@as(usize, 0), r7.errors.len);
+    try std.testing.expect(r7.settings.push and r7.settings.private);
+    try std.testing.expectEqualStrings("out/model", r7.settings.model);
+    try std.testing.expectEqualStrings("me/model", r7.settings.push_to_hub.?);
 
     try std.testing.expectEqual(@as(usize, 2), editDistance("bench", "bnech"));
     try std.testing.expectEqualStrings("n-trials", (try suggestOption(r6.arena.allocator(), "ntrials")).?);
