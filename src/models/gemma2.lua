@@ -13,5 +13,5 @@ return {
     pre_ff_norm = "pre_feedforward_layernorm.weight",
     post_ff_norm = "post_feedforward_layernorm.weight",
   },
-  hook = "gemma",
+  config = require("gemma").config_gemma,
 }

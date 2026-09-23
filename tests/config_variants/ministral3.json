@@ -1,0 +1,11 @@
+[
+  {"rope_parameters": {"rope_type": "default", "rope_theta": 10000.0}},
+  {"llama_4_scaling_beta": 0.25},
+  {"rope_parameters": "$delete", "llama_4_scaling_beta": 0.3},
+  {"rope_parameters": "$delete"},
+  {"llama_4_scaling_beta": "x"},
+  {"llama_4_scaling_beta": null},
+  {"max_position_embeddings": 100000},
+  {"rope_parameters": {"rope_type": "default", "rope_theta": 10000.0, "llama_4_scaling_beta": null}},
+  {"rope_parameters": {"rope_type": "default", "rope_theta": 10000.0, "llama_4_scaling_beta": 2}}
+]

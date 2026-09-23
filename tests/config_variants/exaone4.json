@@ -1,0 +1,18 @@
+[
+  {"sliding_window_pattern": "LG"},
+  {"sliding_window_pattern": ""},
+  {"sliding_window_pattern": "GGGGL"},
+  {"sliding_window_pattern": "lx"},
+  {"sliding_window_pattern": 2},
+  {"sliding_window_pattern": 3.9},
+  {"sliding_window_pattern": "$delete"},
+  {"sliding_window_pattern": -1},
+  {"sliding_window_pattern": true},
+  {"sliding_window_pattern": null},
+  {"sliding_window_pattern": 1},
+  {"sliding_window": "$delete"},
+  {"sliding_window": null},
+  {"layer_types": ["sliding_attention", "full_attention", "full_attention", "sliding_attention"]},
+  {"layer_types": ["full_attention", "full_attention", "full_attention", "full_attention"], "sliding_window": "$delete"},
+  {"num_hidden_layers": 6}
+]
