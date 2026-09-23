@@ -11,6 +11,7 @@ const hf = @import("hf.zig");
 const tensor = @import("tensor.zig");
 const stream = @import("stream.zig");
 const directions = @import("directions.zig");
+const budget_mod = @import("budget.zig");
 
 const Allocator = std.mem.Allocator;
 const Model = model_mod.Model;
@@ -30,6 +31,8 @@ pub const Progress = struct {
     total: usize,
     start: Io.Timestamp,
     last_quarter: usize = 0,
+    /// Counts bytes: sizes are printed human-readable, with the transfer rate.
+    bytes: bool = false,
 
     pub fn init(out: *Io.Writer, io: Io, label: []const u8, total: usize) Progress {
         return .{ .out = out, .io = io, .label = label, .total = total, .start = Io.Timestamp.now(io, .awake) };
@@ -50,7 +53,10 @@ pub const Progress = struct {
         }
         const remaining = if (done > 0) elapsed / @as(f64, @floatFromInt(done)) * @as(f64, @floatFromInt(self.total - @min(done, self.total))) else 0;
         if (progress_style == .tty) self.out.writeAll("\r") catch {};
-        self.out.print("  {d}/{d} {s} ({d:.0} s elapsed, {d:.0} s remaining)", .{ done, self.total, self.label, elapsed, remaining }) catch {};
+        if (self.bytes) {
+            const rate: u64 = @intFromFloat(@as(f64, @floatFromInt(done)) / @max(elapsed, 1e-3));
+            self.out.print("  {f}/{f} {s} ({f}/s, {d:.0} s elapsed, {d:.0} s remaining)", .{ budget_mod.fmtBytes(done), budget_mod.fmtBytes(self.total), self.label, budget_mod.fmtBytes(rate), elapsed, remaining }) catch {};
+        } else self.out.print("  {d}/{d} {s} ({d:.0} s elapsed, {d:.0} s remaining)", .{ done, self.total, self.label, elapsed, remaining }) catch {};
         if (progress_style == .tty) self.out.print("{s: <6}", .{""}) catch {} else self.out.writeAll("\n") catch {};
         self.out.flush() catch {};
     }
