@@ -1,4 +1,4 @@
-//! `ditch render-template <DIR> <CASES.json>`, left out of the help: renders
+//! `ditch render-template <DIR> <CASES.json> [--family]`, left out of the help: renders
 //! conversations with a model directory's chat template and encodes them as
 //! a study would, for `tools/chat_template_check.py` to compare with
 //! transformers' `apply_chat_template`. DIR needs only the tokenizer files
@@ -9,7 +9,8 @@
 //! bool, "kwargs": {...}}`. Output is one JSON object on stdout:
 //! `{"renderer": "jinja" | family, "fold_system": bool, "content_parts":
 //! bool, "warnings": [], "results": [{"text": ..., "ids": [...]} |
-//! {"error": ...}]}`; the ids are present when a tokenizer loads.
+//! {"error": ...}]}`; the ids are present when a tokenizer loads. `--family`
+//! renders with the named family `chat.detect` picks instead of the template.
 
 const std = @import("std");
 const Io = std.Io;
@@ -21,8 +22,9 @@ const Tokenizer = @import("tokenizer.zig").Tokenizer;
 const Allocator = std.mem.Allocator;
 
 pub fn run(gpa: Allocator, arena: Allocator, io: Io, args: []const []const u8, out: *Io.Writer) !void {
-    if (args.len != 2) {
-        std.log.err("usage: ditch render-template <DIR> <CASES.json>", .{});
+    const family_only = args.len == 3 and std.mem.eql(u8, args[2], "--family");
+    if (args.len != 2 and !family_only) {
+        std.log.err("usage: ditch render-template <DIR> <CASES.json> [--family]", .{});
         return error.InvalidArguments;
     }
     const cwd = Io.Dir.cwd();
@@ -46,7 +48,8 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, args: []const []const u8, o
     const now = Io.Clock.real.now(io);
     chat.now_seconds = @intCast(@divFloor(now.nanoseconds, std.time.ns_per_s));
     chat.today = chat.Date.fromUnix(chat.now_seconds);
-    var format = try chat.Format.init(gpa, source, tokens, chat.detect(source, model_type));
+    const family = chat.detect(source, model_type);
+    var format = if (family_only) chat.Format.named(family) else try chat.Format.init(gpa, source, tokens, family);
     defer format.deinit();
 
     const tok: ?*Tokenizer = if (Tokenizer.loadDir(gpa, io, arena, dir, args[0], tokenizer_config)) |l| l.tokenizer else |_| null;
