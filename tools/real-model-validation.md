@@ -4756,3 +4756,24 @@ not fit on the disk).
   does not fit in 15 GiB either; `tools/ref_f32_but_embed.py` loads it in bf16
   and moves everything but the input embedding (a lookup of bf16 values,
   exact either way) to float32.
+
+## Abliteration: Kimi-Linear (`kimi_linear`), KDA and MLA layers with per-expert tensors
+
+`moonshotai/Kimi-Linear-48B-A3B-Instruct`, first 4 layers (layer 0 KDA with
+the dense MLP, layers 1-2 KDA with the MoE, layer 3 MLA with the MoE), the
+first 8 of 256 experts (`--experts 8`); float32 export.
+
+* **Edited set:** `self_attn.o_proj` (the KDA output projection in layers 1-2,
+  the MLA one in layer 3), every routed expert's `w2` (all 8) and
+  `shared_experts.down_proj`, in layers 1-3. Layer 0 is untouched, and should
+  be: its distance from the trial's peaks (2.39 for attention, 2.30 for the
+  MLP) is beyond both `min_weight_distance`s (1.47, 1.77). The KDA gates and
+  projections (`f_a/f_b/g_a/g_b/b_proj`, `q/k/v_proj`, the convolutions,
+  `A_log`, `dt_bias`, `o_norm`), `w1`/`w3`, the router and its correction
+  bias are all untouched.
+* **Maths:** all 30 edited matrices within 1.2e-06 of the best rank-3
+  approximation of the exact edit (λ 1.08-1.24 per layer).
+* **Export:** ditch's reload check 0.0000 over 4 prompts. transformers'
+  `modeling_kimi_linear.py` (its torch KDA fallback) against `ditch probe` on
+  the export: residuals within 2.95e-06, logits 9.3e-07 of range, argmax and
+  top-5 equal on both prompts.
