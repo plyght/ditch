@@ -666,7 +666,7 @@ pub fn referenceChecks(arena: Allocator, text: []const u8, tolerance: f64) ![]Ch
             .detail = if (first_bad) |l|
                 try std.fmt.allocPrint(arena, "first diverge at entry {d} ({s}) on {s}; worst {e:.2} relative", .{ l, if (l == 0) "the embedding output" else try std.fmt.allocPrint(arena, "the output of layer {d}", .{l - 1}), first_bad_prompt, worst_res })
             else
-                try std.fmt.allocPrint(arena, "all {d} entries agree, worst {e:.2} relative (entry {d:.0}); last third / first third {d:.2}", .{ n_layers, worst_res, worst_res_layer, growth }),
+                try std.fmt.allocPrint(arena, "all {d} entries agree, worst {e:.2} relative (entry {d:.0}){s}", .{ n_layers, worst_res, worst_res_layer, if (n_layers >= 4) try std.fmt.allocPrint(arena, "; last third / first third {d:.2}", .{growth}) else "" }),
             .numbers = try arena.dupe(Number, &.{ .{ .key = "worst", .value = worst_res }, .{ .key = "worst_entry", .value = worst_res_layer }, .{ .key = "entries", .value = @floatFromInt(n_layers) }, .{ .key = "growth", .value = growth } }),
         });
     } else try out.append(arena, .{ .name = "residuals", .status = .skip, .detail = "no residuals in the probe" });

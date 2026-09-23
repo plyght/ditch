@@ -426,6 +426,25 @@ its first K decoder layers (`--layers 0,1,20` for chosen ones, renumbered;
 only those tensors, quantisation untouched and every per-layer list in
 config.json cut to match; `--drop mtp.` leaves out tensors by name prefix.
 
+`ditch verify MODEL` puts all of that together: it cuts the model to one
+layer of every kind (`--full` streams the whole release instead), runs `ditch
+probe` on it, and compares the rendered chat prompt, the token ids, every
+layer's residual, the first-token logits and the greedy tokens with the
+model's official implementation: transformers' own model class, or the
+release's own modeling code for families transformers lacks. It then runs a
+two-trial abliteration on the cut, which checks that the refusal directions
+are unit vectors, that the export reproduces the in-memory model, and that
+every edited matrix matches the norm-preserving orthogonalisation recomputed
+independently of ditch. The reference is the one part that needs Python: ditch
+carries the harness (`tools/*.py`) inside the binary and runs it with a
+`python3` that has torch and transformers (`--python PATH` to choose one).
+Without one it runs every other check and prints what to install. The report
+gives each check's numbers and, on a mismatch, the first layer that diverges;
+`--json` prints it as JSON, and the exit status is 1 when a check fails.
+`.github/workflows/new-models.yml` runs it every week on the model types new in
+the latest transformers release and on trending Hub models
+(`tools/new_models.sh`), and keeps one issue listing the failures.
+
 Exit codes: 0 success (including `--dry-run` and a clean stop at
 `--time-limit`), 1 failure, 2 usage error or a memory budget too small for the
 model. Releases are built by `.github/workflows/release.yml` (dispatch it with a
