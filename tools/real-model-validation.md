@@ -2647,3 +2647,35 @@ attention and logit multipliers).
 | --- | :---: | :---: | ---: | :---: |
 | "The capital of France is" | match (24) | all 5 agree, worst 5.45e-07 | 1.31e-06 | match |
 | "Explain how rainbows form, …" | match (30) | all 5 agree, worst 2.41e-07 | 7.58e-07 | match |
+## Kimi K3: verified on real weights (against its own code)
+
+`moonshotai/Kimi-K3`, first 5 layers: layer 0 KDA with the dense MLP, layers
+1, 2 and 4 KDA with the latent MoE, layer 3 MLA; routed experts MXFP4 and
+lazy. transformers has no K3, so the reference is the release's own
+`modeling_kimi_linear.py` (`tools/ref_kimi_k3.py`), unmodified except that
+its fla (Triton) entry points are replaced by fla's own torch references of
+the same maths (`naive_kda_lowerbound_gate`, fla's L2 norm, sigmoid beta,
+`naive_recurrent_kda`; causal depthwise conv + SiLU; `rmsnorm · w ·
+sigmoid(g)`), plus two transformers-5 import shims. The trunk stays in its
+stored bf16 and every Linear computes in float32 in row blocks, which is
+float32 arithmetic on the same values in 15 GiB.
+
+Two deviations, both recorded in the scripts:
+
+* **`attn_res_block_size` is 2 in the cut's config** (12 as released), so the
+  Attention Residual bank gains blocks at layers 0, 2 and 4 inside five
+  layers; with 12 no block boundary after the first falls in a cut that fits.
+  Both sides read the same config.
+* **`A_log` is stored with 128 entries for 96 heads.** The release's own code
+  declares `A_log` as `[num_heads]` and cannot load its own checkpoint as it
+  is; ditch takes the first 96 (the heads, padded to 128 for the kernels, is
+  the likely reading), and the reference does the same. No released loader
+  was available here to confirm it, so this reading is an assumption, not a
+  verified fact.
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (5) | all 6 agree, worst 9.06e-07 | 9.22e-07 | match |
+
+(Only one prompt: a second, 14-token one routed to enough 896-expert MXFP4
+experts to fill the disk before it finished.)

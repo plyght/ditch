@@ -97,8 +97,15 @@ class LazyCheckpoint:
         info = self.header[name]
         a, b = info["data_offsets"]
         npdt, tdt = DTYPES[info["dtype"]]
-        raw = np.frombuffer(self._read(name, 0, b - a), dtype=npdt).copy()
-        return torch.from_numpy(raw).view(tdt).reshape(info["shape"])
+        if name in self.lazy["holes"]:
+            self._fill(name, 0, b - a)
+        # Read straight into the tensor's own buffer: one copy of a large table, not two.
+        buf = torch.empty(b - a, dtype=torch.uint8)
+        fd, base = self.where[name]
+        view, done = memoryview(buf.numpy()), 0
+        while done < b - a:
+            done += os.preadv(fd, [view[done:]], base + a + done)
+        return buf.view(tdt).reshape(info["shape"])
 
     def rows(self, name, idx):
         """Rows `idx` (1-D, int) of a 2-D tensor, fetching only those rows of a lazy one."""

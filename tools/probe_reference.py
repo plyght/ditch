@@ -60,6 +60,8 @@ def find_final_norm(model):
             continue
         if "hc_head" in name:  # the hyper-connection head's own norm reads the streams
             continue
+        if "attn_res" in name:  # Attention Residual's scoring norm (Kimi K3), never called as a module
+            continue
         if "norm" in type(mod).__name__.lower() or "norm" in name.rsplit(".", 1)[-1]:
             found = mod
     return found
