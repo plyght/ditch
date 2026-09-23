@@ -574,6 +574,26 @@ fn deinterleave(arena: Allocator, v: []const f32) ![2][]f32 {
     return .{ a, b };
 }
 
+/// The router's `e_score_correction_bias`, under the family's name or the
+/// other of its two on-disk spellings: `mlp.gate.e_score_correction_bias`
+/// (DeepSeek V3) and `mlp.e_score_correction_bias` (K-EXAONE's release,
+/// which transformers renames on load). A missing bias is not an error, since
+/// a router without one is valid, so a misspelt name would otherwise route
+/// silently without it.
+fn loadCorrectionBias(model: anytype, arena: Allocator, lp: []const u8, name: ?[]const u8) !?[]const f32 {
+    const t = name orelse return null;
+    if (model.loadVecOpt(try cat(arena, &.{ lp, t }))) |v| return v;
+    const gate = ".gate.e_score_correction_bias";
+    const bare = ".e_score_correction_bias";
+    const alt = if (std.mem.endsWith(u8, t, gate))
+        try std.mem.concat(arena, u8, &.{ t[0 .. t.len - gate.len], bare })
+    else if (std.mem.endsWith(u8, t, bare))
+        try std.mem.concat(arena, u8, &.{ t[0 .. t.len - bare.len], gate })
+    else
+        return null;
+    return model.loadVecOpt(try cat(arena, &.{ lp, alt }));
+}
+
 /// Loads the MoE block of layer `li` with tensor prefix `lp` (e.g. "model.layers.3.").
 pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !MoeLayer {
     const c = &model.config;
@@ -598,7 +618,7 @@ pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !Mo
         .router = try model.loadMat(router_name),
         .router_ref = router_ref,
         .router_bias = model.loadVecOpt(try model_mod.biasName(arena, router_name)),
-        .correction_bias = if (names.router_correction_bias) |t| model.loadVecOpt(try cat(arena, &.{ lp, t })) else null,
+        .correction_bias = try loadCorrectionBias(model, arena, lp, names.router_correction_bias),
         .top_k = @min(c.num_experts_per_tok, n_experts),
         .norm_topk_prob = c.norm_topk_prob,
         .routing = c.moe,

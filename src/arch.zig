@@ -3162,13 +3162,8 @@ fn extraDots1(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
 fn extraExaoneMoe(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
     c.qk_norm = .head;
     try dsRouter(c, obj);
-    if (obj.get("layer_types") == null and c.sliding_window != null) {
-        const pattern = getInt(obj, "sliding_window_pattern", 4);
-        if (pattern > 0) for (c.sliding_layers, 0..) |*s, i| {
-            s.* = ((i + 1) % pattern != 0);
-        };
-    }
-    _ = arena;
+    // Same layer kinds as EXAONE 4: RoPE on the sliding layers only, global NoPE.
+    try extraExaone4(c, arena, obj);
 }
 
 fn extraSolarOpen(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
@@ -5864,4 +5859,20 @@ test "parseConfig picks the Qwen4-Exp, GLM-5.3-Flash and GLM-4.7-Flash knobs" {
     try std.testing.expectEqual(@as(usize, 2), gl.moe.n_group);
     try std.testing.expectEqual(@as(f32, 1e-5), gl.rms_norm_eps);
     try std.testing.expectEqual(@as(f32, 1.8), gl.moe.routed_scaling_factor);
+}
+
+test "parseConfig: EXAONE MoE global layers have no RoPE" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // K-EXAONE's release: explicit layer_types, and the string pattern.
+    const lt = try parseConfig(a,
+        \\{"model_type":"exaone_moe","hidden_size":64,"num_attention_heads":4,"num_key_value_heads":2,"num_hidden_layers":4,"vocab_size":100,"num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":16,"num_shared_experts":1,"first_k_dense_replace":1,"sliding_window":128,"sliding_window_pattern":"LLLG","layer_types":["sliding_attention","sliding_attention","sliding_attention","full_attention"]}
+    );
+    try std.testing.expect(lt.sliding_layers[0] and lt.sliding_layers[2] and !lt.sliding_layers[3]);
+    try std.testing.expect(lt.rope_layers[0] and lt.rope_layers[2] and !lt.rope_layers[3]);
+    const pat = try parseConfig(a,
+        \\{"model_type":"exaone_moe","hidden_size":64,"num_attention_heads":4,"num_key_value_heads":2,"num_hidden_layers":4,"vocab_size":100,"num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":16,"sliding_window":128,"sliding_window_pattern":"LLLG"}
+    );
+    try std.testing.expect(pat.rope_layers[1] and !pat.sliding_layers[3] and !pat.rope_layers[3]);
 }

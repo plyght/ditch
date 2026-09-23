@@ -1364,8 +1364,8 @@ spec("dots1", tok="qwen2", L=3, qk_norm="head", sliding=4, sliding_layers=[1, 1,
              "layer_types": ["sliding_attention", "sliding_attention", "full_attention"],
              "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "silu", "max_position_embeddings": 128,
              "tie_word_embeddings": False})
-spec("exaone_moe", tok="llama3", L=4, qk_norm="head", sliding=4, sliding_layers=[1, 1, 1, 0], lm_head="lm_head.weight",
-     moe=dict(DS_ROUTER, layers=[1, 2, 3]),
+spec("exaone_moe", tok="llama3", L=4, qk_norm="head", sliding=4, sliding_layers=[1, 1, 1, 0], rope_layers=[1, 1, 1, 0], lm_head="lm_head.weight",
+     moe=dict(DS_ROUTER, layers=[1, 2, 3], corr_bias_name="mlp.e_score_correction_bias"),  # the release's spelling
      config={"model_type": "exaone_moe", "hidden_size": 32, "intermediate_size": 32, "moe_intermediate_size": 12,
              "num_hidden_layers": 4, "num_attention_heads": 4, "num_key_value_heads": 2, "num_experts": 4,
              "num_shared_experts": 1, "num_experts_per_tok": 2, "n_group": 2, "topk_group": 1, "routed_scaling_factor": 2.5,

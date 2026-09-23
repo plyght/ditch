@@ -2647,6 +2647,7 @@ attention and logit multipliers).
 | --- | :---: | :---: | ---: | :---: |
 | "The capital of France is" | match (24) | all 5 agree, worst 5.45e-07 | 1.31e-06 | match |
 | "Explain how rainbows form, …" | match (30) | all 5 agree, worst 2.41e-07 | 7.58e-07 | match |
+
 ## Kimi K3: verified on real weights (against its own code)
 
 `moonshotai/Kimi-K3`, first 5 layers: layer 0 KDA with the dense MLP, layers
@@ -2679,3 +2680,48 @@ Two deviations, both recorded in the scripts:
 
 (Only one prompt: a second, 14-token one routed to enough 896-expert MXFP4
 experts to fill the disk before it finished.)
+
+## Bug 58 — EXAONE MoE's global layers were roped (fixed)
+
+**Symptom.** `LGAI-EXAONE/K-EXAONE-236B-A23B`, cut to layers 0 and 3 (the
+dense sliding layer and the first global MoE layer, so every layer kind is
+present; one MoE layer's experts, 9.6 GB, is what the disk holds): the sliding
+layer agreed, the global layer's output differed by 1.8e-02 of its magnitude,
+the logits by 2.8e-02 of their range.
+
+**Cause.** EXAONE MoE, like EXAONE 4, has RoPE on its sliding layers only;
+transformers applies it `if self.sliding_window is None or self.is_sliding`.
+`extraExaone4` sets `rope_layers` from `sliding_layers`, `extraExaoneMoe` did
+not, so every global layer was roped. It also read `sliding_window_pattern` as
+an integer, while the release writes `"LLLG"`. The fixture was generated from
+the same misreading (its spec gave `sliding_layers` and no `rope_layers`), so
+it agreed.
+
+**Fix.** `extraExaoneMoe` takes EXAONE 4's layer kinds (pattern string or
+integer, RoPE on the sliding layers only); the fixture spec now has
+`rope_layers=[1, 1, 1, 0]` and was regenerated; a parse test checks both the
+`layer_types` and the pattern spelling.
+
+## Bug 59 — K-EXAONE's router bias was never loaded (fixed)
+
+**Symptom.** After bug 58, the global MoE layer still differed by ~1e-03, the
+same with every one of its 128 experts filled (so not a lazy hole), and the
+difference was proportional to neither the attention nor the MoE output.
+
+**Cause.** The release stores the router's correction bias as
+`mlp.e_score_correction_bias`; transformers renames it to
+`mlp.gate.e_score_correction_bias` on load, which is the name ditch looked
+for. A router may lack the bias, so a missing one was not an error: the name
+did not resolve and ditch routed on the raw sigmoid scores, choosing some
+experts other than the model does.
+
+**Fix.** `loadCorrectionBias` in `src/moe.zig` tries the family's name, then
+the other spelling (`.gate.e_score_correction_bias` ↔
+`.e_score_correction_bias`), for every family. The exaone_moe fixture now
+writes the release's spelling; before the fix its test fails (logits off by
+16), after it passes.
+
+| K-EXAONE, layers 0 and 3 | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (22) | all 3 agree, worst 1.23e-06 | 8.29e-07 | match |
+| "Explain how rainbows form, …" | match (26) | all 3 agree, worst 1.27e-06 | 6.65e-07 | match |
