@@ -601,7 +601,8 @@ pub const Arch = struct {
     aliases: []const []const u8 = &.{},
     /// llama.cpp architecture name (for a GGUF writer), if there is one.
     llama_cpp: ?[]const u8,
-    /// Chat template family used when the model's Jinja template is not recognised.
+    /// Chat template family used when the model ships no Jinja template or
+    /// it cannot be rendered (see `chat.Format`).
     chat: []const u8 = "raw",
     /// Verified against a NumPy fixture (see `notes`).
     verified: bool = false,

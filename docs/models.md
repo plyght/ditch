@@ -465,7 +465,7 @@ every fourth layer attends globally while the others use a sliding window:
 return {
   model_type = "acme_lm",
   base = "qwen3", -- start from the Qwen3 definition
-  chat = "chatml", -- used when the model's own template is not recognised
+  chat = "chatml", -- used when the model ships no chat template
   notes = "Acme LM: Qwen3 layout, renamed MLP, residual scale, 3:1 local/global.",
   names = {
     gate = "mlp.w1.weight",
@@ -501,7 +501,7 @@ Every field is optional except `model_type`. Enumerations are strings.
 | `aliases` | Other `model_type` spellings of the same layout, e.g. multimodal wrappers' text configs. |
 | `base` | A known `model_type` to start from (built-in definitions and earlier files). |
 | `llama_cpp` | llama.cpp architecture name, used by the GGUF writer and to recognise GGUF input (nil: no GGUF path). |
-| `chat` | Template family used when the model's own chat template is not recognised: one of the names in `src/chat.zig` (`chatml`, `llama3`, `gemma`, `mistral`, …; `raw` = no template). A recognised template in the checkpoint always wins. |
+| `chat` | Template family used when the model ships no chat template, or one ditch cannot render: one of the names in `src/chat.zig` (`chatml`, `llama3`, `gemma`, `mistral`, …; `raw` = no template). A template in the checkpoint always wins: ditch renders it as transformers does (`src/jinja.zig`). |
 | `verified`, `notes` | Whether a reference forward pass checks the family, and what it covers. |
 | `norm` | `rms`, `rms_gemma` (`(1 + w)` scale), `layer`, `layer_1p` (Nemotron), `none` (weightless LayerNorm), `rms_none` (weightless RMSNorm). (`rms`) |
 | `default_norm_eps`, `default_rope_theta` | Values when config.json has none (1e-6 for RMS norms, else 1e-5; 10000). |
