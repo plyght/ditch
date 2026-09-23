@@ -2466,7 +2466,7 @@ Method as in the frontier pass: `tools/truncate_checkpoint.py`, then
 `ditch probe --residuals --json` against `tools/probe_reference.py` in float32,
 two chat prompts.
 
-## GLM-4.7-Flash (`glm4_moe_lite`): verified; transformers' latent-norm epsilon differs
+## GLM-4.7-Flash (`glm4_moe_lite`): verified (latent-norm epsilon, see Bug F3)
 
 `zai-org/GLM-4.7-Flash`, first 3 layers (layer 0 MLA with the dense MLP,
 layers 1-2 MLA with the 64-expert MoE and shared expert), all 64 experts kept.
@@ -2475,21 +2475,26 @@ layers 1-2 MLA with the 64-expert MoE and shared expert), all 64 experts kept.
 logits by 9e-04 of their range; argmax and greedy text agreed. A one-layer cut
 with the MLP zeroed still differed by 5.7e-04, so the gap was in attention.
 
-**Cause.** Not ditch. transformers' `Glm4MoeLiteAttention` builds
-`q_a_layernorm` and `kv_a_layernorm` as `Glm4MoeLiteRMSNorm(rank)`, whose
-epsilon defaults to 1e-6, while the config's `rms_norm_eps` is 1e-5. vLLM's and
-SGLang's DeepSeek V2 attention, which both use for this model, pass
-`eps=config.rms_norm_eps` to both norms, as ditch does. With the reference's
-two latent norms set to 1e-5, every layer agrees to 2e-06. ditch keeps the
-config's value; `tools/ref_config_eps.py` is the reference with that one
-change. (DeepSeek V3's own config has `rms_norm_eps` 1e-6, so the difference
-does not show there.)
+**Cause.** The two MLA latent norms' epsilon. transformers'
+`Glm4MoeLiteAttention` builds `q_a_layernorm` and `kv_a_layernorm` as
+`Glm4MoeLiteRMSNorm(rank)`, whose epsilon defaults to 1e-6, while the config's
+`rms_norm_eps` (1e-5) was what ditch used. With the reference's two latent
+norms set to 1e-5, every layer agreed to 2e-06. vLLM's and SGLang's DeepSeek
+V2 attention, which serve this model, pass `rms_norm_eps`, so the
+serving engines disagree with transformers here.
+
+**Resolution.** The frontier session found the same difference on Kimi K2.5
+at the same time (Bug F3 below) and settled it on transformers' value: DeepSeek's own
+`modeling_deepseek.py` and transformers use 1e-6, and ditch now does too for
+every MLA family but GLM-5.3-Flash. That is the reading kept here as well:
+ditch follows transformers, as heretic does. Rerun after Bug F3 against stock
+transformers:
 
 | prompt | tokens | residuals | first-token logits | greedy |
 | --- | :---: | :---: | ---: | :---: |
-| "The capital of France is" | match (17) | all 4 agree, worst 2.12e-06 | 5.64e-07 | match |
-| "Explain how rainbows form, …" | match (23) | all 4 agree, worst 8.72e-07 | 8.33e-07 | match |
-| same, stock transformers (latent eps 1e-6) | match | first differs at layer 1, 1.4e-03 | 9.2e-04 | argmax match |
+| "The capital of France is" | match (17) | all 4 agree, worst 8.96e-07 | 6.56e-07 | match |
+| "Explain how rainbows form, …" | match (23) | all 4 agree, worst 6.42e-07 | 1.31e-06 | match |
+| before Bug F3 (ditch 1e-5, transformers 1e-6) | match | first differs at layer 1, 1.4e-03 | 9.2e-04 | argmax match |
 
 ## ERNIE 4.5 21B-A3B (`ernie4_5_moe`): verified
 
