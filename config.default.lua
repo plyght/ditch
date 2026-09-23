@@ -1,12 +1,13 @@
--- Copy this file to config.lua in the directory you run ditch from and edit it
--- to your liking. It is an ordinary Lua 5.4 script that returns a table of
+-- Copy this file to ~/.config/ditch/config.lua ($XDG_CONFIG_HOME/ditch) and
+-- edit it to your liking; settings for one model go in
+-- ~/.config/ditch/configs/<org>/<name>.lua (e.g. configs/Qwen/Qwen3-8B.lua, or
+-- configs/<name>.lua for a local model) and override this file for that model. It is an ordinary Lua 5.4 script that returns a table of
 -- settings (assigning globals works too). Every option can also be given on
 -- the command line (--option-name value); command-line options take precedence
 -- over this file. Run `ditch --help` for the full list.
 --
 -- The script runs in a sandbox: the base, string, table, math and utf8
 -- libraries and os.getenv are available; io, require and file loading are not.
--- Heretic's config.toml files are also accepted (pass --config config.toml).
 
 local home = os.getenv("HOME") or "."
 

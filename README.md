@@ -135,13 +135,16 @@ Defaults are Heretic's: `mlabonne/harmless_alpaca`, `mlabonne/harmful_behaviors`
 
 ## Configuration
 
-Settings live in `config.lua` (or `--config FILE`), a sandboxed Lua 5.4 script
-returning a table keyed like the flags; every option is documented in
-[`config.default.lua`](config.default.lua), and Heretic `config.toml` files are
-accepted. Precedence, highest first: flags, `DITCH_*` environment variables
-(`DITCH_THREADS`, `DITCH_MAX_RAM`, `DITCH_CACHE`, `DITCH_DEVICE`,
-`DITCH_REMOTE_CACHE_SIZE`, `DITCH_NO_COLOR`),
-`./config.lua`, then `$XDG_CONFIG_HOME/ditch/config.lua`. Messages go to stderr
+Settings live in `~/.config/ditch/config.lua` (`$XDG_CONFIG_HOME/ditch`, or
+`--config FILE`), a sandboxed Lua 5.4 script returning a table keyed like the
+flags; every option is documented in [`config.default.lua`](config.default.lua),
+which the installer puts beside it. Settings for one model go in
+`~/.config/ditch/configs/<org>/<name>.lua` (for example
+`configs/Qwen/Qwen3-8B.lua`, or `configs/<name>.lua` for a local directory or
+GGUF) and apply whenever that model runs. Precedence, highest first: flags,
+`DITCH_*` environment variables (`DITCH_THREADS`, `DITCH_MAX_RAM`,
+`DITCH_CACHE`, `DITCH_DEVICE`, `DITCH_REMOTE_CACHE_SIZE`, `DITCH_NO_COLOR`), the
+model's config file, then the global `config.lua`. Messages go to stderr
 and results to stdout (`--json` for one JSON document, `--plain` for
 grep-friendly lines); `--no-input` turns every prompt into an error naming the
 flag to pass instead.

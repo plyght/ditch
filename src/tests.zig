@@ -17,7 +17,7 @@ comptime {
     _ = @import("abliterate.zig");
     _ = @import("directions.zig");
     _ = @import("tpe.zig");
-    _ = @import("toml.zig");
+    _ = @import("tree.zig");
     _ = @import("config.zig");
     _ = @import("chat.zig");
     _ = @import("hf.zig");

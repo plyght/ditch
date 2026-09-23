@@ -1315,8 +1315,7 @@ fn estimateFor(model: *const Model, settings: *const config.Settings, threads: u
 /// and `--models-dir`.
 fn loadUserModels(arena: Allocator, io: Io, settings: *const config.Settings, env: *std.process.Environ.Map, out: *Io.Writer) !void {
     var dirs: [2]?[]const u8 = .{ null, settings.models_dir };
-    const base: ?[]const u8 = if (env.get("XDG_CONFIG_HOME")) |x| x else if (env.get("HOME")) |h| try std.fs.path.join(arena, &.{ h, ".config" }) else null;
-    if (base) |b| dirs[0] = try std.fs.path.join(arena, &.{ b, "ditch", "models" });
+    if (try config.configDir(arena, env)) |d| dirs[0] = try std.fs.path.join(arena, &.{ d, "models" });
     for (dirs) |d| if (d) |dir| {
         const n = try models.loadDir(io, arena, dir, reportModelFile);
         if (n > 0) try out.print("Loaded {d} model definition{s} from {s}\n", .{ n, if (n == 1) "" else "s", dir });
@@ -1482,7 +1481,7 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         try out.flush();
         std.process.exit(1);
     }
-    if (settings.config_path) |p| try out.print("Using configuration file {s}\n", .{p});
+    if (settings.config_path) |p| try out.print("Using configuration {s}\n", .{p});
     if (settings.seed == null) {
         var b: [8]u8 = undefined;
         io.random(&b);
