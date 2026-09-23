@@ -149,6 +149,9 @@ pub const Source = struct {
     chunks_unpersisted: std.atomic.Value(u64) = .init(0),
     chunks_invalid: std.atomic.Value(u64) = .init(0),
     write_failure_reported: std.atomic.Value(bool) = .init(false),
+    /// Tests: the chunk cache's filesystem holds this many bytes of chunks
+    /// (a write beyond it fails with `NoSpaceLeft`).
+    test_disk_bytes: ?u64 = null,
 
     /// Bound of the chunk cache in bytes (0 = keep nothing on disk).
     cache_limit: u64 = 0,
@@ -903,7 +906,8 @@ pub const RemoteFile = struct {
     fn keep(self: *RemoteFile, io: Io, dir: Io.Dir, index: u64, name: []const u8, body: []u8) void {
         const src = self.src;
         if (src.reserve(self, index, body.len)) {
-            if (writeChunk(io, dir, name, body)) {
+            const full = if (src.test_disk_bytes) |cap| src.cache_bytes > cap else false;
+            if (if (full) error.NoSpaceLeft else writeChunk(io, dir, name, body)) {
                 src.lockAcquire();
                 const c = self.chunks.getPtr(index).?;
                 c.state = .present;
@@ -913,12 +917,24 @@ pub const RemoteFile = struct {
                 src.gpa.free(body);
                 return;
             } else |err| {
-                if (!src.write_failure_reported.swap(true, .monotonic))
-                    std.log.warn("could not write to the chunk cache {s} ({s}); chunks that do not fit are fetched again when needed", .{ self.chunk_dir, @errorName(err) });
                 src.lockAcquire();
                 src.cache_bytes -= body.len;
                 self.chunks.getPtr(index).?.size = 0;
+                // The filesystem is full below the bound: bound the cache at
+                // what it holds, so that later chunks evict older ones
+                // instead of each failing to be written (and a prefetched
+                // chunk being fetched again when it is read).
+                const shrunk = err == error.NoSpaceLeft and src.cache_bytes < src.cache_limit;
+                if (shrunk) src.cache_limit = src.cache_bytes;
+                const limit = src.cache_limit;
                 src.lockRelease();
+                if (!src.write_failure_reported.swap(true, .monotonic)) {
+                    if (shrunk) {
+                        std.log.warn("the filesystem of the chunk cache {s} is full; bounding the cache at the {f} it holds", .{ self.chunk_dir, fmtBytes(limit) });
+                    } else {
+                        std.log.warn("could not write to the chunk cache {s} ({s}); chunks that do not fit are fetched again when needed", .{ self.chunk_dir, @errorName(err) });
+                    }
+                }
             }
         }
         src.lockAcquire();
@@ -1014,7 +1030,7 @@ pub const Footprint = struct {
 
     /// Link rate the per-token time estimate assumes: about what the Hub
     /// serves to `default_connections` range requests at once.
-    pub const assumed_rate: u64 = 100 * 1000 * 1000;
+    pub const assumed_rate: u64 = 100 << 20;
 
     /// Bytes one decoded token fetches in the steady state, when every
     /// expert is equally likely: the trunk again unless the cache holds it,
