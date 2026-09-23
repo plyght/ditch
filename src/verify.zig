@@ -496,6 +496,9 @@ const Verify = struct {
             "--n-trials",                      "2",
             "--n-startup-trials",              "1",
             "--expert-selection",              "broad",
+            // Every expert, visited by the prompts or not (warp mode edits only
+            // visited ones by default), so the intended set is the whole layer.
+            "--visited-experts-only",          "false",
             "--max-response-length",           "8",
             "--good-prompts-dataset",          good,
             "--bad-prompts-dataset",           bad,
