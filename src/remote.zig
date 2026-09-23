@@ -928,6 +928,26 @@ pub fn planModel(src: *Source, gpa: Allocator, model: *const model_mod.Model) !F
         }
         var rit = f.raw.iterator();
         while (rit.next()) |kv| try classify(&groups, rf, &fp, kv.value_ptr.name, kv.value_ptr.offset, kv.value_ptr.byte_len);
+        // A dequantised tensor is such a view, its stored codes and scales out
+        // of both indexes: count them by the view's name (gpt-oss's MXFP4
+        // expert blocks, fp8 trunks), in whichever file holds each.
+        for (f.dequants.items) |dq| {
+            for ([_]?@TypeOf(dq.data){ dq.data, dq.scale, dq.zero }) |maybe| if (maybe) |p| {
+                if (p.byte_len == 0) continue;
+                const prf = switch (p.file.source) {
+                    .remote => |r| r,
+                    .local => continue,
+                };
+                try classify(&groups, prf, &fp, dq.name, p.offset, p.byte_len);
+            };
+        }
+    }
+    // Then the chunks the trunk spans, once every file's trunk is marked.
+    for (model.files) |f| {
+        const rf = switch (f.source) {
+            .remote => |r| r,
+            .local => continue,
+        };
         const cs = src.chunk_size;
         src.lockAcquire();
         var tit = rf.trunk.keyIterator();

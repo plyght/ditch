@@ -2802,13 +2802,25 @@ Warp mode over `hf://` with the chunk cache bounded to this disk:
     Disk estimate (remote chunk cache, 2.0MB chunks):
       trunk                    26.68GB stored, 27.12GB of chunks (re-read by every forward pass)
       routed expert            72.0MB each stored, 12600 experts, 23.63GB in total
-      chunk cache bound        18.00GB, 592.1MB cached now, 15.05GB free on its filesystem
-      too small for the trunk: every forward pass fetches it again (--remote-cache-size 28.00GB holds it)
+      ...
     Dry run: ... stopping here (exit 0).   process RSS peak 198.7MB, 5m27s
 
+That disk estimate missed every dequantised tensor's stored bytes (Bug F7
+below). Rerun after the fix (default 8 MB chunks):
+
+    $ ditch --dry-run hf://AikidoSec/altar-1 --max-ram 14GB --remote-cache-size 18GB --no-input
+      (memory estimate unchanged)
+    Disk estimate (remote chunk cache, 8.0MB chunks):
+      trunk                    32.53GB stored, 33.89GB of chunks (re-read by every forward pass)
+      routed expert            72.0MB each stored, 12600 experts, 272.89GB in total
+      chunk cache bound        18.00GB, 2.30GB cached now, 18.34GB free on its filesystem
+      too small for the trunk: every forward pass fetches it again (--remote-cache-size 34.00GB holds it)
+    Dry run: ... stopping here (exit 0).   process RSS peak 218.7MB, 7m48s
+
 So on a 16 GB machine altar-1 needs 12.4 GB resident and, to avoid
-re-fetching the INT4 trunk on every forward pass, 28 GB of cache disk; with
-the 18 GB that fits here it runs, fetching the trunk each pass.
+re-fetching the trunk on every forward pass, 34 GB of cache disk (305 GB
+stored in all); with the 18 GB that fits here it runs, fetching the trunk
+each pass.
 
 ## GLM-5.3-Flash: verified on real weights (within the bar, not to 1e-6)
 
@@ -3201,3 +3213,26 @@ it, so its ids had a `<s>` that ditch's lacked. transformers'
 tokens, and gives ditch's ids; the reference now tokenises the same way.
 `tools/truncate_checkpoint.py` now also cuts Nemotron-H's
 `hybrid_override_pattern` string with the layers.
+
+## Bug F7 — the remote disk estimate missed dequantised tensors (fixed)
+
+**Symptom.** The warp-mode study of `hf://openai/gpt-oss-20b` printed
+"routed expert 16.9KB each stored, 768 experts, 12.7MB in total": the
+experts' two bias rows, of a 12.6 MB MXFP4 expert. altar-1's estimate had its
+INT4 experts at 23.63 GB of 273 GB, and its trunk 6 GB short.
+
+**Cause.** `remote.planModel` sorts every stored tensor into trunk or expert
+by module, from the file's tensor and raw indexes. A tensor ditch dequantises
+(MXFP4 `_blocks` / `_scales`, fp8 codes and scales, pack-quantized INT) is
+replaced in them by a decoded view above the file, so its stored bytes were
+counted nowhere: experts looked tiny (the cache plan thought all of
+gpt-oss-20b's experts fit in 12.7 MB), and quantised trunk chunks were not
+marked as trunk, which eviction keeps longest. Only the estimate and the
+eviction priority; the weights read were right.
+
+**Fix.** The codes, scales and zero points of every dequantised view are
+classified by the view's name, in whichever file holds them, before the trunk
+chunks are summed. `remote_test.zig` serves `gpt_oss_mxfp4` and `qwen2_fp8`
+and checks that trunk + experts is every stored byte (it counted 79920 of
+158256 before). gpt-oss-20b now: 3.35 GB trunk, 12.6 MB per expert, 9.47 GB
+of experts.

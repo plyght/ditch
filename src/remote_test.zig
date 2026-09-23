@@ -226,6 +226,10 @@ const Env = struct {
     sink: Io.Writer.Allocating,
 
     fn init(self: *Env, gpa: std.mem.Allocator, io: Io) !void {
+        return self.initDir(gpa, io, fixture);
+    }
+
+    fn initDir(self: *Env, gpa: std.mem.Allocator, io: Io, dir: []const u8) !void {
         self.gpa = gpa;
         self.io = io;
         self.tmp = std.testing.tmpDir(.{});
@@ -236,7 +240,7 @@ const Env = struct {
         errdefer gpa.free(self.root);
         const log_path = try std.fs.path.join(gpa, &.{ self.root, "requests.log" });
         defer gpa.free(log_path);
-        self.server = try Server.start(io, fixture, log_path);
+        self.server = try Server.start(io, dir, log_path);
         errdefer self.server.stop(io);
         self.base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/", .{self.server.port});
         self.arena = std.heap.ArenaAllocator.init(gpa);
@@ -420,6 +424,35 @@ test "remote chunk cache: bounded below the model, LRU with the trunk kept, bit-
         try std.testing.expectEqualSlices(f32, want, got);
         try std.testing.expect(src.stats().peak_cache_bytes <= bound / 2);
         try std.testing.expect((try chunkDirUsage(io, src)).bytes <= bound / 2);
+    }
+}
+
+test "remote footprint: dequantised tensors' codes and scales are counted (gpt-oss MXFP4 experts, fp8 trunk)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const pool = tensor.Pool.init(io, 2);
+    for ([_][]const u8{ "tests/fixtures/gpt_oss_mxfp4", "tests/fixtures/qwen2_fp8" }) |dir| {
+        var env: Env = undefined;
+        try env.initDir(gpa, io, dir);
+        defer env.deinit();
+        const scratch = try env.path("scratch");
+        defer gpa.free(scratch);
+        const cache = try env.path("cache");
+        defer gpa.free(cache);
+        const src = try env.open(cache, std.math.maxInt(u64));
+        defer src.deinit();
+        const model = try loadRemote(gpa, io, &pool, src, scratch);
+        defer model.deinit();
+        const fp = try remote.planModel(src, gpa, model);
+        // Every stored byte is trunk or expert, the quantised ones included.
+        var stored: u64 = 0;
+        for (model.files) |f| stored += f.len - 8 - f.header_len;
+        try std.testing.expectEqual(stored, fp.trunk_bytes + fp.total_expert_bytes);
+        if (fp.num_experts > 0) {
+            // gpt-oss: the experts are their MXFP4 blocks and scales, not only their biases.
+            try std.testing.expect(fp.total_expert_bytes > stored / 2);
+            try std.testing.expectEqual(fp.total_expert_bytes, fp.expert_bytes * fp.num_experts);
+        }
     }
 }
 
