@@ -9,5 +9,8 @@ return {
     q_norm = "self_attn.q_layernorm.weight",
     k_norm = "self_attn.k_layernorm.weight",
   },
-  hook = "stablelm",
+  config = function(cfg, c)
+    c.attention_bias = flag(cfg.use_qkv_bias, false)
+    if flag(cfg.qk_layernorm, false) then c.qk_norm = "head" end
+  end,
 }

@@ -25,5 +25,22 @@ return {
     up = "ffn.up_proj.weight",
     down = "ffn.down_proj.weight",
   },
-  hook = "mpt",
+  config = function(cfg, c)
+    local ratio = f32(num(cfg.expansion_ratio, 4.0))
+    if type(cfg.intermediate_size) ~= "number" then
+      c.intermediate_size = math.tointeger(math.floor(f32(f32(c.hidden_size) * ratio)))
+    end
+    local ac = obj(cfg.attn_config)
+    if ac then
+      if flag(ac.qk_ln, false) then c.qk_norm = "full" end
+      if flag(ac.alibi, false) then c.positional = "alibi" else c.positional = "none" end
+    end
+    local fc = obj(cfg.ffn_config)
+    if fc then
+      local t = str(fc.ffn_type)
+      if t and t ~= "mptmlp" then
+        unsupported("mpt: ffn_type '" .. t .. "' is not supported (only mptmlp)")
+      end
+    end
+  end,
 }

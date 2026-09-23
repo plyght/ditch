@@ -6,5 +6,8 @@ return {
   verified = true,
   notes = "fixture: q/k/v biases, tied embeddings. Qwen2-VL / Qwen2.5-VL text configs (nested text_config, mrope over text positions) use the same path.",
   attention_bias = true,
-  hook = "qwen_vl",
+  config = function(cfg, c)
+    -- `c.model_type` is the config's own spelling (qwen2_5_vl_text, ...).
+    if string.sub(c.model_type, 1, 5) == "qwen2" then c.attention_bias = flag(cfg.attention_bias, true) end
+  end,
 }
