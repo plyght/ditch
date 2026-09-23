@@ -3297,3 +3297,24 @@ stacked per-expert ones.
 | --- | :---: | :---: | ---: | :---: |
 | "The capital of France is" | match (5) | all 3 agree, worst 3.21e-07 | 1.28e-06 | match (2 tokens) |
 | "Explain how rainbows form, …" | match (16) | all 3 agree, worst 6.17e-07 | 1.70e-06 | match (2 tokens) |
+
+## Llama 4 Scout (`llama4`): verified on real weights
+
+`meta-llama/Llama-4-Scout-17B-16E-Instruct` is gated (401 here); its ungated
+bf16 copy `unsloth/Llama-4-Scout-17B-16E-Instruct` was cut instead, layers 0
+and 3 (chunked-attention RoPE layer, NoPE layer; each a 16-expert top-1 MoE
+with a shared expert, 252 MB an expert, lazy). `truncate_checkpoint.py` now
+cuts `no_rope_layers` and renumbers `moe_layers`. Reference: transformers'
+`llama4` through `tools/ref_lazy_moe.py`, with two reference-side changes:
+Linear subclasses with a forward of their own (`Llama4Router`) keep it, on
+float32 weights, and `Llama4TextExperts.forward` (a dense `bmm` over every
+expert of the router-scaled input) runs only the experts with a nonzero
+block, which is exactly the same sum and reads only the routed experts.
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (5) | all 3 agree, worst 9.24e-07 | 6.34e-07 | match (2 tokens) |
+
+One prompt: the second's experts would not fit on the disk. The NoPE
+layers' attention temperature and the 8192-token chunks only differ from
+plain attention past 8192 tokens.

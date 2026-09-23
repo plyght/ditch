@@ -26,6 +26,7 @@ import os
 import re
 import sys
 import tempfile
+import types
 
 import torch
 
@@ -167,6 +168,8 @@ def f32_arithmetic(model, store):
     keep = set()
     for m in model.modules():
         if isinstance(m, torch.nn.Linear) and m.weight.device.type != "meta":
+            if type(m).forward is not torch.nn.Linear.forward:
+                continue  # a subclass with its own forward (Llama 4's router): float32 weights below
             keep.add(id(m.weight))
             m.forward = types.MethodType(linear, m)
         elif isinstance(m, torch.nn.Embedding):
@@ -210,6 +213,22 @@ class LazyRows(torch.nn.Module):
             k = next(k for k in range(len(self.names)) if r < self.starts[k + 1])
             out[i] = self.store.rows(self.names[k], [r - self.starts[k]])[0].float()
         return out.view(*ids.shape, self.dim)
+
+
+def llama4_experts_forward(self, hidden_states):
+    """Llama4TextExperts.forward, sparse: transformers runs every expert on
+    its block of the router-scaled input (`bmm` over all of them); an expert
+    whose block is all zero (not routed to) contributes zero (no biases,
+    `act(0) * 0 = 0`), so only the routed experts are computed, and read."""
+    n = len(self.gate_up_proj)
+    hs = hidden_states.view(n, -1, self.hidden_size)
+    out = torch.zeros_like(hs)
+    for e in range(n):
+        if not torch.any(hs[e] != 0):
+            continue
+        gate, up = (hs[e] @ self.gate_up_proj[e]).chunk(2, dim=-1)
+        out[e] = (up * self.act_fn(gate)) @ self.down_proj[e]
+    return out.view(-1, self.hidden_size)
 
 
 class LazyStack:
@@ -416,6 +435,8 @@ def load(model_dir, dtype=torch.float32):
                 m.gate_up_proj = LazyStack(expert_loader(prefix, "gate_up"), n)
                 m.down_proj = LazyStack(expert_loader(prefix, "down"), n)
             n_swapped += 1
+            if type(m).__name__ == "Llama4TextExperts":
+                m.forward = types.MethodType(llama4_experts_forward, m)
     for name, m in model.named_modules():
         if type(m).__name__.endswith("NGramEmbedding") and ngram:
             li = int(re.search(r"layers\.(\d+)\.", name).group(1))
