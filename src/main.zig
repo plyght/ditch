@@ -1518,7 +1518,13 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         return;
     }
     if (settings.probe) {
-        try probe.run(gpa, arena, io, settings, &http, cache_root, pool, out, con.result);
+        // Loaded as the study would load it: streamed under --max-ram, warp
+        // mode, and `hf://` weights read through the chunk cache.
+        var probe_src: ?*remote.Source = null;
+        defer if (probe_src) |s| s.deinit();
+        if (is_remote) probe_src = try remote.Source.open(gpa, io, &http, cache_root, settings.model, .{ .revision = settings.model_commit, .chunk_size = settings.remote_chunk_size, .cache_size = settings.remote_cache_size }, out);
+        try probe.run(gpa, arena, io, settings, &http, cache_root, pool, .{ .store = store_mode, .budget = &budget, .expert_cache = settings.expert_cache, .remote = probe_src }, if (probe_src) |s| s.dir_path else null, out, con.result);
+        if (probe_src) |s| printRemoteStats(out, s);
         return;
     }
     try out.print("\nLoading model {s}...\n", .{settings.model});
@@ -1533,11 +1539,7 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     defer model.deinit();
     // Printed before the model goes away (and before the memory report).
     defer {
-        if (remote_src) |s| {
-            const st = s.stats();
-            out.print("\nRemote source: fetched {d} ranges ({f}), {d} chunk reads served from the disk cache\n", .{ st.ranges_fetched, budget_mod.fmtBytes(st.bytes_fetched), st.chunks_from_disk }) catch {};
-            out.print("Chunk cache: {f} on disk of a {f} bound (peak {f}), {d} chunks evicted, {d} served from RAM without being kept\n", .{ budget_mod.fmtBytes(st.cache_bytes), budget_mod.fmtBytes(st.cache_limit), budget_mod.fmtBytes(st.peak_cache_bytes), st.chunks_evicted, st.chunks_unpersisted }) catch {};
-        }
+        if (remote_src) |s| printRemoteStats(out, s);
         if (model.expert_cache) |ec| {
             ec.stats().print(out, "\nExpert cache") catch {};
             if (settings.hotlist) {
@@ -1935,4 +1937,12 @@ fn runReproduction(
         .scores = records,
     };
     _ = try app.modelLoop(&trial);
+}
+
+/// The end-of-run summary of a remote source: ranges fetched, and the chunk cache.
+fn printRemoteStats(out: *Io.Writer, s: *remote.Source) void {
+    const st = s.stats();
+    out.print("\nRemote source: fetched {d} ranges ({f}), {d} chunk reads served from the disk cache\n", .{ st.ranges_fetched, budget_mod.fmtBytes(st.bytes_fetched), st.chunks_from_disk }) catch {};
+    out.print("Chunk cache: {f} on disk of a {f} bound (peak {f}), {d} chunks evicted, {d} served from RAM without being kept\n", .{ budget_mod.fmtBytes(st.cache_bytes), budget_mod.fmtBytes(st.cache_limit), budget_mod.fmtBytes(st.peak_cache_bytes), st.chunks_evicted, st.chunks_unpersisted }) catch {};
+    out.flush() catch {};
 }

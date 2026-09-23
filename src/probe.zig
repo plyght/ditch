@@ -18,6 +18,7 @@ const model_mod = @import("model.zig");
 const engine_mod = @import("engine.zig");
 const chat = @import("chat.zig");
 const hf = @import("hf.zig");
+const remote = @import("remote.zig");
 
 const Model = model_mod.Model;
 const Engine = engine_mod.Engine;
@@ -43,16 +44,25 @@ fn topK(logits: []const f32, out: []Top) []Top {
 }
 
 /// Runs the probe: messages go to `out`, the report (text or JSON) to `result_out`.
-pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings, http: *hf.Http, cache_root: []const u8, pool: *const tensor.Pool, out: *Io.Writer, result_out: *Io.Writer) !void {
+/// `load` are the options the study would load the model with (streamed under
+/// a memory budget, warp mode, a remote source); `remote_dir` is the remote
+/// source's directory for an `hf://` model, which is then not resolved here.
+pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings, http: *hf.Http, cache_root: []const u8, pool: *const tensor.Pool, load: model_mod.LoadOptions, remote_dir: ?[]const u8, out: *Io.Writer, result_out: *Io.Writer) !void {
     if (settings.probe_prompts.len == 0) {
         std.log.err("ditch probe needs at least one --prompt TEXT", .{});
         std.process.exit(2);
     }
     try out.print("\nProbing {s}...\n", .{settings.model});
     try out.flush();
-    const model_dir = try hf.resolveModel(arena, http, cache_root, settings.model, settings.model_commit, out);
-    const model = try Model.load(gpa, io, pool, model_dir);
+    const model_dir = remote_dir orelse try hf.resolveModel(arena, http, cache_root, settings.model, settings.model_commit, out);
+    const model = try Model.loadWithOptions(gpa, io, pool, model_dir, load);
     defer model.deinit();
+    // Marks the trunk's chunks so that eviction keeps them longest.
+    if (load.remote) |src| try (try remote.planModel(src, gpa, model)).warn(out);
+    defer if (model.expert_cache) |ec| {
+        ec.stats().print(out, "\nExpert cache") catch {};
+        out.flush() catch {};
+    };
     const c = &model.config;
     const template = if (settings.chat_template) |name| (chat.Template.parse(name) orelse return error.InvalidChatTemplate) else chat.detect(model.chat_template, c.model_type);
     var engine = Engine.init(gpa, model, settings, template);
@@ -80,7 +90,9 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings,
         const ids = try model.tokenizer.encode(gpa, text, !settings.probe_raw and engine.add_special);
         defer gpa.free(ids);
         const prompts = [_][]u32{ids};
+        const start = Io.Timestamp.now(io, .awake);
         const generated = try engine.generateBatch(gpa, &prompts, @max(settings.max_response_length, 1));
+        const gen_seconds = @as(f64, @floatFromInt(start.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds)) / 1e9;
         defer {
             for (generated) |g| model.gpa.free(g);
             model.gpa.free(generated);
@@ -125,6 +137,8 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings,
             try js.write(generated[0]);
             try js.objectField("response");
             try js.write(response);
+            try js.objectField("generate_seconds");
+            try js.write(gen_seconds);
             try js.objectField("logits");
             try js.write(logits);
             if (residuals) |r| {
@@ -140,7 +154,8 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings,
             for (ids) |id| try result_out.print(" {d}", .{id});
             try result_out.writeAll("\nTop first-token logits:\n");
             for (top) |t| try result_out.print("  {d:>8}  {d:>10.4}  {s}\n", .{ t.id, t.logit, tokenText(model, t.id) });
-            try result_out.print("Greedy ({d} tokens): {s}\n", .{ generated[0].len, response });
+            const tps = if (gen_seconds > 0) @as(f64, @floatFromInt(generated[0].len)) / gen_seconds else 0;
+            try result_out.print("Greedy ({d} tokens in {d:.1} s with the prefill, {d:.3} tokens/s): {s}\n", .{ generated[0].len, gen_seconds, tps, response });
             if (residuals) |r| {
                 try result_out.writeAll("Residual norm per layer (last token):\n");
                 var l: usize = 0;
