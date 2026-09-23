@@ -132,8 +132,7 @@ const Checkpoint = struct {
 
 const small_names = [_][]const u8{
     "config.json",     "generation_config.json", "tokenizer.json",          "tokenizer_config.json",        "tiktoken.model",
-    "tokenizer.model", "chat_template.jinja",    "special_tokens_map.json", "model.safetensors.index.json",
-    "chat_template.json",
+    "tokenizer.model", "chat_template.jinja",    "special_tokens_map.json", "model.safetensors.index.json", "chat_template.json",
 };
 
 /// Shard file names from an index's `weight_map` (sorted, unique).
