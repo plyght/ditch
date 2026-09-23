@@ -338,6 +338,8 @@ const Trial = struct {
     /// Templates of `used` that name no tensor of the checkpoint (a tighter
     /// fit has fewer), and the tie-breaker of `affinity`.
     absent: usize = 0,
+    /// config.json keys the family leaves unread (fewer explains more).
+    keys_unread: usize = 0,
     affinity: f64 = 0,
     /// Name overrides tried on top of the family (`names` field -> template).
     overrides: []const Override,
@@ -538,48 +540,79 @@ fn modelPrefix(a: Allocator, ck: *const Checkpoint, names: *const Names) ![]cons
     return names.prefixes[0];
 }
 
-fn locate(a: Allocator, names: *const Names, prefix: []const u8, layers: usize, experts: usize, name: []const u8) !Place {
-    var place: Place = .{ .prefix = prefix, .rel = name };
-    for (0..layers) |i| {
-        const lp = try expand(a, names.layer, prefix, i, null);
-        if (!std.mem.startsWith(u8, name, lp)) continue;
-        place.layer = i;
-        place.layer_prefix = lp;
-        place.rel = name[lp.len..];
-        for (0..experts) |e| {
-            const ep = try expand(a, names.expert, prefix, i, e);
-            if (std.mem.startsWith(u8, place.rel, ep)) {
-                place.expert = e;
-                place.expert_prefix = ep;
-                place.rel = place.rel[ep.len..];
-                break;
-            }
+const Match = struct { len: usize, i: ?usize = null, e: ?usize = null };
+
+/// Matches template `t` (`{p}` the model prefix, `{i}` and `{e}` numbers)
+/// against the start of `s`, without allocating.
+fn matchTemplate(t: []const u8, prefix: []const u8, s: []const u8) ?Match {
+    var m: Match = .{ .len = 0 };
+    var k: usize = 0;
+    var j: usize = 0;
+    while (k < t.len) {
+        if (std.mem.startsWith(u8, t[k..], "{p}")) {
+            if (!std.mem.startsWith(u8, s[j..], prefix)) return null;
+            j += prefix.len;
+            k += 3;
+        } else if (std.mem.startsWith(u8, t[k..], "{i}") or std.mem.startsWith(u8, t[k..], "{e}")) {
+            const start = j;
+            while (j < s.len and std.ascii.isDigit(s[j])) j += 1;
+            if (j == start) return null;
+            const n = std.fmt.parseInt(usize, s[start..j], 10) catch return null;
+            if (t[k + 1] == 'i') m.i = n else m.e = n;
+            k += 3;
+        } else {
+            if (j >= s.len or s[j] != t[k]) return null;
+            j += 1;
+            k += 1;
         }
-        return place;
     }
+    m.len = j;
+    return m;
+}
+
+fn locate(names: *const Names, prefix: []const u8, layers: usize, experts: usize, name: []const u8) Place {
+    var place: Place = .{ .prefix = prefix, .rel = name };
+    const lm = matchTemplate(names.layer, prefix, name) orelse return place;
+    const li = lm.i orelse return place;
+    if (li >= layers) return place;
+    place.layer = li;
+    place.layer_prefix = name[0..lm.len];
+    place.rel = name[lm.len..];
+    if (experts > 0) if (matchTemplate(names.expert, prefix, place.rel)) |em| if (em.e) |e| if (e < experts) {
+        place.expert = e;
+        place.expert_prefix = place.rel[0..em.len];
+        place.rel = place.rel[em.len..];
+    };
     return place;
 }
 
 /// The `names` field whose template produced `rel` at `place` (a model-level
 /// template is matched with its prefix expanded).
-fn fieldOf(a: Allocator, names: *const Names, place: Place, full: []const u8) !?[]const u8 {
+fn fieldOf(names: *const Names, place: Place, full: []const u8) ?[]const u8 {
+    @setEvalBranchQuota(20000);
     inline for (@typeInfo(Names).@"struct".fields) |f| {
         const skip = comptime std.mem.eql(u8, f.name, "prefixes") or std.mem.eql(u8, f.name, "layer") or std.mem.eql(u8, f.name, "expert");
         if (!skip) {
             const v = @field(names.*, f.name);
             const T = @TypeOf(v);
             if (T == []const u8 or T == ?[]const u8) {
-                if (@as(?[]const u8, v)) |t| if (try templateIs(a, t, place, full)) return f.name;
+                if (@as(?[]const u8, v)) |t| if (templateIs(t, place, full)) return f.name;
             } else if (T == []const []const u8) {
-                for (v) |t| if (try templateIs(a, t, place, full)) return f.name;
+                for (v) |t| if (templateIs(t, place, full)) return f.name;
             }
         }
     }
     return null;
 }
 
-fn templateIs(a: Allocator, t: []const u8, place: Place, full: []const u8) !bool {
-    if (std.mem.indexOf(u8, t, "{p}") != null) return std.mem.eql(u8, try expand(a, t, place.prefix, place.layer, place.expert), full);
+fn templateIs(t: []const u8, place: Place, full: []const u8) bool {
+    if (std.mem.indexOf(u8, t, "{p}") != null) {
+        const m = matchTemplate(t, place.prefix, full) orelse return false;
+        if (m.len != full.len) return false;
+        if (m.i != null and (place.layer == null or m.i.? != place.layer.?)) return false;
+        if (m.e != null and (place.expert == null or m.e.? != place.expert.?)) return false;
+        return true;
+    }
     return std.mem.eql(u8, t, place.rel);
 }
 
@@ -652,14 +685,14 @@ fn expectedShape(a: Allocator, c: *const arch.Config, field: []const u8, li: usi
 fn proposeRename(a: Allocator, ck: *const Checkpoint, f: *const Arch, c: *const arch.Config, missing: []const u8, unread: []const []const u8) !?Override {
     const names = &f.names;
     const prefix = try modelPrefix(a, ck, names);
-    const place = try locate(a, names, prefix, c.num_layers, c.num_experts, missing);
-    const field = (try fieldOf(a, names, place, missing)) orelse return null;
+    const place = locate(names, prefix, c.num_layers, c.num_experts, missing);
+    const field = (fieldOf(names, place, missing)) orelse return null;
     const want = try expectedShape(a, c, field, place.layer orelse 0);
     var best: ?[]const u8 = null;
     var best_score: usize = 0;
     var ties: usize = 0;
     for (unread) |n| {
-        const p = try locate(a, names, prefix, c.num_layers, c.num_experts, n);
+        const p = locate(names, prefix, c.num_layers, c.num_experts, n);
         if ((p.layer == null) != (place.layer == null) or (p.layer != null and p.layer.? != place.layer.?)) continue;
         if ((p.expert == null) != (place.expert == null)) continue;
         const t = ck.find(n) orelse continue;
@@ -674,7 +707,7 @@ fn proposeRename(a: Allocator, ck: *const Checkpoint, f: *const Arch, c: *const 
     }
     const chosen = best orelse return null;
     if (ties > 1) return null;
-    const p = try locate(a, names, prefix, c.num_layers, c.num_experts, chosen);
+    const p = locate(names, prefix, c.num_layers, c.num_experts, chosen);
     // The new template, in the form the field takes.
     var template: []const u8 = p.rel;
     if (place.layer == null) template = if (std.mem.startsWith(u8, chosen, prefix)) try std.fmt.allocPrint(a, "{{p}}{s}", .{chosen[prefix.len..]}) else chosen;
@@ -734,21 +767,38 @@ fn plainness(f: *const Arch) usize {
     return n;
 }
 
-/// Every template string of a family, relative to its layer or expert
-/// prefix, for a first cheap ranking.
-fn coverage(a: Allocator, ck: *const Checkpoint, f: *const Arch, c: *const arch.Config) !f64 {
+/// One tensor of each name pattern (layer and expert indices folded), with
+/// how many tensors share it: what the families are ranked on.
+const Rep = struct { name: []const u8, count: usize };
+
+fn representatives(a: Allocator, ck: *const Checkpoint) ![]const Rep {
+    var reps: std.ArrayList(Rep) = .empty;
+    var index: std.StringHashMapUnmanaged(usize) = .{};
+    for (ck.tensors) |t| {
+        if (outsideTextModel(t.name) != null) continue;
+        const p = try pattern(a, t.name);
+        const gop = try index.getOrPut(a, p.pat);
+        if (gop.found_existing) {
+            reps.items[gop.value_ptr.*].count += 1;
+        } else {
+            gop.value_ptr.* = reps.items.len;
+            try reps.append(a, .{ .name = t.name, .count = 1 });
+        }
+    }
+    return reps.items;
+}
+
+/// The share of the checkpoint's tensors (of the text model) that some
+/// template of the family names: a first, cheap ranking.
+fn coverage(a: Allocator, ck: *const Checkpoint, f: *const Arch, c: *const arch.Config, reps: []const Rep) !f64 {
     const prefix = try modelPrefix(a, ck, &f.names);
     var known: usize = 0;
     var total: usize = 0;
-    for (ck.tensors) |t| {
-        if (outsideTextModel(t.name) != null) continue;
-        total += 1;
-        const p = try locate(a, &f.names, prefix, @min(c.num_layers, 4096), @min(c.num_experts, 4096), t.name);
-        const probe = if (std.mem.endsWith(u8, p.rel, ".bias")) try std.fmt.allocPrint(a, "{s}.weight", .{p.rel[0 .. p.rel.len - ".bias".len]}) else p.rel;
-        var q = p;
-        q.rel = probe;
-        const full = if (std.mem.endsWith(u8, t.name, ".bias")) try std.fmt.allocPrint(a, "{s}.weight", .{t.name[0 .. t.name.len - ".bias".len]}) else t.name;
-        if (try fieldOf(a, &f.names, q, full) != null) known += 1;
+    for (reps) |r| {
+        total += r.count;
+        const full = if (std.mem.endsWith(u8, r.name, ".bias")) try std.fmt.allocPrint(a, "{s}.weight", .{r.name[0 .. r.name.len - ".bias".len]}) else r.name;
+        const p = locate(&f.names, prefix, c.num_layers, c.num_experts, full);
+        if (fieldOf(&f.names, p, full) != null) known += r.count;
     }
     return if (total == 0) 0 else @as(f64, @floatFromInt(known)) / @as(f64, @floatFromInt(total));
 }
@@ -770,6 +820,15 @@ fn affinity(a: Allocator, config_text: []const u8, own_type: []const u8, f: *con
     const stem = std.mem.trimEnd(u8, own_type[0 .. std.mem.indexOfAny(u8, own_type, "_-") orelse own_type.len], "0123456789.");
     if (stem.len >= 3 and std.mem.startsWith(u8, f.model_type, stem)) bonus += 0.1;
     if (std.mem.startsWith(u8, own_type, f.model_type)) bonus += 0.05;
+    // Between a dense family and its MoE twin (qwen3, qwen3_moe: the same
+    // layout, a different GGUF architecture), the one the experts call for.
+    const says_moe = std.mem.indexOf(u8, f.model_type, "moe") != null or (if (f.llama_cpp) |l| std.mem.indexOf(u8, l, "moe") != null else false);
+    const has_experts = if (v == .object) blk: {
+        const o = if (v.object.get("text_config")) |tc| (if (tc == .object) tc.object else v.object) else v.object;
+        for ([_][]const u8{ "num_experts", "num_local_experts", "n_routed_experts" }) |k| if (arch.getNum(o, k)) |n| if (n > 0) break :blk true;
+        break :blk false;
+    } else false;
+    if (says_moe == has_experts) bonus += 0.01;
     return bonus;
 }
 
@@ -816,29 +875,76 @@ fn classifyKeys(a: Allocator, config_text: []const u8) !KeyReport {
     if (root != .object) return error.InvalidConfig;
     const nested = if (root.object.get("text_config")) |tc| (if (tc == .object) tc.object else null) else null;
     const obj = nested orelse root.object;
-    const base = dumpConfig(a, config_text);
-    var unread: std.ArrayList([]const u8) = .empty;
-    var read: usize = 0;
+
+    // A key can matter only when another is set (Qwen's max_window_layers
+    // once use_sliding_window is true and sliding_window is not null), so
+    // each key is also tried with every boolean flipped and every null set,
+    // one at a time and all together.
+    var contexts: std.ArrayList(std.json.ObjectMap) = .empty;
+    try contexts.append(a, obj);
+    var all = try obj.clone(a);
     var it = obj.iterator();
     while (it.next()) |kv| {
-        const key = kv.key_ptr.*;
-        if (contains(&ignorable_keys, key)) continue;
-        var changed = false;
-        for (0..1 + perturbations.len) |variant| {
-            if (changed) break;
+        if (contains(&ignorable_keys, kv.key_ptr.*)) continue;
+        const changed: ?std.json.Value = switch (kv.value_ptr.*) {
+            .bool => |b| .{ .bool = !b },
+            .null => .{ .integer = 1 },
+            else => null,
+        };
+        if (changed) |v| {
             var o = try obj.clone(a);
-            if (variant == 0) {
-                _ = o.orderedRemove(key);
-            } else try o.put(a, key, perturb(a, kv.value_ptr.*, variant - 1));
-            var r = try root.object.clone(a);
-            if (nested != null) try r.put(a, "text_config", .{ .object = o }) else r = o;
-            const text = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = r }, .{});
-            if (!std.mem.eql(u8, dumpConfig(a, text), base)) changed = true;
+            try o.put(a, kv.key_ptr.*, v);
+            try contexts.append(a, o);
+            try all.put(a, kv.key_ptr.*, v);
         }
-        if (changed) read += 1 else try unread.append(a, key);
+    }
+    if (contexts.items.len > 2) try contexts.append(a, all);
+
+    var read_set: std.StringHashMapUnmanaged(void) = .{};
+    for (contexts.items) |ctx_obj| {
+        const base = dumpConfig(a, try withText(a, root.object, nested != null, ctx_obj));
+        if (std.mem.indexOfScalar(u8, base, '\n') == null) continue; // the context itself is refused
+        var kit = ctx_obj.iterator();
+        while (kit.next()) |kv| {
+            const key = kv.key_ptr.*;
+            if (contains(&ignorable_keys, key) or read_set.contains(key)) continue;
+            for (0..1 + variantCount(kv.value_ptr.*)) |variant| {
+                var o = try ctx_obj.clone(a);
+                if (variant == 0) {
+                    _ = o.orderedRemove(key);
+                } else try o.put(a, key, perturb(a, kv.value_ptr.*, variant - 1));
+                if (!std.mem.eql(u8, dumpConfig(a, try withText(a, root.object, nested != null, o)), base)) {
+                    try read_set.put(a, key, {});
+                    break;
+                }
+            }
+        }
+    }
+    var unread: std.ArrayList([]const u8) = .empty;
+    it = obj.iterator();
+    while (it.next()) |kv| {
+        if (!contains(&ignorable_keys, kv.key_ptr.*) and !read_set.contains(kv.key_ptr.*)) try unread.append(a, kv.key_ptr.*);
     }
     sortStrings(unread.items);
-    return .{ .unread = unread.items, .read = read };
+    return .{ .unread = unread.items, .read = read_set.count() };
+}
+
+/// config.json text with `obj` as the (text) config.
+fn withText(a: Allocator, root: std.json.ObjectMap, nested: bool, obj: std.json.ObjectMap) ![]const u8 {
+    var r = obj;
+    if (nested) {
+        r = try root.clone(a);
+        try r.put(a, "text_config", .{ .object = obj });
+    }
+    return std.json.Stringify.valueAlloc(a, std.json.Value{ .object = r }, .{});
+}
+
+fn variantCount(v: std.json.Value) usize {
+    return switch (v) {
+        .string => perturbations.len,
+        .integer, .float => 2,
+        else => 1,
+    };
 }
 
 /// String values a key may take that ditch knows (activations, rope and
@@ -1002,6 +1108,7 @@ fn match(ctx: Ctx, ck: *const Checkpoint, work: []const u8, own_type: []const u8
     const out = ctx.out;
     // Rank the families whose reading of config.json succeeds.
     var candidates: std.ArrayList(Candidate) = .empty;
+    const reps = try representatives(a, ck);
     var quiet: Capture = .{ .arena = a };
     capture = &quiet;
     for (models.families()) |f| {
@@ -1011,7 +1118,7 @@ fn match(ctx: Ctx, ck: *const Checkpoint, work: []const u8, own_type: []const u8
         } else {
             const text = try retype(a, config_text, f.model_type);
             const cfg = arch.parseConfig(a, text) catch continue;
-            const score = try coverage(a, ck, f, &cfg) + affinity(a, config_text, own_type, f);
+            const score = try coverage(a, ck, f, &cfg, reps) + affinity(a, config_text, own_type, f);
             try candidates.append(a, .{ .family = f, .score = score, .cfg = cfg, .plainness = plainness(f) });
         }
     }
@@ -1043,8 +1150,9 @@ fn match(ctx: Ctx, ck: *const Checkpoint, work: []const u8, own_type: []const u8
             if (t.ok) {
                 var trial = t;
                 trial.absent = try absentTemplates(a, ck, t.used, &cand.cfg);
+                trial.keys_unread = if (classifyKeys(a, try retype(a, config_text, t.used.model_type))) |k| k.unread.len else |_| std.math.maxInt(usize);
                 trial.affinity = affinity(a, config_text, own_type, cand.family);
-                try out.print("  {s}{s}: loads; {d} tensor(s) of the text model unread, {d} of its names absent\n", .{ cand.family.model_type, if (overrides.items.len > 0) " (renamed)" else "", countText(t.unread), trial.absent });
+                try out.print("  {s}{s}: loads; {d} tensor(s) of the text model unread, {d} of its names absent, {d} config key(s) unread\n", .{ cand.family.model_type, if (overrides.items.len > 0) " (renamed)" else "", countText(t.unread), trial.absent, trial.keys_unread });
                 if (best == null or better(trial, best.?)) best = trial;
                 break;
             }
@@ -1073,6 +1181,7 @@ fn better(x: Trial, y: Trial) bool {
     if (xu != yu) return xu < yu;
     if (x.overrides.len != y.overrides.len) return x.overrides.len < y.overrides.len;
     if (x.absent != y.absent) return x.absent < y.absent;
+    if (x.keys_unread != y.keys_unread) return x.keys_unread < y.keys_unread;
     if (x.affinity != y.affinity) return x.affinity > y.affinity;
     return x.family.verified and !y.family.verified;
 }
@@ -1102,7 +1211,7 @@ fn absentTemplates(a: Allocator, ck: *const Checkpoint, f: *const Arch, c: *cons
             if (list.len > 0 and !(expert_field and c.num_experts == 0)) {
                 var found = false;
                 for (list) |t| {
-                    const full = if (std.mem.indexOf(u8, t, "{p}") != null) try expand(a, t, prefix, 0, 0) else try std.fmt.allocPrint(a, "{s}{s}{s}", .{ lp, if (expert_field) ep[lp.len..] else "", t });
+                    const full = if (std.mem.indexOf(u8, t, "{p}") != null) try expand(a, t, prefix, 0, 0) else try std.fmt.allocPrint(a, "{s}{s}{s}", .{ lp, if (expert_field) ep else "", t });
                     if (ck.find(full) != null) found = true;
                     if (!found and std.mem.endsWith(u8, full, ".weight")) {
                         if (ck.find(try std.fmt.allocPrint(a, "{s}.bias", .{full[0 .. full.len - ".weight".len]})) != null) found = true;
@@ -1136,8 +1245,8 @@ fn unreadExcept(a: Allocator, all: []const []const u8, ck: *const Checkpoint, f:
     const prefix = try modelPrefix(a, ck, &f.names);
     outer: for (all) |n| {
         if (outsideTextModel(n) != null) continue;
-        const p = try locate(a, &f.names, prefix, c.num_layers, c.num_experts, n);
-        if (try fieldOf(a, &f.names, p, n) != null) continue;
+        const p = locate(&f.names, prefix, c.num_layers, c.num_experts, n);
+        if (fieldOf(&f.names, p, n) != null) continue;
         for (overrides) |o| if (std.mem.indexOf(u8, o.value, p.rel) != null and p.rel.len > 0) continue :outer;
         try out.append(a, n);
     }
