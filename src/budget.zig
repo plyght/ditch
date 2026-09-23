@@ -554,6 +554,15 @@ pub fn estimate(model: *const model_mod.Model, p: EstimateParams) Estimate {
     var largest_name: []const u8 = "";
     var layer_bytes = [_]u64{0} ** 4096;
     var max_cols: u64 = 0;
+    const warp = model.warp();
+    // In warp mode a routed expert's tensor (a stacked one included) is
+    // never resident whole: only the experts a token selects are.
+    var expert_names = std.StringHashMapUnmanaged(void).empty;
+    defer expert_names.deinit(model.gpa);
+    if (warp) for (model.layers) |*l| if (l.moe) |*m| for (m.experts) |*ex| {
+        for ([_][]const u8{ ex.gate_ref.ref.name, ex.up_ref.ref.name, ex.down_ref.ref.name }) |n|
+            expert_names.put(model.gpa, n, {}) catch {};
+    };
     for (model.files) |f| {
         var it = f.tensors.iterator();
         while (it.next()) |kv| {
@@ -561,6 +570,7 @@ pub fn estimate(model: *const model_mod.Model, p: EstimateParams) Estimate {
             total += info.byte_len;
             // A table read a row at a time is never resident (see Model.row_tables).
             if (model.isRowTable(info.name)) continue;
+            if (expert_names.contains(info.name)) continue;
             if (info.byte_len > largest) {
                 largest = info.byte_len;
                 largest_name = info.name;
@@ -571,7 +581,6 @@ pub fn estimate(model: *const model_mod.Model, p: EstimateParams) Estimate {
             }
         }
     }
-    const warp = model.warp();
     var largest_layer: u64 = 0;
     // By name a layer holds all of its routed experts; in warp mode only the
     // experts a token selects are resident, which the model's own figure
