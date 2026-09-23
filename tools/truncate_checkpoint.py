@@ -28,6 +28,11 @@ entries. Quantisation and everything else stays exactly as released.
 Layer tensors are recognised in both spellings: `model.layers.N.` and the
 unprefixed `layers.N.` of DeepSeek's own naming.
 
+--experts K     keep the first K routed experts of every MoE layer: per-expert tensors of
+                the others are left out, stacked expert tensors, the router and its bias
+                are cut to their first K rows, and the config's expert count (and top-k,
+                and group-limited routing) follow. Both sides then run the same smaller
+                model on real weights; for a cut whose experts would not fit otherwise.
 --drop PREFIX   leave out tensors whose name starts with PREFIX (e.g. `mtp.`,
                 the multi-token-prediction layers, which no forward pass reads)
 --lazy REGEX    write the tensors whose name matches into `model-lazy.safetensors`
@@ -51,12 +56,15 @@ from huggingface_hub import hf_hub_url, hf_hub_download, list_repo_files
 
 args = sys.argv[1:]
 drop, lazy, pos, layers = [], [], [], None
+n_keep_experts = None
 i = 0
 while i < len(args):
     if args[i] == '--drop':
         drop.append(args[i + 1]); i += 2
     elif args[i] == '--lazy':
         lazy.append(re.compile(args[i + 1])); i += 2
+    elif args[i] == '--experts':
+        n_keep_experts = int(args[i + 1]); i += 2
     elif args[i] == '--layers':
         layers = [int(x) for x in args[i + 1].split(',')]; i += 2
     else:
@@ -126,7 +134,20 @@ if 'candidate_source_layer_id' in tc:
 if any('mtp' in d for d in drop):
     for key in ('num_nextn_predict_layers',):
         if key in tc: tc[key] = 0
+E_orig = None
+if n_keep_experts:
+    for key in ('n_routed_experts', 'num_experts', 'num_local_experts', 'moe_num_experts', 'num_routed_experts'):
+        if isinstance(tc.get(key), int) and tc[key] > n_keep_experts:
+            E_orig = tc[key]; tc[key] = n_keep_experts
+    for key in ('num_experts_per_tok', 'moe_k', 'top_k', 'num_experts_per_token'):
+        if isinstance(tc.get(key), int): tc[key] = min(tc[key], n_keep_experts)
+    if isinstance(tc.get('n_group'), int) and tc['n_group'] > 1:
+        tc['n_group'] = 1; tc['topk_group'] = 1
 json.dump(cfg, open(f"{out}/config.json", 'w'), indent=1)
+expert_idx_re = re.compile(r'experts\.(\d+)\.')
+def expert_rows(name, shape):
+    # tensors indexed by expert along their first axis: stacked experts, the router, its bias
+    return bool(E_orig and shape and shape[0] == E_orig and layer_re.search(name) and re.search(r'(expert|gate|router|correction)', name))
 
 if 'model.safetensors.index.json' in files:
     wm = json.load(open(hf_hub_download(repo, 'model.safetensors.index.json', local_dir='/tmp/truncate_idx_' + repo.replace('/', '_'))))['weight_map']
@@ -138,6 +159,9 @@ layer_re = re.compile(r'(?:^|\.)layers\.(\d+)\.')
 
 def keep(name):
     if any(name.startswith(d) for d in drop): return False
+    if E_orig:
+        m = expert_idx_re.search(name)
+        if m and int(m.group(1)) >= n_keep_experts: return False
     m = layer_re.search(name)
     return m is None or int(m.group(1)) in new_id
 
@@ -174,7 +198,10 @@ for sh in shards:
         a, b = v['data_offsets']
         shape = v['shape']
         sl = per_layer_slice(k, shape)
-        if sl:
+        if expert_rows(k, shape):
+            b = a + (b - a) // E_orig * n_keep_experts
+            shape = [n_keep_experts] + shape[1:]
+        elif sl:
             axis, width = sl
             slices[renamed(k)] = (axis, width, shape, (b - a) // (shape[0] * shape[1]))
             shape = [N * width, shape[1]] if axis == 0 else [shape[0], N * width]
