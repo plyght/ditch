@@ -858,6 +858,8 @@ pub const Model = struct {
             return error.IncompleteModel;
         } else |_| {}
         self.dequantised = 0;
+        // `self.* = undefined` above drops field defaults; a GGUF has no special_tokens_map.json.
+        self.special_tokens_map_json = null;
         if (gguf_path) |p| {
             try gguf_model.attach(self, p, opts.store == .mapped, .{ .ignore_embedded = opts.gguf_ignore_embedded });
             self.export_config_json = self.config_json;
