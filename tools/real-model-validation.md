@@ -4156,3 +4156,27 @@ against its 1.16 GB LM head): warp mode never holds it whole. Routed-expert
 tensors are now left out of the largest tensor in warp mode. Regression
 test: "warp-mode estimate: a layer is its trunk plus the top-k experts, not
 every expert" (`src/stream_test.zig`).
+## Bug F12 — one rate-limited range ended a full-depth `hf://` run (fixed)
+
+**Symptom.** `ditch probe hf://zai-org/GLM-5.3-Flash --max-ram 10GB
+--remote-cache-size 8GB --raw --max-response-length 1 --residuals`, a
+full-depth prefill: after 33m57s, 62.5 GB read and 1124 experts fetched, the
+run ended with
+
+    warning: .../model-00023-of-00062.safetensors: HttpError; retrying (3/3)
+    error: curl failed for .../model-00023-of-00062.safetensors: curl: (22) The requested URL returned error: 429
+    error: HttpError
+
+**Cause.** The Hub rate-limits unauthenticated clients (HTTP 429). A long
+full-depth run reaches that limit, all the more with two sessions fetching
+from the same address. ditch classed a 429 as an ordinary transient error:
+3 attempts, 2 s and 4 s apart. That is far too short for a rate limit, and
+the whole run was lost with it.
+
+**Fix.** A 429 is its own error (`error.RateLimited`, from both the native
+client and the curl fallback, which no longer treats it as a native-client
+failure), retried up to 10 times at 15 s × the attempt number (675 s in
+all). Other transient failures keep 3 attempts. A test pins both schedules.
+`tools/ref_stream.py` waits out a 429 the same way (15 s × the attempt, 12
+attempts).
+

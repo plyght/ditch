@@ -168,14 +168,19 @@ class Source:
         sess = getattr(self.tls, "s", None) or requests.Session()
         self.tls.s = sess
         url = self._url(sh)
-        for attempt in range(8):
+        for attempt in range(12):
+            wait = min(2 ** attempt, 60)
             try:
-                data = sess.get(url, headers={"Range": f"bytes={a}-{a + m - 1}"}, timeout=300).content
+                r = sess.get(url, headers={"Range": f"bytes={a}-{a + m - 1}"}, timeout=300)
+                data = r.content
                 if len(data) == m:
                     break
+                if r.status_code == 429:  # the Hub's rate limit: wait it out
+                    wait = 15 * (attempt + 1)
+                    print(f"[ref_stream] rate limited; retrying in {wait} s", file=sys.stderr, flush=True)
             except requests.RequestException:
                 pass
-            time.sleep(2 ** attempt)
+            time.sleep(wait)
         else:
             raise RuntimeError(f"could not fetch {m} bytes at {a} of {sh}")
         STATS["fetched"] += m

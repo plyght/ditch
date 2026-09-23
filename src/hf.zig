@@ -70,6 +70,20 @@ pub const Http = struct {
     /// Transient failures (anything but 401/403/404 and out of memory) are
     /// retried this many times with a growing pause.
     const attempts = 3;
+    /// A 429 (the Hub's rate limit, which a long `hf://` run of a large model
+    /// reaches) is retried this many times, waiting `rate_limit_pause`
+    /// seconds times the attempt number: ~11 minutes in all, where giving up
+    /// after the 6 seconds of the transient schedule loses the whole run.
+    const rate_limit_attempts = 10;
+    const rate_limit_pause = 15;
+
+    /// Seconds to wait before retrying after `attempt` failures ending in
+    /// `err` (attempts count from 1), or null to give up.
+    fn retryPause(err: anyerror, attempt: usize) ?u64 {
+        if (err == error.RateLimited) return if (attempt < rate_limit_attempts) rate_limit_pause * attempt else null;
+        if (attempt >= attempts or !transient(err)) return null;
+        return attempt * 2;
+    }
 
     fn transient(err: anyerror) bool {
         return switch (err) {
@@ -79,7 +93,11 @@ pub const Http = struct {
     }
 
     fn pause(self: *Http, attempt: usize) void {
-        self.io.sleep(Io.Duration.fromSeconds(@intCast(attempt * 2)), .awake) catch {};
+        self.sleep(attempt * 2);
+    }
+
+    fn sleep(self: *Http, seconds: u64) void {
+        self.io.sleep(Io.Duration.fromSeconds(@intCast(seconds)), .awake) catch {};
     }
 
     /// Appends curl's connect timeout and the stall abort (< 1 B/s for that
@@ -117,9 +135,10 @@ pub const Http = struct {
         while (true) : (attempt += 1) {
             return self.getRangeOnce(url, range) catch |err| {
                 if (budget_mod.interrupted()) return error.Interrupted;
-                if (attempt >= attempts or !transient(err)) return err;
-                std.log.warn("{s}: {s}; retrying ({d}/{d})", .{ url, @errorName(err), attempt + 1, attempts });
-                self.pause(attempt);
+                const wait = retryPause(err, attempt) orelse return err;
+                const of: usize = if (err == error.RateLimited) rate_limit_attempts else attempts;
+                std.log.warn("{s}: {s}; retrying in {d} s ({d}/{d})", .{ url, @errorName(err), wait, attempt + 1, of });
+                self.sleep(wait);
                 continue;
             };
         }
@@ -130,7 +149,7 @@ pub const Http = struct {
             if (self.getNative(url, range)) |body| {
                 return body;
             } else |err| switch (err) {
-                error.NotFound, error.Forbidden, error.OutOfMemory, error.RangeNotSupported => return err,
+                error.NotFound, error.Forbidden, error.OutOfMemory, error.RangeNotSupported, error.RateLimited => return err,
                 else => {
                     std.log.debug("native http failed for {s}: {s}; trying curl", .{ url, @errorName(err) });
                     self.native_ok = false;
@@ -179,6 +198,7 @@ pub const Http = struct {
             },
             .not_found => return error.NotFound,
             .unauthorized, .forbidden => return error.Forbidden,
+            .too_many_requests => return error.RateLimited,
             else => return error.HttpError,
         }
     }
@@ -213,6 +233,7 @@ pub const Http = struct {
         const code = std.fmt.parseInt(u16, std.mem.trim(u8, result.stdout[nl + 1 ..], " \r\n"), 10) catch 0;
         if (code == 404) return error.NotFound;
         if (code == 401 or code == 403) return error.Forbidden;
+        if (code == 429) return error.RateLimited;
         if (range != null and code == 200) return error.RangeNotSupported;
         if (code != (if (range != null) @as(u16, 206) else @as(u16, 200))) {
             std.log.err("curl failed for {s}: {s}", .{ url, std.mem.trim(u8, result.stderr, "\n") });
@@ -667,6 +688,20 @@ pub fn loadPrompts(arena: Allocator, http: *Http, cache_root: []const u8, settin
         prompts[i] = .{ .system = spec.system_prompt orelse settings.system_prompt, .user = user };
     }
     return prompts;
+}
+
+test "a rate limit is waited out, other failures retried briefly" {
+    // 429: ten attempts, 15 s, 30 s, ... between them (675 s in all).
+    var total: u64 = 0;
+    var attempt: usize = 1;
+    while (Http.retryPause(error.RateLimited, attempt)) |s| : (attempt += 1) total += s;
+    try std.testing.expectEqual(@as(usize, Http.rate_limit_attempts), attempt);
+    try std.testing.expectEqual(@as(u64, 675), total);
+    // Other transient failures: three attempts, 2 s then 4 s.
+    try std.testing.expectEqual(@as(?u64, 2), Http.retryPause(error.HttpError, 1));
+    try std.testing.expectEqual(@as(?u64, 4), Http.retryPause(error.HttpError, 2));
+    try std.testing.expectEqual(@as(?u64, null), Http.retryPause(error.HttpError, 3));
+    try std.testing.expectEqual(@as(?u64, null), Http.retryPause(error.NotFound, 1));
 }
 
 test "parse split" {
