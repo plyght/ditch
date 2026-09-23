@@ -3835,3 +3835,36 @@ whole by `from_pretrained` in float32, same ids, 5 greedy tokens):
 The MXFP4 stub's 3e-08 is a last-bit difference, the same with lazy and with
 whole-layer experts.
 
+## gpt-oss-20b at full depth: verified
+
+`openai/gpt-oss-20b`, all 24 layers, the two prompts of the earlier
+full-depth run with the harmony system block, 24 greedy tokens each.
+ditch: `ditch probe hf://openai/gpt-oss-20b --max-ram 10GB
+--remote-cache-size 13GB --max-response-length 24 --residuals --json`
+(ReleaseFast). Reference: `tools/ref_stream.py`, experts lazy (32 a layer,
+3.2 GB as float32), MXFP4 dequantised by transformers' `Mxfp4Dequantize`.
+
+| prompt | tokens | residuals (25 entries) | first-token logits | greedy (24 tokens) |
+| --- | :---: | :---: | ---: | :---: |
+| "What is the capital of France?" | match (87) | all agree, worst 3.49e-06 (layer 11) | 1.12e-06 | match |
+| "What is 12 times 12?" | match (88) | all agree, worst 2.74e-06 (layer 11) | 8.23e-07 | match |
+
+Per layer (first prompt): 0 at the embedding, then between 6.2e-07 and
+3.5e-06 from layer 1 to 24, with no trend: 1.7e-06 after layer 0, 3.5e-06 at
+11, 8e-07 at 15-19, 2.9e-06 at the final norm's input. The error does not
+grow with depth. Greedy text on both sides: `<|channel|>analysis<|message|>We
+need to answer: "What is the capital of France?" The answer: Paris. Provide
+concise answer` and `... The user asks: "What is 12 times 12?" It's a simple
+multiplication. 12*`.
+
+| side | fetched | peak RSS | wall |
+| --- | ---: | ---: | ---: |
+| ditch (warp mode) | 11.89 GB, 1524 ranges | 7.08 GB | 885 s |
+| reference | 15.25 GB, 3946 requests (+143 GB re-read from its cache) | 10.07 GB | 2070 s |
+
+The reference fetched more than the 13.8 GB stored because its cache filled
+at 12 GB, after which the uncached experts were fetched again for later
+tokens. Its 1200 layer loads (24 layers x 50 forward passes) and 6920 expert
+loads are what the time goes to. Peak RSS: the float32 trunk (4.6 GB:
+embedding and LM head, 201088 x 2880 each), the 3 GB expert LRU, one layer.
+
