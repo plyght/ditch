@@ -1606,10 +1606,6 @@ pub fn parseConfigAs(arena: Allocator, json_text: []const u8, family: ?*const Ar
         return error.InvalidConfig;
     }
     if (c.positional != .rope) @memset(c.rope_layers, false);
-    if (getNum(obj, "sliding_window_pattern") == null and c.arch.norm == .rms_gemma and obj.get("layer_types") == null and c.sliding_window != null) {
-        // Gemma 2: even layers are local.
-        for (c.sliding_layers, 0..) |*s, i| s.* = (i % 2 == 0);
-    }
     return c;
 }
 

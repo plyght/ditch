@@ -9,4 +9,5 @@ return {
     shared_expert = "mlp.shared_expert.",
     shared_expert_gate = "mlp.shared_expert_gate.weight",
   },
+  config = require("qwen").sliding,
 }

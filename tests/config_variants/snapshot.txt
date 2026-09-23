@@ -593,12 +593,12 @@ config gemma2 variant 7	26b816ddd4cb307b
 config gemma2 variant 8	d9728dacee7b5b24
 config gemma2 variant 9	bdcbea28f2e459dc
 config gemma3	4ae2ca3de8734f95
-config gemma3 variant 1	4ae2ca3de8734f95
-config gemma3 variant 2	a17f7a26fd3994b7
+config gemma3 variant 1	716835fa204504d6
+config gemma3 variant 2	dbdddc798c8a3b20
 config gemma3 variant 3	4ae2ca3de8734f95
 config gemma3 variant 4	a82094e221461fbf
 config gemma3 variant 5	51791a2a416a21da
-config gemma3 variant 6	4ae2ca3de8734f95
+config gemma3 variant 6	716835fa204504d6
 config gemma3 variant 7	4ae2ca3de8734f95
 config gemma3 variant 8	b37518a925229b24
 config gemma3 variant 9	8f9c9f8e1674802a
@@ -1806,17 +1806,32 @@ config qwen2 variant 2	7f9188cc12e6d672
 config qwen2 variant 3	401badb17c24a170
 config qwen2 variant 4	9aa7a689a531289
 config qwen2 variant 5	7e44079065b4f8e2
+config qwen2 variant 6	7f9188cc12e6d672
+config qwen2 variant 7	c744b1c0ac96d89c
+config qwen2 variant 8	d8c42964f0425640
+config qwen2 variant 9	7f9188cc12e6d672
+config qwen2 variant 10	c5034bf09f9f87e1
 config qwen2_fp8	9e5f2540a9fe4a5b
 config qwen2_fp8 variant 1	ce66f85bb39b98a
 config qwen2_int4	38fab31bcea21ad3
 config qwen2_int4_actorder	38fab31bcea21ad3
 config qwen2_moe	9ba3fbf47e37efc1
+config qwen2_moe variant 1	9ba3fbf47e37efc1
+config qwen2_moe variant 2	ed7dfd920c47a857
+config qwen2_moe variant 3	5b33dc3edeae6c36
+config qwen2_moe variant 4	9ba3fbf47e37efc1
+config qwen2_moe variant 5	8411c28b71fcfbbe
 config qwen3	726736a67ef7ece5
+config qwen3 variant 1	726736a67ef7ece5
+config qwen3 variant 2	89f71454ec130f33
+config qwen3 variant 3	37065b889d879816
+config qwen3 variant 4	726736a67ef7ece5
+config qwen3 variant 5	bf6f4538b378b6e6
 config qwen3_5	6bb6a1501b535e3e
 config qwen3_5 variant 1	6bb6a1501b535e3e
 config qwen3_5 variant 2	ba7797fcb66a20fc
 config qwen3_5_moe	a158a18c1b82fc65
-config qwen3_5_moe variant 1	a158a18c1b82fc65
+config qwen3_5_moe variant 1	1140ad53d38a1553
 config qwen3_5_moe variant 2	a158a18c1b82fc65
 config qwen3_5_moe variant 3	1140ad53d38a1553
 config qwen3_5_moe variant 4	a158a18c1b82fc65
@@ -1827,6 +1842,11 @@ config qwen3_5_moe variant 8	34175d9c5acfad74
 config qwen3_5_moe variant 9	a158a18c1b82fc65
 config qwen3_5_moe variant 10	a12f68d0e0e3c4a3
 config qwen3_moe	790701ce80b3c966
+config qwen3_moe variant 1	790701ce80b3c966
+config qwen3_moe variant 2	4e640a19bcc1659e
+config qwen3_moe variant 3	aeb580757757d1fb
+config qwen3_moe variant 4	790701ce80b3c966
+config qwen3_moe variant 5	b13f960401bba3d1
 config qwen3_moe_big	71db16ba39337cc6
 config qwen3_moe_fused	790701ce80b3c966
 config qwen3_moe_fused_t	790701ce80b3c966
