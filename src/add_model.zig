@@ -795,7 +795,11 @@ const ignorable_keys = [_][]const u8{
 const KeyReport = struct { unread: []const []const u8, read: usize };
 
 fn dumpConfig(a: Allocator, text: []const u8) []const u8 {
-    const cfg = arch.parseConfig(a, text) catch |err| return @errorName(err);
+    return dumpConfigAs(a, text, null);
+}
+
+fn dumpConfigAs(a: Allocator, text: []const u8, family: ?*const Arch) []const u8 {
+    const cfg = arch.parseConfigAs(a, text, family) catch |err| return @errorName(err);
     var out: std.Io.Writer.Allocating = .init(a);
     models.dump(arch.Config, &out.writer, cfg, "") catch return "?";
     return out.written();
@@ -897,10 +901,27 @@ pub fn run(ctx: Ctx) !u8 {
 
     // 1. Read.
     const ck = if (hf.isLocalDir(io, model)) try readLocal(ctx, model) else try readRemote(ctx, model, out);
-    const config_text = ck.file("config.json") orelse {
+    var config_text = ck.file("config.json") orelse {
         std.log.err("{s} has no config.json", .{model});
         return 1;
     };
+    // The family the checkpoint really is, when ditch knows it and the
+    // draft is made under another name (`--model-type`): the draft is
+    // compared with it.
+    var really: ?*const Arch = null;
+    if (ctx.settings.add_model_type) |t| {
+        const orig = try configType(a, config_text);
+        really = if (orig.text) |x| models.lookup(x) else null;
+        if (really == null) if (orig.top) |x| {
+            really = models.lookup(x);
+        };
+        // As if the checkpoint were an unknown family called `t`: no
+        // `architectures` class to go by either.
+        config_text = try retype(a, config_text, t);
+        for (@constCast(ck.small)) |*f| if (std.mem.eql(u8, f.name, "config.json")) {
+            f.bytes = config_text;
+        };
+    }
     if (ck.tensors.len == 0) {
         std.log.err("{s} has no safetensors weights (add-model needs their headers)", .{model});
         return 1;
@@ -912,7 +933,7 @@ pub fn run(ctx: Ctx) !u8 {
     };
     try out.print("* config.json: model_type {s}{s}{s}; {d} tensors in {d} safetensors file(s)\n", .{ own_type, if (types.text != null) " (text config of " else "", if (types.text != null) try std.fmt.allocPrint(a, "{s})", .{types.top orelse "?"}) else "", ck.tensors.len, ck.shards.len });
     const known = models.lookup(own_type) orelse if (types.top) |t| models.lookup(t) else null;
-    if (known) |k| try out.print("* {s} is already defined ({s}, {s}): drafting without it, to compare the draft with it\n", .{ own_type, k.model_type, models.origin(k) });
+    if (known) |k| try out.print("* {s} is already defined ({s}, {s}): the draft is compared with it\n", .{ own_type, k.model_type, models.origin(k) });
 
     // 2. The shape-only copy.
     var name_buf: std.ArrayList(u8) = .empty;
@@ -923,7 +944,7 @@ pub fn run(ctx: Ctx) !u8 {
     try out.flush();
 
     // 3. Match.
-    const chosen = (try match(ctx, &ck, work, own_type, config_text, known)) orelse {
+    const chosen = (try match(ctx, &ck, work, own_type, config_text)) orelse {
         std.log.err("no known family reads this config.json (every one refused it); a new family needs a definition written by hand (docs/models.md)", .{});
         return 1;
     };
@@ -956,7 +977,7 @@ pub fn run(ctx: Ctx) !u8 {
         std.log.err("the draft does not load: {s}", .{diag.message orelse @errorName(err)});
         return 1;
     };
-    if (known) |k| try compareWithKnown(ctx, config_text, own_type, k);
+    if (known orelse really) |k| try compareWithKnown(ctx, config_text, own_type, k);
     if (!chosen.ok) {
         try out.writeAll("The draft does not load this checkpoint yet (see its comments); edit it, then run ditch verify.\n");
         return 1;
@@ -974,10 +995,8 @@ pub fn run(ctx: Ctx) !u8 {
 
 /// Ranks the known families by how well they read the checkpoint (see
 /// the module comment) and returns the best trial load, or null when no
-/// family reads its config.json. `known` (the definition ditch already has
-/// for this model_type, if any) is left out, so that the draft is made
-/// without it and can be compared with it.
-fn match(ctx: Ctx, ck: *const Checkpoint, work: []const u8, own_type: []const u8, config_text: []const u8, known: ?*const Arch) !?Trial {
+/// family reads its config.json.
+fn match(ctx: Ctx, ck: *const Checkpoint, work: []const u8, own_type: []const u8, config_text: []const u8) !?Trial {
     const a = ctx.arena;
     const out = ctx.out;
     // Rank the families whose reading of config.json succeeds.
@@ -985,7 +1004,6 @@ fn match(ctx: Ctx, ck: *const Checkpoint, work: []const u8, own_type: []const u8
     var quiet: Capture = .{ .arena = a };
     capture = &quiet;
     for (models.families()) |f| {
-        if (known != null and f == known.?) continue;
         if (f.inherits != null or std.mem.startsWith(u8, f.model_type, "add_model_trial")) continue;
         for (candidates.items) |cand| {
             if (cand.family == f) break;
@@ -1130,9 +1148,13 @@ fn unreadExcept(a: Allocator, all: []const []const u8, ck: *const Checkpoint, f:
 fn compareWithKnown(ctx: Ctx, config_text: []const u8, own_type: []const u8, known: *const Arch) !void {
     const a = ctx.arena;
     const draft_family = models.lookup(own_type).?;
-    const as_draft = dumpConfig(a, config_text);
-    const as_known = dumpConfig(a, try retype(a, config_text, known.model_type));
-    if (std.mem.eql(u8, as_draft, as_known) and std.mem.eql(u8, draft_family.names.layer, known.names.layer)) {
+    var quiet: Capture = .{ .arena = a };
+    capture = &quiet;
+    // The family itself and the config's own model_type are the names that differ.
+    const as_draft = try withoutNames(a, dumpConfigAs(a, config_text, draft_family));
+    const as_known = try withoutNames(a, dumpConfigAs(a, config_text, known));
+    capture = null;
+    if (std.mem.eql(u8, as_draft, as_known)) {
         try ctx.out.print("* The draft parses this config.json exactly as the built-in {s} does.\n", .{known.model_type});
         return;
     }
@@ -1149,6 +1171,17 @@ fn compareWithKnown(ctx: Ctx, config_text: []const u8, own_type: []const u8, kno
     }
 }
 
+fn withoutNames(a: Allocator, dump: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var it = std.mem.splitScalar(u8, dump, '\n');
+    while (it.next()) |line| {
+        if (std.mem.startsWith(u8, line, "arch = ") or std.mem.startsWith(u8, line, "model_type = ")) continue;
+        try out.appendSlice(a, line);
+        try out.append(a, '\n');
+    }
+    return out.items;
+}
+
 fn writeDraft(ctx: Ctx, ck: *const Checkpoint, own_type: []const u8, t: Trial, keys: KeyReport, known: ?*const Arch) ![]const u8 {
     const a = ctx.arena;
     var out: std.Io.Writer.Allocating = .init(a);
@@ -1156,7 +1189,7 @@ fn writeDraft(ctx: Ctx, ck: *const Checkpoint, own_type: []const u8, t: Trial, k
     const f = t.family;
     try w.print("-- {s}: drafted by `ditch add-model {s}`\n", .{ own_type, ctx.settings.model });
     try w.print("-- from {s} ({d} tensors in {d} safetensors file(s)).\n", .{ ck.source, ck.tensors.len, ck.shards.len });
-    if (known) |k| try w.print("-- ditch already defines {s} ({s}); this draft was made without that definition.\n", .{ own_type, k.model_type });
+    if (known) |k| try w.print("-- ditch already defines {s} ({s} in {s}).\n", .{ own_type, k.model_type, models.origin(k) });
     try w.writeAll("--\n");
     if (t.ok) {
         const text_unread = countText(t.unread);
