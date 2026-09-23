@@ -3868,3 +3868,27 @@ tokens. Its 1200 layer loads (24 layers x 50 forward passes) and 6920 expert
 loads are what the time goes to. Peak RSS: the float32 trunk (4.6 GB:
 embedding and LM head, 201088 x 2880 each), the 3 GB expert LRU, one layer.
 
+## gpt-oss-120b at full depth over `hf://`: network-bound, no token in 90 minutes
+
+`openai/gpt-oss-120b` (36 layers, 128 MXFP4 experts a layer, 65 GB stored)
+through `ditch probe hf://openai/gpt-oss-120b --max-ram 10GB
+--remote-cache-size 18GB`, ReleaseFast, one prompt ("What is the capital of
+France?", 87 tokens with the harmony system block).
+
+    dry run:  warp mode min 6.48GB, with prefetch + expert cache + RAM caches 19.56GB
+              trunk 3.96GB stored, routed expert 12.6MB stored (47.5MB decoded), 4608 experts 56.80GB
+              expert cache 5.67GB = 122 of 4608 experts
+    measured: peak RSS 7.49GB (under the 9GB limit), chunk cache at its 18GB bound (2308 chunks)
+              the Hub served ~19MB/s here (one curl stream: 200MB in 10.9 s)
+              12-token run stopped after 5401 s with no token generated;
+              1-token (prefill only) run stopped after 32 min, still in the prefill
+
+Why: the 87-token prompt routes to most of the 4608 experts, about 57 GB of
+MXFP4, while this machine's disk leaves room for an 18 GB chunk cache, so
+the prefill's working set cannot stay on disk: at ~19 MB/s the first pass
+alone needs ~50 minutes, and experts evicted before a later layer or token
+reads them again are fetched again. No warm-cache number is possible here
+for the same reason (the warm working set is three times the cache). A
+machine with ~60 GB of disk for the cache would hold every expert after one
+pass; the RAM side fits (7.5 GB). Not a correctness result: gpt-oss-120b's
+arithmetic is verified on its truncated cut above.
