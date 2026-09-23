@@ -2573,3 +2573,15 @@ the scale's dtype, bf16 here — which is what ditch reproduces. With
 
 The Kimi-Linear numbers above were measured before this fix: its MLA layer's
 latents are large enough that ε moved nothing past 2.6e-06.
+
+## Qwen3-Next-80B-A3B (`qwen3_next`): verified
+
+`Qwen/Qwen3-Next-80B-A3B-Instruct`, first 4 layers (three gated DeltaNet
+layers, then gated full attention; every layer the 512-expert top-10 MoE with
+a gated shared expert), MTP layers dropped, routed experts lazy. transformers
+runs its PyTorch fallbacks for the causal conv and the chunked delta rule.
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (24) | all 5 agree, worst 3.23e-07 | 5.15e-07 | match |
+| "Explain how rainbows form, …" | match (30) | all 5 agree, worst 1.68e-07 | 5.90e-07 | match |
