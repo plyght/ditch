@@ -32,6 +32,7 @@ const bench = @import("bench.zig");
 const probe = @import("probe.zig");
 const compute = @import("compute.zig");
 const selftest = @import("selftest.zig");
+const truncate_mod = @import("truncate.zig");
 const directions = @import("directions.zig");
 const remote = @import("remote.zig");
 const logo = @import("logo.zig");
@@ -1426,6 +1427,15 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         kpool.* = tensor.Pool.initPersistent(gpa, io, settings.threads);
         defer kpool.deinit();
         try bench.runKernels(gpa, io, settings, kpool, out, con.result);
+        return;
+    }
+
+    // `ditch truncate`: range-reads a few layers into a new checkpoint; no
+    // threads, device or memory budget.
+    if (settings.truncate) {
+        var http = try hf.Http.initWithOptions(gpa, io, arena, init.environ_map, .{ .token_file = settings.token_file, .timeout_seconds = settings.http_timeout_seconds });
+        defer http.deinit();
+        try truncate_mod.runCli(gpa, arena, io, &http, settings, out, con.result);
         return;
     }
 

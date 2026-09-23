@@ -413,7 +413,12 @@ every layer, and `tools/probe_reference.py MODEL probe.json` compares all of it
 with transformers on the CPU, naming the layer a forward pass first diverges
 at. Config and tensor names can be checked without the weights: `ditch
 --dry-run hf://owner/name --max-ram 6GB` fetches the index and the shard
-headers only, runs the loader and stops at the memory estimate.
+headers only, runs the loader and stops at the memory estimate. For a model
+too large to check whole, `ditch truncate MODEL K OUT` writes a checkpoint of
+its first K decoder layers (`--layers 0,1,20` for chosen ones, renumbered;
+`--kinds` for the fewest layers covering every layer kind) by range-reading
+only those tensors, quantisation untouched and every per-layer list in
+config.json cut to match; `--drop mtp.` leaves out tensors by name prefix.
 
 Exit codes: 0 success (including `--dry-run` and a clean stop at
 `--time-limit`), 1 failure, 2 usage error or a memory budget too small for the
