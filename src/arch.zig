@@ -3077,7 +3077,13 @@ fn extraMiMoV2(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
             c.rope_scaling = try parseRopeScaling(arena, obj, f, c.rotary_dim, c.max_position_embeddings);
         }
         if (swa) |s| {
-            local_theta = getF32(s, "rope_theta", 10_000.0);
+            // A flat `rope_parameters` (MiMo V2.5 / V2.6: `{rope_theta: 1e7, ...}`)
+            // is the full layers' base; the sliding layers keep `swa_rope_theta`,
+            // which the remote code writes over it for them.
+            local_theta = if (getObj(rp, "sliding_attention") == null and getNum(obj, "swa_rope_theta") != null)
+                getF32(obj, "swa_rope_theta", 10_000.0)
+            else
+                getF32(s, "rope_theta", 10_000.0);
             const sf = getNum(s, "partial_rotary_factor") orelse 0.334;
             const t = getStr(s, "rope_type") orelse getStr(s, "type") orelse "default";
             if (sf != factor or !(std.mem.eql(u8, t, "default") or std.mem.eql(u8, t, "mrope"))) {
@@ -3121,6 +3127,9 @@ fn extraMiMoV2(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
     // pre-sharded over `num_key_value_heads` chunks, each `[Q | K | V]`.
     c.qkv_alt = .grouped;
     c.qkv_chunks = kv_full;
+    // The fp8 attention projections (fused or not) are block-quantised
+    // shard by shard, one shard per full-layer kv head (SGLang's loader).
+    c.quant.attn_row_shards = kv_full;
 }
 
 /// OLMoE / FlexOLMo: softmax over every expert, top-k, optional renormalisation.

@@ -42,6 +42,9 @@ from lazy_checkpoint import LazyCheckpoint  # noqa: E402
 
 # FP8 block size (`weight_block_size`), set from the checkpoint's config by load().
 FP8_BLOCK = None
+# MiMo V2 (SGLang's loader): the fp8 attention projections are
+# `num_key_value_heads` row shards, each block-quantised on its own.
+ATTN_ROW_SHARDS = 1
 
 E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
 PROJ = {"gate": ("w1", "gate_proj"), "up": ("w3", "up_proj"), "down": ("w2", "down_proj")}
@@ -63,7 +66,14 @@ def dequant_expert(store, module, cfg_q):
             # The configured block, the last one partial (GLM-5.3's kv_a_proj
             # is 576 rows in 5 blocks of 128); only without one is it derived.
             br, bc = FP8_BLOCK or (-(-w.shape[0] // s.shape[0]), -(-w.shape[1] // s.shape[1]))
-            deq = w.float() * s.repeat_interleave(br, 0)[: w.shape[0]].repeat_interleave(bc, 1)[:, : w.shape[1]]
+            # MiMo V2's attention projections are blocked per tensor-parallel
+            # shard (`ATTN_ROW_SHARDS` of them), each from its own first row.
+            k = ATTN_ROW_SHARDS if re.search(r"self_attn\.(qkv|q|k|v)_proj$", module) else 1
+            parts = [(w, s)]
+            if k > 1 and w.shape[0] % k == 0 and s.shape[0] == k * -(-(w.shape[0] // k) // br):
+                parts = list(zip(w.chunk(k, 0), s.chunk(k, 0)))
+            deq = torch.cat([pw.float() * ps.repeat_interleave(br, 0)[: pw.shape[0]].repeat_interleave(bc, 1)[:, : pw.shape[1]]
+                             for pw, ps in parts], 0)
             return deq.to(torch.bfloat16).float()
         return w.float()
     packed = store.tensor(module + ".weight_packed")
@@ -212,9 +222,12 @@ def load(model_dir, dtype=torch.float32):
     wq = next(iter(groups.values()), {}).get("weights", {}) if groups else {}
     global FP8_BLOCK
     FP8_BLOCK = tuple(qcfg["weight_block_size"]) if qcfg.get("weight_block_size") else None
+    global ATTN_ROW_SHARDS
+    tcfg = cfg.get("text_config") or cfg
+    ATTN_ROW_SHARDS = tcfg.get("num_key_value_heads", 1) if tcfg.get("model_type") in ("mimo_v2", "mimo_v2_flash") else 1
     lazy_names = [k for k in store.keys() if k in store.lazy["holes"]]
     pat = re.compile(r"^(.*layers\.(\d+)\..*experts)\.(\d+)\.(w1|w2|w3|gate_proj|up_proj|down_proj)\.")
-    stacked_pat = re.compile(r"^(.*layers\.(\d+)\..*experts)\.(gate_up_proj|down_proj)$")
+    stacked_pat = re.compile(r"^(.*layers\.(\d+)\..*experts)\.(gate_up_proj|down_proj)(?:_blocks)?$")
     prefixes, stacked = {}, {}
     for k in lazy_names:
         m = pat.match(k)
@@ -354,7 +367,15 @@ def load(model_dir, dtype=torch.float32):
     def slab_loader(name, want):
         # Expert e of a stacked `[E, ...]` checkpoint tensor is its slab e.
         def load_e(e):
-            t = store.rows(name, [e])[0].float()
+            if name.endswith("_blocks"):
+                # gpt-oss MXFP4: `[E, rows, cols/32, 16]` e2m1 nibble pairs (low
+                # nibble first) with `_scales` `[E, rows, cols/32]` E8M0 exponents.
+                b = store.rows(name, [e])[0]
+                sc = store.rows(name[: -len("_blocks")] + "_scales", [e])[0]
+                q = torch.stack([E2M1[(b & 0xF).long()], E2M1[(b >> 4).long()]], -1).reshape(*b.shape[:-1], 32)
+                t = (q * torch.exp2(sc.float() - 127).unsqueeze(-1)).reshape(b.shape[0], -1)
+            else:
+                t = store.rows(name, [e])[0].float()
             if tuple(t.shape) != want:
                 if tuple(t.shape[::-1]) == want:
                     t = t.transpose(0, 1).contiguous()

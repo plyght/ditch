@@ -455,6 +455,14 @@ test "gpt_oss_mxfp4 fixture (MXFP4 expert blocks and scales)" {
 test "kimi_k3_mxfp4 fixture (compressed-tensors mxfp4-pack-quantized experts)" {
     try checkFixture("kimi_k3_mxfp4");
 }
+test "mimo_v2_fp8 fixture (MiMo V2.5 / V2.6 fp8 qkv_proj blocked per tensor-parallel shard)" {
+    try checkFixture("mimo_v2_fp8");
+}
+
+test "mimo_v2_split_fp8 fixture (MiMo-V2-Flash fp8 q/k/v blocked per tensor-parallel shard)" {
+    try checkFixture("mimo_v2_split_fp8");
+}
+
 test "mimo_v2_mxfp4 fixture (MiMo V2.6 store_dtype mxfp4 experts, bf16 MoE router)" {
     try checkFixture("mimo_v2_mxfp4");
 }

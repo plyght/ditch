@@ -126,6 +126,17 @@ def quant_fp8_block(name, w, block):
     return bf16_round(deq), [(name, "F8_E4M3", codes), (name + "_scale_inv", "F32", scale)]
 
 
+def quant_fp8_sharded(name, w, block, shards):
+    """`quant_fp8_block` of each of `shards` equal row slices on its own (MiMo
+    V2's attention projections, blocked per tensor-parallel shard): every
+    slice starts a block and may end in a partial one."""
+    rows = w.shape[0] // shards
+    parts = [quant_fp8_block(name, w[i * rows:(i + 1) * rows], block) for i in range(shards)]
+    return (np.concatenate([deq for deq, _ in parts], 0),
+            [(name, "F8_E4M3", np.concatenate([t[0][2] for _, t in parts], 0)),
+             (name + "_scale_inv", "F32", np.concatenate([t[1][2] for _, t in parts], 0))])
+
+
 def pack_bits(vals, bits):
     """compressed-tensors `pack_to_int32` along the last axis: element i occupies bits
     [i * bits, (i + 1) * bits) of the little-endian word stream of its row."""
@@ -471,8 +482,9 @@ def base(**kw):
         extra_tensors=[],
         # MiMo V2: values narrower than the keys outside MLA, sinks only on the
         # sliding layers, and a fused qkv ("chunked" layout) of `qkv_chunks`
-        # chunks of [q heads | k heads | v heads].
-        narrow_v=False, sinks_sliding_only=False, qkv_chunks=0,
+        # chunks of [q heads | k heads | v heads]; fp8 attention projections
+        # blocked per row shard (`attn_row_shards` of them).
+        narrow_v=False, sinks_sliding_only=False, qkv_chunks=0, attn_row_shards=0,
         quant=None,
         config={}, extra_config={},
     )
@@ -1225,8 +1237,25 @@ spec("mimo_v2", config=_MIMO_V2_CONFIG, **_MIMO_V2)
 # 32-element group, so the routed experts are wider here than in `mimo_v2`.
 _MIMO_V2_MXFP4_QUANT = {"activation_scheme": "dynamic", "fmt": "e4m3", "ignored_layers": ["model.layers.*.self_attn", "model.layers.*.mlp.gate", "model.embed_tokens", "lm_head"],
                         "mxfp4_block_size": 32, "quant_method": "fp8", "store_dtype": "mxfp4", "weight_block_size": [128, 128]}
+# MiMo V2.5 / V2.6's fp8 trunk: the fused qkv_proj is its `num_key_value_heads`
+# tensor-parallel shards, each block-quantised on its own. With 32-row blocks
+# a full layer's 44-row shards end in partial blocks (4 scale rows, where
+# blocking the whole 88 rows would give 3); the sliding layers' 64-row shards
+# are whole blocks.
+spec("mimo_v2_fp8", quant={"kind": "fp8", "block": [32, 8]},
+     config=dict(_MIMO_V2_CONFIG, quantization_config={"activation_scheme": "dynamic", "fmt": "e4m3", "quant_method": "fp8", "weight_block_size": [32, 8]}), **_MIMO_V2)
+# MiMo-V2-Flash's split q/k/v are blocked the same way, per shard: with
+# 8-row blocks a full layer's k_proj (two 12-row shards) has 4 scale rows
+# where blocking its 24 rows whole would give 3.
+spec("mimo_v2_split_fp8", quant={"kind": "fp8", "block": [8, 8]}, attn_row_shards=2,
+     config=dict(_MIMO_V2_CONFIG, quantization_config={"activation_scheme": "dynamic", "fmt": "e4m3", "quant_method": "fp8", "weight_block_size": [8, 8]}),
+     **{k: v for k, v in _MIMO_V2.items() if k not in ("qkv", "qkv_layout", "qkv_chunks", "extra_tensors")},
+     extra_tensors=MIMO_MTP)
+# Its config also carries V2.6's flat `rope_parameters` (the full layers' base;
+# the sliding layers keep `swa_rope_theta`).
 spec("mimo_v2_mxfp4", quant={"kind": "mxfp4_store"},
-     config=dict(_MIMO_V2_CONFIG, moe_intermediate_size=32, moe_router_dtype="bfloat16", quantization_config=_MIMO_V2_MXFP4_QUANT),
+     config=dict(_MIMO_V2_CONFIG, moe_intermediate_size=32, moe_router_dtype="bfloat16", quantization_config=_MIMO_V2_MXFP4_QUANT,
+                 rope_parameters={"partial_rotary_factor": 0.334, "rope_theta": 50000.0, "rope_type": "default", "type": "default"}),
      **dict(_MIMO_V2, moe=dict(_MIMO_V2["moe"], MI=32)))
 
 # --- families swept from transformers' causal-LM mapping --------------------
@@ -1452,7 +1481,9 @@ def generate_generic(family, out_dir):
     def quantize(name, w):
         """Re-encodes `w` in the spec's quantised format (in place) and records its storage tensors."""
         q = s["quant"]
-        if q["kind"] == "fp8":
+        if q["kind"] == "fp8" and s["attn_row_shards"] and re.search(r"self_attn\.(qkv|q|k|v)_proj\.weight$", name):
+            deq, tensors = quant_fp8_sharded(name, w, q["block"], s["attn_row_shards"])
+        elif q["kind"] == "fp8":
             deq, tensors = quant_fp8_block(name, w, q["block"])
         elif q["kind"] == "int":
             gi = None
@@ -1690,6 +1721,19 @@ def generate_generic(family, out_dir):
             weights[lp + s["qkv"]] = np.concatenate(
                 [np.concatenate([d["q"][c * qpc * hd_l:(c + 1) * qpc * hd_l], d["k"][c * kpc * hd_l:(c + 1) * kpc * hd_l],
                                  d["v"][c * kpc * vd_l:(c + 1) * kpc * vd_l]], 0) for c in range(nc)], 0)
+            if s["quant"] and s["quant"]["kind"] == "fp8":
+                # fp8: every chunk is blocked on its own (its own partial last
+                # block and scale rows), as MiMo V2.5 / V2.6 are quantised; the
+                # reference reads the dequantised parts.
+                name = lp + s["qkv"]
+                rc = weights[name].shape[0] // nc
+                fused, qtensors[name] = quant_fp8_sharded(name, weights[name], s["quant"]["block"], nc)
+                weights[name] = fused
+                for c in range(nc):
+                    part = fused[c * rc:(c + 1) * rc]
+                    d["q"][c * qpc * hd_l:(c + 1) * qpc * hd_l] = part[:qpc * hd_l]
+                    d["k"][c * kpc * hd_l:(c + 1) * kpc * hd_l] = part[qpc * hd_l:(qpc + kpc) * hd_l]
+                    d["v"][c * kpc * vd_l:(c + 1) * kpc * vd_l] = part[(qpc + kpc) * hd_l:]
         elif s["qkv"]:
             w = mat(lp + s["qkv"], qd + 2 * kvd, H)
             b = bias_for(lp + s["qkv"], qd + 2 * kvd, s["attn_bias"])

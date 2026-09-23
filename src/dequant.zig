@@ -76,6 +76,11 @@ pub const QuantConfig = struct {
     /// FP8 with `expert_dtype = "fp4"` (DeepSeek V4 / V4.1): the routed experts
     /// are I8 E2M1 nibble pairs with an F8_E8M0 `scale` per 32 columns.
     fp4_experts: bool = false,
+    /// FP8: the attention projections (`self_attn.{qkv,q,k,v}_proj`) are this
+    /// many equal row shards, each block-quantised on its own, its scale rows
+    /// those of the shard (MiMo V2: the checkpoints' tensor-parallel shards,
+    /// one per kv head of the full layers); set by the architecture, 0 = one tensor.
+    attn_row_shards: usize = 0,
     /// Human-readable format name for messages.
     label: []const u8 = "none",
 };
@@ -323,6 +328,8 @@ pub const Dequant = struct {
     scale_cols: usize = 0,
     block_rows: usize = 0,
     block_cols: usize = 0,
+    /// FP8: rows per independently blocked row shard (`QuantConfig.attn_row_shards`); 0 = none.
+    row_shard: usize = 0,
     e5m2: bool = false,
     /// FP8: the scales are F8_E8M0 exponents (`2^(byte - 127)`), not floats.
     scale_e8m0: bool = false,
@@ -407,6 +414,13 @@ pub const Dequant = struct {
 
     // -- FP8 ----------------------------------------------------------------
 
+    /// The FP8 scale row of matrix row `r`: its block, counted within its row shard.
+    fn scaleRow(self: *const Dequant, r: usize) usize {
+        if (self.row_shard == 0) return r / self.block_rows;
+        const per_shard = (self.row_shard + self.block_rows - 1) / self.block_rows;
+        return r / self.row_shard * per_shard + r % self.row_shard / self.block_rows;
+    }
+
     fn readFp8(self: *Dequant, io: Io, slab: usize, a: usize, n: usize, out: []u8) !void {
         const pa = std.heap.page_allocator;
         const src_rb = self.src_cols; // one byte per element
@@ -419,8 +433,8 @@ pub const Dequant = struct {
             defer pa.free(codes);
             try self.data.read(io, (@as(u64, slab) * self.src_rows + r) * src_rb, codes);
             // Scale rows covering [r, r + cn).
-            const s0 = r / self.block_rows;
-            const s1 = (r + cn - 1) / self.block_rows + 1;
+            const s0 = self.scaleRow(r);
+            const s1 = self.scaleRow(r + cn - 1) + 1;
             const es: usize = if (self.scale_e8m0) 1 else self.scale.dtype.size();
             const sraw = try pa.alloc(u8, (s1 - s0) * self.scale_cols * es);
             defer pa.free(sraw);
@@ -432,7 +446,7 @@ pub const Dequant = struct {
             } else tensor.convertToF32(self.scale.dtype, sraw, scales);
             const dst = std.mem.bytesAsSlice(u16, out[(r - a) * self.rowBytes() ..][0 .. cn * self.rowBytes()]);
             for (0..cn) |i| {
-                const srow = scales[((r + i) / self.block_rows - s0) * self.scale_cols ..][0..self.scale_cols];
+                const srow = scales[(self.scaleRow(r + i) - s0) * self.scale_cols ..][0..self.scale_cols];
                 const crow = codes[i * src_rb ..][0..self.cols];
                 const drow = dst[i * self.cols ..][0..self.cols];
                 var c: usize = 0;
@@ -746,6 +760,14 @@ fn install(gpa: Allocator, io: Io, f: *safetensors.File, dq: *Dequant, shape: []
     try f.addDequant(dq, shape, data);
 }
 
+/// `self_attn.{qkv,q,k,v}_proj.weight` (see `QuantConfig.attn_row_shards`).
+fn isAttnProjection(name: []const u8) bool {
+    for ([_][]const u8{ "self_attn.qkv_proj.weight", "self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight" }) |suffix| {
+        if (std.mem.endsWith(u8, name, suffix)) return true;
+    }
+    return false;
+}
+
 fn registerFp8(gpa: Allocator, io: Io, files: []const *safetensors.File, w: FoundRaw, cfg: QuantConfig) !bool {
     const name = w.info.name;
     if (w.info.shape.len < 2) return false;
@@ -791,7 +813,18 @@ fn registerFp8(gpa: Allocator, io: Io, files: []const *safetensors.File, w: Foun
     }
     var block_rows = (rows + scale_rows - 1) / scale_rows;
     var block_cols = (cols + scale_cols - 1) / scale_cols;
-    if (cfg.block_rows > 0 and cfg.block_cols > 0 and (rows + cfg.block_rows - 1) / cfg.block_rows == scale_rows and (cols + cfg.block_cols - 1) / cfg.block_cols == scale_cols) {
+    var row_shard: usize = 0;
+    const k = cfg.attn_row_shards;
+    const cols_fit = cfg.block_cols > 0 and (cols + cfg.block_cols - 1) / cfg.block_cols == scale_cols;
+    if (k > 1 and cfg.block_rows > 0 and cols_fit and isAttnProjection(name) and rows % k == 0 and
+        scale_rows == k * ((rows / k + cfg.block_rows - 1) / cfg.block_rows))
+    {
+        // Shards blocked one by one: each starts a block (and may end in a
+        // partial one). When a shard is whole blocks this is the plain grid.
+        row_shard = rows / k;
+        block_rows = cfg.block_rows;
+        block_cols = cfg.block_cols;
+    } else if (cfg.block_rows > 0 and cfg.block_cols > 0 and (rows + cfg.block_rows - 1) / cfg.block_rows == scale_rows and (cols + cfg.block_cols - 1) / cfg.block_cols == scale_cols) {
         block_rows = cfg.block_rows;
         block_cols = cfg.block_cols;
     }
@@ -811,6 +844,7 @@ fn registerFp8(gpa: Allocator, io: Io, files: []const *safetensors.File, w: Foun
         .scale_cols = scale_cols,
         .block_rows = block_rows,
         .block_cols = block_cols,
+        .row_shard = row_shard,
         .e5m2 = std.mem.eql(u8, w.info.dtype, "F8_E5M2"),
         .scale_e8m0 = scale_e8m0,
     };

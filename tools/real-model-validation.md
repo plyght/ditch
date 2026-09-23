@@ -3080,3 +3080,73 @@ looked wrong although the logits agreed to 3e-06.
 Not runnable, by design: `facebook/opt-125m`, `tiiuae/falcon-rw-1b` and
 `nvidia/Nemotron-Mini-4B-Instruct` ship `pytorch_model.bin` (and `.nemo`)
 only, no safetensors.
+## Bug F5 — MiMo V2's fp8 attention projections are blocked per shard (fixed)
+
+**Symptom.** `XiaomiMiMo/MiMo-V2.6-Flash-RL`, layers 0, 1, 5 (full attention
+with the dense MLP, sliding attention with MXFP4 experts, full attention with
+experts): layer 0's output was off by its whole magnitude. `MiMo-V2-Flash`, the
+same cut: layer 0 off by 2e-3, only with more than one token.
+
+**Cause.** The checkpoints are quantised shard by shard for tensor parallelism
+over the full layers' `num_key_value_heads` (4): every attention projection
+is 4 row shards, each fp8-blocked from its own first row with its own partial
+last block. A V2.5 / V2.6 fused `qkv_proj` of a full layer is 4 × `[q | k | v]`
+of 3392 rows (26.5 blocks of 128), 108 scale rows where blocking the 13568
+rows whole gives 106; MiMo-V2-Flash's full-layer `k_proj` is 4 × 192 rows, 8
+scale rows for 6. ditch took a grid that does not match the configured block
+as uniform blocks of `ceil(rows / scale_rows)` rows (126, 96), misaligning
+every scale after the first shard. SGLang's loader
+(`get_mimo_v2_fused_qkv_expected_tp_size`, `_resolve_deferred_qkv_scale_inv`)
+splits them by shard. The sliding layers' shards and the q / v projections
+are whole blocks, which is why only the full layers showed it. The fixture
+generator had no fp8 MiMo fixture: `mimo_v2_mxfp4` keeps its attention bf16.
+
+**Fix.** `QuantConfig.attn_row_shards` (set to the full layers' kv heads by
+the MiMo architecture): the fp8 scales of `self_attn.{qkv,q,k,v}_proj` are
+read per row shard (`Dequant.row_shard`) when the grid is the per-shard one.
+The generator quantises MiMo attention per shard (`quant_fp8_sharded`), and
+two fixtures fail without the fix: `mimo_v2_fp8` (fused qkv, 44-row shards in
+32-row blocks) and `mimo_v2_split_fp8` (split q/k/v, the full layers' 12-row
+k shards in 8-row blocks). The references (`tools/ref_mimo_v2.py`, the release's
+`modeling_mimo_v2.py`; `tools/ref_lazy_moe.py` for transformers'
+`mimo_v2_flash`) dequantise by shard too, and `ref_mimo_v2.py` regroups the
+fused shards into the `[all q | all k | all v]` its code splits, as SGLang does.
+
+## Bug F6 — MiMo V2.6's sliding layers took the full layers' RoPE base (fixed)
+
+**Symptom.** After F5, MiMo V2.6's sliding layer diverged by 4e-4 to 9e-3
+(more for the longer prompt); with its experts zeroed in both, still 2e-3, so
+the attention.
+
+**Cause.** V2.6's config has a flat `rope_parameters`
+(`{rope_theta: 1e7, partial_rotary_factor: 0.334}`) next to `swa_rope_theta:
+10000`. ditch read a flat dictionary as the base of both layer kinds; the
+release's `MiMoV2RotaryEmbedding` writes `swa_rope_theta` over it for the
+sliding layers. MiMo-V2-Flash (no `rope_parameters`) was unaffected. The
+generator's MiMo configs had no `rope_parameters`, so no fixture saw it.
+
+**Fix.** A flat `rope_parameters` is the full layers' base; the sliding layers
+keep `swa_rope_theta`. The `mimo_v2_mxfp4` fixture's config now carries the
+flat dictionary (reference unchanged, fails without the fix).
+
+## MiMo V2.6 and MiMo-V2-Flash: verified on real weights
+
+Layers 0, 1, 5 of each (dense full attention, sliding attention with sinks and
+MoE, full attention with MoE), routed experts lazy. MiMo V2.6: fp8 fused qkv,
+MXFP4 experts (`store_dtype`), bf16 router config; reference: the release's
+code (`tools/ref_mimo_v2.py`, float32 router as it computes it). MiMo-V2-Flash:
+fp8 split q/k/v and experts; reference: transformers' `mimo_v2_flash`
+(`tools/ref_lazy_moe.py`; the release's code gives the same numbers).
+`truncate_checkpoint.py` now cuts `hybrid_layer_pattern` / `moe_layer_freq`
+and writes `layer_types` / `mlp_layer_types`, which transformers otherwise
+derives from the layer index.
+
+| model | prompt | tokens | residuals | first-token logits | greedy |
+| --- | --- | :---: | :---: | ---: | :---: |
+| V2.6-Flash-RL | "The capital of France is" | match (5) | all 4 agree, worst 4.83e-07 (was 1.01e+00) | 5.14e-07 | match |
+| V2.6-Flash-RL | "Explain how rainbows form, …" | match (15) | all 4 agree, worst 1.84e-06 (was 1.00e+00) | 6.22e-07 | match |
+| V2-Flash | "The capital of France is" | match (5) | all 4 agree, worst 4.13e-07 (was 2.08e-03) | 3.64e-07 | match |
+| V2-Flash | "Explain how rainbows form, …" | match (15) | all 4 agree, worst 1.27e-06 (was 3.83e-03) | 8.95e-07 | match |
+
+V2.6 Pro (`MiMo-V2.6-Pro-RL`) shares the architecture and both fixes; it was not
+cut separately.

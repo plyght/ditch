@@ -75,8 +75,15 @@ for f in files:
 cfg = json.load(open(f"{out}/config.json"))
 tc = cfg.get('text_config', cfg)
 tc['num_hidden_layers'] = N
-for key in ('layer_types', 'mlp_layer_types', 'num_attention_heads_per_layer', 'compress_ratios', 'is_moe_layer', 'sliding_windows'):
+for key in ('layer_types', 'mlp_layer_types', 'num_attention_heads_per_layer', 'compress_ratios', 'is_moe_layer', 'sliding_windows', 'hybrid_layer_pattern', 'moe_layer_freq'):
     if isinstance(tc.get(key), list): tc[key] = [tc[key][j] for j in layers]
+# MiMo V2: transformers' mimo_v2_flash derives the layer kinds from the layer
+# index (full at 0 and every 6th) unless `layer_types` says; in a cut the
+# index no longer tells, so the kinds are written out from the patterns.
+if isinstance(tc.get('hybrid_layer_pattern'), list) and 'layer_types' not in tc:
+    tc['layer_types'] = ['sliding_attention' if x else 'full_attention' for x in tc['hybrid_layer_pattern']]
+    if isinstance(tc.get('moe_layer_freq'), list):
+        tc['mlp_layer_types'] = ['sparse' if x else 'dense' for x in tc['moe_layer_freq']]
 paired = {'engram_layer_ids': ['engram_num_embeddings']}
 for key in ('kv_source_layer_ids', 'index_source_layer_ids', 'engram_layer_ids', 'dspark_target_layer_ids'):
     if isinstance(tc.get(key), list):
@@ -99,7 +106,7 @@ if isinstance(tc.get('first_k_dense_replace'), int):
     tc['first_k_dense_replace'] = sum(1 for j in layers if j < tc['first_k_dense_replace'])
 if 'candidate_source_layer_id' in tc:
     tc['candidate_source_layer_id'] = new_id.get(tc['candidate_source_layer_id'], -1)
-if any(d.startswith('mtp') for d in drop):
+if any('mtp' in d for d in drop):
     for key in ('num_nextn_predict_layers',):
         if key in tc: tc[key] = 0
 json.dump(cfg, open(f"{out}/config.json", 'w'), indent=1)
