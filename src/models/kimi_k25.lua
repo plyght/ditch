@@ -1,3 +1,5 @@
+local moe = require("moe")
+
 return {
   model_type = "kimi_k25",
   llama_cpp = "deepseek2",
@@ -14,5 +16,7 @@ return {
     router_correction_bias = "mlp.gate.e_score_correction_bias",
     shared_expert = "mlp.shared_experts.",
   },
-  hook = "deepseek",
+  config = function(cfg, c)
+    moe.deepseek(cfg, c)
+  end,
 }

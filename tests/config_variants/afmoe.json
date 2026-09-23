@@ -1,0 +1,13 @@
+[
+  {"layer_types": "$delete"},
+  {"layer_types": "$delete", "global_attn_every_n_layers": "$delete"},
+  {"layer_types": "$delete", "global_attn_every_n_layers": 0},
+  {"layer_types": "$delete", "global_attn_every_n_layers": 3},
+  {"layer_types": "$delete", "sliding_window": "$delete"},
+  {"layer_types": null},
+  {"mup_enabled": false},
+  {"mup_enabled": "$delete"},
+  {"mup_enabled": 1},
+  {"route_scale": "$delete"},
+  {"route_scale": 2}
+]

@@ -1,0 +1,6 @@
+[
+  {"norm_topk_prob": false},
+  {"norm_topk_prob": "$delete"},
+  {"norm_topk_prob": 0},
+  {"norm_topk_prob": "yes"}
+]

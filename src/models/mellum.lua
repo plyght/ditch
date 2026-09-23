@@ -9,5 +9,9 @@ return {
     q_norm = "self_attn.q_norm.weight",
     k_norm = "self_attn.k_norm.weight",
   },
-  hook = "mellum",
+  -- Mellum: a plain softmax top-k router (renormalised) over fused experts.
+  config = function(cfg, c)
+    c.qk_norm = "head"
+    c.norm_topk_prob = flag(cfg.norm_topk_prob, true)
+  end,
 }
