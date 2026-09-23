@@ -803,7 +803,7 @@ fn expectedShape(a: Allocator, c: *const arch.Config, field: []const u8, li: usi
     };
     for (table) |e| if (std.mem.eql(u8, e[0], field)) return try a.dupe(usize, &e[1]);
     const vectors = [_]struct { []const u8, usize }{
-        .{ "final_norm", H }, .{ "embed_norm", H }, .{ "input_norm", H }, .{ "pre_ff_norm", H }, .{ "post_attn_norm", H },
+        .{ "final_norm", H },   .{ "embed_norm", H }, .{ "input_norm", H }, .{ "pre_ff_norm", H }, .{ "post_attn_norm", H },
         .{ "post_ff_norm", H }, .{ "mlp_norm", H },
     };
     for (vectors) |e| if (std.mem.eql(u8, e[0], field)) return try a.dupe(usize, &.{e[1]});
