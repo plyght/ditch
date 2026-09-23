@@ -2487,3 +2487,15 @@ does not show there.)
 | "The capital of France is" | match (17) | all 4 agree, worst 2.12e-06 | 5.64e-07 | match |
 | "Explain how rainbows form, …" | match (23) | all 4 agree, worst 8.72e-07 | 8.33e-07 | match |
 | same, stock transformers (latent eps 1e-6) | match | first differs at layer 1, 1.4e-03 | 9.2e-04 | argmax match |
+
+## ERNIE 4.5 21B-A3B (`ernie4_5_moe`): verified
+
+`baidu/ERNIE-4.5-21B-A3B-PT`, first 3 layers (layer 0 dense, layers 1-2 the
+64-expert top-6 MoE with two shared experts), all experts kept. The second
+pass's stub could not check the routing (its router was all zeros, so every
+expert choice was a tie); the real router does.
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (19) | all 4 agree, worst 1.75e-06 | 5.76e-07 | match |
+| "Explain how rainbows form, …" | match (26) | all 4 agree, worst 1.20e-06 | 4.45e-07 | match |
