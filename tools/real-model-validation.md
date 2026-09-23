@@ -4778,6 +4778,39 @@ first 8 of 256 experts (`--experts 8`); float32 export.
   the export: residuals within 2.95e-06, logits 9.3e-07 of range, argmax and
   top-5 equal on both prompts.
 
+## Abliteration: Kimi K3 (`kimi_k3`), latent MoE with MXFP4 experts
+
+`moonshotai/Kimi-K3`, layers 0, 1 and 3 (KDA with the dense MLP, KDA with the
+latent MoE, MLA with the latent MoE), the first 8 of 896 experts
+(`--experts 8`), routed experts MXFP4 as released; bf16 export (the cut is
+9.6 GB, an f32 export does not fit beside it).
+
+* **Edited set:** `self_attn.o_proj` (KDA in layer 1, MLA in layer 2),
+  `shared_experts.down_proj` and `block_sparse_moe.routed_expert_up_proj` in
+  layers 1 and 2. K3's routed experts run in a 3584-wide latent space: their
+  `w2` writes the latent, and `routed_expert_up_proj` takes the weighted sum
+  back to the 7168-wide residual, so that projection, not each expert's `w2`,
+  is the one writing the refusal direction; the experts, the latent down
+  projection and its norm, the router and the KDA gates are untouched. Layer 0
+  sits outside both weight windows in both trials run. (The checker first
+  counted the latent up projection as an attention matrix and applied the
+  wrong λ; it now classes it with the MLP outputs.)
+* **MXFP4 experts:** exported dequantised to bf16 (the MXFP4 values are exact
+  in bf16), `quantization_config` dropped; the checker finds every expert
+  tensor equal to its dequantised original.
+* **Maths (bf16 export):** 99.93-99.97% of the elements bit-equal to
+  `bf16(W + D₃)`; the error against the exact edit exceeds that rounded
+  floor by at most 9.9e-08. Two trials (global scope, then per-layer scope)
+  both land there. Reload check 0.0132 (bf16 rounding of the merged weights).
+* **Export:** the release's own code (`tools/ref_kimi_k3.py`) on the export
+  against `ditch probe --raw`: residuals within 9.1e-07, logits 9.4e-07 of
+  range, argmax and top-5 equal. Loading it needed bug 71's fix (the export
+  had no `configuration_kimi_k3.py` / `modeling_*.py` / `tokenization_kimi.py`),
+  and two reference fixes: `ref_kimi_k3.py` imports fla before
+  `ref_lazy_moe.py`, which otherwise hides it from the release's modeling
+  file, and `probe_reference.py` no longer assumes a factory's model has a
+  `config`. This cut keeps the released `attn_res_block_size` of 12.
+
 ## Exact ranges for scattered experts: gpt-oss-20b with a cache below its experts
 
 After the account of gpt-oss-120b's decode above (whole 8 MB chunks per
