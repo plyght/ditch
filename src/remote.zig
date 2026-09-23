@@ -124,6 +124,11 @@ pub const Stats = struct {
     chunks_unpersisted: u64,
     /// Chunks found short or missing on disk and fetched again.
     chunks_invalid: u64,
+    /// Exact ranges fetched ahead for sparse reads (see `RemoteFile.prefetchRange`),
+    /// their bytes, and the reads they served.
+    partial_ranges: u64 = 0,
+    partial_bytes: u64 = 0,
+    partial_hits: u64 = 0,
 };
 
 pub const Source = struct {
@@ -178,8 +183,34 @@ pub const Source = struct {
     prefetch_workers: u32 = 0,
     prefetch_group: Io.Group = .init,
     chunks_prefetched: std.atomic.Value(u64) = .init(0),
+    /// Exact byte ranges fetched ahead where a prefetch hint covers little
+    /// of a chunk (a decode step's few experts: a scale slice of a few
+    /// hundred KB would otherwise cost a whole chunk), kept in RAM until
+    /// read or pushed out; `partial_limit` bounds their bytes (guarded by `lock`).
+    partials: std.ArrayList(Partial) = .empty,
+    /// Whether sparse hints fetch exact ranges: set by `planModel` when the
+    /// routed experts do not fit the cache beside the trunk (chunks would be
+    /// evicted before they are used again anyway). Otherwise whole chunks
+    /// are kept, so that a later run reads everything from disk.
+    sparse_reads: bool = false,
+    partial_held: u64 = 0,
+    partial_limit: u64 = 512 << 20,
+    partial_ranges: std.atomic.Value(u64) = .init(0),
+    partial_bytes: std.atomic.Value(u64) = .init(0),
+    partial_hits: std.atomic.Value(u64) = .init(0),
 
-    const PrefetchJob = struct { file: *RemoteFile, index: u64 };
+    /// A chunk to fetch into the cache, or (`len > 0`) the exact range `[offset, offset + len)`.
+    const PrefetchJob = struct { file: *RemoteFile, index: u64 = 0, offset: u64 = 0, len: u64 = 0 };
+
+    const Partial = struct {
+        file: *RemoteFile,
+        offset: u64,
+        len: u64,
+        body: []u8 = &.{},
+        ready: bool = false,
+        pins: u32 = 0,
+        tick: u64 = 0,
+    };
 
     pub const OpenOptions = struct {
         revision: ?[]const u8 = null,
@@ -311,6 +342,8 @@ pub const Source = struct {
         self.lockRelease();
         self.prefetch_group.await(self.io) catch {};
         self.prefetch_jobs.deinit(self.gpa);
+        for (self.partials.items) |pt| if (pt.body.len > 0) self.gpa.free(pt.body);
+        self.partials.deinit(self.gpa);
         for (self.ram) |slot| if (slot.body.len > 0) self.gpa.free(slot.body);
         for (self.files.items) |f| f.deinit();
         self.files.deinit(self.gpa);
@@ -426,6 +459,9 @@ pub const Source = struct {
             .bytes_evicted = self.bytes_evicted.load(.monotonic),
             .chunks_unpersisted = self.chunks_unpersisted.load(.monotonic),
             .chunks_invalid = self.chunks_invalid.load(.monotonic),
+            .partial_ranges = self.partial_ranges.load(.monotonic),
+            .partial_bytes = self.partial_bytes.load(.monotonic),
+            .partial_hits = self.partial_hits.load(.monotonic),
         };
     }
 
@@ -447,8 +483,33 @@ pub const Source = struct {
             const job = self.prefetch_jobs.items[self.prefetch_head];
             self.prefetch_head += 1;
             self.lockRelease();
-            job.file.prefetchChunk(job.index);
+            if (job.len > 0) job.file.prefetchPartial(job.offset, job.len) else job.file.prefetchChunk(job.index);
         }
+    }
+
+    /// Under the lock: the partial range of `f` holding `[offset, offset + len)`.
+    fn partialFind(self: *Source, f: *RemoteFile, offset: u64, len: u64) ?usize {
+        for (self.partials.items, 0..) |pt, i| {
+            if (pt.file == f and pt.offset <= offset and offset + len <= pt.offset + pt.len) return i;
+        }
+        return null;
+    }
+
+    /// Under the lock: makes room for `len` more bytes of partial ranges by
+    /// dropping the least recently used ready ones. False if they do not fit.
+    fn partialRoom(self: *Source, len: u64) bool {
+        while (self.partial_held + len > self.partial_limit) {
+            var pick: ?usize = null;
+            for (self.partials.items, 0..) |pt, i| {
+                if (!pt.ready or pt.pins > 0) continue;
+                if (pick == null or pt.tick < self.partials.items[pick.?].tick) pick = i;
+            }
+            const i = pick orelse return false;
+            const pt = self.partials.swapRemove(i);
+            self.partial_held -= pt.len;
+            self.gpa.free(pt.body);
+        }
+        return true;
     }
 
     fn lockAcquire(self: *Source) void {
@@ -664,28 +725,46 @@ pub const RemoteFile = struct {
         Io.Dir.cwd().deleteFile(self.src.io, path) catch {};
     }
 
-    /// Queues the chunks of `[offset, offset + len)` that are not on disk
-    /// yet to be fetched in the background into the chunk cache, so that a
-    /// later `readRange` finds them there: the routed experts of a layer are
+    /// Queues `[offset, offset + len)` to be fetched in the background, so
+    /// that a later `readRange` finds it: the routed experts of a layer are
     /// all known before the first of them runs, and fetching them over
     /// `max_in_flight` connections while the others compute is what makes a
-    /// model bigger than RAM run at the link's speed. At most half the cache
-    /// bound is queued ahead (further hints are dropped, and the chunks are
-    /// fetched on demand); nothing is queued without a disk cache.
+    /// model bigger than RAM run at the link's speed. A chunk the range
+    /// covers at least half of is fetched whole into the chunk cache; of a
+    /// chunk it covers less of, only the covered bytes are fetched, into RAM
+    /// (`Source.partials`), so that a few scattered experts do not cost a
+    /// whole chunk per piece. At most half the cache bound is queued ahead
+    /// (further hints are dropped, and the bytes are fetched on demand);
+    /// nothing is queued without a disk cache. Callers merge adjacent ranges
+    /// first (`stream.WeightStore.prefetchRemote`).
     pub fn prefetchRange(self: *RemoteFile, offset: u64, len: u64) void {
         if (len == 0) return;
         const src = self.src;
         const cs = src.chunk_size;
         if (src.cache_limit == 0) return;
         const ahead_max = @max(1, src.cache_limit / 2 / cs);
+        const end = offset + len;
         var spawn: u32 = 0;
         src.lockAcquire();
         var index = offset / cs;
-        const last = (offset + len - 1) / cs;
+        const last = (end - 1) / cs;
         while (index <= last) : (index += 1) {
             if (src.prefetch_jobs.items.len - src.prefetch_head >= ahead_max) break;
             if (self.chunks.contains(index) or src.ramFind(self, index) != null) continue;
-            src.prefetch_jobs.append(src.gpa, .{ .file = self, .index = index }) catch break;
+            const lo = @max(offset, index * cs);
+            const hi = @min(end, (index + 1) * cs);
+            if (!src.sparse_reads or (hi - lo) * 2 >= cs) {
+                src.prefetch_jobs.append(src.gpa, .{ .file = self, .index = index }) catch break;
+                continue;
+            }
+            if (src.partialFind(self, lo, hi - lo) != null) continue;
+            if (!src.partialRoom(hi - lo)) continue;
+            src.partials.append(src.gpa, .{ .file = self, .offset = lo, .len = hi - lo }) catch break;
+            src.prefetch_jobs.append(src.gpa, .{ .file = self, .offset = lo, .len = hi - lo }) catch {
+                _ = src.partials.pop();
+                break;
+            };
+            src.partial_held += hi - lo;
         }
         const queued = src.prefetch_jobs.items.len - src.prefetch_head;
         while (src.prefetch_workers < src.max_in_flight and src.prefetch_workers < queued) {
@@ -698,6 +777,65 @@ pub const RemoteFile = struct {
             src.prefetch_workers -= 1;
             src.lockRelease();
         };
+    }
+
+    /// Fetches the exact range of a queued partial into RAM (or drops it on failure).
+    fn prefetchPartial(self: *RemoteFile, offset: u64, len: u64) void {
+        const src = self.src;
+        const body = self.fetchRange(src.io, offset, offset + len - 1) catch null;
+        src.lockAcquire();
+        defer src.lockRelease();
+        for (src.partials.items, 0..) |*pt, i| {
+            if (pt.file != self or pt.offset != offset or pt.len != len or pt.ready) continue;
+            if (body) |b| if (b.len == len) {
+                pt.body = b;
+                pt.ready = true;
+                pt.tick = src.nextTick();
+                _ = src.partial_ranges.fetchAdd(1, .monotonic);
+                _ = src.partial_bytes.fetchAdd(len, .monotonic);
+                return;
+            };
+            src.partial_held -= pt.len;
+            _ = src.partials.swapRemove(i);
+            break;
+        }
+        if (body) |b| src.gpa.free(b);
+    }
+
+    /// Serves `dest` from a partial range holding it, waiting while one is
+    /// being fetched. False when none holds it.
+    fn readPartial(self: *RemoteFile, io: Io, offset: u64, dest: []u8) !bool {
+        const src = self.src;
+        while (true) {
+            src.lockAcquire();
+            const i = src.partialFind(self, offset, dest.len) orelse {
+                src.lockRelease();
+                return false;
+            };
+            const pt = &src.partials.items[i];
+            if (!pt.ready) {
+                src.lockRelease();
+                try io.sleep(Io.Duration.fromNanoseconds(std.time.ns_per_ms), .awake);
+                continue;
+            }
+            // Pinned, the entry cannot be dropped, but the list can move: keep the body.
+            pt.pins += 1;
+            pt.tick = src.nextTick();
+            const body = pt.body;
+            const key = .{ pt.offset, pt.len };
+            src.lockRelease();
+            @memcpy(dest, body[@intCast(offset - key[0])..][0..dest.len]);
+            src.lockAcquire();
+            for (src.partials.items) |*q| {
+                if (q.file == self and q.offset == key[0] and q.len == key[1] and q.ready) {
+                    q.pins -= 1;
+                    break;
+                }
+            }
+            src.lockRelease();
+            _ = src.partial_hits.fetchAdd(1, .monotonic);
+            return true;
+        }
     }
 
     /// Fetches chunk `index` into the cache unless it is there or on its way.
@@ -781,6 +919,7 @@ pub const RemoteFile = struct {
     /// from the disk cache, the RAM ring, or a fetch.
     fn readChunk(self: *RemoteFile, io: Io, dir: Io.Dir, index: u64, in_chunk: u64, dest: []u8) !void {
         const src = self.src;
+        if (try self.readPartial(io, index * src.chunk_size + in_chunk, dest)) return;
         var name_buf: [32]u8 = undefined;
         const name = chunkName(&name_buf, index);
         var retries: usize = 0;
@@ -954,6 +1093,12 @@ pub const RemoteFile = struct {
     }
 
     fn fetchChunk(self: *RemoteFile, io: Io, index: u64) ![]u8 {
+        const start = index * self.src.chunk_size;
+        return self.fetchRange(io, start, start + self.src.chunk_size - 1);
+    }
+
+    /// Fetches bytes `[start, last]` (inclusive) with one range request.
+    fn fetchRange(self: *RemoteFile, io: Io, start: u64, last: u64) ![]u8 {
         const src = self.src;
         // Bounded concurrency across all shards of the source.
         while (true) {
@@ -965,8 +1110,6 @@ pub const RemoteFile = struct {
             try io.sleep(Io.Duration.fromNanoseconds(2 * std.time.ns_per_ms), .awake);
         }
         defer _ = src.in_flight.fetchSub(1, .release);
-        const start = index * src.chunk_size;
-        const last = start + src.chunk_size - 1;
         const body = try src.http.getRange(self.url, start, last);
         _ = src.ranges_fetched.fetchAdd(1, .monotonic);
         _ = src.bytes_fetched.fetchAdd(body.len, .monotonic);
@@ -1153,6 +1296,11 @@ pub fn planModel(src: *Source, gpa: Allocator, model: *const model_mod.Model) !F
     }
     var git = groups.valueIterator();
     while (git.next()) |g| fp.total_expert_bytes += g.bytes;
+    // Experts that cannot all stay cached are fetched as exact ranges when few are wanted at a time.
+    const room = if (fp.trunkFits()) fp.cache_limit - fp.trunk_chunk_bytes else 0;
+    src.lockAcquire();
+    src.sparse_reads = fp.total_expert_bytes > room;
+    src.lockRelease();
     for (model.layers) |*l| if (l.moe) |*m| for (m.experts) |*ex| {
         var seen: [3][]const u8 = undefined;
         var n_seen: usize = 0;

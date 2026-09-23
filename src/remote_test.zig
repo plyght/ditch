@@ -665,6 +665,72 @@ test "remote source: a read that fails while loading is reported, not taken for 
     try std.testing.expectError(error.NotFound, loadRemote(gpa, io, &pool, src, scratch));
 }
 
+test "remote prefetchRange: sparse hints fetch exact ranges, served to the reads; logits unchanged" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const pool = tensor.Pool.init(io, 2);
+    var env: Env = undefined;
+    try env.init(gpa, io);
+    defer env.deinit();
+    const shard = "model-00001-of-00002.safetensors";
+    var dir = try Io.Dir.cwd().openDir(io, fixture, .{});
+    defer dir.close(io);
+    const file = try dir.openFile(io, shard, .{});
+    defer file.close(io);
+    {
+        const cache = try env.path("cache_sparse");
+        defer gpa.free(cache);
+        const src = try env.openWith(cache, std.math.maxInt(u64), 8);
+        defer src.deinit();
+        src.sparse_reads = true;
+        const rf = try src.openFile(shard);
+        const before = src.stats();
+        // Three small pieces in three chunks, and one that covers most of a chunk.
+        const small = [_]u64{ 5 * chunk + 100, 9 * chunk + 3000, 12 * chunk + 7 };
+        for (small) |o| rf.prefetchRange(o, 300);
+        rf.prefetchRange(20 * chunk + 10, chunk - 20);
+        src.awaitPrefetch();
+        const after = src.stats();
+        try std.testing.expectEqual(before.partial_ranges + 3, after.partial_ranges);
+        try std.testing.expectEqual(before.partial_bytes + 900, after.partial_bytes);
+        // The three exact ranges and one whole chunk: far less than four chunks.
+        try std.testing.expectEqual(before.bytes_fetched + 900 + chunk, after.bytes_fetched);
+        var want: [300]u8 = undefined;
+        var got: [300]u8 = undefined;
+        for (small) |o| {
+            try std.testing.expectEqual(@as(usize, 300), try file.readPositionalAll(io, &want, o));
+            try rf.readRange(io, o, &got);
+            try std.testing.expectEqualSlices(u8, &want, &got);
+            // A read inside a range is served by it too.
+            try rf.readRange(io, o + 50, got[0..100]);
+            try std.testing.expectEqualSlices(u8, want[50..150], got[0..100]);
+        }
+        const read = src.stats();
+        try std.testing.expectEqual(after.ranges_fetched, read.ranges_fetched);
+        try std.testing.expectEqual(after.partial_hits + 6, read.partial_hits);
+    }
+    // A prefill with exact ranges for its scattered experts: the same logits as the local model.
+    const local = try Model.load(gpa, io, &pool, fixture);
+    defer local.deinit();
+    const want = try firstTokenLogits(gpa, local, &long_ids);
+    defer gpa.free(want);
+    const scratch = try env.path("scratch");
+    defer gpa.free(scratch);
+    const cache = try env.path("cache_model");
+    defer gpa.free(cache);
+    const src = try env.open(cache, null);
+    defer src.deinit();
+    const model = try loadRemote(gpa, io, &pool, src, scratch);
+    defer model.deinit();
+    _ = try remote.planModel(src, gpa, model);
+    src.sparse_reads = true;
+    const got = try firstTokenLogits(gpa, model, &long_ids);
+    defer gpa.free(got);
+    try std.testing.expectEqualSlices(f32, want, got);
+    const st = src.stats();
+    try std.testing.expect(st.partial_ranges > 0 and st.partial_hits > 0);
+}
+
 test "remote chunk cache: size 0 keeps nothing on disk" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
