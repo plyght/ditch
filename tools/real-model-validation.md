@@ -4937,6 +4937,32 @@ n-gram tensors are not there).
   against `ditch probe`: residuals within 2.3e-06, logits 1.4e-06 of range,
   argmax and top-5 equal. ditch's reload check 0.0000.
 
+## Abliteration: Qwen3.8-2.4T-A95B (`qwen3_5_moe`), stacked experts
+
+`Qwen/Qwen3.8-2.4T-A95B`, layers 0 and 3 (Gated DeltaNet, then gated full
+attention), the first 2 of 512 experts (`--experts 2`) and no MTP layer
+(`--drop mtp.`): with 8 experts the cut is 13.7 GB, and a bf16 export does
+not fit beside it. bf16 export; the 8.1 GB embedding and LM head leave no room
+for float32.
+
+* **Edited set:** `linear_attn.out_proj` in layer 0, `self_attn.o_proj` in
+  layer 1, the stacked `mlp.experts.down_proj` (both slabs) and
+  `shared_expert.down_proj` in both layers; `gate_up_proj`, the router, the
+  shared expert's gate, the DeltaNet projections and the attention output
+  gate are untouched.
+* **Maths (bf16 export):** 99.79-99.98% of the elements bit-equal to
+  `bf16(W + D₃)`, the error against the exact edit at most 6.4e-07 over that
+  rounded floor (per matrix, from -1.9e-06 to 6.4e-07). The least bit-equal
+  matrix is layer 0's expert 0, as in Qwen3.8-Flash-Next. Reload check 0.0106.
+* **Export:** transformers' `qwen3_5_moe` on the export (`tools/ref_plain.py`
+  with `REF_F32_ARITH=1`: bf16 weights, float32 arithmetic through
+  `ref_lazy_moe`'s `f32_arithmetic`, which a 21 GB float32 copy would not fit
+  in memory for) against `ditch probe`: residuals within 5.3e-06, logits
+  2.2e-06 of range, argmax and top-5 equal. The same chat-templated prompt on
+  the unabliterated cut gives 1.0e-05 and 2.3e-06: the level belongs to the
+  prompt (15 tokens through the DeltaNet recurrence; the forward check's
+  2-token prompt gave 2.7e-07), not to the edit.
+
 ## Exact ranges for scattered experts: gpt-oss-20b with a cache below its experts
 
 After the account of gpt-oss-120b's decode above (whole 8 MB chunks per
