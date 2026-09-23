@@ -28,8 +28,14 @@ pub fn build(b: *std.Build) void {
         std.debug.print("-Dmetal needs a macOS target ({s} was requested)\n", .{@tagName(target.result.os.tag)});
         std.process.exit(1);
     }
+    // The Vulkan backend (Linux and Windows) needs nothing at build time: the
+    // loader is opened at run time and the shaders are committed as SPIR-V
+    // (tools/gen_spirv.sh), so it is on by default. A statically linked musl
+    // binary cannot load the loader and reports the backend unavailable.
+    const vulkan = b.option(bool, "vulkan", "Build the Vulkan backend (Linux and Windows; loaded at run time, default true)") orelse true;
     const options = b.addOptions();
     options.addOption(bool, "metal", metal);
+    options.addOption(bool, "vulkan", vulkan);
     options.addOption(bool, "accelerate", accelerate and is_macos);
     options.addOption(u32, "vector_width", vector_width);
     options.addOption(u32, "tile_rows", tile_rows);
