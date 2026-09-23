@@ -2881,3 +2881,43 @@ over the four layers), so this is one short prompt, one generated token:
 | prompt | tokens | residuals | first-token logits | greedy |
 | --- | :---: | :---: | ---: | :---: |
 | "Paris is" | match (2) | all 5 agree, worst 2.65e-07 | 8.96e-07 | match (1 token) |
+
+## DeepSeek V3.2-Exp (`deepseek_v32`): layer-0 drift traced to the reference
+
+`deepseek-ai/DeepSeek-V3.2-Exp`, layers 0 and 3 (`--layers 0,3`: the dense
+MLA layer and the first MoE layer, FP8 block-quantised, routed experts lazy).
+`index_topk` is 2048, so for these prompts the lightning indexer keeps every
+key and the reference's sparse attention is dense, as ditch runs it. ditch
+runs streamed (`DITCH_NO_MMAP=1`); mapped, it dequantised every expert at load
+and ran out of memory.
+
+**transformers cannot load the cut.** Its FP8 converter refuses
+`kv_a_proj_with_mqa` (`Weight shape (576, 7168) not divisible by scale grid
+(5, 56)`): 576 rows are four full 128-row blocks and a half one. The reference
+therefore reads a view of the cut whose FP8 trunk is dequantised beforehand.
+
+**Symptom.** Against that view, layer 0's output differed by 1.6e-01.
+
+**Ruled out, in order.** Attention against MLP: ditch's attention output was
+0.83 times the reference's, uniformly; the MLP difference followed from it.
+YaRN `mscale`, NeoX against interleaved rope and the latent-norm epsilon each
+moved the gap by under 3e-03. The indexer: transformers' `deepseek_v3` on the
+same view gives exactly the same output as `deepseek_v32`. ditch on the view
+itself (trunk already float) matched the view, so the difference was in the
+FP8 trunk. Tensor by tensor, with only one kept FP8 at a time, every one
+matched, but only because the view had dropped `quantization_config`: without
+`weight_block_size`, ditch derives the block size from the scale grid, as the
+view's own dequantisation did.
+
+**Cause: the reference view.** Deriving the block from the grid gives
+ceil(576 / 5) = 116-row blocks for `kv_a_proj_with_mqa`; the release's blocks
+are 128 rows (`weight_block_size`), the last one partial. ditch reads
+`weight_block_size` when the config has it and gets 128; the view got 116 and
+mis-scaled the latent and rope-key rows. Not a ditch bug. The view now takes
+the block size from the config.
+
+**A second, smaller difference.** `o_proj`'s scales are not powers of two
+(despite `scale_fmt: ue8m0`), and ditch rounds every dequantised weight to
+bf16 (dequant.zig, as the Hugging Face integrations do when they dequantise
+to bf16), so against a float32 dequantisation layer 0 moves by 5.5e-04. The
+view rounds to bf16 as well, so the comparison measures the rest.
