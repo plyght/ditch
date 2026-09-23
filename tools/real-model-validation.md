@@ -3626,3 +3626,27 @@ byte-level round-trip test had a merge (`Ġ w`) whose part `w` was not in its
 vocabulary, which `tokenizers` refuses to load; `w` was added to it.
 Byte-level tokenizers have every byte in their vocabulary, so nothing changes
 for them.
+
+## Summary of the remaining-families pass
+
+Every registered family outside the frontier session's list that has a
+reachable release has now been compared with a float32 reference on its real
+weights, whole or cut (first *N* layers, `--layers` for far-apart layer kinds,
+lazy experts, or a subset of experts where the reference would not fit):
+GLM-4.7-Flash, GLM-4.5-Air, GLM-4, ChatGLM, ERNIE 4.5 MoE, Hunyuan A13B,
+Seed-OSS, Qwen2/2-MoE/3/3-MoE/3-Next/3.5-MoE, dots.llm1, Solar Open, EXAONE 4,
+K-EXAONE, Granite 3.3 and 4.0-H, DeepSeek V2 and V3.2, Mixtral, Mistral,
+Llama 3.2, Gemma 2, 3 and 3n (with KV sharing), GPT-2, GPT-J, GPT-NeoX, BLOOM,
+OPT, OLMo, OLMo 2, FlexOlmo, StableLM 2, Phi-2, Phi-3.5, SmolLM3, StarCoder 2,
+GPTBigCode, Mamba2, Nemotron-H, Nemotron (Minitron), Falcon (7B and RW),
+MiniCPM4 (by hand, one layer). Bugs 58-67 were found this way, plus four
+reference-side artefacts recorded where they occurred: transformers' latent-norm
+epsilon (Bug F3), its sdpa attention dropping Gemma 2's softcap, the Mamba
+hidden-state offset, and its bf16 ALiBi.
+
+Not verified, and why: `internlm2` (no working tokenizer can be produced under
+transformers 5), `baichuan` and `persimmon` (`.bin` and no `tokenizer.json`),
+`jais2` and `laguna` releases (gated), `hy_v3` (no text release), `bitnet`
+(refused by design: the release quantises activations at run time), and
+`gemma3n`'s audio/vision towers and any family's behaviour beyond the cut
+layers (by construction of the method).
