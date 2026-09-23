@@ -1,0 +1,6 @@
+[
+  {"rope_interleave": false},
+  {"scoring_func": "$delete", "topk_method": "$delete"},
+  {"n_group": 3},
+  {"routed_scaling_factor": "$delete"}
+]

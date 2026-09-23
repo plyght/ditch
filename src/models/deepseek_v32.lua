@@ -1,3 +1,5 @@
+local moe = require("moe")
+
 return {
   model_type = "deepseek_v32",
   llama_cpp = "deepseek2",
@@ -14,5 +16,11 @@ return {
     router_correction_bias = "mlp.gate.e_score_correction_bias",
     shared_expert = "mlp.shared_experts.",
   },
-  hook = "deepseek_v32",
+  config = function(cfg, c)
+    moe.deepseek(cfg, c)
+    -- The lightning indexer keeps the best `index_topk` keys per query, so
+    -- dense attention is exactly the reference up to that many tokens.
+    local topk = int(cfg.index_topk, 2048)
+    if topk > 0 then c.index_bound = { block = 1, max_blocks = topk } end
+  end,
 }

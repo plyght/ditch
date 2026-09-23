@@ -1,0 +1,6 @@
+[
+  {"norm_topk_prob": "$delete"},
+  {"norm_topk_prob": false},
+  {"norm_topk_prob": 1},
+  {"num_experts": 0}
+]

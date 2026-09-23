@@ -15,5 +15,15 @@ return {
     router_correction_bias = "mlp.gate.e_score_correction_bias",
     shared_expert = "mlp.shared_experts.",
   },
-  hook = "glm_moe_dsa",
+  config = function(cfg, c)
+    c.rope_style = flag(cfg.rope_interleave, true) and "gptj" or "neox"
+    c.moe.scoring = "sigmoid"
+    c.moe.topk_method = "group_limited"
+    c.moe.n_group = math.max(1, int(cfg.n_group, 1))
+    c.moe.topk_group = math.max(1, int(cfg.topk_group, 1))
+    c.moe.routed_scaling_factor = num(cfg.routed_scaling_factor, 1.0)
+    if type(cfg.index_topk) == "number" then
+      warn("sparse indexer runs as dense attention (exact for short contexts)")
+    end
+  end,
 }

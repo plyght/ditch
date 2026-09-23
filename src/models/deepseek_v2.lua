@@ -1,3 +1,5 @@
+local moe = require("moe")
+
 return {
   model_type = "deepseek_v2",
   aliases = { "deepseek_ocr2", "deepseek_ocr2_text", "youtu" },
@@ -15,5 +17,7 @@ return {
     router_correction_bias = "mlp.gate.e_score_correction_bias",
     shared_expert = "mlp.shared_experts.",
   },
-  hook = "deepseek",
+  config = function(cfg, c)
+    moe.deepseek(cfg, c)
+  end,
 }
