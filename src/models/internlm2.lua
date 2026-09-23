@@ -1,0 +1,22 @@
+return {
+  model_type = "internlm2",
+  llama_cpp = "internlm2",
+  chat = "chatml",
+  verified = true,
+  notes = "fixture: grouped wqkv layout, attention.wo, feed_forward.w1/w2/w3, output.weight.",
+  qkv = "grouped",
+  names = {
+    embed = "{p}tok_embeddings.weight",
+    lm_head = { "output.weight" },
+    input_norm = { "attention_norm.weight" },
+    pre_ff_norm = "ffn_norm.weight",
+    q = false,
+    k = false,
+    v = false,
+    qkv = "attention.wqkv.weight",
+    o = "attention.wo.weight",
+    gate = "feed_forward.w1.weight",
+    up = "feed_forward.w3.weight",
+    down = "feed_forward.w2.weight",
+  },
+}

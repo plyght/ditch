@@ -17,7 +17,7 @@ comptime {
     _ = @import("abliterate.zig");
     _ = @import("directions.zig");
     _ = @import("tpe.zig");
-    _ = @import("toml.zig");
+    _ = @import("tree.zig");
     _ = @import("config.zig");
     _ = @import("chat.zig");
     _ = @import("hf.zig");
@@ -27,6 +27,7 @@ comptime {
     _ = @import("export.zig");
     _ = @import("search.zig");
     _ = @import("lua.zig");
+    _ = @import("models.zig");
     _ = @import("budget.zig");
     _ = @import("stream.zig");
     _ = @import("stream_test.zig");

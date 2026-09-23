@@ -4,9 +4,10 @@
 //! The result is converted into the generic config value tree.
 
 const std = @import("std");
-const toml = @import("toml.zig");
+const tree = @import("tree.zig");
 
-const c = @cImport({
+/// The Lua C API, shared with the model-definition loader (models.zig).
+pub const c = @cImport({
     @cInclude("lua.h");
     @cInclude("lauxlib.h");
     @cInclude("lualib.h");
@@ -27,12 +28,14 @@ fn takeError(L: *c.lua_State, a: Allocator) ![]const u8 {
 }
 
 pub const Result = struct {
-    parsed: toml.Parsed,
+    parsed: tree.Parsed,
     /// Error description when parsing failed (allocated in the parsed arena).
     err: ?[]const u8 = null,
 };
 
-fn openSandbox(L: *c.lua_State) void {
+/// Opens the sandboxed standard libraries: base, string, table, math, utf8
+/// and `os.getenv`; nothing that reads or writes files or loads code.
+pub fn openSandbox(L: *c.lua_State) void {
     c.luaL_requiref(L, "_G", c.luaopen_base, 1);
     c.lua_settop(L, -2);
     c.luaL_requiref(L, "string", c.luaopen_string, 1);
@@ -63,7 +66,7 @@ pub fn parse(gpa: Allocator, source: []const u8, chunk_name: []const u8) !Result
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
-    const root = try a.create(toml.Table);
+    const root = try a.create(tree.Table);
     root.* = .{};
 
     const L = c.luaL_newstate() orelse return error.OutOfMemory;
@@ -123,7 +126,7 @@ fn luaString(L: *c.lua_State, a: Allocator, idx: c_int) ![]const u8 {
     return a.dupe(u8, p[0..len]);
 }
 
-fn convert(L: *c.lua_State, a: Allocator, idx: c_int, depth: usize) Error!toml.Value {
+fn convert(L: *c.lua_State, a: Allocator, idx: c_int, depth: usize) Error!tree.Value {
     const abs = c.lua_absindex(L, idx);
     switch (c.lua_type(L, abs)) {
         c.LUA_TBOOLEAN => return .{ .boolean = c.lua_toboolean(L, abs) != 0 },
@@ -144,7 +147,7 @@ fn convert(L: *c.lua_State, a: Allocator, idx: c_int, depth: usize) Error!toml.V
                     c.lua_settop(L, -2);
                 }
                 if (is_seq) {
-                    const arr = try a.alloc(toml.Value, @intCast(n));
+                    const arr = try a.alloc(tree.Value, @intCast(n));
                     var i: c.lua_Integer = 1;
                     while (i <= @as(c.lua_Integer, @intCast(n))) : (i += 1) {
                         _ = c.lua_rawgeti(L, abs, i);
@@ -154,7 +157,7 @@ fn convert(L: *c.lua_State, a: Allocator, idx: c_int, depth: usize) Error!toml.V
                     return .{ .array = arr };
                 }
             }
-            const t = try a.create(toml.Table);
+            const t = try a.create(tree.Table);
             t.* = .{};
             try fillTable(L, a, t, abs, depth + 1);
             return .{ .table = t };
@@ -163,7 +166,7 @@ fn convert(L: *c.lua_State, a: Allocator, idx: c_int, depth: usize) Error!toml.V
     }
 }
 
-fn fillTable(L: *c.lua_State, a: Allocator, t: *toml.Table, idx: c_int, depth: usize) Error!void {
+fn fillTable(L: *c.lua_State, a: Allocator, t: *tree.Table, idx: c_int, depth: usize) Error!void {
     const abs = c.lua_absindex(L, idx);
     c.lua_pushnil(L);
     while (c.lua_next(L, abs) != 0) {

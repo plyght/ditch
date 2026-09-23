@@ -1,0 +1,22 @@
+return {
+  model_type = "exaone",
+  llama_cpp = "exaone",
+  chat = "exaone",
+  verified = true,
+  notes = "fixture: EXAONE 3.x tensor names (transformer.h, attn.attention, c_fc_0/c_fc_1).",
+  names = {
+    prefixes = { "transformer.", "" },
+    embed = "{p}wte.weight",
+    final_norm = "{p}ln_f.weight",
+    layer = "{p}h.{i}.",
+    input_norm = { "ln_1.weight" },
+    pre_ff_norm = "ln_2.weight",
+    q = "attn.attention.q_proj.weight",
+    k = "attn.attention.k_proj.weight",
+    v = "attn.attention.v_proj.weight",
+    o = "attn.attention.out_proj.weight",
+    gate = "mlp.c_fc_0.weight",
+    up = "mlp.c_fc_1.weight",
+    down = "mlp.c_proj.weight",
+  },
+}

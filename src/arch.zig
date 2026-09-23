@@ -14,6 +14,7 @@
 const std = @import("std");
 const tensor = @import("tensor.zig");
 const dequant = @import("dequant.zig");
+const models = @import("models.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -639,8 +640,12 @@ pub const Arch = struct {
     parallel_ssm: bool = false,
     /// Recurrence of the family's `linear_attention` layers, if it has any.
     linear: LinearKind = .gated_deltanet,
-    /// Family-specific config keys.
+    /// Family-specific config keys: a Zig hook (`hooks`, named by a
+    /// definition's `hook` field) ...
     extra: ?*const fn (*Config, Allocator, std.json.ObjectMap) anyerror!void = null,
+    /// ... and a Lua `config` function run after it (a reference into the
+    /// definitions' Lua state, see models.zig).
+    script: ?c_int = null,
 };
 
 pub const Config = struct {
@@ -877,6 +882,15 @@ pub const Config = struct {
     }
 };
 
+/// Config parsing reports why it refuses a checkpoint as an error message;
+/// the Lua/Zig equivalence test parses configs that are meant to be refused
+/// and sets this to keep those messages at debug level.
+pub var quiet_errors = false;
+
+pub fn logErr(comptime format: []const u8, args: anytype) void {
+    if (quiet_errors) std.log.debug(format, args) else std.log.err(format, args);
+}
+
 // ---------------------------------------------------------------------------
 // JSON helpers
 // ---------------------------------------------------------------------------
@@ -970,8 +984,13 @@ pub fn parseActivation(name: []const u8) ?tensor.Activation {
 // Config parsing
 // ---------------------------------------------------------------------------
 
-/// Finds the descriptor for a `model_type`.
+/// Finds the definition of a `model_type` (the Lua model definitions, see models.zig).
 pub fn lookup(model_type: []const u8) ?*const Arch {
+    return models.lookup(model_type);
+}
+
+/// Finds the descriptor for a `model_type` in the Zig table below.
+fn lookupZig(model_type: []const u8) ?*const Arch {
     for (&registry) |*a| {
         if (std.mem.eql(u8, a.model_type, model_type)) return a;
         for (a.aliases) |alias| if (std.mem.eql(u8, alias, model_type)) return a;
@@ -1017,7 +1036,7 @@ fn rejectKnownHybrid(model_type: []const u8) !void {
     };
     inline for (table) |e| {
         if (std.mem.eql(u8, model_type, e[0])) {
-            std.log.err("unsupported model: {s}", .{e[1]});
+            logErr("unsupported model: {s}", .{e[1]});
             return error.UnsupportedArchitecture;
         }
     }
@@ -1030,13 +1049,13 @@ fn rejectUnsupportedMath(top: std.json.ObjectMap, obj: std.json.ObjectMap) !dequ
     var quant = try dequant.parseQuantConfig(getObj(top, "quantization_config") orelse getObj(obj, "quantization_config"));
     if (getStr(obj, "expert_dtype") orelse getStr(top, "expert_dtype")) |dt| {
         if (!dequant.expertDtypeSupported(dt)) {
-            std.log.err("unsupported model: '{s}' expert dtype cannot be dequantised (bf16/f16/f32, fp8, fp4, mxfp4 and pack-quantized int4 are supported)", .{dt});
+            logErr("unsupported model: '{s}' expert dtype cannot be dequantised (bf16/f16/f32, fp8, fp4, mxfp4 and pack-quantized int4 are supported)", .{dt});
             return error.UnsupportedArchitecture;
         }
         // DeepSeek V4 spells its FP4 experts at the top level of config.json.
         if (std.ascii.eqlIgnoreCase(dt, "fp4")) {
             if (quant.method != .fp8) {
-                std.log.err("unsupported model: expert_dtype fp4 without an fp8 quantization_config (found: {s})", .{quant.label});
+                logErr("unsupported model: expert_dtype fp4 without an fp8 quantization_config (found: {s})", .{quant.label});
                 return error.UnsupportedArchitecture;
             }
             quant.fp4_experts = true;
@@ -1093,24 +1112,31 @@ pub fn sanitizeJson(arena: Allocator, text: []const u8) ![]const u8 {
 /// `minicpm`, when the lowercased class prefix is a registered model type.
 /// Without it such a config would be read as Llama and lose its family's
 /// scalings.
-fn typeFromArchitectures(arena: Allocator, obj: std.json.ObjectMap) ?[]const u8 {
+fn typeFromArchitectures(arena: Allocator, obj: std.json.ObjectMap, comptime find: Finder) ?[]const u8 {
     const archs = obj.get("architectures") orelse return null;
     if (archs != .array or archs.array.items.len == 0 or archs.array.items[0] != .string) return null;
     const name = archs.array.items[0].string;
     for ([_][]const u8{ "ForCausalLM", "LMHeadModel", "ForConditionalGeneration" }) |suffix| {
         if (!std.mem.endsWith(u8, name, suffix)) continue;
         const lower = std.ascii.allocLowerString(arena, name[0 .. name.len - suffix.len]) catch return null;
-        if (lookup(lower)) |a| return a.model_type;
+        if (find(lower)) |a| return a.model_type;
     }
     return null;
 }
 
+const Finder = fn ([]const u8) ?*const Arch;
+
 pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
+    return parseConfigIn(arena, json_text, lookup);
+}
+
+/// `parseConfig` against the families `find` knows.
+fn parseConfigIn(arena: Allocator, json_text: []const u8, comptime find: Finder) !Config {
     var parsed = try std.json.parseFromSlice(std.json.Value, arena, try sanitizeJson(arena, json_text), .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidConfig;
     var obj = parsed.value.object;
-    const top_type = getStr(obj, "model_type") orelse typeFromArchitectures(arena, obj) orelse "llama";
+    const top_type = getStr(obj, "model_type") orelse typeFromArchitectures(arena, obj, find) orelse "llama";
     var model_type = top_type;
     // Omni wrappers (Qwen2.5-Omni, Qwen3-Omni) nest the language model under
     // the thinker; the talker and vocoder tensors are passed through.
@@ -1123,28 +1149,34 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
     if (getObj(obj, "text_config")) |tc| {
         obj = tc;
         if (getStr(obj, "model_type")) |m| model_type = m;
-        arch_opt = lookup(model_type);
+        arch_opt = find(model_type);
         // A wrapper with its own entry wins over the family of its text
         // config: Kimi K3 nests a `kimi_linear` config but adds AttnRes,
         // latent MoE and SiTU on top of it.
-        if (lookup(top_type)) |ta| {
+        if (find(top_type)) |ta| {
             if (arch_opt == null or ta != arch_opt.?) {
                 arch_opt = ta;
                 model_type = top_type;
             }
         }
-    } else arch_opt = lookup(model_type);
+    } else arch_opt = find(model_type);
     const arch = arch_opt orelse {
         try rejectKnownHybrid(model_type);
         try rejectKnownHybrid(top_type);
         _ = try rejectUnsupportedMath(parsed.value.object, obj);
-        var names: std.Io.Writer.Allocating = .init(arena);
-        for (&registry, 0..) |*a, i| {
-            if (i > 0) try names.writer.writeAll(", ");
-            try names.writer.writeAll(a.model_type);
+        // Families whose name shares the unknown one's stem are likely relatives.
+        var similar: std.Io.Writer.Allocating = .init(arena);
+        const stem = std.mem.trimEnd(u8, model_type[0 .. std.mem.indexOfAny(u8, model_type, "_-") orelse model_type.len], "0123456789.");
+        var n_similar: usize = 0;
+        for (models.families()) |a| {
+            if (stem.len < 3 or !std.mem.startsWith(u8, a.model_type, stem) or n_similar == 6) continue;
+            try similar.writer.writeAll(if (n_similar == 0) " (related families: " else ", ");
+            try similar.writer.writeAll(a.model_type);
+            n_similar += 1;
         }
-        std.log.err("unsupported model_type: {s} (supported: {s})", .{ model_type, names.written() });
-        return error.UnsupportedArchitecture;
+        if (n_similar > 0) try similar.writer.writeAll(")");
+        logErr("unknown model_type: {s}: there is no built-in or user model definition for it{s}", .{ model_type, similar.written() });
+        return error.UnknownModelType;
     };
     const quant = try rejectUnsupportedMath(parsed.value.object, obj);
     // Nested attention config (MPT).
@@ -1289,7 +1321,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
                         if (arch.ssm != .none) {
                             ssm_layers[i] = true;
                         } else if (std.mem.eql(u8, t, "mamba")) {
-                            std.log.err("unsupported layer type 'mamba' in a {s} model", .{model_type});
+                            logErr("unsupported layer type 'mamba' in a {s} model", .{model_type});
                             return error.UnsupportedArchitecture;
                         } else {
                             linear_layers[i] = true;
@@ -1305,7 +1337,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
                         // `Config.index_bound`.
                     } else if (std.mem.eql(u8, t, "mlp") or std.mem.eql(u8, t, "moe")) {
                         if (!arch.single_mixer) {
-                            std.log.err("unsupported layer type '{s}' in a {s} model", .{ t, model_type });
+                            logErr("unsupported layer type '{s}' in a {s} model", .{ t, model_type });
                             return error.UnsupportedArchitecture;
                         }
                         if (t[1] == 'l') mlp_only[i] = true else moe_only[i] = true;
@@ -1325,7 +1357,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
                             std.log.warn("minimax_m3_sparse runs as dense attention (exact while the context fits index_topk_blocks blocks)", .{});
                         }
                     } else {
-                        std.log.err("unsupported layer type '{s}' (only full/sliding/linear attention, conv, Mamba, mlp and moe blocks are implemented)", .{t});
+                        logErr("unsupported layer type '{s}' (only full/sliding/linear attention, conv, Mamba, mlp and moe blocks are implemented)", .{t});
                         return error.UnsupportedArchitecture;
                     }
                 }
@@ -1559,6 +1591,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
     }
     if (getBool(attn_cfg, "alibi", false)) c.positional = .alibi;
     if (arch.extra) |f| try f(&c, arena, obj);
+    if (arch.script) |ref| try models.runConfig(ref, &c, arena, obj);
     // Hooks may mark linear / Mamba layers after the fact (Kimi Linear's
     // kda_layers, the Jamba periods): those layers hold no attention block
     // unless the family runs both side by side.
@@ -1568,7 +1601,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         if (c.ssm.kind != arch.ssm) return error.InvalidConfig;
         const d = &c.ssm;
         if (d.inter == 0 or d.state == 0 or d.conv_kernel == 0 or (d.kind == .mamba2 and (d.heads == 0 or d.head_dim == 0 or d.groups == 0 or d.heads % d.groups != 0 or d.heads * d.head_dim != d.inter)) or (d.kind == .mamba1 and d.dt_rank == 0)) {
-            std.log.err("inconsistent Mamba block dimensions in config.json", .{});
+            logErr("inconsistent Mamba block dimensions in config.json", .{});
             return error.InvalidConfig;
         }
         if (d.norm_groups == 0 or d.inter % d.norm_groups != 0) return error.InvalidConfig;
@@ -1582,11 +1615,11 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
     // Only the Gemma tables derive frequencies from a wider head than they rotate.
     if (c.rope_local == null) c.rope_freq_dim = c.rotary_dim;
     if (c.has_conv and c.conv_kernel < 2) {
-        std.log.err("conv layers need conv_L_cache >= 2", .{});
+        logErr("conv layers need conv_L_cache >= 2", .{});
         return error.InvalidConfig;
     }
     if (c.has_linear and c.linear_kind != .lightning and (c.linear_k_heads == 0 or c.linear_k_dim == 0 or c.linear_v_heads == 0 or c.linear_v_dim == 0 or c.linear_conv_kernel == 0)) {
-        std.log.err("linear_attention layers need linear_num_key_heads/key_head_dim/num_value_heads/value_head_dim/conv_kernel_dim", .{});
+        logErr("linear_attention layers need linear_num_key_heads/key_head_dim/num_value_heads/value_head_dim/conv_kernel_dim", .{});
         return error.InvalidConfig;
     }
     if (c.positional != .rope) @memset(c.rope_layers, false);
@@ -1600,7 +1633,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
 /// Parses a `rope_scaling` / `rope_parameters` dictionary `rs` (`obj` is the
 /// model config it belongs to, for the fallback keys some families keep at
 /// the top level).
-fn parseRopeScaling(arena: Allocator, obj: std.json.ObjectMap, rs: std.json.ObjectMap, rotary_dim: usize, max_pos: usize) !RopeScaling {
+pub fn parseRopeScaling(arena: Allocator, obj: std.json.ObjectMap, rs: std.json.ObjectMap, rotary_dim: usize, max_pos: usize) !RopeScaling {
     var result: RopeScaling = .none;
     const t = getStr(rs, "rope_type") orelse getStr(rs, "type") orelse "";
     if (std.mem.eql(u8, t, "llama3")) {
@@ -1746,13 +1779,13 @@ fn kvSharing(c: *Config, obj: std.json.ObjectMap) !void {
             }
         }
         if (!found) {
-            std.log.err("layer {d} shares keys/values but no earlier layer of its kind exists", .{i});
+            logErr("layer {d} shares keys/values but no earlier layer of its kind exists", .{i});
             return error.InvalidConfig;
         }
     }
 }
 
-fn yarnMscale(scale: f32, mscale: f32) f32 {
+pub fn yarnMscale(scale: f32, mscale: f32) f32 {
     if (scale <= 1) return 1.0;
     return 0.1 * mscale * @log(scale) + 1.0;
 }
@@ -1820,12 +1853,12 @@ fn extraGemma4(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
     if (getStr(obj, "hidden_activation") == null and getStr(obj, "hidden_act") == null) c.activation = .gelu_tanh;
     if (getStr(obj, "use_bidirectional_attention")) |m| {
         if (std.mem.eql(u8, m, "all")) {
-            std.log.err("unsupported model: Gemma 4 with bidirectional attention on every token", .{});
+            logErr("unsupported model: Gemma 4 with bidirectional attention on every token", .{});
             return error.UnsupportedArchitecture;
         }
     }
     if (getBool(obj, "enable_moe_block", false)) {
-        std.log.err("unsupported model: Gemma 4 MoE block (a routed expert block in parallel with the dense MLP, as in gemma-4-26B-A4B) is not implemented", .{});
+        logErr("unsupported model: Gemma 4 MoE block (a routed expert block in parallel with the dense MLP, as in gemma-4-26B-A4B) is not implemented", .{});
         return error.UnsupportedArchitecture;
     }
     if (obj.get("layer_types") == null) {
@@ -2302,7 +2335,7 @@ fn mlpLayerTypes(c: *Config, obj: std.json.ObjectMap, first_dense: usize) !void 
             if (i >= c.num_layers) break;
             if (v != .string) return error.InvalidConfig;
             if (std.mem.eql(u8, v.string, "sparse")) c.moe_layers[i] = true else if (!std.mem.eql(u8, v.string, "dense")) {
-                std.log.err("unsupported mlp_layer_types entry '{s}' (dense or sparse)", .{v.string});
+                logErr("unsupported mlp_layer_types entry '{s}' (dense or sparse)", .{v.string});
                 return error.UnsupportedArchitecture;
             }
         }
@@ -2329,7 +2362,7 @@ fn extraGlm4MoeLite(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
     c.moe.norm_eps_floor = true;
     if (c.num_experts % c.moe.n_group != 0) return error.InvalidConfig;
     if (c.mla == null) {
-        std.log.err("glm4_moe_lite: the MLA keys (kv_lora_rank, qk_rope_head_dim, ...) are required", .{});
+        logErr("glm4_moe_lite: the MLA keys (kv_lora_rank, qk_rope_head_dim, ...) are required", .{});
         return error.InvalidConfig;
     }
     try mlpLayerTypes(c, obj, 1);
@@ -2341,7 +2374,7 @@ fn extraGlm4MoeLite(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
 fn mlaNoPe(c: *Config, obj: std.json.ObjectMap, family: []const u8) !void {
     if (c.mla == null) {
         if (getNum(obj, "kv_lora_rank") == null) {
-            std.log.err("{s}: the MLA keys (q_lora_rank, kv_lora_rank, qk_nope_head_dim, v_head_dim) are required", .{family});
+            logErr("{s}: the MLA keys (q_lora_rank, kv_lora_rank, qk_nope_head_dim, v_head_dim) are required", .{family});
             return error.InvalidConfig;
         }
         c.mla = .{
@@ -2354,11 +2387,11 @@ fn mlaNoPe(c: *Config, obj: std.json.ObjectMap, family: []const u8) !void {
     }
     const m = c.mla.?;
     if (m.qk_rope_head_dim != 0) {
-        std.log.err("{s}: the attention layers are NoPE (qk_rope_head_dim must be 0, config has {d})", .{ family, m.qk_rope_head_dim });
+        logErr("{s}: the attention layers are NoPE (qk_rope_head_dim must be 0, config has {d})", .{ family, m.qk_rope_head_dim });
         return error.UnsupportedArchitecture;
     }
     if (m.q_lora_rank == null or m.q_lora_rank.? == 0) {
-        std.log.err("{s}: q_lora_rank is required (the sparse indexer reads the low-rank query)", .{family});
+        logErr("{s}: q_lora_rank is required (the sparse indexer reads the low-rank query)", .{family});
         return error.InvalidConfig;
     }
     if (m.kv_lora_rank == 0 or m.qk_nope_head_dim == 0 or m.v_head_dim == 0 or m.v_head_dim > m.qk_nope_head_dim) return error.InvalidConfig;
@@ -2446,7 +2479,7 @@ fn extraGlm5Next(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
     const topk = getInt(obj, "index_topk", 2048);
     if (topk % kpool != 0) return error.InvalidConfig;
     if (!getBool(obj, "index_kpool_always_select_tail", true)) {
-        std.log.err("unsupported model: glm5_next without index_kpool_always_select_tail (the incomplete tail would be dropped)", .{});
+        logErr("unsupported model: glm5_next without index_kpool_always_select_tail (the incomplete tail would be dropped)", .{});
         return error.UnsupportedArchitecture;
     }
     c.index_bound = .{ .block = kpool, .max_blocks = topk / kpool };
@@ -2469,7 +2502,7 @@ fn extraQwen4Exp(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
     if (std.mem.eql(u8, gate, "sigmoid")) {
         c.linear_gate_sigmoid = true;
     } else if (!std.mem.eql(u8, gate, "silu") and !std.mem.eql(u8, gate, "swish")) {
-        std.log.err("unsupported output_gate_type '{s}' (sigmoid or silu)", .{gate});
+        logErr("unsupported output_gate_type '{s}' (sigmoid or silu)", .{gate});
         return error.UnsupportedArchitecture;
     }
     if (obj.get("layer_types") == null and getNum(obj, "full_attention_interval") == null) {
@@ -2486,7 +2519,7 @@ fn extraQwen4Exp(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
     // Gated hyper-connections.
     c.hc_mult = @max(1, getInt(obj, "hc_count", 4));
     if (c.hc_mult < 2) {
-        std.log.err("qwen4_exp needs hc_count > 1 (config has {d})", .{c.hc_mult});
+        logErr("qwen4_exp needs hc_count > 1 (config has {d})", .{c.hc_mult});
         return error.InvalidConfig;
     }
     c.hyper = .{ .kind = .gated, .head = .gated_mixer, .lowrank = getInt(obj, "hc_lowrank", 320) };
@@ -2497,7 +2530,7 @@ fn extraQwen4Exp(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
         const budget = getInt(obj, "indexer_budget", 0);
         const ratio = getInt(obj, "indexer_compress_ratio", 0);
         if (budget == 0 or ratio == 0 or budget % ratio != 0 or getInt(obj, "indexer_kv_heads", 1) != 1) {
-            std.log.err("qwen4_exp: the QSA config needs indexer_budget (a multiple of indexer_compress_ratio) and indexer_kv_heads = 1", .{});
+            logErr("qwen4_exp: the QSA config needs indexer_budget (a multiple of indexer_compress_ratio) and indexer_kv_heads = 1", .{});
             return error.InvalidConfig;
         }
         c.index_bound = .{ .block = ratio, .max_blocks = budget / ratio };
@@ -2509,7 +2542,7 @@ fn extraQwen4Exp(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
             var ids = std.ArrayList(usize).empty;
             for (ids_1) |id1| {
                 if (id1 < 1 or id1 > c.num_layers) {
-                    std.log.err("qwen4_exp: ple_layer_ids entry {d} is outside 1..{d}", .{ id1, c.num_layers });
+                    logErr("qwen4_exp: ple_layer_ids entry {d} is outside 1..{d}", .{ id1, c.num_layers });
                     return error.InvalidConfig;
                 }
                 const id0 = id1 - 1;
@@ -2519,7 +2552,7 @@ fn extraQwen4Exp(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
             }
             std.mem.sort(usize, ids.items, {}, std.sort.asc(usize));
             for (ids.items) |id0| if (!c.linear_layers[id0]) {
-                std.log.err("qwen4_exp: PLE layer {d} is not a linear_attention layer", .{id0 + 1});
+                logErr("qwen4_exp: PLE layer {d} is not a linear_attention layer", .{id0 + 1});
                 return error.UnsupportedArchitecture;
             };
             const ngram = getInt(obj, "ngram_size", 3);
@@ -2536,7 +2569,7 @@ fn extraQwen4Exp(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
                 };
             };
             if (eos == 0xFFFFFFFF) {
-                std.log.err("qwen4_exp: eos_token_id must be set in the text config when PLE layers are enabled (it pads the n-gram history)", .{});
+                logErr("qwen4_exp: eos_token_id must be set in the text config when PLE layers are enabled (it pads the n-gram history)", .{});
                 return error.InvalidConfig;
             }
             c.ngram_ple = .{
@@ -2613,7 +2646,7 @@ fn extraMamba2(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
     dtLimit(obj, d);
     const want: usize = @intFromFloat(getF32(obj, "expand", 2) * @as(f32, @floatFromInt(c.hidden_size)));
     if (want != d.inter) {
-        std.log.err("mamba2: expand * hidden_size ({d}) must equal num_heads * head_dim ({d})", .{ want, d.inter });
+        logErr("mamba2: expand * hidden_size ({d}) must equal num_heads * head_dim ({d})", .{ want, d.inter });
         return error.InvalidConfig;
     }
     // No attention anywhere: placeholder attention dimensions keep the KV
@@ -2653,11 +2686,11 @@ fn extraNemotronH(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
     c.positional = .none;
     if (obj.get("layer_types") == null and obj.get("layers_block_type") == null) {
         const pat = getStr(obj, "hybrid_override_pattern") orelse {
-            std.log.err("nemotron_h: config.json needs layers_block_type or hybrid_override_pattern", .{});
+            logErr("nemotron_h: config.json needs layers_block_type or hybrid_override_pattern", .{});
             return error.InvalidConfig;
         };
         if (pat.len != c.num_layers) {
-            std.log.err("nemotron_h: hybrid_override_pattern has {d} entries for {d} layers", .{ pat.len, c.num_layers });
+            logErr("nemotron_h: hybrid_override_pattern has {d} entries for {d} layers", .{ pat.len, c.num_layers });
             return error.InvalidConfig;
         }
         for (pat, 0..) |ch, i| {
@@ -2666,7 +2699,7 @@ fn extraNemotronH(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
             c.mlp_layers[i] = ch == '-' or ch == 'E';
             c.moe_layers[i] = ch == 'E';
             if (ch != 'M' and ch != '*' and ch != '-' and ch != 'E') {
-                std.log.err("nemotron_h: unknown block '{c}' in hybrid_override_pattern", .{ch});
+                logErr("nemotron_h: unknown block '{c}' in hybrid_override_pattern", .{ch});
                 return error.UnsupportedArchitecture;
             }
         }
@@ -2674,11 +2707,11 @@ fn extraNemotronH(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
     var any_moe = false;
     for (c.moe_layers) |m| any_moe = any_moe or m;
     if (any_moe and c.num_experts == 0) {
-        std.log.err("nemotron_h: moe layers without n_routed_experts", .{});
+        logErr("nemotron_h: moe layers without n_routed_experts", .{});
         return error.InvalidConfig;
     }
     if (getNum(obj, "moe_latent_size") != null) {
-        std.log.err("unsupported model: nemotron_h latent expert projections (moe_latent_size) are not implemented", .{});
+        logErr("unsupported model: nemotron_h latent expert projections (moe_latent_size) are not implemented", .{});
         return error.UnsupportedArchitecture;
     }
     c.moe.scoring = .sigmoid;
@@ -2772,7 +2805,7 @@ fn uniformInt(obj: std.json.ObjectMap, key: []const u8, default: usize) !usize {
                 if (item != .integer) return error.InvalidConfig;
                 if (first == null) first = item.integer;
                 if (item.integer != first.?) {
-                    std.log.err("per-layer values of '{s}' differ; only uniform values are supported", .{key});
+                    logErr("per-layer values of '{s}' differ; only uniform values are supported", .{key});
                     return error.UnsupportedArchitecture;
                 }
             }
@@ -2827,7 +2860,7 @@ fn extraMiniMax(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
     // remote code's default, `postnorm: false`, keeps the residual from
     // before the norm; no release uses it and it is not implemented.
     if (!std.mem.eql(u8, c.model_type, "minimax") and !getBool(obj, "postnorm", false)) {
-        std.log.err("unsupported model: MiniMax with postnorm: false (the residual taken before the norm); every release sets postnorm: true", .{});
+        logErr("unsupported model: MiniMax with postnorm: false (the residual taken before the norm); every release sets postnorm: true", .{});
         return error.UnsupportedArchitecture;
     }
     if (c.num_experts > 0) @memset(c.moe_layers, true);
@@ -2919,7 +2952,7 @@ fn extraHunyuanMoe(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
     c.qk_norm_after_rope = true;
     c.attention_bias = getBool(obj, "attention_bias", false);
     if (getBool(obj, "use_cla", false)) {
-        std.log.err("unsupported model: HunYuan cross-layer attention (use_cla)", .{});
+        logErr("unsupported model: HunYuan cross-layer attention (use_cla)", .{});
         return error.UnsupportedArchitecture;
     }
     c.num_experts = try uniformInt(obj, "num_experts", c.num_experts);
@@ -2966,7 +2999,7 @@ fn extraKimiLinear(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
     c.moe_latent = getInt(obj, "routed_expert_hidden_size", 0);
     c.moe_latent_norm = getBool(obj, "latent_moe_use_norm", false);
     if (getBool(obj, "mla_use_nope", true) == false) {
-        std.log.err("kimi_linear: full-attention layers with RoPE (mla_use_nope = false) are not implemented", .{});
+        logErr("kimi_linear: full-attention layers with RoPE (mla_use_nope = false) are not implemented", .{});
         return error.UnsupportedArchitecture;
     }
     c.linear_k_heads = heads;
@@ -2992,7 +3025,7 @@ fn extraKimiLinear(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
     c.has_linear = false;
     for (c.linear_layers) |l| c.has_linear = c.has_linear or l;
     if (c.mla == null) {
-        std.log.err("kimi_linear: full-attention layers need the MLA keys (kv_lora_rank, qk_rope_head_dim, ...)", .{});
+        logErr("kimi_linear: full-attention layers need the MLA keys (kv_lora_rank, qk_rope_head_dim, ...)", .{});
         return error.InvalidConfig;
     }
     // MLA layers carry no positional encoding (positions come from the KDA layers).
@@ -3050,7 +3083,7 @@ fn extraMiMoV2(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
     // experts on read); a copy at the config level says the same thing.
     if (getStr(obj, "store_dtype")) |sd| {
         if (!dequant.expertDtypeSupported(sd)) {
-            std.log.err("unsupported model: MiMo experts stored as '{s}' (store_dtype) cannot be dequantised; convert the experts to bf16 first", .{sd});
+            logErr("unsupported model: MiMo experts stored as '{s}' (store_dtype) cannot be dequantised; convert the experts to bf16 first", .{sd});
             return error.UnsupportedArchitecture;
         }
     }
@@ -3059,7 +3092,7 @@ fn extraMiMoV2(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
     // a quantised router would need a reader of its own.
     if (getStr(obj, "moe_router_dtype")) |rd| {
         if (!dequant.storeFloatDtype(rd)) {
-            std.log.err("unsupported model: MiMo MoE router in '{s}' (moe_router_dtype)", .{rd});
+            logErr("unsupported model: MiMo MoE router in '{s}' (moe_router_dtype)", .{rd});
             return error.UnsupportedArchitecture;
         }
     }
@@ -3085,13 +3118,13 @@ fn extraMiMoV2(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
     c.v_head_dim = getInt(obj, "v_head_dim", c.head_dim);
     c.narrow_values = true;
     if (getInt(obj, "swa_num_attention_heads", c.num_heads) != c.num_heads or getInt(obj, "swa_head_dim", c.head_dim) != c.head_dim or getInt(obj, "swa_v_head_dim", c.v_head_dim) != c.v_head_dim) {
-        std.log.err("unsupported model: MiMo sliding layers with their own head count or head size (swa_num_attention_heads / swa_head_dim / swa_v_head_dim)", .{});
+        logErr("unsupported model: MiMo sliding layers with their own head count or head size (swa_num_attention_heads / swa_head_dim / swa_v_head_dim)", .{});
         return error.UnsupportedArchitecture;
     }
     if (c.v_head_dim > c.head_dim) {
         // Values share the keys' cache stride, so they may be narrower (every
         // release: 192 / 128) but not wider.
-        std.log.err("unsupported model: MiMo v_head_dim {d} is wider than head_dim {d}", .{ c.v_head_dim, c.head_dim });
+        logErr("unsupported model: MiMo v_head_dim {d} is wider than head_dim {d}", .{ c.v_head_dim, c.head_dim });
         return error.UnsupportedArchitecture;
     }
     if (c.v_head_dim == 0 or kv_full == 0 or kv_swa == 0) return error.InvalidConfig;
@@ -3124,7 +3157,7 @@ fn extraMiMoV2(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
             const sf = getNum(s, "partial_rotary_factor") orelse 0.334;
             const t = getStr(s, "rope_type") orelse getStr(s, "type") orelse "default";
             if (sf != factor or !(std.mem.eql(u8, t, "default") or std.mem.eql(u8, t, "mrope"))) {
-                std.log.err("unsupported model: MiMo sliding layers with their own rotary factor or scaling ({s})", .{t});
+                logErr("unsupported model: MiMo sliding layers with their own rotary factor or scaling ({s})", .{t});
                 return error.UnsupportedArchitecture;
             }
         }
@@ -3325,7 +3358,7 @@ fn dsv4Common(c: *Config, arena: Allocator, obj: std.json.ObjectMap, d: *DsV4) !
     c.norm = .rms;
     c.num_kv_heads = getInt(obj, "num_key_value_heads", 1);
     if (c.num_kv_heads != 1) {
-        std.log.err("deepseek_v4: shared-KV attention needs num_key_value_heads = 1 (config has {d})", .{c.num_kv_heads});
+        logErr("deepseek_v4: shared-KV attention needs num_key_value_heads = 1 (config has {d})", .{c.num_kv_heads});
         return error.UnsupportedArchitecture;
     }
     // Every layer carries the sliding window; the compressed branch is extra.
@@ -3501,12 +3534,12 @@ fn extraDeepseekV41(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void
             if (sidx <= i and (source[i] == null or sidx > source[i].?)) source[i] = sidx;
         }
         const src = source[i] orelse {
-            std.log.err("deepseek_v41: layer {d} has a compressed branch but no kv_source_layer_ids entry at or before it", .{i});
+            logErr("deepseek_v41: layer {d} has a compressed branch but no kv_source_layer_ids entry at or before it", .{i});
             return error.InvalidConfig;
         };
         if (src >= n or ratio[src] == 0) return error.InvalidConfig;
         if (ratio[src] != ratio[i]) {
-            std.log.err("deepseek_v41: layer {d} (ratio {d}) reads the compressed cache of layer {d} (ratio {d})", .{ i, ratio[i], src, ratio[src] });
+            logErr("deepseek_v41: layer {d} (ratio {d}) reads the compressed cache of layer {d} (ratio {d})", .{ i, ratio[i], src, ratio[src] });
             return error.InvalidConfig;
         }
     }
@@ -3544,6 +3577,97 @@ fn extraDeepseekV41(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void
         }
     }
     c.dsv4 = d;
+}
+
+/// The family hooks by name: the Zig building blocks a model definition
+/// (models.zig) names in its `hook` field. A hook reads family-specific
+/// config.json keys into the `Config` after the generic parser has run.
+pub const hooks = [_]struct { name: []const u8, f: *const fn (*Config, Allocator, std.json.ObjectMap) anyerror!void }{
+    .{ .name = "gemma", .f = extraGemma },
+    .{ .name = "gemma3n", .f = extraGemma3n },
+    .{ .name = "gemma4", .f = extraGemma4 },
+    .{ .name = "lfm2", .f = extraLfm2 },
+    .{ .name = "mistral4", .f = extraMistral4 },
+    .{ .name = "mixtral", .f = extraMixtral },
+    .{ .name = "phi3", .f = extraPhi3 },
+    .{ .name = "phi", .f = extraPhi },
+    .{ .name = "neox", .f = extraNeox },
+    .{ .name = "falcon", .f = extraFalcon },
+    .{ .name = "stablelm", .f = extraStableLm },
+    .{ .name = "olmo2", .f = extraOlmo2 },
+    .{ .name = "cohere", .f = extraCohere },
+    .{ .name = "glm4", .f = extraGlm4 },
+    .{ .name = "chatglm", .f = extraChatGlm },
+    .{ .name = "granite", .f = extraGranite },
+    .{ .name = "deepseek", .f = extraDeepseek },
+    .{ .name = "llama4", .f = extraLlama4 },
+    .{ .name = "gpt_oss", .f = extraGptOss },
+    .{ .name = "minicpm", .f = extraMiniCpm },
+    .{ .name = "exaone4", .f = extraExaone4 },
+    .{ .name = "nemotron", .f = extraNemotron },
+    .{ .name = "dense_mlp", .f = extraDenseMlp },
+    .{ .name = "ernie", .f = extraErnie },
+    .{ .name = "hunyuan_dense", .f = extraHunyuanDense },
+    .{ .name = "nanochat", .f = extraNanoChat },
+    .{ .name = "persimmon", .f = extraPersimmon },
+    .{ .name = "gptj", .f = extraGptJ },
+    .{ .name = "codegen", .f = extraCodeGen },
+    .{ .name = "gpt_neo", .f = extraGptNeo },
+    .{ .name = "xglm", .f = extraXglm },
+    .{ .name = "biogpt", .f = extraBioGpt },
+    .{ .name = "ministral3", .f = extraMinistral3 },
+    .{ .name = "smollm3", .f = extraSmolLm3 },
+    .{ .name = "opt", .f = extraOpt },
+    .{ .name = "mpt", .f = extraMpt },
+    .{ .name = "starcoder2", .f = extraStarcoder2 },
+    .{ .name = "gpt_bigcode", .f = extraGptBigcode },
+    .{ .name = "baichuan", .f = extraBaichuan },
+    .{ .name = "qwen_vl", .f = extraQwenVl },
+    .{ .name = "qwen_hybrid", .f = extraQwenHybrid },
+    .{ .name = "glm4_moe", .f = extraGlm4Moe },
+    .{ .name = "glm_moe_dsa", .f = extraGlmMoeDsa },
+    .{ .name = "glm4_moe_lite", .f = extraGlm4MoeLite },
+    .{ .name = "glm5_next", .f = extraGlm5Next },
+    .{ .name = "qwen4_exp", .f = extraQwen4Exp },
+    .{ .name = "mamba2", .f = extraMamba2 },
+    .{ .name = "nemotron_h", .f = extraNemotronH },
+    .{ .name = "falcon_h1", .f = extraFalconH1 },
+    .{ .name = "jamba", .f = extraJamba },
+    .{ .name = "granite_hybrid", .f = extraGraniteHybrid },
+    .{ .name = "minimax_m2", .f = extraMiniMaxM2 },
+    .{ .name = "minimax", .f = extraMiniMax },
+    .{ .name = "minimax_m3", .f = extraMiniMaxM3 },
+    .{ .name = "ernie_moe", .f = extraErnieMoe },
+    .{ .name = "hunyuan_moe", .f = extraHunyuanMoe },
+    .{ .name = "kimi_linear", .f = extraKimiLinear },
+    .{ .name = "granite_moe", .f = extraGraniteMoe },
+    .{ .name = "mimo_v2", .f = extraMiMoV2 },
+    .{ .name = "olmoe", .f = extraOlmoe },
+    .{ .name = "dots1", .f = extraDots1 },
+    .{ .name = "exaone_moe", .f = extraExaoneMoe },
+    .{ .name = "solar_open", .f = extraSolarOpen },
+    .{ .name = "axk1", .f = extraAxk1 },
+    .{ .name = "afmoe", .f = extraAfmoe },
+    .{ .name = "mellum", .f = extraMellum },
+    .{ .name = "laguna", .f = extraLaguna },
+    .{ .name = "hy_v3", .f = extraHyV3 },
+    .{ .name = "granite_swa", .f = extraGraniteSwa },
+    .{ .name = "granite_moe_swa", .f = extraGraniteMoeSwa },
+    .{ .name = "deepseek_v32", .f = extraDeepseekV32 },
+    .{ .name = "deepseek_v4", .f = extraDeepseekV4 },
+    .{ .name = "deepseek_v41", .f = extraDeepseekV41 },
+};
+
+/// The hook registered under `name`.
+pub fn hookByName(name: []const u8) ?*const fn (*Config, Allocator, std.json.ObjectMap) anyerror!void {
+    for (hooks) |h| if (std.mem.eql(u8, h.name, name)) return h.f;
+    return null;
+}
+
+/// The name of a hook, for writing a definition back out.
+pub fn hookName(f: *const fn (*Config, Allocator, std.json.ObjectMap) anyerror!void) ?[]const u8 {
+    for (hooks) |h| if (h.f == f) return h.name;
+    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -5952,4 +6076,94 @@ test "parseConfig: Baichuan 2 normalises its LM head, Baichuan 1 does not" {
         \\{"model_type":"baichuan","hidden_size":64,"num_attention_heads":4,"num_hidden_layers":2,"vocab_size":64000,"max_position_embeddings":4096}
     );
     try std.testing.expect(!b1.lm_head_l2norm);
+}
+
+test "the Lua model definitions reproduce the Zig registry" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for (&registry) |*z| {
+        const l = models.lookup(z.model_type) orelse {
+            std.debug.print("no Lua definition for {s}\n", .{z.model_type});
+            return error.TestUnexpectedResult;
+        };
+        // A family whose hook became a Lua config function is compared by
+        // the configurations it parses to (below).
+        var zc = z.*;
+        var lc = l.*;
+        if (l.script != null) {
+            zc.extra = null;
+            lc.extra = null;
+        }
+        try std.testing.expectEqualStrings(try models.dumpFamily(arena, &zc), try models.dumpFamily(arena, &lc));
+        for (z.aliases) |alias| try std.testing.expect(models.lookup(alias) == l);
+    }
+    try std.testing.expectEqual(registry.len, models.builtins().len);
+
+    // Every fixture's config.json, and every variant of it in
+    // tests/config_variants, parses to the same configuration either way.
+    var checked: usize = 0;
+    quiet_errors = true;
+    defer quiet_errors = false;
+    for (try configCorpus(arena)) |entry| {
+        const zig_dump = try dumpParsed(arena, entry.text, lookupZig);
+        const lua_dump = try dumpParsed(arena, entry.text, lookup);
+        std.testing.expectEqualStrings(zig_dump, lua_dump) catch |err| {
+            std.debug.print("config {s}:\n{s}\n", .{ entry.name, entry.text });
+            return err;
+        };
+        checked += 1;
+    }
+    try std.testing.expect(checked > 100);
+}
+
+const CorpusEntry = struct { name: []const u8, text: []const u8 };
+
+/// The config.json of every fixture, then the variants of
+/// tests/config_variants/<fixture>.json: each is a list of patches applied
+/// to the fixture's config (a key set to "$delete" is removed), covering the
+/// keys the families read beyond what their fixture sets.
+fn configCorpus(arena: Allocator) ![]CorpusEntry {
+    const io = std.testing.io;
+    var out: std.ArrayList(CorpusEntry) = .empty;
+    var dir = try std.Io.Dir.cwd().openDir(io, "tests/fixtures", .{ .iterate = true });
+    defer dir.close(io);
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| if (entry.kind == .directory) try names.append(arena, try arena.dupe(u8, entry.name));
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    for (names.items) |name| {
+        const text = dir.readFileAlloc(io, try std.fmt.allocPrint(arena, "{s}/config.json", .{name}), arena, .limited(1 << 20)) catch continue;
+        try out.append(arena, .{ .name = name, .text = text });
+        const vpath = try std.fmt.allocPrint(arena, "tests/config_variants/{s}.json", .{name});
+        const vtext = std.Io.Dir.cwd().readFileAlloc(io, vpath, arena, .limited(1 << 20)) catch continue;
+        const base = try std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{});
+        const patches = try std.json.parseFromSliceLeaky(std.json.Value, arena, vtext, .{});
+        if (patches != .array) return error.InvalidConfig;
+        for (patches.array.items, 0..) |patch, k| {
+            if (patch != .object) return error.InvalidConfig;
+            var obj = try base.object.clone(arena);
+            var pit = patch.object.iterator();
+            while (pit.next()) |kv| {
+                if (kv.value_ptr.* == .string and std.mem.eql(u8, kv.value_ptr.string, "$delete")) {
+                    _ = obj.orderedRemove(kv.key_ptr.*);
+                } else try obj.put(arena, kv.key_ptr.*, kv.value_ptr.*);
+            }
+            const patched = try std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = obj }, .{});
+            try out.append(arena, .{ .name = try std.fmt.allocPrint(arena, "{s} variant {d}", .{ name, k + 1 }), .text = patched });
+        }
+    }
+    return out.items;
+}
+
+fn dumpParsed(arena: Allocator, text: []const u8, comptime find: Finder) ![]const u8 {
+    const cfg = parseConfigIn(arena, text, find) catch |err| return @errorName(err);
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try models.dump(Config, &out.writer, cfg, "");
+    return out.written();
 }

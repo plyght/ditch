@@ -1,7 +1,7 @@
-//! Settings: defaults, `config.lua` (or a heretic-style `config.toml`) and command-line parsing.
+//! Settings: defaults, `config.lua` and command-line parsing.
 
 const std = @import("std");
-const toml = @import("toml.zig");
+const tree = @import("tree.zig");
 const lua = @import("lua.zig");
 const abliterate = @import("abliterate.zig");
 const directions = @import("directions.zig");
@@ -303,6 +303,10 @@ pub const Settings = struct {
     http_timeout_seconds: u64 = 30,
     /// `ditch help <topic>`.
     help_topic: ?[]const u8 = null,
+    /// `ditch add-model <model>`: draft a Lua model definition from a checkpoint (docs/models.md).
+    add_model: bool = false,
+    /// Directory of Lua model definitions, read after $XDG_CONFIG_HOME/ditch/models.
+    models_dir: ?[]const u8 = null,
 
     /// The parsed `--device`, or null when it names no known backend.
     pub fn deviceKind(self: *const Settings) ?compute.Kind {
@@ -314,7 +318,7 @@ pub const Settings = struct {
 /// headings in bold on a terminal.
 pub const HelpSection = struct { title: []const u8, body: []const u8 };
 
-pub const tagline = "ditch censorship: fully automatic refusal removal for open-weight language models, on a CPU.";
+pub const tagline = "Fully automatic refusal removal for open-weight language models, on a CPU.";
 pub const issues_url = "https://github.com/plyght/ditch/issues";
 
 pub const usage_text =
@@ -324,6 +328,7 @@ pub const usage_text =
     \\  ditch verify [OPTIONS] <MODEL>   check it against the official implementation (see ditch verify --help)
     \\  ditch selftest [--device D]      check a compute backend against the CPU reference kernels
     \\  ditch truncate <MODEL> <K> <OUT> write a checkpoint of the first K decoder layers
+    \\  ditch add-model <MODEL>          draft a Lua model definition for a model_type ditch does not know
     \\  ditch help [bench]               this help (or the benchmark options)
     \\
     \\<MODEL> is a Hugging Face model id (Qwen/Qwen2.5-0.5B-Instruct), a local directory, a .gguf
@@ -354,7 +359,7 @@ pub const help_sections = [_]HelpSection{
     \\  -n, --dry-run                  Stop after loading the model and printing the memory estimate.
     \\  -q, --quiet                    Only trial results, scores and errors (no banner, no progress).
     \\  --json                         Results, evaluation or benchmark as one JSON document on stdout.
-    \\  --config <path>                Configuration file, .lua or .toml (default: ./config.lua).
+    \\  --config <path>                Lua config file (default: ~/.config/ditch/config.lua).
     \\
     },
     .{ .title = "Model and runtime", .body =
@@ -531,10 +536,16 @@ pub const help_sections = [_]HelpSection{
     \\
     },
     .{ .title = "Configuration", .body =
-    \\  --config <path>                Configuration file, .lua or .toml (default: ./config.lua, else
-    \\                                 ./config.toml). See config.default.lua for every option.
+    \\  --config <path>                Lua config file to use instead of ~/.config/ditch/config.lua
+    \\                                 ($XDG_CONFIG_HOME/ditch/config.lua). The installer puts
+    \\                                 config.default.lua, every option documented, beside it.
+    \\  Per-model settings go in ~/.config/ditch/configs/<org>/<name>.lua (for example
+    \\  configs/Qwen/Qwen3-8B.lua; configs/<name>.lua for a local model) and apply on top of the
+    \\  global file whenever that model is run.
+    \\  --models-dir <dir>             Also read Lua model definitions from this directory (after
+    \\                                 $XDG_CONFIG_HOME/ditch/models; see docs/models.md).
     \\  Precedence: flags > DITCH_* environment variables (DITCH_THREADS, DITCH_MAX_RAM, DITCH_CACHE,
-    \\  DITCH_DEVICE, DITCH_GPU_MEMORY, DITCH_REMOTE_CACHE_SIZE, DITCH_NO_COLOR) > ./config.lua > $XDG_CONFIG_HOME/ditch/config.lua (~/.config/ditch/config.lua).
+    \\  DITCH_DEVICE, DITCH_GPU_MEMORY, DITCH_REMOTE_CACHE_SIZE, DITCH_NO_COLOR) > the model's config file > the global config file.
     \\  Every option accepts --name value or --name=value; flags and subcommands may come in any order.
     \\
     },
@@ -608,7 +619,7 @@ pub fn writeHelp(w: *std.Io.Writer, bold: bool) !void {
 
 /// The short help printed when ditch is run without arguments.
 pub fn writeConciseHelp(w: *std.Io.Writer, bold: bool) !void {
-    try w.print("ditch {s}: {s}\n\n", .{ version, tagline });
+    try w.print("ditch {s}: {c}{s}\n\n", .{ version, std.ascii.toLower(tagline[0]), tagline[1..] });
     try writeHeading(w, "Usage", bold);
     try w.writeAll(usage_text);
     try w.writeAll("\n");
@@ -687,42 +698,74 @@ pub const LoadResult = struct {
     }
 };
 
-/// Loads settings from the config file and command line.
-/// Applies one configuration file (`.lua`, or `.toml` for heretic
-/// compatibility); a missing file is only an error when it was named explicitly.
+/// Applies one Lua configuration file; a missing file is only an error when
+/// it was named explicitly. Returns false when the file does not load.
 fn applyConfigFile(gpa: Allocator, io: std.Io, a: Allocator, settings: *Settings, errors: *std.ArrayList([]const u8), path: []const u8, explicit: bool) !bool {
-    const cwd = std.Io.Dir.cwd();
-    const text = cwd.readFileAlloc(io, path, a, .unlimited) catch |err| {
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited) catch |err| {
         if (explicit) try errors.append(a, try std.fmt.allocPrint(a, "could not read {s}: {s}", .{ path, @errorName(err) }));
         return true;
     };
-    settings.config_path = try a.dupe(u8, path);
-    if (std.mem.endsWith(u8, path, ".toml")) {
-        var parsed = toml.parse(gpa, text) catch |err| {
-            try errors.append(a, try std.fmt.allocPrint(a, "could not parse {s}: {s}", .{ path, @errorName(err) }));
-            return false;
-        };
-        defer parsed.deinit();
-        try applyToml(a, settings, parsed.root, errors);
-    } else {
-        var result = try lua.parse(gpa, text, path);
-        defer result.parsed.deinit();
-        if (result.err) |e| {
-            try errors.append(a, try std.fmt.allocPrint(a, "could not load {s}: {s}", .{ path, e }));
-            return false;
-        }
-        try applyToml(a, settings, result.parsed.root, errors);
+    settings.config_path = if (settings.config_path) |prev| try std.fmt.allocPrint(a, "{s}, {s}", .{ prev, path }) else try a.dupe(u8, path);
+    var result = try lua.parse(gpa, text, path);
+    defer result.parsed.deinit();
+    if (result.err) |e| {
+        try errors.append(a, try std.fmt.allocPrint(a, "could not load {s}: {s}", .{ path, e }));
+        return false;
     }
+    try applyTable(a, settings, result.parsed.root, errors);
     return true;
 }
 
-pub const subcommands = [_][]const u8{ "bench", "probe", "verify", "selftest", "truncate", "help" };
+/// The directory of the user's configuration: $XDG_CONFIG_HOME/ditch, else
+/// ~/.config/ditch (%USERPROFILE%\.config\ditch on Windows).
+pub fn configDir(a: Allocator, env: *const std.process.Environ.Map) !?[]const u8 {
+    if (env.get("XDG_CONFIG_HOME")) |x| if (x.len > 0) return try std.fs.path.join(a, &.{ x, "ditch" });
+    const home = env.get("HOME") orelse env.get("USERPROFILE") orelse return null;
+    return try std.fs.path.join(a, &.{ home, ".config", "ditch" });
+}
 
-/// Parses the configuration: the user file ($XDG_CONFIG_HOME/ditch/config.lua),
-/// the project file (./config.lua, ./config.toml or --config), the DITCH_*
-/// environment variables and finally the command line, later sources taking
-/// precedence. `-h`/`--help` anywhere wins over every error.
+pub const subcommands = [_][]const u8{ "bench", "probe", "verify", "selftest", "truncate", "help", "add-model" };
+
+/// Parses the configuration: the global config file (--config, else
+/// ~/.config/ditch/config.lua), the model's own file in
+/// ~/.config/ditch/configs/ (see `modelConfigName`), the DITCH_* environment
+/// variables and finally the command line, later sources taking precedence.
+/// `-h`/`--help` anywhere wins over every error.
 pub fn load(gpa: Allocator, io: std.Io, args: []const []const u8, environ: ?*std.process.Environ.Map) !LoadResult {
+    var first = try loadLayers(gpa, io, args, environ, null);
+    // The model is only known once every source is read; when it has a
+    // config file of its own, read everything again with that file layered in.
+    const env = environ orelse return first;
+    if (first.settings.model.len == 0) return first;
+    const a = first.arena.allocator();
+    const dir = try configDir(a, env) orelse return first;
+    const name = modelConfigName(first.settings.model) orelse return first;
+    const path = try std.fmt.allocPrint(a, "{s}{c}configs{c}{s}.lua", .{ dir, std.fs.path.sep, std.fs.path.sep, name });
+    std.Io.Dir.cwd().access(io, path, .{}) catch return first;
+    const per_model = try gpa.dupe(u8, path);
+    defer gpa.free(per_model);
+    first.deinit();
+    return loadLayers(gpa, io, args, environ, per_model);
+}
+
+/// The name of a model's own config file under ~/.config/ditch/configs,
+/// without `.lua`: the Hub id for a Hub model ("Qwen/Qwen3-8B", so the file
+/// is configs/Qwen/Qwen3-8B.lua), the last path component for a local
+/// directory or file ("./out/my-model" and "x/my-model.gguf" give "my-model").
+pub fn modelConfigName(model: []const u8) ?[]const u8 {
+    var m = model;
+    if (std.mem.startsWith(u8, m, "hf://")) m = m["hf://".len..];
+    if (std.mem.indexOfScalar(u8, m, '@')) |at| m = m[0..at];
+    m = std.mem.trimEnd(u8, m, "/\\");
+    if (std.mem.endsWith(u8, m, ".gguf")) m = std.fs.path.basename(m)[0 .. std.fs.path.basename(m).len - ".gguf".len];
+    const local = m.len > 0 and (m[0] == '/' or m[0] == '.' or m[0] == '~' or m[0] == '\\' or
+        std.mem.indexOfScalar(u8, m, '\\') != null or std.mem.count(u8, m, "/") != 1);
+    if (local) m = std.fs.path.basename(m);
+    if (m.len == 0 or std.mem.indexOf(u8, m, "..") != null) return null;
+    return m;
+}
+
+fn loadLayers(gpa: Allocator, io: std.Io, args: []const []const u8, environ: ?*std.process.Environ.Map, per_model: ?[]const u8) !LoadResult {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -741,25 +784,14 @@ pub fn load(gpa: Allocator, io: std.Io, args: []const []const u8, environ: ?*std
             settings.help = true;
         }
     }
-    // User configuration, then the project's config.lua (falling back to
-    // config.toml for heretic compatibility).
-    const cwd = std.Io.Dir.cwd();
-    if (config_path == null) {
-        if (environ) |env| {
-            const base: ?[]const u8 = if (env.get("XDG_CONFIG_HOME")) |x| x else if (env.get("HOME")) |h| try std.fs.path.join(a, &.{ h, ".config" }) else null;
-            if (base) |bdir| {
-                const user_path = try std.fs.path.join(a, &.{ bdir, "ditch", "config.lua" });
-                if (!try applyConfigFile(gpa, io, a, &settings, &errors, user_path, false)) return .{ .settings = settings, .arena = arena, .errors = try errors.toOwnedSlice(a) };
-            }
-        }
-    }
-    var path: []const u8 = config_path orelse "config.lua";
-    if (config_path == null) {
-        if (cwd.access(io, "config.lua", .{})) |_| {} else |_| {
-            if (cwd.access(io, "config.toml", .{})) |_| path = "config.toml" else |_| {}
-        }
-    }
-    if (!try applyConfigFile(gpa, io, a, &settings, &errors, path, config_path != null)) return .{ .settings = settings, .arena = arena, .errors = try errors.toOwnedSlice(a) };
+    var path: ?[]const u8 = config_path;
+    if (path == null) if (environ) |env| if (try configDir(a, env)) |dir| {
+        path = try std.fs.path.join(a, &.{ dir, "config.lua" });
+    };
+    if (path) |p| if (!try applyConfigFile(gpa, io, a, &settings, &errors, p, config_path != null))
+        return .{ .settings = settings, .arena = arena, .errors = try errors.toOwnedSlice(a) };
+    if (per_model) |p| if (!try applyConfigFile(gpa, io, a, &settings, &errors, p, true))
+        return .{ .settings = settings, .arena = arena, .errors = try errors.toOwnedSlice(a) };
 
     // Environment variables.
     if (environ) |env| {
@@ -824,6 +856,10 @@ pub fn load(gpa: Allocator, io: std.Io, args: []const []const u8, environ: ?*std
                 settings.truncate = true;
                 continue;
             }
+            if (std.mem.eql(u8, arg, "add-model")) {
+                settings.add_model = true;
+                continue;
+            }
             if (std.mem.eql(u8, arg, "help")) {
                 settings.help = true;
                 expect_help_topic = true;
@@ -836,7 +872,7 @@ pub fn load(gpa: Allocator, io: std.Io, args: []const []const u8, environ: ?*std
             }
             // A near miss of a subcommand that is not a path is a typo, not a model.
             var is_path = false;
-            if (cwd.access(io, arg, .{})) |_| is_path = true else |_| {}
+            if (std.Io.Dir.cwd().access(io, arg, .{})) |_| is_path = true else |_| {}
             if (!is_path and std.mem.indexOfScalar(u8, arg, '/') == null) {
                 for (subcommands) |sc| if (editDistance(arg, sc) <= 2) {
                     try errors.append(a, try std.fmt.allocPrint(a, "unknown command {s}; did you mean {s}? (a local model directory of that name: ./{s})", .{ arg, sc, arg }));
@@ -965,6 +1001,10 @@ fn applyDatasetOption(a: Allocator, spec: *DatasetSpec, field: []const u8, value
 
 fn applyOption(a: Allocator, s: *Settings, key: []const u8, value: []const u8) !void {
     const eql = std.mem.eql;
+    if (eql(u8, key, "models_dir")) {
+        s.models_dir = try a.dupe(u8, value);
+        return;
+    }
     if (eql(u8, key, "model")) s.model = try a.dupe(u8, value) else if (eql(u8, key, "model_commit")) s.model_commit = try a.dupe(u8, value) else if (eql(u8, key, "evaluate_model")) s.evaluate_model = try a.dupe(u8, value) else if (eql(u8, key, "dump_directions")) s.dump_directions = try a.dupe(u8, value) else if (eql(u8, key, "threads")) s.threads = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "cache_dir")) s.cache_dir = try a.dupe(u8, value) else if (eql(u8, key, "chat_template")) s.chat_template = try a.dupe(u8, value) else if (eql(u8, key, "batch_size")) s.batch_size = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "max_batch_size")) s.max_batch_size = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "max_response_length")) s.max_response_length = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "response_prefix")) s.response_prefix = try a.dupe(u8, value) else if (eql(u8, key, "system_prompt")) s.system_prompt = try a.dupe(u8, value) else if (eql(u8, key, "print_debug_information")) s.print_debug_information = try parseBool(value) else if (eql(u8, key, "print_residual_geometry")) s.print_residual_geometry = try parseBool(value) else if (eql(u8, key, "orthogonalize_direction")) s.orthogonalize_direction = try parseBool(value) else if (eql(u8, key, "row_normalization")) s.row_normalization = abliterate.RowNormalization.parse(value) orelse return error.InvalidEnum else if (eql(u8, key, "full_normalization_lora_rank")) s.full_normalization_lora_rank = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "expert_selection")) s.expert_selection = abliterate.ExpertSelection.parse(value) orelse return error.InvalidEnum else if (eql(u8, key, "winsorization_quantile")) s.winsorization_quantile = try std.fmt.parseFloat(f32, value) else if (eql(u8, key, "n_directions")) {
         s.n_directions = try std.fmt.parseInt(usize, value, 10);
         if (s.n_directions == 0) return error.InvalidValue;
@@ -1005,7 +1045,7 @@ fn appendString(a: Allocator, list: []const []const u8, value: []const u8) ![]co
     return out;
 }
 
-fn tomlString(a: Allocator, v: toml.Value) ![]const u8 {
+fn valueString(a: Allocator, v: tree.Value) ![]const u8 {
     return switch (v) {
         .string => |s| try a.dupe(u8, s),
         .integer => |i| try std.fmt.allocPrint(a, "{d}", .{i}),
@@ -1015,13 +1055,13 @@ fn tomlString(a: Allocator, v: toml.Value) ![]const u8 {
     };
 }
 
-fn applyDatasetTable(a: Allocator, spec: *DatasetSpec, t: *const toml.Table, errors: *std.ArrayList([]const u8)) !void {
+fn applyDatasetTable(a: Allocator, spec: *DatasetSpec, t: *const tree.Table, errors: *std.ArrayList([]const u8)) !void {
     var it = t.map.iterator();
     while (it.next()) |e| {
         const k = e.key_ptr.*;
         if (std.mem.startsWith(u8, k, "residual_plot")) continue;
         if (std.mem.eql(u8, k, "commit")) continue;
-        const v = tomlString(a, e.value_ptr.*) catch {
+        const v = valueString(a, e.value_ptr.*) catch {
             try errors.append(a, try std.fmt.allocPrint(a, "dataset field {s} must be a string", .{k}));
             continue;
         };
@@ -1031,7 +1071,7 @@ fn applyDatasetTable(a: Allocator, spec: *DatasetSpec, t: *const toml.Table, err
     }
 }
 
-fn applyToml(a: Allocator, s: *Settings, root: *const toml.Table, errors: *std.ArrayList([]const u8)) !void {
+fn applyTable(a: Allocator, s: *Settings, root: *const tree.Table, errors: *std.ArrayList([]const u8)) !void {
     var it = root.map.iterator();
     while (it.next()) |e| {
         const k = e.key_ptr.*;
@@ -1047,12 +1087,12 @@ fn applyToml(a: Allocator, s: *Settings, root: *const toml.Table, errors: *std.A
                 if (se.value_ptr.* != .table) continue;
                 const st = se.value_ptr.table;
                 if (std.mem.startsWith(u8, name, "KeywordRate")) {
-                    if (st.get("score_name")) |sn| s.keyword_rate.score_name = try tomlString(a, sn);
+                    if (st.get("score_name")) |sn| s.keyword_rate.score_name = try valueString(a, sn);
                     if (st.get("print_responses")) |pr| s.keyword_rate.print_responses = pr == .boolean and pr.boolean;
                     if (st.get("keyword_markers")) |km| {
                         if (km == .array) {
                             var list = std.ArrayList([]const u8).empty;
-                            for (km.array) |m| try list.append(a, try tomlString(a, m));
+                            for (km.array) |m| try list.append(a, try valueString(a, m));
                             s.keyword_rate.keyword_markers = list.items;
                         }
                     }
@@ -1067,14 +1107,14 @@ fn applyToml(a: Allocator, s: *Settings, root: *const toml.Table, errors: *std.A
             var list = std.ArrayList(ScorerConfig).empty;
             for (v.array) |item| {
                 if (item != .table) continue;
-                const plugin = try tomlString(a, item.table.get("plugin") orelse .{ .string = "" });
+                const plugin = try valueString(a, item.table.get("plugin") orelse .{ .string = "" });
                 const kind = ScorerKind.fromPlugin(plugin) orelse {
                     try errors.append(a, try std.fmt.allocPrint(a, "unsupported scorer plugin: {s} (available: keyword_rate, kl_divergence, refusal_logit)", .{plugin}));
                     continue;
                 };
-                const opt_s = try tomlString(a, item.table.get("optimization") orelse .{ .string = "none" });
+                const opt_s = try valueString(a, item.table.get("optimization") orelse .{ .string = "none" });
                 const opt: Optimization = if (std.mem.eql(u8, opt_s, "minimize")) .minimize else if (std.mem.eql(u8, opt_s, "maximize")) .maximize else .none;
-                const inst = if (item.table.get("instance_name")) |n| try tomlString(a, n) else null;
+                const inst = if (item.table.get("instance_name")) |n| try valueString(a, n) else null;
                 try list.append(a, .{ .kind = kind, .optimization = opt, .instance_name = inst });
             }
             s.scorers = list.items;
@@ -1082,13 +1122,13 @@ fn applyToml(a: Allocator, s: *Settings, root: *const toml.Table, errors: *std.A
             var list = std.ArrayList([2][]const u8).empty;
             for (v.array) |pair| {
                 if (pair != .array or pair.array.len != 2) continue;
-                try list.append(a, .{ try tomlString(a, pair.array[0]), try tomlString(a, pair.array[1]) });
+                try list.append(a, .{ try valueString(a, pair.array[0]), try valueString(a, pair.array[1]) });
             }
             s.chain_of_thought_skips = list.items;
         } else if (std.mem.eql(u8, k, "dtypes") or std.mem.eql(u8, k, "quantization") or std.mem.eql(u8, k, "device_map") or std.mem.eql(u8, k, "max_memory") or std.mem.eql(u8, k, "offload_outputs_to_cpu") or std.mem.startsWith(u8, k, "residual_plot") or std.mem.eql(u8, k, "plot_residuals") or std.mem.eql(u8, k, "benchmarks")) {
             // Accepted for compatibility with heretic config files; ignored.
         } else {
-            const str = tomlString(a, v) catch {
+            const str = valueString(a, v) catch {
                 try errors.append(a, try std.fmt.allocPrint(a, "unsupported config value for {s}", .{k}));
                 continue;
             };
@@ -1132,17 +1172,52 @@ test "budget options" {
     try std.testing.expectEqual(@as(u64, 24 << 30), r.settings.max_vram);
     try std.testing.expectEqual(@as(?u64, 5400), r.settings.time_limit_seconds);
     try std.testing.expectEqualStrings("/tmp/x", r.settings.scratch_dir.?);
-    // TOML values go through the same parser.
-    var parsed = try toml.parse(gpa, "max_ram = \"2GB\"\ntime_limit = \"2h\"\n");
+    // Lua values go through the same parser.
+    var parsed = (try lua.parse(gpa, "return { max_ram = \"2GB\", time_limit = \"2h\" }", "test.lua")).parsed;
     defer parsed.deinit();
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     var s = Settings{};
     var errors = std.ArrayList([]const u8).empty;
-    try applyToml(arena.allocator(), &s, parsed.root, &errors);
+    try applyTable(arena.allocator(), &s, parsed.root, &errors);
     try std.testing.expectEqual(@as(usize, 0), errors.items.len);
     try std.testing.expectEqual(@as(u64, 2 << 30), s.max_ram);
     try std.testing.expectEqual(@as(?u64, 7200), s.time_limit_seconds);
+}
+
+test "per-model config files layer between the global file and the flags" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    try std.testing.expectEqualStrings("Qwen/Qwen3-8B", modelConfigName("Qwen/Qwen3-8B").?);
+    try std.testing.expectEqualStrings("Qwen/Qwen3-8B", modelConfigName("hf://Qwen/Qwen3-8B@main").?);
+    try std.testing.expectEqualStrings("my-model", modelConfigName("./out/my-model/").?);
+    try std.testing.expectEqualStrings("my-model", modelConfigName("/models/my-model.gguf").?);
+    try std.testing.expectEqualStrings("tiny", modelConfigName("tiny").?);
+    try std.testing.expect(modelConfigName("") == null);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "ditch/configs/Org");
+    try tmp.dir.writeFile(io, .{ .sub_path = "ditch/config.lua", .data = "return { max_ram = \"2GB\", n_trials = 50 }" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "ditch/configs/Org/Model.lua", .data = "return { max_ram = \"4GB\", seed = 7 }" });
+    const base = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(base);
+    var env: std.process.Environ.Map = .init(gpa);
+    defer env.deinit();
+    try env.put("XDG_CONFIG_HOME", base);
+
+    const args = [_][]const u8{ "ditch", "Org/Model", "--seed", "9" };
+    var r = try load(gpa, io, &args, &env);
+    defer r.deinit();
+    try std.testing.expectEqual(@as(usize, 0), r.errors.len);
+    try std.testing.expectEqual(@as(u64, 4 << 30), r.settings.max_ram);
+    try std.testing.expectEqual(@as(usize, 50), r.settings.n_trials);
+    try std.testing.expectEqual(@as(?u64, 9), r.settings.seed);
+
+    const other = [_][]const u8{ "ditch", "Org/Other" };
+    var r2 = try load(gpa, io, &other, &env);
+    defer r2.deinit();
+    try std.testing.expectEqual(@as(u64, 2 << 30), r2.settings.max_ram);
 }
 
 test "warp mode options" {
@@ -1242,7 +1317,7 @@ test "algorithm options" {
     defer arena.deinit();
     var s = Settings{};
     var errors = std.ArrayList([]const u8).empty;
-    try applyToml(arena.allocator(), &s, result.parsed.root, &errors);
+    try applyTable(arena.allocator(), &s, result.parsed.root, &errors);
     try std.testing.expectEqual(@as(usize, 0), errors.items.len);
     try std.testing.expectEqual(ScorerKind.refusal_logit, s.scorers[0].kind);
     try std.testing.expectEqual(DirectionRange.auto, s.direction_range);
