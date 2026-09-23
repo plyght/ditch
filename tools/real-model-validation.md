@@ -2445,3 +2445,45 @@ transformers' own `forward`.
 | "The capital of France is" | match (5) | all 5 agree, worst 1.95e-06 | 1.87e-06 | match |
 | "Explain how rainbows form, …" | match (14) | all 5 agree, worst 2.12e-06 | 2.30e-06 | match |
 | 318-token passage | match (318) | all 5 agree, worst 2.56e-06 | 3.13e-06 | match |
+
+# Remaining families on real weights
+
+Asked whether the frontier-size releases can be tested at all on this machine
+(4 cores, 15 GiB RAM, ~20 GiB free disk), there were three ways on: stream a
+whole release through warp mode for one full-depth pass (hundreds of GB over
+the network per pass, no study), rent a machine with the RAM for a full run,
+or keep cutting releases to their first layers. The third was taken: it adds a
+real-weight check to a new family for a few GB of download each, where one
+streamed pass would cost an 850 GB download and check one family. The families
+below had only a config check; the frontier session owns DeepSeek V4/V4.1,
+Kimi, GLM-5.x, Qwen 3.8, MiMo, MiniMax, gpt-oss, Gemma 4, Mistral 4 and
+Llama 4, so those are left out.
+
+Method as in the frontier pass: `tools/truncate_checkpoint.py`, then
+`ditch probe --residuals --json` against `tools/probe_reference.py` in float32,
+two chat prompts.
+
+## GLM-4.7-Flash (`glm4_moe_lite`): verified; transformers' latent-norm epsilon differs
+
+`zai-org/GLM-4.7-Flash`, first 3 layers (layer 0 MLA with the dense MLP,
+layers 1-2 MLA with the 64-expert MoE and shared expert), all 64 experts kept.
+
+**Symptom.** Layer 0's output differed by 1.4e-03 of its magnitude, the
+logits by 9e-04 of their range; argmax and greedy text agreed. A one-layer cut
+with the MLP zeroed still differed by 5.7e-04, so the gap was in attention.
+
+**Cause.** Not ditch. transformers' `Glm4MoeLiteAttention` builds
+`q_a_layernorm` and `kv_a_layernorm` as `Glm4MoeLiteRMSNorm(rank)`, whose
+epsilon defaults to 1e-6, while the config's `rms_norm_eps` is 1e-5. vLLM's and
+SGLang's DeepSeek V2 attention, which both use for this model, pass
+`eps=config.rms_norm_eps` to both norms, as ditch does. With the reference's
+two latent norms set to 1e-5, every layer agrees to 2e-06. ditch keeps the
+config's value; `tools/ref_config_eps.py` is the reference with that one
+change. (DeepSeek V3's own config has `rms_norm_eps` 1e-6, so the difference
+does not show there.)
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (17) | all 4 agree, worst 2.12e-06 | 5.64e-07 | match |
+| "Explain how rainbows form, …" | match (23) | all 4 agree, worst 8.72e-07 | 8.33e-07 | match |
+| same, stock transformers (latent eps 1e-6) | match | first differs at layer 1, 1.4e-03 | 9.2e-04 | argmax match |
