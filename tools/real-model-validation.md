@@ -387,7 +387,7 @@ config-and-tensor-name check. Eight bugs, all fixed with tests.
     Build: zig build -Doptimize=ReleaseFast ; zig build test --summary all -> 246/246 before,
     253/253 after (7 tests added)
 
-## Method
+## Abliteration: method
 
 Two new pieces of tooling carried this pass; both are in the repo.
 
@@ -2270,7 +2270,7 @@ looks. None of their arithmetic had been compared with a reference on real
 weights, and the Qwen 3.5, Helium and Cohere bugs show why that matters: a
 fixture written from the same misreading as the code agrees with it.
 
-## Method
+## Abliteration: method
 
 Truncated real checkpoints. `tools/truncate_checkpoint.py REPO K OUT` range-reads
 each shard's header, then streams the embedding, the final norm, the LM head
@@ -4200,7 +4200,7 @@ The forward pass of every family is checked above; this section checks the
 edit itself: which matrices a trial changes, whether the change is the
 orthogonalisation it should be, and whether the export carries it faithfully.
 
-## Method
+## Abliteration: method
 
 **One trial on a cut.** `ditch CUT --n-trials 1 --n-startup-trials 1` with 8
 harmful and 8 harmless prompts (also as the refusal and KL scorer prompts),
@@ -4238,7 +4238,7 @@ matrices changed, exactly the attention `o_proj` of layers 8-19 and the
 `down_proj` of 13-23 that the trial's two kernels reach; every one within
 2.5e-06 of the rank-3 optimum of the exact edit.
 
-## gpt-oss (`gpt_oss`): MXFP4 experts
+## Abliteration: gpt-oss (`gpt_oss`), MXFP4 experts
 
 `openai/gpt-oss-20b`, first layer, experts MXFP4.
 
@@ -4324,7 +4324,7 @@ as the range reads (F13). `tools/range_server.py` serves a
 Regression test: "remote source: rate-limited small files are waited for,
 not taken for missing ones" (`src/remote_test.zig`, the native client and
 curl; it fails with the old mapping).
-## Gemma 4 (`gemma4`): dense, per-layer inputs, KV sharing
+## Abliteration: Gemma 4 (`gemma4`), dense, per-layer inputs, KV sharing
 
 `google/gemma-4-E2B-it`, layers 0-4, 15 and 19 (sliding, global and KV-shared),
 towers dropped, the per-layer input table cut to the kept layers.
