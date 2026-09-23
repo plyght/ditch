@@ -159,6 +159,7 @@ pub fn loadLayer(model: *Model, layer: *Layer, arena: Allocator, li: usize, lp: 
             const ep = try cat(arena, lp, "engram.");
             const table_name = try std.fmt.allocPrint(arena, "{s}engram_tables.{d}.weight", .{ model.prefix, li });
             const table = try model.ref(table_name);
+            try model.addRowTable(arena, table_name[0 .. table_name.len - ".weight".len]);
             if (!table.dtype.isFloat()) {
                 std.log.err("{s} is stored as {s}; ditch reads F32/F16/BF16 tables (dequantise the checkpoint first)", .{ table_name, table.dtype.safetensorsName() });
                 return error.UnsupportedArchitecture;

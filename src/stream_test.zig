@@ -243,6 +243,39 @@ test "calibration, two trials, export and reload stay under the memory budget" {
     });
 }
 
+test "tables read a row at a time are left out of the memory estimate" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const pool = tensor.Pool.init(io, 2);
+    var paths = try TmpPaths.init(gpa, io);
+    defer paths.deinit(gpa);
+    // DeepSeek V4.1's engram table and Qwen4-Exp's n-gram shards: a 98 GB
+    // table a layer in the releases, of which a prompt reads a few rows.
+    const cases = .{
+        .{ "deepseek_v41", "model.engram_tables.1.weight", "model.layers.1.engram.wkv.weight" },
+        .{ "qwen4_exp", "model.layers.0.ple.ple_embedding.ngram_embedding.shard_1.weight", "model.layers.0.mlp.gate.weight" },
+    };
+    inline for (cases) |case| {
+        const model = try Model.loadWithOptions(gpa, io, &pool, "tests/fixtures/" ++ case[0], .{ .store = .streamed, .scratch_dir = paths.scratch, .expert_cache = 1 << 20 });
+        defer model.deinit();
+        try std.testing.expect(model.isRowTable(case[1]));
+        try std.testing.expect(!model.isRowTable(case[2]));
+        var largest: u64 = 0;
+        for (model.files) |f| {
+            var it = f.tensors.iterator();
+            while (it.next()) |kv| if (!model.isRowTable(kv.value_ptr.name)) {
+                largest = @max(largest, kv.value_ptr.byte_len);
+            };
+        }
+        const est = budget_mod.estimate(model, .{ .batch_size = 1, .max_prompt_tokens = 8, .max_response_length = 4, .threads = 2 });
+        try std.testing.expectEqual(largest, est.largest_tensor_bytes);
+        // In warp mode a layer's resident set is its trunk plus the experts a
+        // token selects (the model's own figure), not every expert it names.
+        try std.testing.expect(est.warp);
+        try std.testing.expectEqual(model.largest_layer_bytes, est.largest_layer_bytes);
+    }
+}
+
 test "feasibility check refuses a budget below one layer" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

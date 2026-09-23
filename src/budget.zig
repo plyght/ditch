@@ -559,6 +559,8 @@ pub fn estimate(model: *const model_mod.Model, p: EstimateParams) Estimate {
         while (it.next()) |kv| {
             const info = kv.value_ptr.*;
             total += info.byte_len;
+            // A table read a row at a time is never resident (see Model.row_tables).
+            if (model.isRowTable(info.name)) continue;
             if (info.byte_len > largest) {
                 largest = info.byte_len;
                 largest_name = info.name;
@@ -569,8 +571,14 @@ pub fn estimate(model: *const model_mod.Model, p: EstimateParams) Estimate {
             }
         }
     }
+    const warp = model.warp();
     var largest_layer: u64 = 0;
-    for (layer_bytes) |b| largest_layer = @max(largest_layer, b);
+    // By name a layer holds all of its routed experts; in warp mode only the
+    // experts a token selects are resident, which the model's own figure
+    // (trunk + top-k) already counts.
+    if (!warp) for (layer_bytes) |b| {
+        largest_layer = @max(largest_layer, b);
+    };
     // The model knows about transient buffers (e.g. transposing fused expert blocks).
     largest_layer = @max(largest_layer, model.largest_layer_bytes);
 
@@ -584,7 +592,6 @@ pub fn estimate(model: *const model_mod.Model, p: EstimateParams) Estimate {
     const inter: u64 = c.intermediate_size;
     const delta = @as(u64, c.num_layers) * @as(u64, p.lora_rank) * ((hidden + hidden) + (hidden + inter)) * 4;
     const export_peak = export_mod.peakBytes(model, p.export_dtype);
-    const warp = model.warp();
     var top_k: usize = 0;
     var num_experts: usize = 0;
     for (model.layers) |l| if (l.moe) |m| {

@@ -826,6 +826,8 @@ pub const Footprint = struct {
     /// Stored bytes of the trunk tensors, and of the chunks they span.
     trunk_bytes: u64 = 0,
     trunk_chunk_bytes: u64 = 0,
+    /// Stored bytes of the tables read a row at a time (never fetched whole).
+    table_bytes: u64 = 0,
     /// Stored bytes of the largest routed expert and of all of them.
     expert_bytes: u64 = 0,
     total_expert_bytes: u64 = 0,
@@ -851,6 +853,8 @@ pub const Footprint = struct {
         try w.print("  trunk                    {f} stored, {f} of chunks (re-read by every forward pass)\n", .{ fmtBytes(self.trunk_bytes), fmtBytes(self.trunk_chunk_bytes) });
         if (self.num_experts > 0)
             try w.print("  routed expert            {f} each stored, {d} experts, {f} in total\n", .{ fmtBytes(self.expert_bytes), self.num_experts, fmtBytes(self.total_expert_bytes) });
+        if (self.table_bytes > 0)
+            try w.print("  row-read tables          {f} stored (only the rows a prompt hashes to are fetched)\n", .{fmtBytes(self.table_bytes)});
         try w.print("  chunk cache bound        {f}{s}, {f} cached now", .{ fmtBytes(self.cache_limit), if (self.cache_limit_default) " (default)" else "", fmtBytes(self.cache_bytes) });
         if (self.disk_free) |f| try w.print(", {f} free on its filesystem", .{fmtBytes(f)});
         try w.writeAll("\n");
@@ -924,10 +928,10 @@ pub fn planModel(src: *Source, gpa: Allocator, model: *const model_mod.Model) !F
             const info = kv.value_ptr.*;
             // Decoded views of quantised tensors live above the file's bytes.
             if (info.offset >= f.len) continue;
-            try classify(&groups, rf, &fp, info.name, info.offset, info.byte_len);
+            try classify(model, &groups, rf, &fp, info.name, info.offset, info.byte_len);
         }
         var rit = f.raw.iterator();
-        while (rit.next()) |kv| try classify(&groups, rf, &fp, kv.value_ptr.name, kv.value_ptr.offset, kv.value_ptr.byte_len);
+        while (rit.next()) |kv| try classify(model, &groups, rf, &fp, kv.value_ptr.name, kv.value_ptr.offset, kv.value_ptr.byte_len);
         // A dequantised tensor is such a view, its stored codes and scales out
         // of both indexes: count them by the view's name (gpt-oss's MXFP4
         // expert blocks, fp8 trunks), in whichever file holds each.
@@ -938,7 +942,7 @@ pub fn planModel(src: *Source, gpa: Allocator, model: *const model_mod.Model) !F
                     .remote => |r| r,
                     .local => continue,
                 };
-                try classify(&groups, prf, &fp, dq.name, p.offset, p.byte_len);
+                try classify(model, &groups, prf, &fp, dq.name, p.offset, p.byte_len);
             };
         }
     }
@@ -978,7 +982,11 @@ pub fn planModel(src: *Source, gpa: Allocator, model: *const model_mod.Model) !F
     return fp;
 }
 
-fn classify(groups: anytype, rf: *RemoteFile, fp: *Footprint, name: []const u8, offset: u64, len: u64) !void {
+fn classify(model: *const model_mod.Model, groups: anytype, rf: *RemoteFile, fp: *Footprint, name: []const u8, offset: u64, len: u64) !void {
+    if (model.isRowTable(name)) {
+        fp.table_bytes += len;
+        return;
+    }
     if (groups.getPtr(modulePrefix(name))) |g| {
         g.bytes += len;
         return;

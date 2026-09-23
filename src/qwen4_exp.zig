@@ -139,6 +139,7 @@ fn loadTable(model: *Model, arena: Allocator, base: []const u8) !Table {
             return error.MissingWeights;
         }
     }
+    try model.addRowTable(arena, base);
     const ng = model.config.ngram_ple.?;
     const head_dim = ng.embed_dim / ((ng.ngram_size - 1) * ng.heads_per_ngram);
     const starts = try arena.alloc(usize, shards.items.len);

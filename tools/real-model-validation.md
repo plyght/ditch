@@ -4067,3 +4067,37 @@ The reference's time is split between the Hub and transformers' own MXFP4
 dequantiser (`convert_moe_packed_tensors`, one expert at a time on the main
 thread) while the next experts download.
 
+## Bug F11 — the memory estimate refused DeepSeek V4.1 and Qwen3.8-Flash-Next over `hf://` (fixed)
+
+**Symptom.** `ditch --dry-run hf://deepseek-ai/DeepSeek-V4.1-Flash --max-ram
+10GB` stopped with "minimum resident set is 183.12GB ... largest tensor
+183.11GB", and the disk plan counted a 206 GB trunk "re-read by every forward
+pass". `Qwen/Qwen3.8-Flash-Next`: "largest layer 100.26GB". Neither model
+could be run at full depth on any machine smaller than those figures.
+
+**Cause.** Two figures in the estimate were wrong; the forward pass itself
+was fine.
+* The tables that are only ever read a row at a time (V4.1's engram tables
+  and Qwen4-Exp's n-gram embedding shards, ~95-190 GB, of which a prompt
+  reads a few rows through `WeightStore.readRow`) were counted as tensors that
+  must be resident, and as trunk the chunk cache must hold. The runtime
+  already kept them out of each layer's trunk (626 MB and 210 MB a layer).
+* The estimate's by-name sum of a layer's tensors counts every routed expert
+  the layer names. In warp mode only the trunk and the experts a token
+  selects are resident, which is the model's own `largest_layer_bytes`. With
+  384 experts of 67.5 MB, V4.1's by-name layer is 25.9 GB. gpt-oss (128
+  experts of 12.6 MB) stayed under the budget, so the error never showed.
+
+**Fix.** `Model.row_tables` records the module of every table read a row at a
+time (`addRowTable`, called where V4.1's engram and Qwen4-Exp's n-gram
+tables are loaded). `budget.estimate` leaves those tables out of the largest
+tensor and the per-layer sums. The remote disk plan lists them as their own
+line ("row-read tables ... only the rows a prompt hashes to are fetched")
+instead of as trunk. In warp mode the largest layer is the model's own trunk
++ top-k figure. A test on the `deepseek_v41` and `qwen4_exp` fixtures checks
+all three.
+
+    after:  DeepSeek-V4.1-Flash  warp mode min 1.24GB; trunk 17.46GB stored; row-read tables 188.83GB
+            Qwen3.8-Flash-Next   warp mode min 3.23GB; trunk 14.91GB stored; row-read tables 95.37GB
+            gpt-oss-120b         unchanged (min 4.45GB, trunk 3.96GB)
+

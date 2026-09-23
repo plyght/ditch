@@ -689,6 +689,10 @@ pub const Model = struct {
     /// Bytes of all routed experts of all layers.
     total_expert_bytes: u64,
     largest_tensor_bytes: u64,
+    /// Module prefixes (ending in '.') of tables read only a row at a time
+    /// (DeepSeek V4.1's engram tables, Qwen4-Exp's n-gram embedding): never
+    /// resident, so the memory and disk estimates leave them out.
+    row_tables: std.ArrayList([]const u8),
     spill_always: bool,
     /// Final norm before the LM head (null for a family without one).
     final_norm: ?Norm,
@@ -1454,6 +1458,7 @@ pub const Model = struct {
         }
 
         self.largest_tensor_bytes = 0;
+        self.row_tables = .empty;
         for (self.files) |f| {
             var it = f.tensors.iterator();
             while (it.next()) |kv| self.largest_tensor_bytes = @max(self.largest_tensor_bytes, kv.value_ptr.byte_len);
@@ -2271,6 +2276,17 @@ pub const Model = struct {
     }
 
     /// Layer index encoded in a tensor name of this model, if any.
+    /// Records that the tensors under `module` (a prefix such as
+    /// `model.engram_tables.3`) are only ever read a row at a time.
+    pub fn addRowTable(self: *Model, arena: Allocator, module: []const u8) !void {
+        try self.row_tables.append(arena, try std.fmt.allocPrint(arena, "{s}.", .{module}));
+    }
+
+    pub fn isRowTable(self: *const Model, name_: []const u8) bool {
+        for (self.row_tables.items) |p| if (std.mem.startsWith(u8, name_, p)) return true;
+        return false;
+    }
+
     pub fn layerIndex(self: *const Model, name_: []const u8) ?usize {
         return layerIndexOfTemplate(self.config.arch.names.layer, self.prefix, name_);
     }
