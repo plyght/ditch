@@ -1,0 +1,20 @@
+return {
+  model_type = "falcon_h1",
+  llama_cpp = "falcon-h1",
+  chat = "chatml",
+  verified = true,
+  notes = "fixtures: Mamba2 and attention in parallel on one input norm with the muP multipliers (ssm/attention in and out, key, mlp, per-section in_proj, embedding, lm_head), grouped gated RMSNorm with either gate order, and the norm-free variant. Both out projections are abliterated.",
+  default_norm_eps = 1e-5,
+  ssm = "mamba2",
+  parallel_ssm = true,
+  names = {
+    prefixes = { "model.", "" },
+    final_norm = "{p}final_layernorm.weight",
+    pre_ff_norm = "pre_ff_layernorm.weight",
+    ssm = "mamba.",
+    gate = "feed_forward.gate_proj.weight",
+    up = "feed_forward.up_proj.weight",
+    down = "feed_forward.down_proj.weight",
+  },
+  hook = "falcon_h1",
+}

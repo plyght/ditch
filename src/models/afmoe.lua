@@ -1,0 +1,20 @@
+return {
+  model_type = "afmoe",
+  llama_cpp = nil,
+  chat = "chatml",
+  verified = true,
+  notes = "fixture: norms on both sublayer inputs and outputs, a sigmoid gate on the attention output, sliding layers every n, sigmoid routing with a selection bias, renormalisation and route_scale, shared experts and dense first layers. AFM (Arcee) MoE.",
+  default_norm_eps = 1e-5,
+  names = {
+    post_attn_norm = "post_attention_layernorm.weight",
+    pre_ff_norm = "pre_mlp_layernorm.weight",
+    post_ff_norm = "post_mlp_layernorm.weight",
+    q_norm = "self_attn.q_norm.weight",
+    k_norm = "self_attn.k_norm.weight",
+    attn_gate = "self_attn.gate_proj.weight",
+    router = "mlp.router.gate.weight",
+    router_correction_bias = "mlp.expert_bias",
+    shared_expert = "mlp.shared_experts.",
+  },
+  hook = "afmoe",
+}

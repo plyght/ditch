@@ -27,6 +27,7 @@ comptime {
     _ = @import("export.zig");
     _ = @import("search.zig");
     _ = @import("lua.zig");
+    _ = @import("models.zig");
     _ = @import("budget.zig");
     _ = @import("stream.zig");
     _ = @import("stream_test.zig");

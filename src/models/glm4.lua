@@ -1,0 +1,20 @@
+return {
+  model_type = "glm4",
+  aliases = { "glm", "glm4v", "glm4v_text" },
+  llama_cpp = "glm4",
+  chat = "glm4",
+  verified = true,
+  notes = "fixture: post_self_attn / post_mlp norms, fused gate_up_proj, interleaved half rotary, q/k/v biases. GLM-4 (0414) and the `glm` model_type (GLM-4-9B HF port).",
+  default_norm_eps = 1.5625e-7,
+  rope_style = "gptj",
+  mlp = "gated_fused",
+  attention_bias = true,
+  names = {
+    post_attn_norm = "post_self_attn_layernorm.weight",
+    post_ff_norm = "post_mlp_layernorm.weight",
+    gate = false,
+    up = false,
+    gate_up = "mlp.gate_up_proj.weight",
+  },
+  hook = "glm4",
+}

@@ -1,0 +1,23 @@
+return {
+  model_type = "jamba",
+  llama_cpp = "jamba",
+  chat = "jamba",
+  verified = true,
+  notes = "fixture: Mamba1 layers (in_proj, conv1d, x_proj with RMS-normalised dt/B/C, dt_proj, per-channel A_log, D, silu(z) gate) at attn_layer_period / offset, attention without positional encoding, softmax MoE at expert_layer_period / offset (separate expert tensors) and dense MLPs.",
+  positional = "none",
+  ssm = "mamba1",
+  names = {
+    prefixes = { "model.", "" },
+    final_norm = "{p}final_layernorm.weight",
+    pre_ff_norm = "pre_ff_layernorm.weight",
+    ssm = "mamba.",
+    gate = "feed_forward.gate_proj.weight",
+    up = "feed_forward.up_proj.weight",
+    down = "feed_forward.down_proj.weight",
+    router = "feed_forward.router.weight",
+    expert = "feed_forward.experts.{e}.",
+    fused_gate_up = { "feed_forward.experts.gate_up_proj" },
+    fused_down = { "feed_forward.experts.down_proj" },
+  },
+  hook = "jamba",
+}

@@ -6,7 +6,8 @@
 const std = @import("std");
 const toml = @import("toml.zig");
 
-const c = @cImport({
+/// The Lua C API, shared with the model-definition loader (models.zig).
+pub const c = @cImport({
     @cInclude("lua.h");
     @cInclude("lauxlib.h");
     @cInclude("lualib.h");
@@ -32,7 +33,9 @@ pub const Result = struct {
     err: ?[]const u8 = null,
 };
 
-fn openSandbox(L: *c.lua_State) void {
+/// Opens the sandboxed standard libraries: base, string, table, math, utf8
+/// and `os.getenv`; nothing that reads or writes files or loads code.
+pub fn openSandbox(L: *c.lua_State) void {
     c.luaL_requiref(L, "_G", c.luaopen_base, 1);
     c.lua_settop(L, -2);
     c.luaL_requiref(L, "string", c.luaopen_string, 1);

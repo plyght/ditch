@@ -14,6 +14,7 @@
 const std = @import("std");
 const tensor = @import("tensor.zig");
 const dequant = @import("dequant.zig");
+const models = @import("models.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -639,8 +640,12 @@ pub const Arch = struct {
     parallel_ssm: bool = false,
     /// Recurrence of the family's `linear_attention` layers, if it has any.
     linear: LinearKind = .gated_deltanet,
-    /// Family-specific config keys.
+    /// Family-specific config keys: a Zig hook (`hooks`, named by a
+    /// definition's `hook` field) ...
     extra: ?*const fn (*Config, Allocator, std.json.ObjectMap) anyerror!void = null,
+    /// ... and a Lua `config` function run after it (a reference into the
+    /// definitions' Lua state, see models.zig).
+    script: ?c_int = null,
 };
 
 pub const Config = struct {
@@ -970,8 +975,13 @@ pub fn parseActivation(name: []const u8) ?tensor.Activation {
 // Config parsing
 // ---------------------------------------------------------------------------
 
-/// Finds the descriptor for a `model_type`.
+/// Finds the definition of a `model_type` (the Lua model definitions, see models.zig).
 pub fn lookup(model_type: []const u8) ?*const Arch {
+    return models.lookup(model_type);
+}
+
+/// Finds the descriptor for a `model_type` in the Zig table below.
+fn lookupZig(model_type: []const u8) ?*const Arch {
     for (&registry) |*a| {
         if (std.mem.eql(u8, a.model_type, model_type)) return a;
         for (a.aliases) |alias| if (std.mem.eql(u8, alias, model_type)) return a;
@@ -1093,24 +1103,31 @@ pub fn sanitizeJson(arena: Allocator, text: []const u8) ![]const u8 {
 /// `minicpm`, when the lowercased class prefix is a registered model type.
 /// Without it such a config would be read as Llama and lose its family's
 /// scalings.
-fn typeFromArchitectures(arena: Allocator, obj: std.json.ObjectMap) ?[]const u8 {
+fn typeFromArchitectures(arena: Allocator, obj: std.json.ObjectMap, comptime find: Finder) ?[]const u8 {
     const archs = obj.get("architectures") orelse return null;
     if (archs != .array or archs.array.items.len == 0 or archs.array.items[0] != .string) return null;
     const name = archs.array.items[0].string;
     for ([_][]const u8{ "ForCausalLM", "LMHeadModel", "ForConditionalGeneration" }) |suffix| {
         if (!std.mem.endsWith(u8, name, suffix)) continue;
         const lower = std.ascii.allocLowerString(arena, name[0 .. name.len - suffix.len]) catch return null;
-        if (lookup(lower)) |a| return a.model_type;
+        if (find(lower)) |a| return a.model_type;
     }
     return null;
 }
 
+const Finder = fn ([]const u8) ?*const Arch;
+
 pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
+    return parseConfigIn(arena, json_text, lookup);
+}
+
+/// `parseConfig` against the families `find` knows.
+fn parseConfigIn(arena: Allocator, json_text: []const u8, comptime find: Finder) !Config {
     var parsed = try std.json.parseFromSlice(std.json.Value, arena, try sanitizeJson(arena, json_text), .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidConfig;
     var obj = parsed.value.object;
-    const top_type = getStr(obj, "model_type") orelse typeFromArchitectures(arena, obj) orelse "llama";
+    const top_type = getStr(obj, "model_type") orelse typeFromArchitectures(arena, obj, find) orelse "llama";
     var model_type = top_type;
     // Omni wrappers (Qwen2.5-Omni, Qwen3-Omni) nest the language model under
     // the thinker; the talker and vocoder tensors are passed through.
@@ -1123,28 +1140,34 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
     if (getObj(obj, "text_config")) |tc| {
         obj = tc;
         if (getStr(obj, "model_type")) |m| model_type = m;
-        arch_opt = lookup(model_type);
+        arch_opt = find(model_type);
         // A wrapper with its own entry wins over the family of its text
         // config: Kimi K3 nests a `kimi_linear` config but adds AttnRes,
         // latent MoE and SiTU on top of it.
-        if (lookup(top_type)) |ta| {
+        if (find(top_type)) |ta| {
             if (arch_opt == null or ta != arch_opt.?) {
                 arch_opt = ta;
                 model_type = top_type;
             }
         }
-    } else arch_opt = lookup(model_type);
+    } else arch_opt = find(model_type);
     const arch = arch_opt orelse {
         try rejectKnownHybrid(model_type);
         try rejectKnownHybrid(top_type);
         _ = try rejectUnsupportedMath(parsed.value.object, obj);
-        var names: std.Io.Writer.Allocating = .init(arena);
-        for (&registry, 0..) |*a, i| {
-            if (i > 0) try names.writer.writeAll(", ");
-            try names.writer.writeAll(a.model_type);
+        // Families whose name shares the unknown one's stem are likely relatives.
+        var similar: std.Io.Writer.Allocating = .init(arena);
+        const stem = std.mem.trimEnd(u8, model_type[0 .. std.mem.indexOfAny(u8, model_type, "_-") orelse model_type.len], "0123456789.");
+        var n_similar: usize = 0;
+        for (models.families()) |a| {
+            if (stem.len < 3 or !std.mem.startsWith(u8, a.model_type, stem) or n_similar == 6) continue;
+            try similar.writer.writeAll(if (n_similar == 0) " (related families: " else ", ");
+            try similar.writer.writeAll(a.model_type);
+            n_similar += 1;
         }
-        std.log.err("unsupported model_type: {s} (supported: {s})", .{ model_type, names.written() });
-        return error.UnsupportedArchitecture;
+        if (n_similar > 0) try similar.writer.writeAll(")");
+        std.log.err("unknown model_type: {s}: there is no built-in or user model definition for it{s}", .{ model_type, similar.written() });
+        return error.UnknownModelType;
     };
     const quant = try rejectUnsupportedMath(parsed.value.object, obj);
     // Nested attention config (MPT).
@@ -1559,6 +1582,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
     }
     if (getBool(attn_cfg, "alibi", false)) c.positional = .alibi;
     if (arch.extra) |f| try f(&c, arena, obj);
+    if (arch.script) |ref| try models.runConfig(ref, &c, arena, obj);
     // Hooks may mark linear / Mamba layers after the fact (Kimi Linear's
     // kda_layers, the Jamba periods): those layers hold no attention block
     // unless the family runs both side by side.
@@ -3544,6 +3568,97 @@ fn extraDeepseekV41(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void
         }
     }
     c.dsv4 = d;
+}
+
+/// The family hooks by name: the Zig building blocks a model definition
+/// (models.zig) names in its `hook` field. A hook reads family-specific
+/// config.json keys into the `Config` after the generic parser has run.
+pub const hooks = [_]struct { name: []const u8, f: *const fn (*Config, Allocator, std.json.ObjectMap) anyerror!void }{
+    .{ .name = "gemma", .f = extraGemma },
+    .{ .name = "gemma3n", .f = extraGemma3n },
+    .{ .name = "gemma4", .f = extraGemma4 },
+    .{ .name = "lfm2", .f = extraLfm2 },
+    .{ .name = "mistral4", .f = extraMistral4 },
+    .{ .name = "mixtral", .f = extraMixtral },
+    .{ .name = "phi3", .f = extraPhi3 },
+    .{ .name = "phi", .f = extraPhi },
+    .{ .name = "neox", .f = extraNeox },
+    .{ .name = "falcon", .f = extraFalcon },
+    .{ .name = "stablelm", .f = extraStableLm },
+    .{ .name = "olmo2", .f = extraOlmo2 },
+    .{ .name = "cohere", .f = extraCohere },
+    .{ .name = "glm4", .f = extraGlm4 },
+    .{ .name = "chatglm", .f = extraChatGlm },
+    .{ .name = "granite", .f = extraGranite },
+    .{ .name = "deepseek", .f = extraDeepseek },
+    .{ .name = "llama4", .f = extraLlama4 },
+    .{ .name = "gpt_oss", .f = extraGptOss },
+    .{ .name = "minicpm", .f = extraMiniCpm },
+    .{ .name = "exaone4", .f = extraExaone4 },
+    .{ .name = "nemotron", .f = extraNemotron },
+    .{ .name = "dense_mlp", .f = extraDenseMlp },
+    .{ .name = "ernie", .f = extraErnie },
+    .{ .name = "hunyuan_dense", .f = extraHunyuanDense },
+    .{ .name = "nanochat", .f = extraNanoChat },
+    .{ .name = "persimmon", .f = extraPersimmon },
+    .{ .name = "gptj", .f = extraGptJ },
+    .{ .name = "codegen", .f = extraCodeGen },
+    .{ .name = "gpt_neo", .f = extraGptNeo },
+    .{ .name = "xglm", .f = extraXglm },
+    .{ .name = "biogpt", .f = extraBioGpt },
+    .{ .name = "ministral3", .f = extraMinistral3 },
+    .{ .name = "smollm3", .f = extraSmolLm3 },
+    .{ .name = "opt", .f = extraOpt },
+    .{ .name = "mpt", .f = extraMpt },
+    .{ .name = "starcoder2", .f = extraStarcoder2 },
+    .{ .name = "gpt_bigcode", .f = extraGptBigcode },
+    .{ .name = "baichuan", .f = extraBaichuan },
+    .{ .name = "qwen_vl", .f = extraQwenVl },
+    .{ .name = "qwen_hybrid", .f = extraQwenHybrid },
+    .{ .name = "glm4_moe", .f = extraGlm4Moe },
+    .{ .name = "glm_moe_dsa", .f = extraGlmMoeDsa },
+    .{ .name = "glm4_moe_lite", .f = extraGlm4MoeLite },
+    .{ .name = "glm5_next", .f = extraGlm5Next },
+    .{ .name = "qwen4_exp", .f = extraQwen4Exp },
+    .{ .name = "mamba2", .f = extraMamba2 },
+    .{ .name = "nemotron_h", .f = extraNemotronH },
+    .{ .name = "falcon_h1", .f = extraFalconH1 },
+    .{ .name = "jamba", .f = extraJamba },
+    .{ .name = "granite_hybrid", .f = extraGraniteHybrid },
+    .{ .name = "minimax_m2", .f = extraMiniMaxM2 },
+    .{ .name = "minimax", .f = extraMiniMax },
+    .{ .name = "minimax_m3", .f = extraMiniMaxM3 },
+    .{ .name = "ernie_moe", .f = extraErnieMoe },
+    .{ .name = "hunyuan_moe", .f = extraHunyuanMoe },
+    .{ .name = "kimi_linear", .f = extraKimiLinear },
+    .{ .name = "granite_moe", .f = extraGraniteMoe },
+    .{ .name = "mimo_v2", .f = extraMiMoV2 },
+    .{ .name = "olmoe", .f = extraOlmoe },
+    .{ .name = "dots1", .f = extraDots1 },
+    .{ .name = "exaone_moe", .f = extraExaoneMoe },
+    .{ .name = "solar_open", .f = extraSolarOpen },
+    .{ .name = "axk1", .f = extraAxk1 },
+    .{ .name = "afmoe", .f = extraAfmoe },
+    .{ .name = "mellum", .f = extraMellum },
+    .{ .name = "laguna", .f = extraLaguna },
+    .{ .name = "hy_v3", .f = extraHyV3 },
+    .{ .name = "granite_swa", .f = extraGraniteSwa },
+    .{ .name = "granite_moe_swa", .f = extraGraniteMoeSwa },
+    .{ .name = "deepseek_v32", .f = extraDeepseekV32 },
+    .{ .name = "deepseek_v4", .f = extraDeepseekV4 },
+    .{ .name = "deepseek_v41", .f = extraDeepseekV41 },
+};
+
+/// The hook registered under `name`.
+pub fn hookByName(name: []const u8) ?*const fn (*Config, Allocator, std.json.ObjectMap) anyerror!void {
+    for (hooks) |h| if (std.mem.eql(u8, h.name, name)) return h.f;
+    return null;
+}
+
+/// The name of a hook, for writing a definition back out.
+pub fn hookName(f: *const fn (*Config, Allocator, std.json.ObjectMap) anyerror!void) ?[]const u8 {
+    for (hooks) |h| if (h.f == f) return h.name;
+    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -5952,4 +6067,47 @@ test "parseConfig: Baichuan 2 normalises its LM head, Baichuan 1 does not" {
         \\{"model_type":"baichuan","hidden_size":64,"num_attention_heads":4,"num_hidden_layers":2,"vocab_size":64000,"max_position_embeddings":4096}
     );
     try std.testing.expect(!b1.lm_head_l2norm);
+}
+
+test "the Lua model definitions reproduce the Zig registry" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for (&registry) |*z| {
+        const l = models.lookup(z.model_type) orelse {
+            std.debug.print("no Lua definition for {s}\n", .{z.model_type});
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expectEqualStrings(try models.dumpFamily(arena, z), try models.dumpFamily(arena, l));
+        for (z.aliases) |alias| try std.testing.expect(models.lookup(alias) == l);
+    }
+    try std.testing.expectEqual(registry.len, models.builtins().len);
+
+    // Every fixture's config.json parses to the same configuration either way.
+    const io = std.testing.io;
+    var dir = try std.Io.Dir.cwd().openDir(io, "tests/fixtures", .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    var checked: usize = 0;
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        const path = try std.fmt.allocPrint(arena, "{s}/config.json", .{entry.name});
+        const text = dir.readFileAlloc(io, path, arena, .limited(1 << 20)) catch continue;
+        const zig_dump = try dumpParsed(arena, text, lookupZig);
+        const lua_dump = try dumpParsed(arena, text, lookup);
+        std.testing.expectEqualStrings(zig_dump, lua_dump) catch |err| {
+            std.debug.print("fixture {s}\n", .{entry.name});
+            return err;
+        };
+        checked += 1;
+    }
+    try std.testing.expect(checked > 100);
+}
+
+fn dumpParsed(arena: Allocator, text: []const u8, comptime find: Finder) ![]const u8 {
+    const cfg = parseConfigIn(arena, text, find) catch |err| return @errorName(err);
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try models.dump(Config, &out.writer, cfg, "");
+    return out.written();
 }

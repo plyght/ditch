@@ -289,6 +289,10 @@ pub const Settings = struct {
     http_timeout_seconds: u64 = 30,
     /// `ditch help <topic>`.
     help_topic: ?[]const u8 = null,
+    /// `ditch add-model <model>`: draft a Lua model definition from a checkpoint (docs/models.md).
+    add_model: bool = false,
+    /// Directory of Lua model definitions, read after $XDG_CONFIG_HOME/ditch/models.
+    models_dir: ?[]const u8 = null,
 
     /// The parsed `--device`, or null when it names no known backend.
     pub fn deviceKind(self: *const Settings) ?compute.Kind {
@@ -308,6 +312,7 @@ pub const usage_text =
     \\  ditch bench [OPTIONS] <MODEL>    measure throughput, timings and memory
     \\  ditch probe [OPTIONS] <MODEL> --prompt TEXT   show tokens, first-token logits, greedy reply
     \\  ditch selftest [--device D]      check a compute backend against the CPU reference kernels
+    \\  ditch add-model <MODEL>          draft a Lua model definition for a model_type ditch does not know
     \\  ditch help [bench]               this help (or the benchmark options)
     \\
     \\<MODEL> is a Hugging Face model id (Qwen/Qwen2.5-0.5B-Instruct), a local directory, a .gguf
@@ -507,6 +512,8 @@ pub const help_sections = [_]HelpSection{
     .{ .title = "Configuration", .body =
     \\  --config <path>                Configuration file, .lua or .toml (default: ./config.lua, else
     \\                                 ./config.toml). See config.default.lua for every option.
+    \\  --models-dir <dir>             Also read Lua model definitions from this directory (after
+    \\                                 $XDG_CONFIG_HOME/ditch/models; see docs/models.md).
     \\  Precedence: flags > DITCH_* environment variables (DITCH_THREADS, DITCH_MAX_RAM, DITCH_CACHE,
     \\  DITCH_DEVICE, DITCH_GPU_MEMORY, DITCH_REMOTE_CACHE_SIZE, DITCH_NO_COLOR) > ./config.lua > $XDG_CONFIG_HOME/ditch/config.lua (~/.config/ditch/config.lua).
     \\  Every option accepts --name value or --name=value; flags and subcommands may come in any order.
@@ -690,7 +697,7 @@ fn applyConfigFile(gpa: Allocator, io: std.Io, a: Allocator, settings: *Settings
     return true;
 }
 
-pub const subcommands = [_][]const u8{ "bench", "probe", "selftest", "help" };
+pub const subcommands = [_][]const u8{ "bench", "probe", "selftest", "help", "add-model" };
 
 /// Parses the configuration: the user file ($XDG_CONFIG_HOME/ditch/config.lua),
 /// the project file (./config.lua, ./config.toml or --config), the DITCH_*
@@ -791,6 +798,10 @@ pub fn load(gpa: Allocator, io: std.Io, args: []const []const u8, environ: ?*std
             }
             if (std.mem.eql(u8, arg, "selftest")) {
                 settings.selftest = true;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "add-model")) {
+                settings.add_model = true;
                 continue;
             }
             if (std.mem.eql(u8, arg, "help")) {
@@ -928,6 +939,10 @@ fn applyDatasetOption(a: Allocator, spec: *DatasetSpec, field: []const u8, value
 
 fn applyOption(a: Allocator, s: *Settings, key: []const u8, value: []const u8) !void {
     const eql = std.mem.eql;
+    if (eql(u8, key, "models_dir")) {
+        s.models_dir = try a.dupe(u8, value);
+        return;
+    }
     if (eql(u8, key, "model")) s.model = try a.dupe(u8, value) else if (eql(u8, key, "model_commit")) s.model_commit = try a.dupe(u8, value) else if (eql(u8, key, "evaluate_model")) s.evaluate_model = try a.dupe(u8, value) else if (eql(u8, key, "dump_directions")) s.dump_directions = try a.dupe(u8, value) else if (eql(u8, key, "threads")) s.threads = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "cache_dir")) s.cache_dir = try a.dupe(u8, value) else if (eql(u8, key, "chat_template")) s.chat_template = try a.dupe(u8, value) else if (eql(u8, key, "batch_size")) s.batch_size = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "max_batch_size")) s.max_batch_size = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "max_response_length")) s.max_response_length = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "response_prefix")) s.response_prefix = try a.dupe(u8, value) else if (eql(u8, key, "system_prompt")) s.system_prompt = try a.dupe(u8, value) else if (eql(u8, key, "print_debug_information")) s.print_debug_information = try parseBool(value) else if (eql(u8, key, "print_residual_geometry")) s.print_residual_geometry = try parseBool(value) else if (eql(u8, key, "orthogonalize_direction")) s.orthogonalize_direction = try parseBool(value) else if (eql(u8, key, "row_normalization")) s.row_normalization = abliterate.RowNormalization.parse(value) orelse return error.InvalidEnum else if (eql(u8, key, "full_normalization_lora_rank")) s.full_normalization_lora_rank = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "expert_selection")) s.expert_selection = abliterate.ExpertSelection.parse(value) orelse return error.InvalidEnum else if (eql(u8, key, "winsorization_quantile")) s.winsorization_quantile = try std.fmt.parseFloat(f32, value) else if (eql(u8, key, "n_directions")) {
         s.n_directions = try std.fmt.parseInt(usize, value, 10);
         if (s.n_directions == 0) return error.InvalidValue;

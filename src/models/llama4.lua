@@ -1,0 +1,22 @@
+return {
+  model_type = "llama4",
+  aliases = { "llama4_text" },
+  llama_cpp = "llama4",
+  chat = "llama4",
+  verified = true,
+  notes = "fixture (text): top-1 sigmoid routing scaling the expert input, shared expert, transposed fused experts, no_rope_layers with attention temperature tuning, L2 qk norm, interleaved rope, dense layers with intermediate_size_mlp. Chunked attention runs as full attention.",
+  default_norm_eps = 1e-5,
+  default_rope_theta = 500000.0,
+  rope_style = "gptj",
+  names = {
+    gate = "feed_forward.gate_proj.weight",
+    up = "feed_forward.up_proj.weight",
+    down = "feed_forward.down_proj.weight",
+    router = "feed_forward.router.weight",
+    expert = "feed_forward.experts.{e}.",
+    fused_gate_up = { "feed_forward.experts.gate_up_proj" },
+    fused_down = { "feed_forward.experts.down_proj" },
+    shared_expert = "feed_forward.shared_expert.",
+  },
+  hook = "llama4",
+}

@@ -36,6 +36,7 @@ const directions = @import("directions.zig");
 const remote = @import("remote.zig");
 const logo = @import("logo.zig");
 const wrap = @import("wrap.zig");
+const models = @import("models.zig");
 
 const Model = model_mod.Model;
 const Engine = engine_mod.Engine;
@@ -65,6 +66,8 @@ fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime
 // ---------------------------------------------------------------------------
 
 var interrupted = std.atomic.Value(bool).init(false);
+/// The model argument, for the `ditch add-model` suggestion on an unknown model_type.
+var model_arg: []const u8 = "";
 
 fn onSigint(_: std.posix.SIG) callconv(.c) void {
     if (interrupted.load(.seq_cst)) {
@@ -1288,6 +1291,7 @@ pub fn main(init: std.process.Init) !void {
             error.BudgetTooSmall => std.log.err("memory budget too small (see above)", .{}),
             error.Interrupted => std.log.err("interrupted", .{}),
             error.NoInput, error.DirectoryNotEmpty => {},
+            error.UnknownModelType => std.log.err("add a definition for it: ditch add-model {s} drafts one from the checkpoint (see docs/models.md)", .{if (model_arg.len > 0) model_arg else "<model>"}),
             else => std.log.err("{s}", .{@errorName(err)}),
         }
         std.process.exit(if (err == error.BudgetTooSmall) 2 else 1);
@@ -1304,6 +1308,22 @@ fn estimateFor(model: *const Model, settings: *const config.Settings, threads: u
         .lora_rank = settings.full_normalization_lora_rank,
         .export_dtype = if (settings.export_dtype) |d| App.parseExportDtype(d) else null,
     });
+}
+
+/// Loads `$XDG_CONFIG_HOME/ditch/models/*.lua` (`~/.config/ditch/models`)
+/// and `--models-dir`.
+fn loadUserModels(arena: Allocator, io: Io, settings: *const config.Settings, env: *std.process.Environ.Map, out: *Io.Writer) !void {
+    var dirs: [2]?[]const u8 = .{ null, settings.models_dir };
+    const base: ?[]const u8 = if (env.get("XDG_CONFIG_HOME")) |x| x else if (env.get("HOME")) |h| try std.fs.path.join(arena, &.{ h, ".config" }) else null;
+    if (base) |b| dirs[0] = try std.fs.path.join(arena, &.{ b, "ditch", "models" });
+    for (dirs) |d| if (d) |dir| {
+        const n = try models.loadDir(io, arena, dir, reportModelFile);
+        if (n > 0) try out.print("Loaded {d} model definition{s} from {s}\n", .{ n, if (n == 1) "" else "s", dir });
+    };
+}
+
+fn reportModelFile(path: []const u8, msg: []const u8) void {
+    std.log.warn("model definition {s} skipped: {s}", .{ path, msg });
 }
 
 /// True when the environment variable is present and non-empty.
@@ -1414,6 +1434,15 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         try out.print("\n  v{s}  ditch censorship.  https://github.com/plyght/ditch\n", .{config.version});
         try out.writeAll("  Built on Heretic: https://github.com/p-e-w/heretic\n\n");
     }
+    if (settings.add_model) {
+        std.log.err("ditch add-model is not available in this build yet; write the definition by hand (docs/models.md)", .{});
+        std.process.exit(2);
+    }
+    // Lua model definitions of the user, then of --models-dir; they shadow
+    // built-in definitions of the same model_type.
+    try loadUserModels(arena, io, settings, env, out);
+    model_arg = settings.model;
+
     // Accelerate (macOS): resolved once, before any kernel runs.
     tensor.accelerate_enabled = settings.accelerate;
     if (tensor.have_accelerate and settings.accelerate) {

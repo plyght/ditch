@@ -93,8 +93,8 @@ Useful flags (all also settable in `config.lua`; see `ditch --help`):
 
 ## Supported models
 
-Families are described by an architecture registry (`src/arch.zig`), one entry
-per Hugging Face `model_type`. **93 families** are registered, from GPT-2,
+Families are described by Lua model definitions (`src/models/*.lua`, compiled
+in), one per Hugging Face `model_type`. **93 families** are defined, from GPT-2,
 GPT-NeoX and BLOOM to Llama, Qwen, Gemma, Phi, GLM, Mistral, Granite, Kimi K3
 and DeepSeek V4.1 — dense and mixture-of-experts, Mamba and linear-attention
 hybrids, and quantised checkpoints. Every one has a fixture test against a
@@ -107,6 +107,9 @@ remaining 11 (`baichuan`, `bitnet`, `deepseek_v3`, `granite_swa`, `hy_v3`,
 random-weight stub: their releases are gated, lack a usable tokenizer, are
 refused by design or were never published, except `deepseek_v3`, `minimax` and
 `minimax_m2`, whose releases have only been config-checked so far.
+A family ditch does not know yet can be added without rebuilding, as a Lua
+file in `~/.config/ditch/models/` ([the
+schema](docs/models.md#model-definitions-in-lua)).
 **[docs/models.md](docs/models.md) is the full list**:
 every `model_type`, its aliases, what each fixture covers, which checkpoint
 verifies it on real weights, and every caveat; the numbers are in
