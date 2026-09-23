@@ -2836,3 +2836,34 @@ reference within 3.9e-07 of it and ditch within 4.6e-06, so the excess is
 ditch's, and small: every epsilon (the hyper-connection RMS, the L2 norm of q
 and k, the gated output norm, the latent norms) and the lower-bound gate
 match the reference. Left open, 25x inside the 1e-3 bar.
+
+## Bug F4 — Qwen 3.8's attention gate was a SiLU (fixed)
+
+**Symptom.** `Qwen/Qwen3.8-27B`, first 4 layers (three Gated DeltaNet, one
+gated full attention): the three linear-attention layers agreed with
+transformers, and layer 3's output was off by 1.77 of its own magnitude, the
+first-token argmax different.
+
+**Cause.** Qwen 3.8 is the first `qwen3_5` / `qwen3_5_moe` release whose
+config sets `output_gate_type` (`"swish"`; 3.5 and 3-Next leave it unset).
+ditch's generic parser read the key as the kind of the *attention* output gate
+and ran it as `x * sigmoid(x)`. In Qwen's configs the key names the Gated
+DeltaNet's output gate (SiLU there already, and the one `qwen4_exp` reads,
+correctly, as `linear_gate_sigmoid`); `Qwen3_5Attention` multiplies its output
+by `sigmoid(gate)` unconditionally, and so does every other family with a
+gated query in transformers. The fixture generator's `qwen3_5_moe` spec had
+`gate_swish=True`, so the fixture agreed with the code. Every Qwen 3.8 dense
+and Max (2.4T-A95B) checkpoint was affected.
+
+**Fix.** The attention gate is a sigmoid, always: `Config.gate_swish` and its
+branch are gone, and so is the generator's; the `qwen3_5_moe` fixture is
+regenerated (its reference outputs change, so it fails against the old code).
+
+**Verification.** `Qwen/Qwen3.8-27B`, first 4 layers, float32 (reference:
+transformers through `tools/ref_lazy_moe.py`, bf16 storage with float32
+arithmetic):
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (5) | all 5 agree, worst 7.24e-07 (was 1.77e+00) | 6.26e-07 (was 1.05e+00) | match |
+| "Explain how rainbows form, …" | match (15) | all 5 agree, worst 6.68e-07 (was 1.72e+00) | 7.54e-07 (was 9.65e-01) | match |

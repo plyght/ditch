@@ -4239,14 +4239,10 @@ fn attentionTail(model: *const Model, layer: *const Layer, li: usize, ws: *Works
     };
     model.pool.parallelFor(chunks * per, &actx, attentionWorker);
     if (gate) |g| if (!gate_compact) {
-        const swish = c.gate_swish;
         for (0..n) |r| {
             const a = ws.attn[r * qd ..][0..qd];
             const gg = g[r * qd ..][0..qd];
-            for (a, 0..) |*v, j| {
-                const s = 1.0 / (1.0 + @exp(-gg[j]));
-                v.* *= if (swish) gg[j] * s else s;
-            }
+            for (a, 0..) |*v, j| v.* *= 1.0 / (1.0 + @exp(-gg[j]));
         }
     };
     if (vd != hd) {

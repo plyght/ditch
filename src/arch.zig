@@ -750,10 +750,10 @@ pub const Config = struct {
     /// Mamba block and attention run in parallel on the same input (Falcon-H1).
     parallel_ssm: bool,
     mult: Multipliers,
-    /// Full-attention `q_proj` carries q rows then gate rows; the gate
-    /// (sigmoid, or silu when `gate_swish`) multiplies the attention output.
+    /// Full-attention `q_proj` carries q rows then gate rows; the gate's
+    /// sigmoid multiplies the attention output. (`output_gate_type` never
+    /// names this gate: in the Qwen configs it is the Gated DeltaNet's.)
     gated_attention: bool,
-    gate_swish: bool,
     /// Gated DeltaNet output norm gated by a sigmoid instead of a silu
     /// (Qwen4-Exp `output_gate_type = "sigmoid"`).
     linear_gate_sigmoid: bool,
@@ -1386,13 +1386,6 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
     const linear_v_heads = getInt(obj, "linear_num_value_heads", 0);
     const linear_v_dim = getInt(obj, "linear_value_head_dim", 0);
     const linear_conv_kernel = getInt(obj, "linear_conv_kernel_dim", 0);
-    const gate_swish = blk: {
-        const t = getStr(obj, "output_gate_type") orelse break :blk false;
-        if (std.mem.eql(u8, t, "swish") or std.mem.eql(u8, t, "silu")) break :blk true;
-        if (std.mem.eql(u8, t, "sigmoid")) break :blk false;
-        std.log.err("unsupported output_gate_type '{s}'", .{t});
-        return error.UnsupportedArchitecture;
-    };
 
     const rope_layers = try arena.alloc(bool, layers);
     @memset(rope_layers, arch.positional == .rope);
@@ -1465,7 +1458,6 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
         .parallel_ssm = arch.parallel_ssm,
         .mult = .{},
         .gated_attention = false,
-        .gate_swish = gate_swish,
         .linear_gate_sigmoid = false,
         .position_offset = 0,
         .tie_word_embeddings = getBool(obj, "tie_word_embeddings", arch.tie_word_embeddings),
@@ -2436,7 +2428,6 @@ fn extraQwen4Exp(c: *Config, arena: Allocator, obj: std.json.ObjectMap) !void {
     c.gated_attention = true;
     // The attention gate is always a sigmoid; `output_gate_type` (default
     // `hidden_act`) picks the Gated DeltaNet output gate.
-    c.gate_swish = false;
     const gate = getStr(obj, "output_gate_type") orelse getStr(obj, "hidden_act") orelse "silu";
     if (std.mem.eql(u8, gate, "sigmoid")) {
         c.linear_gate_sigmoid = true;
@@ -5787,7 +5778,7 @@ test "parseConfig picks the Qwen4-Exp, GLM-5.3-Flash and GLM-4.7-Flash knobs" {
     );
     try std.testing.expectEqualStrings("qwen4_exp", q4.arch.model_type);
     try std.testing.expect(q4.linear_layers[0] and q4.linear_layers[2] and !q4.linear_layers[3] and q4.has_linear);
-    try std.testing.expect(q4.gated_attention and !q4.gate_swish and q4.linear_gate_sigmoid);
+    try std.testing.expect(q4.gated_attention and q4.linear_gate_sigmoid);
     try std.testing.expectEqual(NormKind.rms_gemma, q4.norm);
     try std.testing.expectEqual(@as(usize, 3), q4.hc_mult);
     try std.testing.expectEqual(HyperKind.gated, q4.hyper.?.kind);

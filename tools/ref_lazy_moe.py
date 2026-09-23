@@ -301,8 +301,8 @@ def load(model_dir, dtype=torch.float32):
             m.gate_up_proj = LazyStack(expert_loader(prefix, "gate_up"), n)
             m.down_proj = LazyStack(expert_loader(prefix, "down"), n)
             n_swapped += 1
-    if n_swapped == 0:
-        raise SystemExit("reference: no experts module found to make lazy")
+    if n_swapped == 0 and store.lazy["holes"]:
+        raise SystemExit("reference: the cut has lazy tensors but no experts module was made lazy")
     orig_forward = model.forward
 
     def forward(*a, **kw):

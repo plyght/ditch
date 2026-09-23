@@ -425,7 +425,7 @@ def base(**kw):
         qk_norm=None, q_norm="self_attn.q_norm.weight", k_norm="self_attn.k_norm.weight", clip=None,
         residual_mult=1.0, logit_scale=1.0, embed_scale=1.0, lm_bias=False, sinks=None, temp=None, pos_offset=0,
         sliding=None, sliding_layers=None, mla=None, moe=None, linear=None, linear_layers=None, full_interval=0,
-        gated_q=False, gate_swish=False,
+        gated_q=False,
         # Mamba blocks: `ssm` describes the block, `ssm_layers` / `attn_layers` /
         # `mlp_layers` which layers hold which block (None: attention everywhere
         # except Mamba / linear layers, an MLP everywhere). `parallel_ssm` runs
@@ -869,7 +869,7 @@ spec("qwen3_5", tok="qwen2", H=32, I=32, L=2, NH=4, NKV=2, HD=8, rotary_dim=2,
                              "linear_num_key_heads": 2, "linear_key_head_dim": 4, "linear_num_value_heads": 4,
                              "linear_value_head_dim": 4, "linear_conv_kernel_dim": 2},
              "vision_config": {"model_type": "qwen3_5"}})
-spec("qwen3_5_moe", tok="qwen2", prefix="model.language_model.", H=32, I=32, L=4, NH=4, NKV=2, HD=8, rotary_dim=2, qk_norm="head", gated_q=True, gate_swish=True, norm="rms1p",
+spec("qwen3_5_moe", tok="qwen2", prefix="model.language_model.", H=32, I=32, L=4, NH=4, NKV=2, HD=8, rotary_dim=2, qk_norm="head", gated_q=True, norm="rms1p",
      linear={"KH": 2, "KD": 4, "VH": 4, "VD": 4, "KC": 2, "fused": False}, linear_layers=[1, 1, 1, 0],
      moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "shared_inter": 16, "shared_gate": True, "scoring": "softmax", "group_limited": False, "rsf": 1.0, "norm": True,
           "layers": [0, 1, 2, 3], "corr_bias": False, "layout": "fused", "prefix": "mlp.", "router": "gate.weight", "shared_name": "shared_expert."},
@@ -2225,9 +2225,9 @@ def generate_generic(family, out_dir):
         if d["ob"] is not None:
             o = o + d["ob"]
         if s["gated_q"] and not s["mla"] and not s["qkv"]:
+            # Always a sigmoid (Qwen3_5Attention); `output_gate_type` names
+            # the Gated DeltaNet's gate, not this one.
             gs = 1 / (1 + np.exp(-gate))
-            if s["gate_swish"]:
-                gs = gate * gs
             o = (out.reshape(T, NH * VD) * gs) @ d["o"].T
             if d["ob"] is not None:
                 o = o + d["ob"]
