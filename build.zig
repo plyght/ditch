@@ -106,8 +106,8 @@ pub fn build(b: *std.Build) void {
 /// so the binary carries the exact copies in the repository.
 fn addHarness(b: *std.Build, mod: *std.Build.Module) void {
     const files = [_][]const u8{
-        "verify_reference.py", "probe_reference.py", "ref_stream.py",       "ref_lazy_moe.py",  "lazy_checkpoint.py",
-        "ref_deepseek_v4.py",  "ref_deepseek_v41.py", "ref_kimi_k3.py",     "ref_mimo_v2.py",   "check_abliteration.py",
+        "verify_reference.py", "probe_reference.py",  "ref_stream.py",  "ref_lazy_moe.py", "lazy_checkpoint.py",
+        "ref_deepseek_v4.py",  "ref_deepseek_v41.py", "ref_kimi_k3.py", "ref_mimo_v2.py",  "check_abliteration.py",
     };
     for (files) |f| mod.addAnonymousImport(b.fmt("harness/{s}", .{f}), .{ .root_source_file = b.path(b.fmt("tools/{s}", .{f})) });
 }

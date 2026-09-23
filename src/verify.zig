@@ -459,19 +459,19 @@ const Verify = struct {
         const dirs = try self.path("abliterated.dirs.safetensors");
         var argv = std.ArrayList([]const u8).empty;
         try argv.appendSlice(self.arena, &.{
-            self.exe,                         self.target,
-            "--n-trials",                     "2",
-            "--n-startup-trials",             "1",
-            "--expert-selection",             "broad",
-            "--max-response-length",          "8",
-            "--good-prompts-dataset",         good,
-            "--bad-prompts-dataset",          bad,
-            "--keyword-rate-prompts-dataset", bad,
+            self.exe,                          self.target,
+            "--n-trials",                      "2",
+            "--n-startup-trials",              "1",
+            "--expert-selection",              "broad",
+            "--max-response-length",           "8",
+            "--good-prompts-dataset",          good,
+            "--bad-prompts-dataset",           bad,
+            "--keyword-rate-prompts-dataset",  bad,
             "--kl-divergence-prompts-dataset", good,
-            "--dump-directions",              dirs,
-            "--trial-index",                  "1",
-            "--model-action",                 "save",
-            "--no-input",                     "-o",
+            "--dump-directions",               dirs,
+            "--trial-index",                   "1",
+            "--model-action",                  "save",
+            "--no-input",                      "-o",
             exported,
         });
         if (self.o.max_ram) |m| try argv.appendSlice(self.arena, &.{ "--max-ram", m });
@@ -715,9 +715,8 @@ pub fn editCheck(arena: Allocator, text: []const u8) !Check {
         .name = name,
         .status = if (pass) .pass else .fail,
         .detail = try std.fmt.allocPrint(arena, "{d} tensors edited; {d:.0} matrices recomputed, worst excess over the rank-3 optimum {e:.2}{s}{s}", .{
-            changed,                                                             matrices, worst,
-            if (unchecked > 0) try std.fmt.allocPrint(arena, "; {d} not checkable", .{unchecked}) else "",
-            if (far > 0) try std.fmt.allocPrint(arena, "; {d:.0} bf16 elements more than a step off", .{far}) else "",
+            changed,                                                                                       matrices,                                                                                                  worst,
+            if (unchecked > 0) try std.fmt.allocPrint(arena, "; {d} not checkable", .{unchecked}) else "", if (far > 0) try std.fmt.allocPrint(arena, "; {d:.0} bf16 elements more than a step off", .{far}) else "",
         }),
         .numbers = try arena.dupe(Number, &.{ .{ .key = "changed", .value = @floatFromInt(changed) }, .{ .key = "worst_excess", .value = worst }, .{ .key = "bits_far", .value = far } }),
     };

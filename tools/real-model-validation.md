@@ -4281,11 +4281,14 @@ Text: `<|channel|>analysis<|message|>The` (first-token logits 36.72
 `<|channel|>`, 16.79 `<|constrain|>`). The prefill routes 87 tokens to
 2401 of the 4608 experts; the expert cache (122 decoded experts, fewer than
 one layer's 128) gets no hits, so every routed expert is decoded from the
-chunk cache once per use, and the working set is fetched exactly once. A
-decode step fetches its 144 experts layer by layer: the 4 experts of a layer
-are known only when its router has run, so each layer waits for a round of
-8 MB range requests (~2-3 s at the per-stream rate here) and the link idles
-between layers. That, not the bandwidth, is the ~263 s a token.
+chunk cache once per use, and no chunk is fetched twice. A decode step is
+still bandwidth-bound, by read amplification: an expert is four pieces in
+four stacked tensors (gate_up blocks 8.29 MB, their scales 0.52 MB, down
+blocks 4.15 MB, their scales 0.26 MB), and each piece is fetched as whole
+8 MB chunks, ~5.5 chunks (~44 MB) for 13.2 MB used. 144 cold experts a step
+are ~6.3 GB, ~263 s at the ~24 MB/s measured; the prefill, which uses most
+of every chunk it fetches, does not pay it. Smaller chunks would cut it and
+multiply the requests the Hub rate-limits (F13).
 
 ## Bug F14 — a failed read at load was taken for a missing tensor (fixed)
 
