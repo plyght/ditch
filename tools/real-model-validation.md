@@ -2747,3 +2747,30 @@ real weights in every tensor.
 | --- | :---: | :---: | ---: | :---: |
 | "The capital of France is" | match (26) | all 5 agree, worst 5.19e-07 | 7.34e-07 | match |
 | "Explain how rainbows form, …" | match (32) | all 5 agree, worst 3.84e-07 | 6.78e-07 | match |
+## GLM-5.3: verified on real weights
+
+`zai-org/GLM-5.3`, first 4 layers (three dense, one MoE; MLA with the DSA
+indexer, which ditch runs as its dense equivalent inside `index_topk`), FP8
+throughout (128 x 128 blocks), routed experts lazy. `rms_norm_eps` is 1e-5, so
+this is also the first release run after bug F3. The reference is transformers'
+`modeling_glm_moe_dsa.py` through `tools/ref_lazy_moe.py`, trunk in bf16 with
+float32 arithmetic and F32-stored tensors restored exactly.
+
+Two reference-side corrections on the way, recorded because a reference that
+is wrong looks exactly like a ditch bug:
+
+* transformers' `FineGrainedFP8Config(dequantize=True)` on the CPU loaded the
+  FP8 codes as bf16 *without their scales* (every weight up to 448); the
+  reference now dequantises FP8 itself.
+* The reference's first FP8 dequantiser took the block height as
+  `ceil(rows / scale_rows)`: 116 for `kv_a_proj_with_mqa`'s 576 rows in 5
+  scale rows, where the convention (and ditch) is `weight_block_size` 128 with
+  a partial last block. Dumping ditch's `kv_a` output against a float64
+  recomputation pinned it: rows 116-127, 232-255, 348-383 and 464-511 — the
+  tails of each 128-row block — were the reference's, scaled by the next
+  block's scale.
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (5) | all 5 agree, worst 2.66e-07 | 4.10e-07 | match |
+| "Explain how rainbows form, …" | match (15) | all 5 agree, worst 4.16e-07 | 4.94e-07 | match |

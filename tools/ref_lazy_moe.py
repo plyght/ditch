@@ -33,6 +33,9 @@ from transformers import AutoConfig, AutoModelForCausalLM
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lazy_checkpoint import LazyCheckpoint  # noqa: E402
 
+# FP8 block size (`weight_block_size`), set from the checkpoint's config by load().
+FP8_BLOCK = None
+
 E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
 PROJ = {"gate": ("w1", "gate_proj"), "up": ("w3", "up_proj"), "down": ("w2", "down_proj")}
 
@@ -42,10 +45,13 @@ def dequant_expert(store, module, cfg_q):
     k = store.keys()
     if module + ".weight" in k:
         w = store.tensor(module + ".weight")
-        if module + ".weight_scale_inv" in k:  # FP8 blocks
+        if module + ".weight_scale_inv" in k:  # FP8 blocks, dequantised to bf16 as the integrations do
             s = store.tensor(module + ".weight_scale_inv").float()
-            br, bc = -(-w.shape[0] // s.shape[0]), -(-w.shape[1] // s.shape[1])
-            return w.float() * s.repeat_interleave(br, 0)[: w.shape[0]].repeat_interleave(bc, 1)[:, : w.shape[1]]
+            # The configured block, the last one partial (GLM-5.3's kv_a_proj
+            # is 576 rows in 5 blocks of 128); only without one is it derived.
+            br, bc = FP8_BLOCK or (-(-w.shape[0] // s.shape[0]), -(-w.shape[1] // s.shape[1]))
+            deq = w.float() * s.repeat_interleave(br, 0)[: w.shape[0]].repeat_interleave(bc, 1)[:, : w.shape[1]]
+            return deq.to(torch.bfloat16).float()
         return w.float()
     packed = store.tensor(module + ".weight_packed")
     scale = store.tensor(module + ".weight_scale")
@@ -64,6 +70,77 @@ def dequant_expert(store, module, cfg_q):
         zp = zp.repeat_interleave(group, 1)
     # compressed-tensors' own arithmetic: in the scale's dtype (bf16 here).
     return _dequantize(q, scale.repeat_interleave(group, 1), zp).float()
+
+
+def dequant_fp8_trunk(model, store):
+    """Every Linear whose checkpoint weight is FP8 with a block `weight_scale_inv`
+    gets the dequantised weight, rounded to bf16 (what ditch and the Hugging
+    Face integrations produce), in place of the raw codes the load copied."""
+    keys = set(store.keys())
+    n = 0
+    with torch.no_grad():
+        for name, m in model.named_modules():
+            if not isinstance(m, torch.nn.Linear) or m.weight.device.type == "meta":
+                continue
+            for cand in (name, name.split(".", 1)[-1], "model." + name, name.replace("model.language_model.", "language_model.model.")):
+                if cand + ".weight_scale_inv" in keys and cand not in store.lazy["holes"]:
+                    m.weight.data = dequant_expert(store, cand, {}).to(torch.bfloat16)
+                    n += 1
+                    break
+    return n
+
+
+def f32_arithmetic(model, store):
+    """Float32 arithmetic on the stored values: Linear and Embedding cast their
+    (bf16) weights to float32 as they compute, in blocks of output rows;
+    every other parameter and buffer becomes float32. Tensors the checkpoint
+    stores as F32 (routers' correction biases, ...) are restored exactly: the
+    bf16 load rounded them."""
+    import types
+    import torch.nn.functional as F
+    f32_names = {}
+    for k in store.keys():
+        if store.header[k]["dtype"] == "F32" and k not in store.lazy["holes"]:
+            for cand in (k, k.split(".", 1)[1] if "." in k else k):
+                f32_names[cand] = k
+    sd_names = dict(model.named_parameters())
+    sd_names.update(dict(model.named_buffers()))
+    with torch.no_grad():
+        for name, t in sd_names.items():
+            key = f32_names.get(name) or next((f32_names[n] for n in (name.split(".", 1)[-1], "model." + name) if n in f32_names), None)
+            if key is not None and tuple(store.header[key]["shape"]) == tuple(t.shape):
+                t.data = store.tensor(key).float()
+
+    def linear(self, x):
+        x = x.float()
+        w = self.weight
+        step = max(1, (64 << 20) // (w.shape[1] * 4))
+        out = torch.cat([F.linear(x, w[i:i + step].float()) for i in range(0, w.shape[0], step)], dim=-1)
+        return out if self.bias is None else out + self.bias.float()
+
+    keep = set()
+    for m in model.modules():
+        if isinstance(m, torch.nn.Linear) and m.weight.device.type != "meta":
+            keep.add(id(m.weight))
+            m.forward = types.MethodType(linear, m)
+        elif isinstance(m, torch.nn.Embedding):
+            keep.add(id(m.weight))
+            m.forward = types.MethodType(lambda self, ids: F.embedding(ids, self.weight).float(), m)
+    with torch.no_grad():
+        for m in model.modules():
+            # A rotary table rounded by the bf16 load is rebuilt from its own init function.
+            inv = getattr(m, "inv_freq", None)
+            if torch.is_tensor(inv) and inv.dtype != torch.float32:
+                fn = getattr(m, "rope_init_fn", None) or getattr(m, "compute_default_rope_parameters", None)
+                if fn is None:
+                    raise SystemExit(f"reference: cannot rebuild the bf16 inv_freq of {type(m).__name__}")
+                new, _ = fn(m.config, "cpu") if getattr(m, "rope_type", None) is None else fn(m.config, "cpu")
+                m.inv_freq = new.float()
+                if hasattr(m, "original_inv_freq"):
+                    m.original_inv_freq = new.float()
+        for t in list(model.parameters()) + list(model.buffers()):
+            if id(t) not in keep and t.is_floating_point() and t.device.type != "meta" and t.dtype != torch.float32:
+                t.data = t.data.float()
 
 
 class LazyStack:
@@ -85,6 +162,8 @@ def load(model_dir, dtype=torch.float32):
     qcfg = cfg.get("quantization_config") or (cfg.get("text_config") or {}).get("quantization_config") or {}
     groups = qcfg.get("config_groups") or {}
     wq = next(iter(groups.values()), {}).get("weights", {}) if groups else {}
+    global FP8_BLOCK
+    FP8_BLOCK = tuple(qcfg["weight_block_size"]) if qcfg.get("weight_block_size") else None
     lazy_names = [k for k in store.keys() if k in store.lazy["holes"]]
     pat = re.compile(r"^(.*layers\.(\d+)\..*experts)\.(\d+)\.(w1|w2|w3|gate_proj|up_proj|down_proj)\.")
     prefixes = {}
@@ -95,7 +174,7 @@ def load(model_dir, dtype=torch.float32):
 
     # A view of the directory without the lazy file: transformers loads the trunk.
     view = tempfile.mkdtemp(prefix="ref_trunk_")
-    trunk_quantised = any(k not in store.lazy["holes"] and re.search(r"weight_(packed|scale_inv|scale)$|_blocks$", k) for k in store.keys())
+    trunk_quantised = any(k not in store.lazy["holes"] and re.search(r"weight_(packed|scale)$|_blocks$", k) for k in store.keys())
     for fn in os.listdir(model_dir):
         if fn in ("model-lazy.safetensors", "lazy.json", "model.safetensors.index.json") or fn.startswith("."):
             continue
@@ -155,13 +234,20 @@ def load(model_dir, dtype=torch.float32):
             if isinstance(c, type) and issubclass(c, torch.nn.Module) and (n.endswith("VisionModel") or n.endswith("MultimodalProjection") or n.endswith("MultiModalProjector")):
                 patched[n] = (mod, c, NoVision)
                 setattr(mod, n, NoVision)
+    # The trunk is held in its stored dtype (bf16; FP8 dequantised to bf16 as
+    # transformers' FP8 integration does) and computed in float32 (below):
+    # float32 arithmetic on the same values, without a float32 copy of a
+    # 6144-wide model.
+    # (FP8 weights are dequantised here after the load: transformers' CPU
+    # `dequantize=True` path left GLM-5.3's codes unscaled.)
+    kw = dict(dtype=torch.bfloat16, experts_implementation="eager", trust_remote_code=False)
     try:
         try:
-            model = AutoModelForCausalLM.from_pretrained(view, dtype=dtype, experts_implementation="eager", trust_remote_code=False)
+            model = AutoModelForCausalLM.from_pretrained(view, **kw)
         except ValueError:
             # Not registered with AutoModelForCausalLM (image-text wrappers): the class the config names.
             from transformers import AutoModelForImageTextToText
-            model = AutoModelForImageTextToText.from_pretrained(view, dtype=dtype, experts_implementation="eager", trust_remote_code=False)
+            model = AutoModelForImageTextToText.from_pretrained(view, **kw)
     finally:
         for name, (mod, cls, _) in patched.items():
             setattr(mod, name, cls)
@@ -185,6 +271,8 @@ def load(model_dir, dtype=torch.float32):
             return dequant_expert(store, module_of(base, "down"), wq).to(dtype)
         return load_e
 
+    dequant_fp8_trunk(model, store)
+    f32_arithmetic(model, store)
     n_swapped = 0
     for name, m in model.named_modules():
         if type(m).__name__ in patched and "gate_up_proj" in m._parameters and hasattr(m, "lazy_n"):
