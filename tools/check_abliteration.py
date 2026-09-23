@@ -144,7 +144,7 @@ worst = 0
 for label, comp, li, lam, err, opt in checks:
     if err is None: print(f'  ?? {label}: no kernel weight / not [hidden, *] (comp {comp}, layer {li})'); continue
     worst = max(worst, err - opt)
-    if len(checks) <= 40 or err - opt > 1e-3: print(f'  {label}: {comp} layer {li} λ={lam:.4f}  |D-Dexact|/|Dexact| = {err:.2e}  (best rank-3{", rounded" if EXP_BF16 else ""}: {opt:.2e})')
+    if len(checks) <= 40 or err - opt > 1e-3: print(f'  {label}: {comp} layer {li} λ={lam:.4f}  |D-Dexact|/|Dexact| = {err:.2e}  (best rank-3{", rounded" if EXP_BF16 else ""}: {opt:.2e}, excess {err - opt:.1e})')
 for b in bits: print('   bits', b[0], 'equal %.6f' % b[1], 'far', b[2][0], 'max %.2e' % b[2][1])
 if EXP_BF16:
     print(f'bf16 export: worst share of elements equal to bf16(W + D3): {min(b[1] for b in bits) if bits else 1:.6f}; elements more than one bf16 step (and 1e-5 of mean |W|) apart: {sum(b[2][0] for b in bits) if bits else 0}; largest difference {max(b[2][1] for b in bits) if bits else 0:.1e} of mean |W|; over {len(bits)} matrices; (E-W) against the exact edit: worst excess over the error of bf16(W + D3) itself {worst:.2e}; scope {scope}')

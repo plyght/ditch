@@ -4913,6 +4913,30 @@ with 128 x 128 blocks; float32 export (its config now says float32, bug 72).
   check used, builds the routed experts empty for a lazy file and now also
   keeps a sharded directory's index when there is no lazy file.
 
+## Abliteration: Qwen3.8-Flash-Next (`qwen4_exp`), hyper-connections and stacked experts
+
+`Qwen/Qwen3.8-Flash-Next`, layers 0 and 3 (Gated DeltaNet, then full
+attention with the QSA indexer), the first 8 of 512 experts
+(`--experts 8`), 4 hyper-connection streams; float32 export. Layer 1, whose
+n-gram embedding (PLE) is 102 GB, is left out: `ple_layer_ids` is 1-based,
+and `tools/truncate_checkpoint.py` now remaps it with the kept layers (it had
+kept `[2]`, which in a two-layer cut names the full-attention layer, whose
+n-gram tensors are not there).
+
+* **Edited set:** `linear_attn.out_proj` in layer 0, `self_attn.o_proj` in
+  layer 1, the stacked `mlp.experts.down_proj` (all 8 slabs) and
+  `shared_expert.down_proj` in both. `gate_up_proj`, the router, the shared
+  expert's gate, the DeltaNet and indexer projections and every
+  hyper-connection tensor are untouched.
+* **Maths:** 20 matrices (the stacked experts slab by slab) within 1.0e-06 of
+  the best rank-3 approximation of the exact edit, except layer 0's expert 0 at
+  1.1e-05 (5.680e-02 against 5.679e-02): the randomised SVD's shortfall on
+  that slab, not λ or the direction, which the other 19 would share. The
+  checker now prints each matrix's excess.
+* **Export:** transformers' `qwen4_exp` (`tools/ref_plain.py`) on the export
+  against `ditch probe`: residuals within 2.3e-06, logits 1.4e-06 of range,
+  argmax and top-5 equal. ditch's reload check 0.0000.
+
 ## Exact ranges for scattered experts: gpt-oss-20b with a cache below its experts
 
 After the account of gpt-oss-120b's decode above (whole 8 MB chunks per
