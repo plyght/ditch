@@ -4819,6 +4819,29 @@ latent MoE, MLA with the latent MoE), the first 8 of 896 experts
   file, and `probe_reference.py` no longer assumes a factory's model has a
   `config`. This cut keeps the released `attn_res_block_size` of 12.
 
+## Abliteration: GLM-5.3 (`glm_moe_dsa`), FP8 blocks, MLA with the DSA indexer
+
+`zai-org/GLM-5.3`, layers 0 and 3 (dense, then the first MoE layer), the first
+8 of 256 experts (`--experts 8`), FP8 with 128 x 128 block scales throughout;
+float32 export.
+
+* **Edited set:** `self_attn.o_proj` in both layers, layer 0's dense
+  `mlp.down_proj`, every routed expert's `down_proj` and
+  `shared_experts.down_proj`. The MLA projections (`q_a/q_b/kv_a/kv_b`), the
+  DSA indexer (`indexer.*`), `gate_proj`/`up_proj`, the router and its
+  correction bias are untouched.
+* **Maths:** the checker dequantises the FP8 originals itself (128 x 128
+  blocks, partial last block); all 12 edited matrices within 1.35e-06 of the
+  best rank-3 approximation of the exact edit. The first trial drew
+  `mlp.down_proj.max_weight` = -0.0965, which the search clamps to 0 (its range
+  starts at -0.25, so a trial can leave the MLPs alone), and edited only the two
+  `o_proj`s (2.4e-08); the recorded trial is the next seed's, which edits the
+  MLPs with λ ≈ 0.05.
+* **Export:** float32, `quantization_config` dropped.
+  transformers' `modeling_glm_moe_dsa.py` loads it as it is; against `ditch
+  probe` on the export: residuals within 7.9e-07, logits 7.0e-07 of range,
+  argmax and top-5 equal. ditch's reload check 0.0000.
+
 ## Exact ranges for scattered experts: gpt-oss-20b with a cache below its experts
 
 After the account of gpt-oss-120b's decode above (whole 8 MB chunks per
