@@ -283,6 +283,12 @@ test "gemma4 fixture" {
 test "gemma3n fixture" {
     try checkFixture("gemma3n");
 }
+// q_a_layernorm / kv_a_layernorm use the RMSNorm default 1e-6, not
+// rms_norm_eps (1e-5 here), as in DeepSeek's code and transformers; the
+// latent projections are scaled down so the difference is plain.
+test "deepseek_v3 fixture with rms_norm_eps 1e-5 and small latents (latent norms at 1e-6)" {
+    try checkFixture("deepseek_v3_latent_eps");
+}
 test "deepseek_v4 fixture" {
     try checkFixture("deepseek_v4");
 }

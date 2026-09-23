@@ -14,6 +14,7 @@ from the file as they are.
 import json
 import os
 import struct
+import time
 
 import numpy as np
 import requests
@@ -65,13 +66,14 @@ class LazyCheckpoint:
         if key in done or [0, h["bytes"]] in done:
             return
         a = h["src"] + start
-        for _ in range(5):
+        for attempt in range(8):
             try:
                 data = self.session.get(h["url"], headers={"Range": f"bytes={a}-{a + length - 1}"}, timeout=300).content
                 if len(data) == length:
                     break
             except requests.RequestException:
                 pass
+            time.sleep(2 ** attempt)
         else:
             raise RuntimeError(f"could not fetch {name} [{start}, {start + length})")
         fd = self.where[name][0]

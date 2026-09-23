@@ -2293,7 +2293,10 @@ input, with the reference's own `attn_hc` output. ditch runs streamed
 Machine as before: 4 cores, 15 GiB RAM, ~28 GiB of free disk, torch
 2.14.0+cpu, transformers 5.17.0.
 
-## Bug 37 — no released DeepSeek V4 could be loaded (fixed)
+This pass runs alongside the continuation of the third pass, so its bugs are
+numbered F1, F2, … to keep the two sequences apart.
+
+## Bug F1 — no released DeepSeek V4 could be loaded (fixed)
 
 **Symptom.** Recorded in the second pass as a gap: `deepseek-ai/DeepSeek-V4-Flash`
 stopped with `'fp4' expert dtype cannot be dequantised`, and V4.1-Flash with
@@ -2355,7 +2358,7 @@ slides; at 317 the CSA layer attends 79 pooled entries (inside `index_topk`
 The whole checkpoint also loads over `hf://` (69187 tensors renamed; 33792
 FP4 and 375 FP8 matrices registered, nothing skipped).
 
-## Bug 38 — V4.1's engram hashed Indic tokens into the wrong buckets (fixed)
+## Bug F2 — V4.1's engram hashed Indic tokens into the wrong buckets (fixed)
 
 **Symptom.** The first V4.1 checkpoint to reach the engram code,
 `deepseek-ai/DeepSeek-V4.1-Flash`, stopped at load:
@@ -2521,3 +2524,52 @@ biases and an o_proj without one).
 | --- | :---: | :---: | ---: | :---: |
 | "The capital of France is" | match (23) | all 3 agree, worst 1.48e-06 | 1.50e-06 | match |
 | "Explain how rainbows form, …" | match (29) | all 3 agree, worst 1.37e-06 | 1.58e-06 | match |
+## Bug F3 — MLA's latent norms took `rms_norm_eps` (fixed)
+
+**Symptom.** `moonshotai/Kimi-K2.5`, first 2 layers (the dense layer and the
+first INT4 MoE layer): argmax, top-5 and greedy text matched transformers, but
+every residual was off by 5e-05 to 9e-05 of its magnitude from the *first*
+layer on, fifty times the usual float32 agreement. A float32 transformers
+reference agrees with a float64 one to 4e-08 on the same layer, so this was
+ditch's.
+
+**Bisection.** Zeroing layer 0's dense `down_proj` on both sides left the
+error in place (attention); a one-token prompt, where RoPE is the identity and
+attention returns the single value, still showed 8.9e-05 (not RoPE, not the
+softmax: the value path). Recomputing that path by hand in float64 from the
+checkpoint reproduced ditch to 1.1e-07 with ε = 1e-5 everywhere, and
+reproduced the reference exactly with ε = 1e-6 on `kv_a_layernorm`.
+
+**Cause.** DeepSeek's own `modeling_deepseek.py` (which Kimi ships), and
+transformers after it, build `q_a_layernorm` and `kv_a_layernorm` as
+`RMSNorm(q_lora_rank)` / `RMSNorm(kv_lora_rank)`: the class default 1e-6,
+*not* `rms_norm_eps`. ditch used `rms_norm_eps` for both. DeepSeek V3 itself
+sets `rms_norm_eps: 1e-6`, so it never showed; Kimi K2 / K2.5, Kimi-Linear,
+Kimi K3, GLM-4.7-Flash, GLM-5.3 and altar-1 set 1e-5. Every MLA family in
+transformers follows the default except GLM-5.3-Flash (`glm5_next`), which
+passes `rms_norm_eps`. `tools/make_fixture.py` used `eps` too, and its
+random-weight latents are large enough that the two epsilons differ by less
+than the fixture tolerance, so no fixture could see it.
+
+**Fix.** `Mla.latent_norm_eps`, 1e-6, set to `rms_norm_eps` by `glm5_next`,
+used by `mlaProject`. The generator uses 1e-6 for the latent norms; the five
+MLA fixtures with `rms_norm_eps` ≠ 1e-6 are regenerated (`glm4_moe_lite`,
+`kimi_linear`, `kimi_linear_hf`, `kimi_k3`, `kimi_k3_mxfp4`; every other
+fixture regenerates byte-identically). New fixture `deepseek_v3_latent_eps`:
+`rms_norm_eps` 1e-5 with the latent projections scaled so the latents' mean
+square is ~1e-6; it fails with the old code and passes with the new. A config
+test pins 1e-6 for a DeepSeek V3 config that says 1e-5.
+
+**A second, reference-side correction.** After the fix the MoE layer still
+differed by 2e-05. The reference dequantised the INT4 experts in float32, but
+compressed-tensors' `_dequantize` computes `x_q.to(scale.dtype) * scale` in
+the scale's dtype, bf16 here — which is what ditch reproduces. With
+`tools/ref_lazy_moe.py` calling compressed-tensors' own `_dequantize`:
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (5) | all 3 agree, worst 3.53e-07 (was 4.90e-05) | 5.95e-07 (was 1.78e-04) | match |
+| "Explain how rainbows form, …" | match (14) | all 3 agree, worst 2.32e-07 (was 9.10e-05) | 6.36e-07 (was 2.28e-04) | match |
+
+The Kimi-Linear numbers above were measured before this fix: its MLA layer's
+latents are large enough that ε moved nothing past 2.6e-06.

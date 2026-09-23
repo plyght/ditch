@@ -52,16 +52,18 @@ def dequant_expert(store, module, cfg_q):
     if packed.dtype == torch.uint8:  # mxfp4-pack-quantized: e2m1 nibble pairs, E8M0 scales
         q = torch.stack([E2M1[(packed & 0xF).long()], E2M1[(packed >> 4).long()]], -1).reshape(packed.shape[0], -1)
         return q * torch.exp2(scale.float() - 127).repeat_interleave(32, 1)
-    from compressed_tensors.compressors.quantized_compressors.pack_quantized import unpack_from_int32
+    from compressed_tensors.compressors.pack_quantized.helpers import unpack_from_int32
     shape = store.tensor(module + ".weight_shape").tolist()
     bits = cfg_q["num_bits"]
-    q = unpack_from_int32(packed, bits, torch.Size(shape)).float()
+    from compressed_tensors.quantization.lifecycle.forward_helpers import _dequantize
+    q = unpack_from_int32(packed, bits, torch.Size(shape))
     group = shape[1] // scale.shape[1]
-    s = scale.float().repeat_interleave(group, 1)
+    zp = None
     if module + ".weight_zero_point" in k:
         zp = unpack_from_int32(store.tensor(module + ".weight_zero_point"), bits, torch.Size([shape[0], scale.shape[1]]), packed_dim=0)
-        q = q - zp.float().repeat_interleave(group, 1)
-    return q * s
+        zp = zp.repeat_interleave(group, 1)
+    # compressed-tensors' own arithmetic: in the scale's dtype (bf16 here).
+    return _dequantize(q, scale.repeat_interleave(group, 1), zp).float()
 
 
 class LazyStack:
@@ -80,7 +82,7 @@ class LazyStack:
 def load(model_dir, dtype=torch.float32):
     store = LazyCheckpoint(model_dir)
     cfg = json.load(open(os.path.join(model_dir, "config.json")))
-    qcfg = (cfg.get("quantization_config") or {})
+    qcfg = cfg.get("quantization_config") or (cfg.get("text_config") or {}).get("quantization_config") or {}
     groups = qcfg.get("config_groups") or {}
     wq = next(iter(groups.values()), {}).get("weights", {}) if groups else {}
     lazy_names = [k for k in store.keys() if k in store.lazy["holes"]]
@@ -93,17 +95,38 @@ def load(model_dir, dtype=torch.float32):
 
     # A view of the directory without the lazy file: transformers loads the trunk.
     view = tempfile.mkdtemp(prefix="ref_trunk_")
+    trunk_quantised = any(k not in store.lazy["holes"] and re.search(r"weight_(packed|scale_inv|scale)$|_blocks$", k) for k in store.keys())
     for fn in os.listdir(model_dir):
         if fn in ("model-lazy.safetensors", "lazy.json", "model.safetensors.index.json") or fn.startswith("."):
+            continue
+        if fn == "config.json" and not trunk_quantised:
+            # Only the (lazy, dequantised here) routed experts are quantised:
+            # keep transformers' quantizer out of the trunk.
+            c = dict(cfg)
+            c.pop("quantization_config", None)
+            if isinstance(c.get("text_config"), dict):
+                c["text_config"] = {k: v for k, v in c["text_config"].items() if k != "quantization_config"}
+            json.dump(c, open(os.path.join(view, fn), "w"))
             continue
         os.symlink(os.path.abspath(os.path.join(model_dir, fn)), os.path.join(view, fn))
 
     config = AutoConfig.from_pretrained(view, trust_remote_code=False)
-    mt = config.model_type if hasattr(config, "num_hidden_layers") else config.text_config.model_type
-    mod = importlib.import_module(f"transformers.models.{mt}.modeling_{mt}")
-    experts_cls = [getattr(mod, n) for n in dir(mod) if n.endswith("Experts") and isinstance(getattr(mod, n), type)]
+    # The experts class lives in the text model's module, which for a wrapper
+    # (Kimi K2.5 around DeepSeek V3) is not the wrapper's own.
+    # (Kimi K2.5's text_config keeps model_type kimi_k2 but is a DeepseekV3Config),
+    # so the modules come from the config classes.
+    cfgs = [config] + ([config.text_config] if getattr(config, "text_config", None) is not None else [])
+    mods = []
+    for c in cfgs:
+        name = type(c).__module__.replace(".configuration_", ".modeling_")
+        try:
+            mods.append(importlib.import_module(name))
+        except ImportError:
+            pass
+    experts_cls = [(mod, getattr(mod, n)) for mod in mods for n in dir(mod)
+                   if n.endswith("Experts") and isinstance(getattr(mod, n), type)]
     patched = {}
-    for cls in experts_cls:
+    for mod, cls in experts_cls:
         class Meta(cls):
             def __init__(self, *a, **kw):
                 with torch.device("meta"):
@@ -113,12 +136,34 @@ def load(model_dir, dtype=torch.float32):
                 self.gate_up_proj = torch.nn.Parameter(torch.empty(0), requires_grad=False)
                 self.down_proj = torch.nn.Parameter(torch.empty(0), requires_grad=False)
         Meta.__name__ = cls.__name__
-        patched[cls.__name__] = (cls, Meta)
+        patched[cls.__name__] = (mod, cls, Meta)
         setattr(mod, cls.__name__, Meta)
+    # Text-only probes: an image-text wrapper's vision tower and projector are
+    # built empty (their tensors load as unexpected and are dropped), which
+    # keeps a float32 reference of a large model inside the RAM.
+    class NoVision(torch.nn.Module):
+        def __init__(self, *a, **kw):
+            super().__init__()
+
+        @classmethod
+        def _from_config(cls, *a, **kw):
+            return cls()
+
+    for mod in mods:
+        for n in dir(mod):
+            c = getattr(mod, n)
+            if isinstance(c, type) and issubclass(c, torch.nn.Module) and (n.endswith("VisionModel") or n.endswith("MultimodalProjection") or n.endswith("MultiModalProjector")):
+                patched[n] = (mod, c, NoVision)
+                setattr(mod, n, NoVision)
     try:
-        model = AutoModelForCausalLM.from_pretrained(view, dtype=dtype, experts_implementation="eager")
+        try:
+            model = AutoModelForCausalLM.from_pretrained(view, dtype=dtype, experts_implementation="eager", trust_remote_code=False)
+        except ValueError:
+            # Not registered with AutoModelForCausalLM (image-text wrappers): the class the config names.
+            from transformers import AutoModelForImageTextToText
+            model = AutoModelForImageTextToText.from_pretrained(view, dtype=dtype, experts_implementation="eager", trust_remote_code=False)
     finally:
-        for name, (cls, _) in patched.items():
+        for name, (mod, cls, _) in patched.items():
             setattr(mod, name, cls)
     model.eval()
 
@@ -142,7 +187,7 @@ def load(model_dir, dtype=torch.float32):
 
     n_swapped = 0
     for name, m in model.named_modules():
-        if type(m).__name__ in patched and "gate_up_proj" in m._parameters:
+        if type(m).__name__ in patched and "gate_up_proj" in m._parameters and hasattr(m, "lazy_n"):
             li = int(re.search(r"layers\.(\d+)\.", name).group(1))
             prefix = prefixes[li]
             n = m.lazy_n

@@ -588,6 +588,13 @@ spec("deepseek_v3", tok="deepseek3", NKV=4, HD=12, VD=8, L=3, rope_style="gptj",
              "scoring_func": "sigmoid", "topk_method": "noaux_tc", "n_group": 2, "topk_group": 1, "routed_scaling_factor": 2.5,
              "norm_topk_prob": True, "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "max_position_embeddings": 128, "hidden_act": "silu",
              "tie_word_embeddings": False, "rope_interleave": True})
+# The latent norms' epsilon: DeepseekV3Attention builds q_a_layernorm and
+# kv_a_layernorm with the RMSNorm default 1e-6, not rms_norm_eps (Kimi K2.5,
+# GLM-5.3 and GLM-4.7-Flash set 1e-5). With the latent projections scaled down
+# the latents' mean square is ~1e-6, where the two epsilons differ plainly.
+SPECS["deepseek_v3_latent_eps"] = dict(SPECS["deepseek_v3"], eps=1e-5,
+                                       mla=dict(SPECS["deepseek_v3"]["mla"], q_a_scale=2e-4, kv_a_scale=2e-4),
+                                       config=dict(SPECS["deepseek_v3"]["config"], rms_norm_eps=1e-5))
 # DeepSeek V3.2-Exp: the V3 layout with every layer an `indexed_attention`
 # layer whose lightning indexer keeps the best `index_topk` keys. While the
 # prompt fits `index_topk` the indexer selects every key, so the reference is
@@ -1660,12 +1667,12 @@ def generate_generic(family, out_dir):
         elif s["mla"]:
             m = s["mla"]
             if m["q_lora_rank"]:
-                d["q_a"] = mat(lp + "self_attn.q_a_proj.weight", m["q_lora_rank"], H)
+                d["q_a"] = mat(lp + "self_attn.q_a_proj.weight", m["q_lora_rank"], H, m.get("q_a_scale", 0.2))
                 d["q_a_norm"] = normw(lp + "self_attn.q_a_layernorm.weight", m["q_lora_rank"])[0]
                 d["q_b"] = mat(lp + "self_attn.q_b_proj.weight", NH * (m["nope"] + m["rope"]), m["q_lora_rank"])
             else:
                 d["q_b"] = mat(lp + "self_attn.q_proj.weight", NH * (m["nope"] + m["rope"]), H)
-            d["kv_a"] = mat(lp + "self_attn.kv_a_proj_with_mqa.weight", m["kv_lora_rank"] + m["rope"], H)
+            d["kv_a"] = mat(lp + "self_attn.kv_a_proj_with_mqa.weight", m["kv_lora_rank"] + m["rope"], H, m.get("kv_a_scale", 0.2))
             d["kv_a_norm"] = normw(lp + "self_attn.kv_a_layernorm.weight", m["kv_lora_rank"])[0]
             d["kv_b"] = mat(lp + "self_attn.kv_b_proj.weight", NH * (m["nope"] + m["v"]), m["kv_lora_rank"])
             if s["mla_gate"]:
@@ -1912,6 +1919,9 @@ def generate_generic(family, out_dir):
 
     # --- reference forward pass (float32, written from the Hugging Face modeling code) ---
     eps = s["eps"]
+    # DeepseekV3Attention (and every MLA family copied from it) builds
+    # q_a_layernorm / kv_a_layernorm with the RMSNorm default, not rms_norm_eps.
+    latent_eps = 1e-6
 
     def norm(x, nw):
         if s["norm"] == "rms_none":
@@ -2065,14 +2075,14 @@ def generate_generic(family, out_dir):
             nope, rp, vd = m["nope"], m["rope"], m["v"]
             if "q_a" in d:
                 qa = h @ d["q_a"].T
-                qa = qa / np.sqrt(np.mean(qa * qa, -1, keepdims=True) + eps) * d["q_a_norm"]
+                qa = qa / np.sqrt(np.mean(qa * qa, -1, keepdims=True) + latent_eps) * d["q_a_norm"]
                 q = qa @ d["q_b"].T
             else:
                 q = h @ d["q_b"].T
             q = q.reshape(T, NH, nope + rp)
             kva = h @ d["kv_a"].T
             ckv, k_pe = kva[:, :m["kv_lora_rank"]], kva[:, m["kv_lora_rank"]:]
-            ckv = ckv / np.sqrt(np.mean(ckv * ckv, -1, keepdims=True) + eps) * d["kv_a_norm"]
+            ckv = ckv / np.sqrt(np.mean(ckv * ckv, -1, keepdims=True) + latent_eps) * d["kv_a_norm"]
             kvb = (ckv @ d["kv_b"].T).reshape(T, NH, nope + vd)
             k_nope, v = kvb[..., :nope], kvb[..., nope:]
             k_pe = k_pe.reshape(T, 1, rp)

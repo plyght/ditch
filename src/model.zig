@@ -3231,7 +3231,7 @@ fn mlaProject(model: *const Model, layer: *const Layer, ws: *Workspace, h: []con
     const nope = m.qk_nope_head_dim;
     const rd = m.qk_rope_head_dim;
     const vd = m.v_head_dim;
-    const eps = c.rms_norm_eps;
+    const eps = m.latent_norm_eps;
     if (mw.q_a) |qa| {
         const qlr = m.q_lora_rank.?;
         const qa_out = try gpa.alloc(f32, n * qlr);

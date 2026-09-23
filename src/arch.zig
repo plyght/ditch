@@ -141,6 +141,11 @@ pub const Mla = struct {
     qk_nope_head_dim: usize,
     qk_rope_head_dim: usize,
     v_head_dim: usize,
+    /// Epsilon of `q_a_layernorm` and `kv_a_layernorm`. DeepSeek's own code,
+    /// and transformers after it, build both with the RMSNorm default 1e-6
+    /// whatever `rms_norm_eps` says (Kimi K2 / K2.5, Kimi-Linear, GLM-4.7-Flash
+    /// and GLM-5.3 set 1e-5); GLM-5.3-Flash passes `rms_norm_eps`.
+    latent_norm_eps: f32 = 1e-6,
 };
 
 /// Position-dependent query scaling `1 + attn_scale * log(floor((pos + offset) / floor_scale) + 1)`:
@@ -2416,6 +2421,8 @@ fn extraGlm5Next(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
         return error.UnsupportedArchitecture;
     }
     c.index_bound = .{ .block = kpool, .max_blocks = topk / kpool };
+    // Glm5NextTextAttention builds its latent norms with `rms_norm_eps`.
+    if (c.mla != null) c.mla.?.latent_norm_eps = c.rms_norm_eps;
     std.log.warn("glm5_next: the DSA indexer runs as dense attention, exact for prompts up to {d} tokens (index_topk); longer prompts are refused", .{topk});
 }
 
@@ -5353,6 +5360,13 @@ test "parseConfig picks family knobs" {
         \\{"model_type":"deepseek_v3","hidden_size":64,"num_attention_heads":4,"num_hidden_layers":3,"vocab_size":100,"q_lora_rank":32,"kv_lora_rank":16,"qk_nope_head_dim":8,"qk_rope_head_dim":4,"v_head_dim":8,"n_routed_experts":8,"num_experts_per_tok":2,"n_group":2,"topk_group":1,"scoring_func":"sigmoid","topk_method":"noaux_tc","first_k_dense_replace":1,"moe_layer_freq":1,"routed_scaling_factor":2.5,"norm_topk_prob":true,"moe_intermediate_size":16,"rope_scaling":{"type":"yarn","factor":40,"mscale":1.0,"mscale_all_dim":1.0,"original_max_position_embeddings":4096}}
     );
     try std.testing.expectEqual(@as(usize, 12), ds.head_dim);
+    // The latent norms keep the RMSNorm default whatever rms_norm_eps says.
+    try std.testing.expectEqual(@as(f32, 1e-6), ds.mla.?.latent_norm_eps);
+    const eps5 = try parseConfig(a,
+        \\{"model_type":"deepseek_v3","hidden_size":64,"num_attention_heads":4,"num_hidden_layers":2,"vocab_size":100,"q_lora_rank":32,"kv_lora_rank":16,"qk_nope_head_dim":8,"qk_rope_head_dim":4,"v_head_dim":8,"rms_norm_eps":1e-5}
+    );
+    try std.testing.expectEqual(@as(f32, 1e-5), eps5.rms_norm_eps);
+    try std.testing.expectEqual(@as(f32, 1e-6), eps5.mla.?.latent_norm_eps);
     try std.testing.expectEqual(@as(usize, 8), ds.v_head_dim);
     try std.testing.expectEqual(@as(usize, 4), ds.rotary_dim);
     try std.testing.expect(!ds.moe_layers[0] and ds.moe_layers[1] and ds.moe_layers[2]);

@@ -41,7 +41,7 @@ unprefixed `layers.N.` of DeepSeek's own naming.
                 the reference did not route to) is zeros, which shows up as a
                 mismatch, never as a silent pass.
 """
-import sys, json, struct, os, re, threading, requests
+import sys, json, struct, os, re, threading, time, requests
 from concurrent.futures import ThreadPoolExecutor
 from huggingface_hub import hf_hub_url, hf_hub_download, list_repo_files
 
@@ -169,12 +169,13 @@ def fetch(job):
     url, a, m, dst = job
     sess = getattr(local, 's', None) or requests.Session()
     local.s = sess
-    for attempt in range(5):
+    for attempt in range(8):
         try:
             data = sess.get(url, headers={'Range': f'bytes={a}-{a+m-1}'}, timeout=300).content
             if len(data) == m: break
         except requests.RequestException:
             pass
+        time.sleep(2 ** attempt)
     else:
         raise SystemExit(f'failed to fetch {m} bytes at {a} of {url}')
     os.pwrite(fd, data, dst)
