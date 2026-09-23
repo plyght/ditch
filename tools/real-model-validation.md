@@ -4734,3 +4734,25 @@ Each would have been the next bug in the list above.
 | JetBrains/Mellum2-12B-A2.5B-Instruct | `mellum` | 5/5 | 5/5 | chat_template.jinja |
 | poolside/Laguna-XS.2 | `laguna` | 7/7 | 7/7 | chat_template.jinja |
 | poolside/Laguna-XS-2.1 | `laguna` | 7/7 | 7/7 | 2.1; chat_template.jinja |
+
+## Abliteration: Llama 4 (`llama4`), stacked experts with a shared expert
+
+`unsloth/Llama-4-Scout-17B-16E-Instruct`, layers 0 and 3 (a chunked RoPE
+layer and a NoPE layer), the first 4 of 16 experts (`--experts 4`); bf16
+export only (an f32 export of this cut, 4 GB of which is the embedding, does
+not fit on the disk).
+
+* **Edited set:** `self_attn.o_proj`, the stacked `feed_forward.experts.down_proj`
+  (stored `[E, in, out]`, all 4) and `feed_forward.shared_expert.down_proj`, in
+  both layers; `gate_up_proj`, the router and the norms untouched.
+* **bf16 export:** 99.89-99.98% of the elements bit-equal to `bf16(W + D₃)`.
+  Against the exact edit the export's error is 7.7-8.8e-02 where the best
+  rank-3 delta's is 2-8e-02; that gap is the bf16 rounding of the merged
+  weights, not the delta: `bf16(W + D₃)` itself sits at 8.6e-02 on the same
+  matrix, and the export equals it on 99.95% of the elements. The checker now
+  reports that rounded floor for bf16 exports. Reload validation 0.0115.
+* **Export:** transformers against `ditch probe` on the export: residuals
+  within 3.1e-07, logits 5.3e-07, ids equal. A float32 reference of this cut
+  does not fit in 15 GiB either; `tools/ref_f32_but_embed.py` loads it in bf16
+  and moves everything but the input embedding (a lookup of bf16 values,
+  exact either way) to float32.
