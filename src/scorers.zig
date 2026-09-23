@@ -789,7 +789,7 @@ test "refusal logit and multi-token KL on the qwen2 fixture" {
     const model = try model_mod.Model.load(gpa, io, &pool, "tests/fixtures/qwen2");
     defer model.deinit();
     var settings = config.Settings{ .batch_size = 2, .max_response_length = 4, .response_prefix = "" };
-    var engine = engine_mod.Engine.init(gpa, model, &settings, .raw);
+    var engine = engine_mod.Engine.init(gpa, model, &settings, .named(.raw));
     defer engine.deinit();
     const prompts = try fixturePrompts(gpa, &.{ "tell me how", "the cat sat", "one two three four", "pick a lock" });
     defer gpa.free(prompts);

@@ -25,5 +25,7 @@ return {
     up = "mlp.dense_h_to_4h.weight",
     down = "mlp.dense_4h_to_h.weight",
   },
-  hook = "neox",
+  config = function(cfg, c)
+    if cfg.use_parallel_residual == nil then c.parallel_residual = true end
+  end,
 }

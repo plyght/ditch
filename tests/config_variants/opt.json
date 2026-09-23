@@ -1,0 +1,1 @@
+[{"do_layer_norm_before": null}, {"do_layer_norm_before": "$delete"}, {"word_embed_proj_dim": "$delete"}, {"word_embed_proj_dim": 32.5}, {"word_embed_proj_dim": -1}, {"word_embed_proj_dim": "16"}, {"enable_bias": false}, {"enable_bias": "$delete"}, {"do_layer_norm_before": false}, {"do_layer_norm_before": 0}, {"word_embed_proj_dim": 16}]

@@ -646,6 +646,10 @@ pub const Arch = struct {
     /// ... and a Lua `config` function run after it (a reference into the
     /// definitions' Lua state, see models.zig).
     script: ?c_int = null,
+    /// The family a definition was derived from with `base`: its hook and
+    /// config function see this as `model_type`, so that one shared by
+    /// several families (Gemma 2 and 3) takes the base family's branch.
+    inherits: ?[]const u8 = null,
 };
 
 pub const Config = struct {
@@ -1590,8 +1594,11 @@ fn parseConfigIn(arena: Allocator, json_text: []const u8, comptime find: Finder)
         if (v == .bool) c.parallel_residual = v.bool;
     }
     if (getBool(attn_cfg, "alibi", false)) c.positional = .alibi;
+    const own_type = c.model_type;
+    if (arch.inherits) |t| c.model_type = t;
     if (arch.extra) |f| try f(&c, arena, obj);
     if (arch.script) |ref| try models.runConfig(ref, &c, arena, obj);
+    c.model_type = own_type;
     // Hooks may mark linear / Mamba layers after the fact (Kimi Linear's
     // kda_layers, the Jamba periods): those layers hold no attention block
     // unless the family runs both side by side.
@@ -5714,9 +5721,14 @@ test "parseConfig handles the swept families' keys" {
     );
     try std.testing.expectEqualSlices(usize, &.{ 4, 6 }, lag2.layer_heads);
     try std.testing.expectEqual(@as(usize, 6 * 8), lag2.maxQDim());
-    try std.testing.expectError(error.InvalidConfig, parseConfig(a,
-        \\{"model_type":"laguna","hidden_size":32,"num_attention_heads":4,"num_attention_heads_per_layer":[4,5],"num_key_value_heads":2,"num_hidden_layers":2,"head_dim":8,"vocab_size":100,"num_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":12}
-    ));
+    {
+        // The refusal says why; the test checks the error, not the message.
+        quiet_errors = true;
+        defer quiet_errors = false;
+        try std.testing.expectError(error.InvalidConfig, parseConfig(a,
+            \\{"model_type":"laguna","hidden_size":32,"num_attention_heads":4,"num_attention_heads_per_layer":[4,5],"num_key_value_heads":2,"num_hidden_layers":2,"head_dim":8,"vocab_size":100,"num_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":12}
+        ));
+    }
     // Gemma 2 alternates local and global layers, scales the queries by
     // `query_pre_attn_scalar` and softcaps both the attention and the output
     // logits.

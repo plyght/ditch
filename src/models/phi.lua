@@ -18,5 +18,7 @@ return {
     up = "mlp.fc1.weight",
     down = "mlp.fc2.weight",
   },
-  hook = "phi",
+  config = function(cfg, c)
+    if flag(cfg.qk_layernorm, false) then c.qk_norm = "head" end
+  end,
 }

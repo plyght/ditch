@@ -16,5 +16,25 @@ return {
     router_correction_bias = "mlp.expert_bias",
     shared_expert = "mlp.shared_experts.",
   },
-  hook = "afmoe",
+  -- AFMoE: a sigmoid router whose selection adds a per-expert bias, weights
+  -- renormalised and scaled by `route_scale`, always-on shared experts, a
+  -- sigmoid gate on the attention output and 1-in-`global_attn_every_n_layers`
+  -- global attention.
+  config = function(cfg, c)
+    c.qk_norm = "head"
+    c.attn_gate = "sigmoid"
+    c.moe.scoring = "sigmoid"
+    c.moe.routed_scaling_factor = num(cfg.route_scale, 1.0)
+    c.moe.norm_eps_floor = true
+    c.norm_topk_prob = true
+    if cfg.layer_types == nil then
+      local every = math.max(1, int(cfg.global_attn_every_n_layers, 4))
+      each_layer(c.sliding_layers, function(i) return (i + 1) % every ~= 0 end)
+    end
+    -- Only the local layers are roped; the full-attention ones are NoPE
+    -- (`AfmoeAttention` applies the rotary under `if self.is_local_attention`).
+    each_layer(c.rope_layers, function(i) return c.sliding_layers[i + 1] end)
+    -- muP: the embeddings are scaled by sqrt(hidden_size) (arcee-ai/Trinity-Nano-Preview sets it).
+    if flag(cfg.mup_enabled, false) then c.embed_scale = f32(math.sqrt(f32(c.hidden_size))) end
+  end,
 }

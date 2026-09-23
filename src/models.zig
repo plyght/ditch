@@ -78,6 +78,11 @@ fn initRegistry(diag: *Diagnostic) !*Registry {
     c.lua_pushvalue(L, -1);
     c.lua_setfield(L, c.LUA_REGISTRYINDEX, "ditch_null");
     c.lua_setglobal(L, "null");
+    // The metatable of JSON arrays (see `pushJson`), for `is_array(v)`.
+    c.lua_createtable(L, 0, 1);
+    _ = c.lua_pushstring(L, "json_array");
+    c.lua_setfield(L, -2, "__name");
+    c.lua_setfield(L, c.LUA_REGISTRYINDEX, "ditch_json_array");
     c.lua_pushcclosure(L, luaWarn, 0);
     c.lua_setglobal(L, "warn");
     c.lua_pushcclosure(L, luaUnsupported, 0);
@@ -291,6 +296,7 @@ fn readFamily(r: *Registry, ctx: *Ctx, idx: c_int) !Arch {
         result.aliases = &.{};
         result.notes = "";
         result.verified = false;
+        result.inherits = parent.inherits orelse parent.model_type;
     }
     c.lua_settop(L, -2);
     _ = c.lua_getfield(L, t, "model_type");
@@ -350,7 +356,7 @@ fn readFamily(r: *Registry, ctx: *Ctx, idx: c_int) !Arch {
 
 fn isSpecial(name: []const u8) bool {
     for (arch_fields_special) |s| if (std.mem.eql(u8, s, name)) return true;
-    return std.mem.eql(u8, name, "extra") or std.mem.eql(u8, name, "script");
+    return std.mem.eql(u8, name, "extra") or std.mem.eql(u8, name, "script") or std.mem.eql(u8, name, "inherits");
 }
 
 fn hookList(a: Allocator) ![]const u8 {
@@ -643,10 +649,26 @@ fn pushJson(L: *c.lua_State, v: std.json.Value) void {
                 pushJson(L, e);
                 c.lua_rawseti(L, -2, @intCast(k + 1));
             }
+            // Marked, so that an empty array is not taken for an empty object.
+            _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "ditch_json_array");
+            _ = c.lua_setmetatable(L, -2);
         },
         .object => |o| {
             c.lua_createtable(L, 0, @intCast(o.count()));
+            // The keys in document order, for `keys(v)`.
+            c.lua_createtable(L, 0, 2);
+            _ = c.lua_pushstring(L, "json_object");
+            c.lua_setfield(L, -2, "__name");
+            c.lua_createtable(L, @intCast(o.count()), 0);
             var it = o.iterator();
+            var k: c.lua_Integer = 1;
+            while (it.next()) |kv| : (k += 1) {
+                _ = c.lua_pushlstring(L, kv.key_ptr.ptr, kv.key_ptr.len);
+                c.lua_rawseti(L, -2, k);
+            }
+            c.lua_setfield(L, -2, "order");
+            _ = c.lua_setmetatable(L, -2);
+            it = o.iterator();
             while (it.next()) |kv| {
                 _ = c.lua_pushlstring(L, kv.key_ptr.ptr, kv.key_ptr.len);
                 pushJson(L, kv.value_ptr.*);
@@ -933,8 +955,13 @@ fn writeFields(comptime T: type, w: *std.Io.Writer, v: T, base: T, indent: usize
 pub fn writeDefinition(w: *std.Io.Writer, a: *const Arch) !void {
     const default: Arch = .{ .model_type = "", .llama_cpp = null };
     try w.writeAll("return {\n");
+    if (a.inherits) |b| {
+        try w.writeAll("  base = ");
+        try writeString(w, b);
+        try w.writeAll(",\n");
+    }
     inline for (@typeInfo(Arch).@"struct".fields) |f| {
-        if (comptime settable(f.type) and !std.mem.eql(u8, f.name, "names") and !std.mem.eql(u8, f.name, "script")) {
+        if (comptime settable(f.type) and !std.mem.eql(u8, f.name, "names") and !std.mem.eql(u8, f.name, "script") and !std.mem.eql(u8, f.name, "inherits")) {
             const always = comptime std.mem.eql(u8, f.name, "model_type") or std.mem.eql(u8, f.name, "llama_cpp");
             if (always or !valueEql(f.type, @field(a.*, f.name), @field(default, f.name))) {
                 try w.print("  {s} = ", .{f.name});

@@ -1,0 +1,13 @@
+[
+  {"attention_multiplier": "$delete"},
+  {"attention_multiplier": 1},
+  {"logits_scaling": 0},
+  {"logits_scaling": "$delete"},
+  {"logits_scaling": 3},
+  {"logits_scaling": 1e-50},
+  {"logits_scaling": "x"},
+  {"embedding_multiplier": "$delete"},
+  {"residual_multiplier": "$delete"},
+  {"residual_multiplier": 0.3},
+  {"num_local_experts": 0}
+]

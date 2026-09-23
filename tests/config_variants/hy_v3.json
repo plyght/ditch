@@ -1,0 +1,8 @@
+[
+  {"router_scaling_factor": "$delete"},
+  {"router_scaling_factor": "$delete", "routed_scaling_factor": 1.5},
+  {"router_scaling_factor": "x", "routed_scaling_factor": 2},
+  {"router_scaling_factor": null, "routed_scaling_factor": 3.3},
+  {"routed_scaling_factor": 1.25},
+  {"router_scaling_factor": 4}
+]

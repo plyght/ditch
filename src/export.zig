@@ -260,6 +260,7 @@ fn saveModelInner(gpa: Allocator, io: Io, model: *const Model, dir: Io.Dir, opts
         defer s.close(io);
         copyIfExists(io, s.*, dir, "special_tokens_map.json");
         copyIfExists(io, s.*, dir, "chat_template.jinja");
+        copyIfExists(io, s.*, dir, "chat_template.json");
         copyIfExists(io, s.*, dir, "added_tokens.json");
         copyIfExists(io, s.*, dir, "preprocessor_config.json");
         // A tiktoken vocabulary (and the tokenizer code that reads it) travels with the

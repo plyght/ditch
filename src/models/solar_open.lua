@@ -1,3 +1,5 @@
+local moe = require("moe")
+
 return {
   model_type = "solar_open",
   llama_cpp = nil,
@@ -10,5 +12,8 @@ return {
     router_correction_bias = "mlp.gate.e_score_correction_bias",
     shared_expert = "mlp.shared_experts.",
   },
-  hook = "solar_open",
+  config = function(cfg, c)
+    moe.ds_router(cfg, c)
+    if c.num_experts > 0 then each_layer(c.moe_layers, function() return true end) end
+  end,
 }

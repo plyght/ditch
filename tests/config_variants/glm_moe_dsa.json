@@ -1,0 +1,11 @@
+[
+  {"rope_interleave": false},
+  {"rope_interleave": "$delete"},
+  {"index_topk": "$delete"},
+  {"index_topk": null},
+  {"index_topk": "x"},
+  {"n_group": 0},
+  {"n_group": 3},
+  {"topk_group": "$delete"},
+  {"routed_scaling_factor": "$delete"}
+]

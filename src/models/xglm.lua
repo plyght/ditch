@@ -18,5 +18,9 @@ return {
     up = "fc1.weight",
     down = "fc2.weight",
   },
-  hook = "xglm",
+  config = function(cfg, c)
+    c.num_kv_heads = c.num_heads
+    c.position_offset = 2
+    if flag(cfg.scale_embedding, true) then c.embed_scale = f32(math.sqrt(f32(c.hidden_size))) end
+  end,
 }

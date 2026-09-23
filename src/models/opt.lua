@@ -20,5 +20,14 @@ return {
     up = "fc1.weight",
     down = "fc2.weight",
   },
-  hook = "opt",
+  config = function(cfg, c)
+    c.position_offset = 2
+    if not flag(cfg.do_layer_norm_before, true) then
+      unsupported("opt: do_layer_norm_before = false (post-norm layers, OPT-350m) is not supported")
+    end
+    if int(cfg.word_embed_proj_dim, c.hidden_size) ~= c.hidden_size then
+      unsupported("opt: word_embed_proj_dim different from hidden_size (projected embeddings, OPT-350m) is not supported")
+    end
+    c.attention_bias = flag(cfg.enable_bias, true)
+  end,
 }

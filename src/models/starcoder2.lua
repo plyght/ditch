@@ -12,5 +12,11 @@ return {
     up = "mlp.c_fc.weight",
     down = "mlp.c_proj.weight",
   },
-  hook = "starcoder2",
+  config = function(cfg, c)
+    c.attention_bias = flag(cfg.use_bias, true)
+    local t = str(cfg.norm_type)
+    if t and t ~= "layer_norm" then
+      unsupported("starcoder2: norm_type '" .. t .. "' is not supported (only layer_norm)")
+    end
+  end,
 }

@@ -171,8 +171,9 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings,
     const model = try Model.load(gpa, io, pool, model_dir);
     defer model.deinit();
     const c = &model.config;
-    const template = if (settings.chat_template) |name| (chat.Template.parse(name) orelse return error.InvalidChatTemplate) else chat.detect(model.chat_template, c.model_type);
-    var engine = Engine.init(gpa, model, settings, template);
+    var format = try engine_mod.modelFormat(gpa, model, settings.chat_template);
+    defer format.deinit();
+    var engine = Engine.init(gpa, model, settings, format);
     defer engine.deinit();
     if (settings.response_prefix == null) settings.response_prefix = "";
 

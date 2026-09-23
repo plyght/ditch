@@ -15,5 +15,7 @@ return {
     fused_gate_up = {},
     fused_down = {},
   },
-  hook = "mixtral",
+  config = function(cfg, c)
+    c.norm_topk_prob = flag(cfg.norm_topk_prob, true)
+  end,
 }

@@ -1,0 +1,13 @@
+[
+  {"logit_scale": "$delete"},
+  {"logit_scale": "x"},
+  {"logit_scale": 0.0625},
+  {"use_qk_norm": false},
+  {"use_qk_norm": "$delete"},
+  {"use_qk_norm": 1},
+  {"model_type": "cohere2", "sliding_window": 4, "num_hidden_layers": 8},
+  {"model_type": "cohere2", "sliding_window": 4, "num_hidden_layers": 8, "sliding_window_pattern": 2},
+  {"model_type": "cohere2", "sliding_window": 4, "num_hidden_layers": 8, "sliding_window_pattern": "x"},
+  {"model_type": "cohere2", "num_hidden_layers": 8},
+  {"model_type": "cohere2", "sliding_window": 4, "layer_types": ["sliding_attention", "full_attention"]}
+]

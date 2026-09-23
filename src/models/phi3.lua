@@ -17,5 +17,8 @@ return {
     up = false,
     gate_up = "mlp.gate_up_proj.weight",
   },
-  hook = "phi3",
+  config = function(cfg, c)
+    -- Phi-3-small style yarn keeps the default attention factor: nothing to
+    -- change.
+  end,
 }

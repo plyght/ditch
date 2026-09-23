@@ -64,12 +64,13 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings,
         out.flush() catch {};
     };
     const c = &model.config;
-    const template = if (settings.chat_template) |name| (chat.Template.parse(name) orelse return error.InvalidChatTemplate) else chat.detect(model.chat_template, c.model_type);
-    var engine = Engine.init(gpa, model, settings, template);
+    var format = try engine_mod.modelFormat(gpa, model, settings.chat_template);
+    defer format.deinit();
+    var engine = Engine.init(gpa, model, settings, format);
     defer engine.deinit();
     if (settings.response_prefix == null) settings.response_prefix = "";
     engine.batch_size = 1;
-    try out.print("* Architecture: {s} ({d} layers, vocabulary {d}, {s} weights), chat template {s}\n", .{ c.model_type, c.num_layers, c.vocab_size, model.dtype.safetensorsName(), @tagName(template) });
+    try out.print("* Architecture: {s} ({d} layers, vocabulary {d}, {s} weights), chat template {s}\n", .{ c.model_type, c.num_layers, c.vocab_size, model.dtype.safetensorsName(), format.name() });
     try out.flush();
 
     var js: std.json.Stringify = .{ .writer = result_out };
@@ -80,7 +81,7 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings,
         try js.objectField("model_type");
         try js.write(c.model_type);
         try js.objectField("chat_template");
-        try js.write(@tagName(template));
+        try js.write(format.name());
         try js.objectField("prompts");
         try js.beginArray();
     }

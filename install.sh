@@ -252,10 +252,9 @@ EOF2
 	fi
 	info "$dir/ditch"
 
-	# The documented example of every setting, next to where the global
-	# config.lua goes, and configs/ for per-model files.
+	# The documented example of every setting, next to where config.lua goes.
 	conf="${XDG_CONFIG_HOME:-$HOME/.config}/ditch"
-	if mkdir -p "$conf/configs" 2>/dev/null && [ -f "$tmp/$name/config.default.lua" ]; then
+	if mkdir -p "$conf" 2>/dev/null && [ -f "$tmp/$name/config.default.lua" ]; then
 		cp "$tmp/$name/config.default.lua" "$conf/config.default.lua"
 		info "$conf/config.default.lua (every setting, documented)"
 	fi
