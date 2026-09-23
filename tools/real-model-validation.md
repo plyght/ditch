@@ -387,7 +387,7 @@ config-and-tensor-name check. Eight bugs, all fixed with tests.
     Build: zig build -Doptimize=ReleaseFast ; zig build test --summary all -> 246/246 before,
     253/253 after (7 tests added)
 
-## Abliteration: method
+## Method
 
 Two new pieces of tooling carried this pass; both are in the repo.
 
@@ -2270,7 +2270,7 @@ looks. None of their arithmetic had been compared with a reference on real
 weights, and the Qwen 3.5, Helium and Cohere bugs show why that matters: a
 fixture written from the same misreading as the code agrees with it.
 
-## Abliteration: method
+## Method
 
 Truncated real checkpoints. `tools/truncate_checkpoint.py REPO K OUT` range-reads
 each shard's header, then streams the embedding, the final norm, the LM head
