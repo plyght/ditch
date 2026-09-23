@@ -153,6 +153,15 @@ def f32_arithmetic(model, store):
         out = torch.cat([F.linear(x, w[i:i + step].float()) for i in range(0, w.shape[0], step)], dim=-1)
         return out if self.bias is None else out + self.bias.float()
 
+    def embedding(self, ids):
+        out = F.embedding(ids, self.weight).float()
+        # Scaled embeddings (Gemma): the scale as a float, not the buffer the
+        # bf16 load rounded (sqrt(1536) = 39.19 is 39.25 in bf16).
+        scale = getattr(self, "scalar_embed_scale", None)
+        if scale is None and torch.is_tensor(getattr(self, "embed_scale", None)):
+            scale = self.embed_scale.float()
+        return out if scale is None else out * scale
+
     keep = set()
     for m in model.modules():
         if isinstance(m, torch.nn.Linear) and m.weight.device.type != "meta":
@@ -160,7 +169,7 @@ def f32_arithmetic(model, store):
             m.forward = types.MethodType(linear, m)
         elif isinstance(m, torch.nn.Embedding):
             keep.add(id(m.weight))
-            m.forward = types.MethodType(lambda self, ids: F.embedding(ids, self.weight).float(), m)
+            m.forward = types.MethodType(embedding, m)
     with torch.no_grad():
         for m in model.modules():
             # A rotary table rounded by the bf16 load is rebuilt from its own init function.
@@ -312,12 +321,13 @@ def load(model_dir, dtype=torch.float32):
     # built empty (their tensors load as unexpected and are dropped), which
     # keeps a float32 reference of a large model inside the RAM.
     class NoVision(torch.nn.Module):
-        def __init__(self, *a, **kw):
+        def __init__(self, config=None, *a, **kw):
             super().__init__()
+            self.config = config  # init hooks that match the class read it (Gemma 4)
 
         @classmethod
-        def _from_config(cls, *a, **kw):
-            return cls()
+        def _from_config(cls, config=None, *a, **kw):
+            return cls(config)
 
     for mod in mods:
         for n in dir(mod):

@@ -3236,3 +3236,48 @@ chunks are summed. `remote_test.zig` serves `gpt_oss_mxfp4` and `qwen2_fp8`
 and checks that trunk + experts is every stored byte (it counted 79920 of
 158256 before). gpt-oss-20b now: 3.35 GB trunk, 12.6 MB per expert, 9.47 GB
 of experts.
+
+## Bug F8 — Gemma 4's proportional RoPE paired the wrong coordinates (fixed)
+
+**Symptom.** `google/gemma-4-E2B-it`, layers 0-4 plus the KV-shared layers 15
+and 19: every sliding layer agreed, the full-attention layer 4 diverged by
+1e-2 and the shared layers reading its KV more (0.95 at the end), while a
+1-token prompt agreed everywhere (to 1e-7): something that depends on the
+position, in the global layers only.
+
+**Cause.** Gemma 4's global layers use `proportional` RoPE: `int(0.25 *
+head_dim / 2)` frequencies over the whole 512-wide head, and transformers'
+table has `head_dim / 2` entries, the rest zero, applied with `rotate_half`
+over the head, so turning pair `i` is coordinates `i` and `i + 256`. ditch
+rotated the first 128 coordinates as a block (pairs `i`, `i + 64`), the
+fixture generator the same (`global_rotary`), so the `gemma4` fixture agreed.
+At position 0 every rotation is the identity, hence the clean 1-token run.
+Every Gemma 4 release's global layers were affected.
+
+**Fix.** `Config.rope_angles`: the proportional global table spans the head
+(`rotary_dim = head_dim`) and its pairs past the turning angles stay still.
+The generator pads its table the same way; the regenerated `gemma4` fixture
+fails without the fix (logits 1.16 off).
+
+Reference-side, for the record: `tools/ref_lazy_moe.py`'s float32 embedding
+dropped Gemma's embedding scale (entry 0 off by sqrt(1536)), its vision stub
+lacked the `config` Gemma 4's init reads, and `tools/probe_reference.py`
+hooked the audio embedder's norm as the final norm; it now prefers the norm
+of the module that holds the layer stack.
+
+## Gemma 4 E2B (`gemma4`): verified on real weights
+
+Layers 0-4 (four sliding, one global) and 15, 19 (KV-shared, reading the
+cut's last sliding and global layers), with per-layer inputs: the
+`[262144, 35 x 256]` table is cut to the kept layers' columns by
+`tools/truncate_checkpoint.py` (and `num_kv_shared_layers` recounted).
+Reference: transformers' `gemma4` through `tools/ref_lazy_moe.py`.
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (5) | all 8 agree, worst 1.52e-06 (was 9.84e-01) | 2.70e-06 | match |
+| "Explain how rainbows form, …" | match (13) | all 8 agree, worst 3.00e-06 | 3.20e-06 | match |
+| the printing-press passage | match (310) | all 8 agree, worst 1.63e-06 | 4.09e-06 | match (1 token) |
+
+`gemma-4-26B-A4B` (`enable_moe_block`) is refused by ditch by design (its MoE
+block is not implemented, see the registry note), so it was not cut.

@@ -2062,6 +2062,11 @@ def generate_generic(family, out_dir):
 
     def rope_tables(T, theta=None, sc=None):
         inv, factor = inv_freq_and_factor(s["theta"] if theta is None else theta, rd, fd, sc)
+        if fd > rd:
+            # Proportional RoPE: transformers' table has a (zero) frequency for
+            # every pair of the head and rotate_half pairs coordinate i with
+            # i + head/2, so the turning pairs are split across the halves.
+            inv = np.concatenate([inv, np.zeros(fd // 2 - rd // 2)])
         ang = np.outer(np.arange(T, dtype=np.float64), inv)
         return (np.cos(ang) * factor).astype(np.float32), (np.sin(ang) * factor).astype(np.float32)
 

@@ -15,10 +15,13 @@ and on the real output of the layer before it in the cut, which is all a
 layer-by-layer comparison needs.
 
 config.json gets num_hidden_layers = the kept count, every per-layer list
-cut to the kept layers (layer_types, mlp_layer_types, compress_ratios, ...) and
+cut to the kept layers (layer_types, mlp_layer_types, compress_ratios, MiMo's
+hybrid_layer_pattern, Llama 4's no_rope_layers, the lists in MiniMax M3's
+sparse_attention_config, ...) and
 first_k_dense_replace recounted over them;
 per-layer *id* lists (kv_source_layer_ids, index_source_layer_ids,
-engram_layer_ids, candidate_source_layer_id) keep the kept ids, renumbered,
+engram_layer_ids, candidate_source_layer_id, Llama 4's moe_layers) keep the
+kept ids, renumbered,
 and a list paired with one of them (engram_num_embeddings) keeps the matching
 entries. Quantisation and everything else stays exactly as released.
 
@@ -74,8 +77,9 @@ for f in files:
 
 cfg = json.load(open(f"{out}/config.json"))
 tc = cfg.get('text_config', cfg)
+n_orig = tc['num_hidden_layers']
 tc['num_hidden_layers'] = N
-for key in ('layer_types', 'mlp_layer_types', 'num_attention_heads_per_layer', 'compress_ratios', 'is_moe_layer', 'sliding_windows', 'hybrid_layer_pattern', 'moe_layer_freq'):
+for key in ('layer_types', 'mlp_layer_types', 'num_attention_heads_per_layer', 'compress_ratios', 'is_moe_layer', 'sliding_windows', 'hybrid_layer_pattern', 'moe_layer_freq', 'no_rope_layers'):
     if isinstance(tc.get(key), list): tc[key] = [tc[key][j] for j in layers]
 # MiMo V2: transformers' mimo_v2_flash derives the layer kinds from the layer
 # index (full at 0 and every 6th) unless `layer_types` says; in a cut the
@@ -84,8 +88,14 @@ if isinstance(tc.get('hybrid_layer_pattern'), list) and 'layer_types' not in tc:
     tc['layer_types'] = ['sliding_attention' if x else 'full_attention' for x in tc['hybrid_layer_pattern']]
     if isinstance(tc.get('moe_layer_freq'), list):
         tc['mlp_layer_types'] = ['sparse' if x else 'dense' for x in tc['moe_layer_freq']]
+# MiniMax M3 keeps its per-layer sparse-attention lists in a dictionary.
+if isinstance(tc.get('sparse_attention_config'), dict):
+    sac = tc['sparse_attention_config']
+    for key, v in list(sac.items()):
+        if isinstance(v, list) and len(v) == n_orig:
+            sac[key] = [v[j] for j in layers]
 paired = {'engram_layer_ids': ['engram_num_embeddings']}
-for key in ('kv_source_layer_ids', 'index_source_layer_ids', 'engram_layer_ids', 'dspark_target_layer_ids'):
+for key in ('kv_source_layer_ids', 'index_source_layer_ids', 'engram_layer_ids', 'dspark_target_layer_ids', 'moe_layers'):
     if isinstance(tc.get(key), list):
         keep = [j for j, x in enumerate(tc[key]) if x in new_id]
         for p in paired.get(key, []):
@@ -107,6 +117,10 @@ if isinstance(tc.get('hybrid_override_pattern'), str):
 # were dense (DeepSeek V3.2 --layers 0,3 keeps one dense layer, not three).
 if isinstance(tc.get('first_k_dense_replace'), int):
     tc['first_k_dense_replace'] = sum(1 for j in layers if j < tc['first_k_dense_replace'])
+# Gemma 4's KV-shared layers are the last num_kv_shared_layers: count the
+# kept ones (each then reads the last kept non-shared layer of its type).
+if isinstance(tc.get('num_kv_shared_layers'), int) and tc['num_kv_shared_layers'] > 0:
+    tc['num_kv_shared_layers'] = sum(1 for j in layers if j >= n_orig - tc['num_kv_shared_layers'])
 if 'candidate_source_layer_id' in tc:
     tc['candidate_source_layer_id'] = new_id.get(tc['candidate_source_layer_id'], -1)
 if any('mtp' in d for d in drop):
@@ -135,6 +149,18 @@ def renamed(name):
 def needed(sh):
     return wm is None or any(keep(k) for k, v in wm.items() if v == sh)
 
+# Gemma 3n / Gemma 4's per-layer inputs are one table for every layer
+# (`embed_tokens_per_layer` `[vocab, layers * width]`, and the projection
+# `[layers * width, hidden]`): cut to the kept layers' slices.
+ple_width = tc.get('hidden_size_per_layer_input') or 0
+slices = {}  # name in the cut -> (axis, width, source shape, element bytes)
+
+def per_layer_slice(name, shape):
+    if not ple_width or len(shape) != 2: return None
+    if name.endswith('embed_tokens_per_layer.weight') and shape[1] == n_orig * ple_width: return (1, ple_width)
+    if name.endswith('per_layer_model_projection.weight') and shape[0] == n_orig * ple_width: return (0, ple_width)
+    return None
+
 # Pass 1: headers.
 plan = []  # (name in the cut, dtype, shape, url, abs_start, nbytes)
 for sh in shards:
@@ -146,7 +172,14 @@ for sh in shards:
     for k, v in sorted(hdr.items(), key=lambda kv: kv[1]['data_offsets'][0]):
         if not keep(k): continue
         a, b = v['data_offsets']
-        plan.append((renamed(k), v['dtype'], v['shape'], url, 8 + n + a, b - a))
+        shape = v['shape']
+        sl = per_layer_slice(k, shape)
+        if sl:
+            axis, width = sl
+            slices[renamed(k)] = (axis, width, shape, (b - a) // (shape[0] * shape[1]))
+            shape = [N * width, shape[1]] if axis == 0 else [shape[0], N * width]
+            b = a + (b - a) // n_orig * N
+        plan.append((renamed(k), v['dtype'], shape, url, 8 + n + a, b - a))
 
 def layout(entries):
     header, off = {}, 0
@@ -165,10 +198,21 @@ base = 8 + len(hb)
 # and the requests run in parallel.
 CH = 32 << 20
 jobs, holes = [], {}
+gathers = []  # column slices, fetched in row blocks after the plain copies
 for k, dt, shp, url, start, nb in plan:
     if is_lazy(k):
         continue
     dst = base + header[k]['data_offsets'][0]
+    if k in slices:
+        axis, width, src_shape, es = slices[k]
+        if axis == 0:  # whole row blocks: one range per kept layer
+            blk = width * src_shape[1] * es
+            for i, l in enumerate(layers):
+                for o in range(0, blk, CH):
+                    jobs.append((url, start + l * blk + o, min(CH, blk - o), dst + i * blk + o))
+        else:
+            gathers.append((url, start, dst, src_shape, width, es))
+        continue
     done = 0
     while done < nb:
         m = min(CH, nb - done)
@@ -196,6 +240,8 @@ def fetch(job):
         time.sleep(2 ** attempt)
     else:
         raise SystemExit(f'failed to fetch {m} bytes at {a} of {url}')
+    if dst is None:
+        return data
     os.pwrite(fd, data, dst)
     return m
 
@@ -205,6 +251,27 @@ with ThreadPoolExecutor(16) as ex:
     for i, m in enumerate(ex.map(fetch, jobs)):
         fetched += m
         if i % 50 == 0: print(f'{fetched/1e9:.2f} GB of {total/1e9:.2f}', flush=True)
+
+def gather(job):
+    # Rows r0.. of a `[rows, layers * width]` table, keeping the kept layers' columns.
+    url, start, dst, (rows, cols), width, es, r0, r1 = job
+    row = cols * es
+    data = fetch((url, start + r0 * row, (r1 - r0) * row, None))
+    seg = width * es
+    out = bytearray()
+    for r in range(r1 - r0):
+        base_r = r * row
+        for l in layers:
+            out += data[base_r + l * seg:base_r + (l + 1) * seg]
+    os.pwrite(fd, bytes(out), dst + r0 * N * seg)
+    return len(out)
+
+for url, start, dst, src_shape, width, es in gathers:
+    step = max(1, (32 << 20) // (src_shape[1] * es))
+    blocks = [(url, start, dst, src_shape, width, es, r, min(r + step, src_shape[0])) for r in range(0, src_shape[0], step)]
+    with ThreadPoolExecutor(16) as ex:
+        for i, m in enumerate(ex.map(gather, blocks)):
+            if i % 20 == 0: print(f'per-layer table: {i}/{len(blocks)} blocks', flush=True)
 os.close(fd)
 lazy_plan = [e for e in plan if is_lazy(e[0])]
 lazy_bytes = 0

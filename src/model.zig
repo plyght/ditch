@@ -2137,6 +2137,11 @@ pub const Model = struct {
         // still rotates the positions ditch scores exactly.
         const len = @min(@max(c.max_position_embeddings, 512), 8192);
         self.rope = try self.fillRope(len, c.rope_theta, c.rotary_dim, c.rope_freq_dim, c.rope_scaling);
+        // Proportional RoPE: the pairs past the turning angles stay still.
+        if (c.rope_angles > 0) for (0..len) |p| for (c.rope_angles..self.rope.half) |i| {
+            self.rope.cos[p * self.rope.half + i] = 1;
+            self.rope.sin[p * self.rope.half + i] = 0;
+        };
         self.rope_local = if (c.rope_local) |l| try self.fillRope(len, l.theta, l.rotary_dim, l.freq_dim, .none) else self.rope;
         self.rope_cos_compress = &.{};
         self.rope_sin_compress = &.{};

@@ -664,6 +664,12 @@ pub const Config = struct {
     /// Denominator of the frequency exponents: `rotary_dim`, or the full head
     /// size when only a proportion of it rotates (Gemma 4 "proportional" RoPE).
     rope_freq_dim: usize,
+    /// Proportional RoPE (Gemma 4's global layers): only the first
+    /// `rope_angles` frequency pairs of the global table turn, the others are
+    /// zero; the table spans the whole head, so pair `i` is coordinates `i`
+    /// and `i + head_dim / 2`, as transformers' `rotate_half` over the head
+    /// pairs them. 0 = every pair turns.
+    rope_angles: usize = 0,
     /// Separate rotary table of the sliding layers (Gemma 3 family); null when
     /// every layer uses the global table.
     rope_local: ?LocalRope,
@@ -1676,8 +1682,11 @@ fn gemmaRope(c: *Config, arena: Allocator, obj: std.json.ObjectMap, hd_local: us
             const t = getStr(full, "rope_type") orelse "default";
             if (getNum(full, "partial_rotary_factor")) |f| {
                 if (std.mem.eql(u8, t, "proportional")) {
-                    // `int(f * head_dim // 2)` angles; the frequencies follow the full head.
-                    global_dim = 2 * @as(usize, @intFromFloat(@floor(@as(f64, @floatFromInt(hd_global)) * f / 2.0)));
+                    // `int(f * head_dim // 2)` turning angles with frequencies
+                    // over the full head, the rest of its pairs still: the
+                    // table covers the whole head (see `Config.rope_angles`).
+                    c.rope_angles = @max(1, @as(usize, @intFromFloat(@floor(@as(f64, @floatFromInt(hd_global)) * f / 2.0))));
+                    global_dim = hd_global;
                     freq_dim = hd_global;
                 } else {
                     global_dim = evenDim(@as(f64, @floatFromInt(hd_global)) * f);
@@ -5737,9 +5746,10 @@ test "parseConfig picks the Gemma 4, Gemma 3n, LFM2 and Mistral 4 knobs" {
     try std.testing.expectEqual(@as(usize, 2), g4.layer_kv_heads[0]);
     try std.testing.expectEqual(@as(usize, 32), g4.kvDim());
     try std.testing.expectEqual(@as(f32, 1.0), g4.layer_attn_scale[3]);
-    // Proportional rope: 8 rotated coordinates with frequencies over the 32-wide head.
-    try std.testing.expectEqual(@as(usize, 8), g4.rotary_dim);
+    // Proportional rope: 4 turning pairs of the 32-wide head's 16, frequencies over the head.
+    try std.testing.expectEqual(@as(usize, 32), g4.rotary_dim);
     try std.testing.expectEqual(@as(usize, 32), g4.rope_freq_dim);
+    try std.testing.expectEqual(@as(usize, 4), g4.rope_angles);
     try std.testing.expectEqual(@as(f32, 1000000.0), g4.rope_theta);
     try std.testing.expectEqual(@as(f32, 10000.0), g4.rope_local.?.theta);
     try std.testing.expectEqual(@as(usize, 16), g4.rope_local.?.rotary_dim);

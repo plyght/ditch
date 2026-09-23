@@ -51,9 +51,21 @@ def find_final_norm(model):
     Named `norm` on most families, but also `ln_f` (GPT-2, GPT-Neo),
     `final_layernorm` (Phi, Nemotron-H) or `embedding_norm` (LFM2), and the
     decoder hangs off `model`, `transformer`, `gpt_neox` or `language_model`
-    depending on the family. So: the last normalisation module that is not
-    inside the layer stack.
+    depending on the family. So: that norm among the children of the module
+    holding the layer stack when there is one (a multimodal wrapper's audio
+    or vision embedders have norms of their own, after the text model's:
+    Gemma 4), else the last normalisation module that is not inside the
+    layer stack.
     """
+    final_names = ("norm", "final_layernorm", "ln_f", "embedding_norm", "final_norm", "norm_f")
+    for name, mod in model.named_modules():
+        stack = next((getattr(mod, a) for a in ("layers", "h", "blocks") if isinstance(getattr(mod, a, None), torch.nn.ModuleList)), None)
+        if stack is None or any(w in name for w in ("mtp", "audio", "vision", "visual")):
+            continue
+        for child_name in final_names:
+            child = getattr(mod, child_name, None)
+            if isinstance(child, torch.nn.Module):
+                return child
     found = None
     for name, mod in model.named_modules():
         if any(part in "." + name + "." for part in LAYER_PARTS):
