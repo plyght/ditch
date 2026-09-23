@@ -3150,3 +3150,19 @@ derives from the layer index.
 
 V2.6 Pro (`MiMo-V2.6-Pro-RL`) shares the architecture and both fixes; it was not
 cut separately.
+
+## gpt-oss-120b (`gpt_oss`): verified on real weights
+
+`openai/gpt-oss-120b`, first 2 layers (one sliding-window layer, window 128,
+one full; attention sinks, YaRN RoPE, 128 MXFP4 experts with biases and the
+clamped SwiGLU). The experts' `_blocks` / `_scales` are lazy in the cut and
+read one expert at a time by `tools/ref_lazy_moe.py` (transformers' `gpt_oss`,
+experts dequantised as its MXFP4 integration does, low nibble first; stored
+`[out, in]` and transposed to the `x @ W` layout explicitly, since the down
+projection is square and its shape cannot tell).
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (5) | all 3 agree, worst 4.87e-07 | 4.67e-07 | match |
+| "Explain how rainbows form, …" | match (14) | all 3 agree, worst 2.59e-06 | 7.01e-07 | match |
+| the printing-press passage (past the 128-token window) | match (311) | all 3 agree, worst 1.62e-06 | 5.65e-07 | match (1 token) |

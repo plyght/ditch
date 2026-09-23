@@ -374,6 +374,9 @@ def load(model_dir, dtype=torch.float32):
                 sc = store.rows(name[: -len("_blocks")] + "_scales", [e])[0]
                 q = torch.stack([E2M1[(b & 0xF).long()], E2M1[(b >> 4).long()]], -1).reshape(*b.shape[:-1], 32)
                 t = (q * torch.exp2(sc.float() - 127).unsqueeze(-1)).reshape(b.shape[0], -1)
+                # Stored `[out, in]`; GptOssExperts computes `x @ W`, `[in, out]`
+                # (said explicitly: gpt-oss's down projection is square).
+                t = t.transpose(0, 1).contiguous()
             else:
                 t = store.rows(name, [e])[0].float()
             if tuple(t.shape) != want:
