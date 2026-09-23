@@ -8,13 +8,23 @@ Usage: range_server.py <directory> [log-file]
 Binds 127.0.0.1 on a free port, prints "PORT <n>" on stdout (flushed) and
 serves until killed. Every request is appended to the log file as
 "<method> <path> <range-or-'-'> <status> <bytes>".
+
+A path under `/ratelimit-<n>/` serves the same files, but the first <n> Range
+requests under that prefix are answered 429 Too Many Requests (a rate-limited
+Hub).
 """
 import http.server
 import os
+import re
 import sys
+import threading
 
 ROOT = os.path.abspath(sys.argv[1])
 LOG = sys.argv[2] if len(sys.argv) > 2 else None
+
+
+LIMITED = {}
+LIMIT_LOCK = threading.Lock()
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -29,7 +39,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 f.write(f"{self.command} {self.path} {rng or '-'} {status} {nbytes}\n")
 
     def do_GET(self):
-        path = os.path.normpath(os.path.join(ROOT, self.path.lstrip("/")))
+        rel = self.path
+        m = re.match(r"^/ratelimit-(\d+)(/.*)$", rel)
+        if m:
+            rel = m.group(2)
+            if self.headers.get("Range"):
+                with LIMIT_LOCK:
+                    LIMITED[m.group(1)] = LIMITED.get(m.group(1), 0) + 1
+                    limited = LIMITED[m.group(1)] <= int(m.group(1))
+                if limited:
+                    self.send_response(429)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    self.record(self.headers.get("Range"), 429, 0)
+                    return
+        path = os.path.normpath(os.path.join(ROOT, rel.lstrip("/")))
         if not path.startswith(ROOT) or not os.path.isfile(path):
             self.send_response(404)
             self.send_header("Content-Length", "0")

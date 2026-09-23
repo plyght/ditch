@@ -4173,27 +4173,23 @@ against its 1.16 GB LM head): warp mode never holds it whole. Routed-expert
 tensors are now left out of the largest tensor in warp mode. Regression
 test: "warp-mode estimate: a layer is its trunk plus the top-k experts, not
 every expert" (`src/stream_test.zig`).
-## Bug F13 — one rate-limited range ended a full-depth `hf://` run (fixed)
+## Bug F13 — the Hub's rate limit ended a streamed run after its prefill (fixed)
 
-**Symptom.** `ditch probe hf://zai-org/GLM-5.3-Flash --max-ram 10GB
---remote-cache-size 8GB --raw --max-response-length 1 --residuals`, a
-full-depth prefill: after 33m57s, 62.5 GB read and 1124 experts fetched, the
-run ended with
+The streamed gpt-oss-120b run above (after F12's disk-full stretch, with
+the routed-expert prefetch) finished its 87-token prefill in about 55
+minutes (2392 of the 4608 experts visited, the expert cache 0% hits as the
+dry run warned: it holds 122 experts, fewer than one layer's 128) and made
+its first decode step (144 misses). Then the Hub began answering `429 Too
+Many Requests`: after about an hour of 8 MB range requests at 3-4 a second
+it rate-limits an anonymous client. Each request retried twice, 2 and 4 s
+later, and the run exited with `HttpError` after 3535 s.
 
-    warning: .../model-00023-of-00062.safetensors: HttpError; retrying (3/3)
-    error: curl failed for .../model-00023-of-00062.safetensors: curl: (22) The requested URL returned error: 429
-    error: HttpError
-
-**Cause.** The Hub rate-limits unauthenticated clients (HTTP 429). A long
-full-depth run reaches that limit, all the more with two sessions fetching
-from the same address. ditch classed a 429 as an ordinary transient error:
-3 attempts, 2 s and 4 s apart. That is far too short for a rate limit, and
-the whole run was lost with it.
-
-**Fix.** A 429 is its own error (`error.RateLimited`, from both the native
-client and the curl fallback, which no longer treats it as a native-client
-failure), retried up to 10 times at 15 s × the attempt number (675 s in
-all). Other transient failures keep 3 attempts. A test pins both schedules.
-`tools/ref_stream.py` waits out a 429 the same way (15 s × the attempt, 12
-attempts).
-
+A 429 (or 503) is now `error.RateLimited`, retried on a schedule of its own
+(5, 10, 20, 40, then 60 s, about 10 minutes in all) that does not use up the
+other retries. The back-off is shared: no request of the source starts
+before it ends, so the 16 concurrent readers wait together instead of each
+spending its retries against the same limit, and it is reported once per
+episode. `tools/range_server.py` serves a `/ratelimit-<n>/` prefix whose
+first n range requests get a 429. Regression test: "remote source: a
+rate-limited server is waited out, the concurrent readers backing off
+together" (`src/remote_test.zig`).

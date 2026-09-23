@@ -24,6 +24,10 @@ pub const Http = struct {
     environ: *std.process.Environ.Map,
     native_ok: bool = true,
     timeout_seconds: u64 = 30,
+    /// After a 429 (or 503): no request starts before this instant (awake
+    /// clock, nanoseconds), so the concurrent range readers back off
+    /// together instead of each spending its retries on the same limit.
+    cooldown_until: std.atomic.Value(i64) = .init(0),
 
     pub const Options = struct {
         /// File holding the Hugging Face token (overrides the environment).
@@ -70,20 +74,14 @@ pub const Http = struct {
     /// Transient failures (anything but 401/403/404 and out of memory) are
     /// retried this many times with a growing pause.
     const attempts = 3;
-    /// A 429 (the Hub's rate limit, which a long `hf://` run of a large model
-    /// reaches) is retried this many times, waiting `rate_limit_pause`
-    /// seconds times the attempt number: ~11 minutes in all, where giving up
-    /// after the 6 seconds of the transient schedule loses the whole run.
-    const rate_limit_attempts = 10;
-    const rate_limit_pause = 15;
-
-    /// Seconds to wait before retrying after `attempt` failures ending in
-    /// `err` (attempts count from 1), or null to give up.
-    fn retryPause(err: anyerror, attempt: usize) ?u64 {
-        if (err == error.RateLimited) return if (attempt < rate_limit_attempts) rate_limit_pause * attempt else null;
-        if (attempt >= attempts or !transient(err)) return null;
-        return attempt * 2;
-    }
+    /// Retries of a rate-limited request, backing off 5, 10, 20, 40 and then
+    /// 60 s at a time (about 10 minutes in all): the Hub limits a client that
+    /// has made many requests in the last minutes, and waiting it out beats
+    /// failing a run that has already fetched tens of GB.
+    const rate_limited_attempts = 14;
+    /// Delay before the first retry of a rate-limited request, doubled up to `rate_limited_max`.
+    pub var rate_limited_base_ms: u64 = 5000;
+    const rate_limited_max_ms: u64 = 60_000;
 
     fn transient(err: anyerror) bool {
         return switch (err) {
@@ -92,12 +90,28 @@ pub const Http = struct {
         };
     }
 
-    fn pause(self: *Http, attempt: usize) void {
-        self.sleep(attempt * 2);
+    /// Holds every request back for `ms`; true when no back-off was running.
+    fn startCooldown(self: *Http, ms: u64) bool {
+        const now: i64 = @intCast(Io.Timestamp.now(self.io, .awake).nanoseconds);
+        const until = now + @as(i64, @intCast(ms)) * std.time.ns_per_ms;
+        var cur = self.cooldown_until.load(.monotonic);
+        const fresh = cur < now;
+        while (cur < until) cur = self.cooldown_until.cmpxchgWeak(cur, until, .monotonic, .monotonic) orelse break;
+        return fresh;
     }
 
-    fn sleep(self: *Http, seconds: u64) void {
-        self.io.sleep(Io.Duration.fromSeconds(@intCast(seconds)), .awake) catch {};
+    fn awaitCooldown(self: *Http) void {
+        while (true) {
+            const now: i64 = @intCast(Io.Timestamp.now(self.io, .awake).nanoseconds);
+            const until = self.cooldown_until.load(.monotonic);
+            if (now >= until) return;
+            if (budget_mod.interrupted()) return;
+            self.io.sleep(Io.Duration.fromNanoseconds(@intCast(@min(until - now, std.time.ns_per_s))), .awake) catch return;
+        }
+    }
+
+    fn pause(self: *Http, attempt: usize) void {
+        self.io.sleep(Io.Duration.fromSeconds(@intCast(attempt * 2)), .awake) catch {};
     }
 
     /// Appends curl's connect timeout and the stall abort (< 1 B/s for that
@@ -132,13 +146,22 @@ pub const Http = struct {
 
     fn getRangeOpt(self: *Http, url: []const u8, range: ?[2]u64) ![]u8 {
         var attempt: usize = 1;
+        var limited: usize = 0;
         while (true) : (attempt += 1) {
+            self.awaitCooldown();
             return self.getRangeOnce(url, range) catch |err| {
                 if (budget_mod.interrupted()) return error.Interrupted;
-                const wait = retryPause(err, attempt) orelse return err;
-                const of: usize = if (err == error.RateLimited) rate_limit_attempts else attempts;
-                std.log.warn("{s}: {s}; retrying in {d} s ({d}/{d})", .{ url, @errorName(err), wait, attempt + 1, of });
-                self.sleep(wait);
+                if (err == error.RateLimited) {
+                    limited += 1;
+                    if (limited >= rate_limited_attempts) return err;
+                    attempt -= 1; // does not count against the other retries
+                    const ms = @min(rate_limited_max_ms, rate_limited_base_ms << @intCast(@min(limited - 1, 16)));
+                    if (self.startCooldown(ms)) std.log.warn("{s}: rate limited by the server; backing off", .{url});
+                    continue;
+                }
+                if (attempt >= attempts or !transient(err)) return err;
+                std.log.warn("{s}: {s}; retrying ({d}/{d})", .{ url, @errorName(err), attempt + 1, attempts });
+                self.pause(attempt);
                 continue;
             };
         }
@@ -149,7 +172,7 @@ pub const Http = struct {
             if (self.getNative(url, range)) |body| {
                 return body;
             } else |err| switch (err) {
-                error.NotFound, error.Forbidden, error.OutOfMemory, error.RangeNotSupported, error.RateLimited => return err,
+                error.NotFound, error.Forbidden, error.OutOfMemory, error.RangeNotSupported => return err,
                 else => {
                     std.log.debug("native http failed for {s}: {s}; trying curl", .{ url, @errorName(err) });
                     self.native_ok = false;
@@ -198,7 +221,7 @@ pub const Http = struct {
             },
             .not_found => return error.NotFound,
             .unauthorized, .forbidden => return error.Forbidden,
-            .too_many_requests => return error.RateLimited,
+            .too_many_requests, .service_unavailable => return error.RateLimited,
             else => return error.HttpError,
         }
     }
@@ -233,7 +256,7 @@ pub const Http = struct {
         const code = std.fmt.parseInt(u16, std.mem.trim(u8, result.stdout[nl + 1 ..], " \r\n"), 10) catch 0;
         if (code == 404) return error.NotFound;
         if (code == 401 or code == 403) return error.Forbidden;
-        if (code == 429) return error.RateLimited;
+        if (code == 429 or code == 503) return error.RateLimited;
         if (range != null and code == 200) return error.RangeNotSupported;
         if (code != (if (range != null) @as(u16, 206) else @as(u16, 200))) {
             std.log.err("curl failed for {s}: {s}", .{ url, std.mem.trim(u8, result.stderr, "\n") });
@@ -688,20 +711,6 @@ pub fn loadPrompts(arena: Allocator, http: *Http, cache_root: []const u8, settin
         prompts[i] = .{ .system = spec.system_prompt orelse settings.system_prompt, .user = user };
     }
     return prompts;
-}
-
-test "a rate limit is waited out, other failures retried briefly" {
-    // 429: ten attempts, 15 s, 30 s, ... between them (675 s in all).
-    var total: u64 = 0;
-    var attempt: usize = 1;
-    while (Http.retryPause(error.RateLimited, attempt)) |s| : (attempt += 1) total += s;
-    try std.testing.expectEqual(@as(usize, Http.rate_limit_attempts), attempt);
-    try std.testing.expectEqual(@as(u64, 675), total);
-    // Other transient failures: three attempts, 2 s then 4 s.
-    try std.testing.expectEqual(@as(?u64, 2), Http.retryPause(error.HttpError, 1));
-    try std.testing.expectEqual(@as(?u64, 4), Http.retryPause(error.HttpError, 2));
-    try std.testing.expectEqual(@as(?u64, null), Http.retryPause(error.HttpError, 3));
-    try std.testing.expectEqual(@as(?u64, null), Http.retryPause(error.NotFound, 1));
 }
 
 test "parse split" {

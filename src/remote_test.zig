@@ -567,6 +567,43 @@ test "remote chunk cache: a full filesystem bounds the cache at what it holds" {
     try std.testing.expect(st.cache_bytes <= st.cache_limit);
 }
 
+test "remote source: a rate-limited server is waited out, the concurrent readers backing off together" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var env: Env = undefined;
+    try env.init(gpa, io);
+    defer env.deinit();
+    const saved = hf.Http.rate_limited_base_ms;
+    hf.Http.rate_limited_base_ms = 20;
+    defer hf.Http.rate_limited_base_ms = saved;
+    const shard = "model-00001-of-00002.safetensors";
+    var dir = try Io.Dir.cwd().openDir(io, fixture, .{});
+    defer dir.close(io);
+    const file = try dir.openFile(io, shard, .{});
+    defer file.close(io);
+    const len: usize = 12 * chunk;
+    const want = try gpa.alloc(u8, len);
+    defer gpa.free(want);
+    try std.testing.expectEqual(len, try file.readPositionalAll(io, want, chunk));
+    // The first 12 range requests (headers included) are answered 429.
+    const url = try std.fmt.allocPrint(gpa, "{s}ratelimit-12/", .{env.base_url});
+    defer gpa.free(url);
+    const cache = try env.path("cache");
+    defer gpa.free(cache);
+    const src = try remote.Source.open(gpa, io, &env.http, cache, url, .{ .chunk_size = chunk, .connections = 8 }, &env.sink.writer);
+    defer src.deinit();
+    const rf = try src.openFile(shard);
+    const got = try gpa.alloc(u8, len);
+    defer gpa.free(got);
+    try rf.readRange(io, chunk, got);
+    try std.testing.expectEqualSlices(u8, want, got);
+    const log_path = try env.path("requests.log");
+    defer gpa.free(log_path);
+    const text = try Io.Dir.cwd().readFileAlloc(io, log_path, gpa, .unlimited);
+    defer gpa.free(text);
+    try std.testing.expectEqual(@as(usize, 12), std.mem.count(u8, text, " 429 "));
+}
+
 test "remote chunk cache: size 0 keeps nothing on disk" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
