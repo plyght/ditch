@@ -1,3 +1,5 @@
+local mamba = require("mamba")
+
 return {
   model_type = "granitemoehybrid",
   llama_cpp = "granitehybrid",
@@ -23,5 +25,30 @@ return {
     shared_down = "output_linear.weight",
     shared_gate_up = "input_linear.weight",
   },
-  hook = "granite_hybrid",
+  config = function(cfg, c)
+    -- Granite's multipliers (the `granite` hook), then Granite MoE's routing.
+    c.embed_scale = num(cfg.embedding_multiplier, 1.0)
+    c.residual_multiplier = num(cfg.residual_multiplier, 1.0)
+    if type(cfg.attention_multiplier) == "number" then c.attention_scale = cfg.attention_multiplier end
+    local ls = f32(num(cfg.logits_scaling, 1.0))
+    if ls ~= 0 then c.logit_scale = f32(1.0 / ls) end
+    -- Top-k over the router logits, softmax over the selected ones (equal
+    -- to a renormalised softmax over every expert).
+    c.norm_topk_prob = true
+    if c.num_experts > 0 then each_layer(c.moe_layers, function() return true end) end
+    mamba.dims(cfg, c)
+    -- Attention layers use RoPE only when the config asks for it.
+    c.positional = "none"
+    if str(cfg.position_embedding_type) == "rope" then
+      c.positional = "rope"
+      each_layer(c.rope_layers, function() return true end)
+    end
+    if cfg.layer_types == nil and cfg.layers_block_type == nil then
+      each_layer(c.ssm_layers, function() return true end)
+      each_layer(c.attn_layers, function() return false end)
+    end
+    -- Softmax over the top-k router logits equals a renormalised softmax top-k.
+    c.norm_topk_prob = true
+    each_layer(c.mlp_layers, function() return true end)
+  end,
 }
