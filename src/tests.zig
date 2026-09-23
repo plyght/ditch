@@ -20,6 +20,7 @@ comptime {
     _ = @import("toml.zig");
     _ = @import("config.zig");
     _ = @import("chat.zig");
+    _ = @import("jinja.zig");
     _ = @import("hf.zig");
     _ = @import("engine.zig");
     _ = @import("scorers.zig");

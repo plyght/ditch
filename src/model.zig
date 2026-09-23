@@ -22,6 +22,7 @@ const stream = @import("stream.zig");
 const budget_mod = @import("budget.zig");
 const gguf_model = @import("gguf_model.zig");
 const Tokenizer = @import("tokenizer.zig").Tokenizer;
+const chat = @import("chat.zig");
 const moe = @import("moe.zig");
 const abliterate = @import("abliterate.zig");
 const search = @import("search.zig");
@@ -713,6 +714,8 @@ pub const Model = struct {
     tokenizer_json: []const u8,
     generation_config_json: ?[]const u8,
     tokenizer_config_json: ?[]const u8,
+    /// The legacy special-token names (`chat.specialTokens`), when present.
+    special_tokens_map_json: ?[]const u8 = null,
     chat_template: ?[]const u8,
     dtype: tensor.DType,
     /// Rotary tables of the global layers and (Gemma 3 family) the sliding
@@ -1979,35 +1982,11 @@ pub const Model = struct {
         self.tokenizer_json = loaded.json;
         self.tokenizer = loaded.tokenizer;
         errdefer self.tokenizer.deinit();
-        self.chat_template = null;
-        if (self.tokenizer_config_json) |tc| {
-            var parsed = try std.json.parseFromSlice(std.json.Value, gpa, tc, .{});
-            defer parsed.deinit();
-            if (parsed.value == .object) {
-                if (parsed.value.object.get("chat_template")) |ct| {
-                    switch (ct) {
-                        .string => |s| self.chat_template = try arena.dupe(u8, s),
-                        .array => |a| {
-                            for (a.items) |item| {
-                                if (item == .object) {
-                                    if (item.object.get("template")) |t| {
-                                        if (t == .string) self.chat_template = try arena.dupe(u8, t.string);
-                                    }
-                                    if (item.object.get("name")) |n| {
-                                        if (n == .string and std.mem.eql(u8, n.string, "default")) break;
-                                    }
-                                }
-                            }
-                        },
-                        else => {},
-                    }
-                }
-            }
-        }
-        if (self.chat_template == null) {
-            const ct = dir.readFileAlloc(io, "chat_template.jinja", arena, .unlimited) catch null;
-            self.chat_template = ct;
-        }
+        // The chat template as transformers picks it (`chat.pickTemplate`).
+        const jinja_file = dir.readFileAlloc(io, "chat_template.jinja", arena, .unlimited) catch null;
+        const processor_json = dir.readFileAlloc(io, "chat_template.json", arena, .unlimited) catch null;
+        self.chat_template = try chat.pickTemplate(arena, self.tokenizer_config_json, jinja_file, processor_json);
+        self.special_tokens_map_json = dir.readFileAlloc(io, "special_tokens_map.json", arena, .unlimited) catch null;
 
         // EOS ids: generation_config eos_token_id (int or list) + tokenizer eos.
         var eos = std.ArrayList(u32).empty;
