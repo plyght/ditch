@@ -172,7 +172,7 @@ pub const Http = struct {
             if (self.getNative(url, range)) |body| {
                 return body;
             } else |err| switch (err) {
-                error.NotFound, error.Forbidden, error.OutOfMemory, error.RangeNotSupported => return err,
+                error.NotFound, error.Forbidden, error.OutOfMemory, error.RangeNotSupported, error.RateLimited => return err,
                 else => {
                     std.log.debug("native http failed for {s}: {s}; trying curl", .{ url, @errorName(err) });
                     self.native_ok = false;
