@@ -5721,9 +5721,14 @@ test "parseConfig handles the swept families' keys" {
     );
     try std.testing.expectEqualSlices(usize, &.{ 4, 6 }, lag2.layer_heads);
     try std.testing.expectEqual(@as(usize, 6 * 8), lag2.maxQDim());
-    try std.testing.expectError(error.InvalidConfig, parseConfig(a,
-        \\{"model_type":"laguna","hidden_size":32,"num_attention_heads":4,"num_attention_heads_per_layer":[4,5],"num_key_value_heads":2,"num_hidden_layers":2,"head_dim":8,"vocab_size":100,"num_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":12}
-    ));
+    {
+        // The refusal says why; the test checks the error, not the message.
+        quiet_errors = true;
+        defer quiet_errors = false;
+        try std.testing.expectError(error.InvalidConfig, parseConfig(a,
+            \\{"model_type":"laguna","hidden_size":32,"num_attention_heads":4,"num_attention_heads_per_layer":[4,5],"num_key_value_heads":2,"num_hidden_layers":2,"head_dim":8,"vocab_size":100,"num_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":12}
+        ));
+    }
     // Gemma 2 alternates local and global layers, scales the queries by
     // `query_pre_attn_scalar` and softcaps both the attention and the output
     // logits.
