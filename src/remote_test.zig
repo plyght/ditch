@@ -605,6 +605,34 @@ test "remote source: a rate-limited server is waited out, the concurrent readers
     try std.testing.expectEqual(@as(usize, 12), std.mem.count(u8, text, " 429 "));
 }
 
+test "remote source: rate-limited small files are waited for, not taken for missing ones" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const saved = hf.Http.rate_limited_base_ms;
+    hf.Http.rate_limited_base_ms = 20;
+    defer hf.Http.rate_limited_base_ms = saved;
+    // Both download paths: the native client, and curl (which exits 22 for a 404 and a 429 alike).
+    for ([_]bool{ true, false }) |native| {
+        var env: Env = undefined;
+        try env.init(gpa, io);
+        defer env.deinit();
+        env.http.native_ok = native;
+        const url = try std.fmt.allocPrint(gpa, "{s}ratelimitall-6/", .{env.base_url});
+        defer gpa.free(url);
+        const cache = try env.path("cache");
+        defer gpa.free(cache);
+        const src = try remote.Source.open(gpa, io, &env.http, cache, url, .{ .chunk_size = chunk }, &env.sink.writer);
+        defer src.deinit();
+        var dir = try Io.Dir.cwd().openDir(io, src.dir_path, .{});
+        defer dir.close(io);
+        // config.json, the tokenizer and the index were fetched; the optional
+        // files the fixture has were not marked missing.
+        for ([_][]const u8{ "config.json", "tokenizer.json", "model.safetensors.index.json" }) |name| try dir.access(io, name, .{});
+        try std.testing.expectError(error.FileNotFound, dir.access(io, "tokenizer_config.json.missing", .{}));
+        try std.testing.expectEqual(@as(usize, 2), src.shards.len);
+    }
+}
+
 test "remote source: a read that fails while loading is reported, not taken for a missing tensor" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
