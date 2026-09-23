@@ -319,7 +319,13 @@ def main():
                     # forward pass (a full-depth streamed reference reads the model again).
                     gen = torch.cat([input_ids, torch.tensor([[int(ref.argmax())]])], dim=1)
                 else:
-                    gen = model.generate(input_ids, max_new_tokens=args.max_new_tokens, do_sample=False)
+                    # Plain greedy. A release's generation_config.json can carry a
+                    # repetition penalty (Qwen2.5-Instruct: 1.1) or n-gram blocking,
+                    # which `generate` merges into any config it is given and applies
+                    # even without sampling; ditch's greedy reply is the argmax. So the
+                    # neutral values are passed explicitly.
+                    gen = model.generate(input_ids, max_new_tokens=args.max_new_tokens, do_sample=False,
+                                         repetition_penalty=1.0, no_repeat_ngram_size=0, min_new_tokens=0)
             except Exception:
                 if not trc:
                     raise
@@ -339,6 +345,18 @@ def main():
         # ditch stops at an end-of-turn token the reference keeps generating past.
         n = min(len(ref_text), len(resp))
         rec["greedy_match"] = ref_text[:n] == resp[:n]
+        ref_ids, got_ids = gen[0, input_ids.shape[1]:].tolist(), entry.get("generated_ids") or []
+        k = next((i for i, (a, b) in enumerate(zip(ref_ids, got_ids)) if a != b), None)
+        if k is not None:
+            # Where the two greedy paths part: the reference's own logit margin
+            # between its token and ditch's, after the tokens they share. A near
+            # tie (a cut's flat logits) is not an error; a decode bug is not a tie.
+            with torch.no_grad():
+                prefix = torch.cat([input_ids, torch.tensor([ref_ids[:k]], dtype=input_ids.dtype)], dim=1)
+                lg = model(input_ids=prefix).logits[0, -1].float()
+            margin = float(lg[ref_ids[k]] - lg[got_ids[k]]) / float(lg.max() - lg.min())
+            rec["greedy_first_difference"], rec["greedy_margin"] = k, margin
+            print(f"  greedy paths part at token {k}: the reference's margin of its token over ditch's is {margin:.2e} of the logit range")
     print("\nRESULT:", "OK" if ok else "MISMATCH")
     if args.json_out:
         report["ok"] = bool(ok)
