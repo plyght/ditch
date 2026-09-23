@@ -1,7 +1,6 @@
 -- Copy this file to ~/.config/ditch/config.lua ($XDG_CONFIG_HOME/ditch) and
--- edit it to your liking; settings for one model go in
--- ~/.config/ditch/configs/<org>/<name>.lua (e.g. configs/Qwen/Qwen3-8B.lua, or
--- configs/<name>.lua for a local model) and override this file for that model. It is an ordinary Lua 5.4 script that returns a table of
+-- edit it to your liking. Settings for one model go in the `models` table at
+-- the end (or in a file of their own, ~/.config/ditch/configs/<org>/<name>.lua). It is an ordinary Lua 5.4 script that returns a table of
 -- settings (assigning globals works too). Every option can also be given on
 -- the command line (--option-name value); command-line options take precedence
 -- over this file. Run `ditch --help` for the full list.
@@ -415,4 +414,19 @@ return {
   -- bench_output = "bench.md",        -- also write the table to this file
   -- bench_kernels = false,            -- `ditch bench --kernels`: per-kernel
                                        -- throughput only, no model needed
+
+  -- -------------------------------------------------------------------------
+  -- Per-model settings
+  -- -------------------------------------------------------------------------
+  -- Settings that apply only when the model matches the key: an exact id, or a
+  -- pattern where * matches anything and ? one character (case-insensitive; a
+  -- local model matches by its directory or file name). They override the
+  -- settings above; a pattern with more literal characters overrides a looser
+  -- one, and an exact id wins. A model can also have a file of its own,
+  -- ~/.config/ditch/configs/<org>/<name>.lua, which overrides these.
+  -- models = {
+  --   ["Qwen/Qwen3-8B"] = { max_ram = "8GB", seed = 7 },
+  --   ["openai/gpt-oss-*"] = { expert_cache = "4GB" },
+  --   ["*-GGUF"] = { export_format = "gguf" },
+  -- },
 }
