@@ -27,7 +27,24 @@ What ditch adds:
 
 ## Install
 
-Download the archive for your platform from the
+```sh
+curl -fsSL https://ditchcensorship.vercel.app/install | sh          # Linux, macOS
+```
+
+```powershell
+irm https://ditchcensorship.vercel.app/install.ps1 | iex           # Windows
+```
+
+The installer picks the build for your CPU (the AVX2 one where it runs),
+checks it against the release's `SHA256SUMS` and puts `ditch` in
+`~/.local/bin` (`%LOCALAPPDATA%\Programs\ditch` on Windows). `DITCH_VERSION`
+pins a release, `DITCH_INSTALL_DIR` changes the directory, and piping to
+`sh -s -- --uninstall` (`$env:DITCH_UNINSTALL=1` on Windows) removes it. The same scripts
+are [`install.sh`](install.sh) and [`install.ps1`](install.ps1) in this
+repository, also served from
+`https://raw.githubusercontent.com/plyght/ditch/main/install.sh`.
+
+Or download the archive for your platform from the
 [releases page](https://github.com/plyght/ditch/releases) and put `ditch` on
 your `PATH`. On x86-64 prefer the **`-v3`** archive: it is built for AVX2 and
 FMA (Intel Haswell, AMD Zen and newer) and is about twice as fast on the matmul
@@ -42,7 +59,7 @@ zig build -Doptimize=ReleaseFast              # portable
 zig build -Doptimize=ReleaseFast -Dcpu=native # tuned for this machine
 ```
 
-To uninstall, delete the binary and its cache, `~/.cache/ditch` (or
+To uninstall by hand, delete the binary and its cache, `~/.cache/ditch` (or
 `$DITCH_CACHE`).
 
 ## Usage
