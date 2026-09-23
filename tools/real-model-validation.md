@@ -3402,3 +3402,15 @@ LongRoPE short factors and scaling factor 1, residual × 1.4/√24, SwiGLU)
 agrees with ditch to 1.9e-07, and to 2.6e-02 without the short factors. So
 MiniCPM4 is verified against its own code by hand, one layer deep, not
 against a running reference.
+
+## Llama 4 Maverick (`llama4`): verified on real weights
+
+`unsloth/Llama-4-Maverick-17B-128E-Instruct` (the ungated bf16 copy; the
+official repository is gated), layers 0 and 3: a dense RoPE layer (16384-wide
+MLP) and a NoPE MoE layer (128 experts, top-1, shared expert; MoE on every
+second layer, `interleave_moe_layer_step: 2`, `moe_layers` renumbered by the
+cut), no q/k norm. Same reference as Scout.
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (5) | all 3 agree, worst 1.20e-06 | 5.95e-07 | match (2 tokens) |
