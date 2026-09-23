@@ -72,10 +72,12 @@ def dequant_expert(store, module, cfg_q):
     return _dequantize(q, scale.repeat_interleave(group, 1), zp).float()
 
 
-def dequant_fp8_trunk(model, store):
-    """Every Linear whose checkpoint weight is FP8 with a block `weight_scale_inv`
-    gets the dequantised weight, rounded to bf16 (what ditch and the Hugging
-    Face integrations produce), in place of the raw codes the load copied."""
+def dequant_fp8_trunk(model, store, cfg_q=None):
+    """Every Linear whose checkpoint weight is quantised gets its dequantised
+    weight in bf16 (what ditch and the Hugging Face integrations produce):
+    FP8 with a block `weight_scale_inv` in place of the raw codes the load
+    copied, compressed-tensors `weight_packed` (INT or MXFP4) in place of the
+    placeholder the load left for a weight it did not find."""
     keys = set(store.keys())
     n = 0
     with torch.no_grad():
@@ -83,8 +85,8 @@ def dequant_fp8_trunk(model, store):
             if not isinstance(m, torch.nn.Linear) or m.weight.device.type == "meta":
                 continue
             for cand in (name, name.split(".", 1)[-1], "model." + name, name.replace("model.language_model.", "language_model.model.")):
-                if cand + ".weight_scale_inv" in keys and cand not in store.lazy["holes"]:
-                    m.weight.data = dequant_expert(store, cand, {}).to(torch.bfloat16)
+                if (cand + ".weight_scale_inv" in keys or cand + ".weight_packed" in keys) and cand + ".weight_packed" not in store.lazy["holes"]:
+                    m.weight.data = dequant_expert(store, cand, cfg_q or {}).to(torch.bfloat16)
                     n += 1
                     break
     return n
@@ -174,13 +176,12 @@ def load(model_dir, dtype=torch.float32):
 
     # A view of the directory without the lazy file: transformers loads the trunk.
     view = tempfile.mkdtemp(prefix="ref_trunk_")
-    trunk_quantised = any(k not in store.lazy["holes"] and re.search(r"weight_(packed|scale)$|_blocks$", k) for k in store.keys())
     for fn in os.listdir(model_dir):
         if fn in ("model-lazy.safetensors", "lazy.json", "model.safetensors.index.json") or fn.startswith("."):
             continue
-        if fn == "config.json" and not trunk_quantised:
-            # Only the (lazy, dequantised here) routed experts are quantised:
-            # keep transformers' quantizer out of the trunk.
+        if fn == "config.json":
+            # Quantised weights (routed experts and trunk alike) are
+            # dequantised here: keep transformers' quantizer out.
             c = dict(cfg)
             c.pop("quantization_config", None)
             if isinstance(c.get("text_config"), dict):
@@ -271,7 +272,7 @@ def load(model_dir, dtype=torch.float32):
             return dequant_expert(store, module_of(base, "down"), wq).to(dtype)
         return load_e
 
-    dequant_fp8_trunk(model, store)
+    dequant_fp8_trunk(model, store, wq)
     f32_arithmetic(model, store)
     n_swapped = 0
     for name, m in model.named_modules():

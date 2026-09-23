@@ -2774,3 +2774,38 @@ is wrong looks exactly like a ditch bug:
 | --- | :---: | :---: | ---: | :---: |
 | "The capital of France is" | match (5) | all 5 agree, worst 2.66e-07 | 4.10e-07 | match |
 | "Explain how rainbows form, …" | match (15) | all 5 agree, worst 4.16e-07 | 4.94e-07 | match |
+
+## AikidoSec/altar-1: verified on real weights
+
+The REAP-pruned GLM-5.3 (168 routed experts, mixed BF16 / INT4). Its first
+three layers are dense BF16 and layer 3 is one of the three MoE layers kept in
+BF16 (3, 77, 78: the `ignore` list), so a 4-layer cut would exercise no INT4;
+the cut is 5 layers, and layer 4 carries compressed-tensors pack-quantized
+INT4 (group 32, *asymmetric*: `weight_zero_point`) in `q_b_proj`, `kv_b_proj`,
+`o_proj` and every routed expert. The reference dequantises with
+compressed-tensors' own `unpack_from_int32` and `_dequantize` (in the scale's
+dtype, bf16), everything else as for GLM-5.3.
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (5) | all 6 agree, worst 2.66e-07 | 4.72e-07 | match |
+| "Explain how rainbows form, …" | match (15) | all 6 agree, worst 4.16e-07 | 5.62e-07 | match |
+
+Warp mode over `hf://` with the chunk cache bounded to this disk:
+
+    $ ditch --dry-run hf://AikidoSec/altar-1 --max-ram 14GB --remote-cache-size 18GB --remote-chunk-size 2MB --no-input
+      weights total            932.86GB (78 layers)
+      trunk per layer          746.8MB (largest; routed experts excluded)
+      routed expert            72.0MB each, 168 per layer, top-8 per token, 885.94GB in total
+      expert cache             7.68GB (holds 109 of 12600 experts)
+      warp mode:     min 12.38GB (trunk + top-8 experts + workspace), with prefetch + expert cache + RAM caches 80.11GB
+    Disk estimate (remote chunk cache, 2.0MB chunks):
+      trunk                    26.68GB stored, 27.12GB of chunks (re-read by every forward pass)
+      routed expert            72.0MB each stored, 12600 experts, 23.63GB in total
+      chunk cache bound        18.00GB, 592.1MB cached now, 15.05GB free on its filesystem
+      too small for the trunk: every forward pass fetches it again (--remote-cache-size 28.00GB holds it)
+    Dry run: ... stopping here (exit 0).   process RSS peak 198.7MB, 5m27s
+
+So on a 16 GB machine altar-1 needs 12.4 GB resident and, to avoid
+re-fetching the INT4 trunk on every forward pass, 28 GB of cache disk; with
+the 18 GB that fits here it runs, fetching the trunk each pass.
