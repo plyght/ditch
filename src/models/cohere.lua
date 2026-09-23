@@ -15,5 +15,15 @@ return {
     q_norm = "self_attn.q_norm.weight",
     k_norm = "self_attn.k_norm.weight",
   },
-  hook = "cohere",
+  config = function(cfg, c)
+    c.logit_scale = num(cfg.logit_scale, 1.0)
+    if flag(cfg.use_qk_norm, false) then c.qk_norm = "heads" end
+    if c.model_type == "cohere2" then
+      -- Command R7B: local layers use RoPE, global layers none.
+      if type(cfg.sliding_window_pattern) ~= "number" then
+        each_layer(c.sliding_layers, function(i) return (i + 1) % 4 ~= 0 end)
+      end
+      each_layer(c.rope_layers, function(i) return c.sliding_layers[i + 1] end)
+    end
+  end,
 }
