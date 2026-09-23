@@ -305,6 +305,39 @@ class LazyExperts:
         return out
 
 
+class LazyRows(torch.nn.Module):
+    """An `nn.Embedding` whose table is the row concatenation of checkpoint
+    tensors `keys` (in the order transformers' `Concatenate(dim=0)` joins
+    them), reading only the rows looked up."""
+
+    def __init__(self, src, keys, like):
+        super().__init__()
+        self.src, self.keys = src, keys
+        self.starts = [0]
+        for k in keys:
+            self.starts.append(self.starts[-1] + src.entries[k][4][0])
+        self.dim = like.weight.shape[1]
+        if not keys or any(src.entries[k][4][1] != self.dim for k in keys) or self.starts[-1] > like.weight.shape[0]:
+            raise SystemExit(f"ref_stream: {keys[:2]}... do not concatenate into a {tuple(like.weight.shape)} table")
+        self.padding_idx = like.padding_idx
+        self.weight = torch.empty(0)  # its device is all a caller asks about
+
+    def forward(self, ids):
+        flat = ids.reshape(-1).tolist()
+        pieces, where = [], []
+        for r in flat:
+            if r >= self.starts[-1]:
+                raise SystemExit(f"ref_stream: row {r} is past the {self.starts[-1]} stored rows")
+            k = next(j for j in range(len(self.keys)) if r < self.starts[j + 1])
+            nb = self.src.entries[self.keys[k]][2] // self.src.entries[self.keys[k]][4][0]
+            pieces.append((self.keys[k], (r - self.starts[k]) * nb, nb))
+            where.append(k)
+        out = torch.empty(len(flat), self.dim)
+        for i, (raw, k) in enumerate(zip(self.src.read_many(pieces), where)):
+            out[i] = torch.frombuffer(raw, dtype=torch.uint8).view(DTYPES[self.src.entries[self.keys[k]][3]]).float()
+        return out.view(*ids.shape, self.dim)
+
+
 class Streamer:
     def __init__(self, model, load_config, src, key_target, units, qdtype, quantised):
         self.model, self.load_config, self.src = model, load_config, src
@@ -339,6 +372,19 @@ class Streamer:
                     del mod._parameters[p]
                     setattr(mod, p, LazyStack(le, p))
                 self.lazy.setdefault(i, []).append(le)
+        # Tables too large to load (Qwen4-Exp's n-gram embedding, ~100 GB in
+        # shards that transformers concatenates along rows): only the rows looked up are read.
+        rows_max = float(os.environ.get("REF_STREAM_ROWS_GB", "2")) * 1e9
+        for i, (prefix, unit) in enumerate(units):
+            for name, mod in list(unit.named_modules()):
+                if not isinstance(mod, torch.nn.Embedding) or mod.weight.numel() * 4 <= rows_max:
+                    continue
+                full = f"{prefix}.{name}.weight"
+                keys = sorted((k for k in by_unit[i] if key_target[k] == full), key=cml.dot_natural_key)
+                table = LazyRows(src, keys, mod)
+                parent, _, attr = name.rpartition(".")
+                setattr(unit.get_submodule(parent) if parent else unit, attr, table)
+                lazy_targets.add(full)
         self.unit_keys = {i: [k for k in ks if key_target[k] not in lazy_targets] for i, ks in by_unit.items()}
         self.prefetched = {}
         self.fetch_pool = cf.ThreadPoolExecutor(1)
