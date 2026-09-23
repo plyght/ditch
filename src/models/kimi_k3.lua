@@ -58,5 +58,6 @@ return {
       latent_norm = "block_sparse_moe.routed_expert_norm.weight",
     },
   },
-  hook = "kimi_linear",
+  -- The Kimi Linear config keys (shared with Kimi K3): src/models/lib/kimi_linear.lua.
+  config = require("kimi_linear").config,
 }
