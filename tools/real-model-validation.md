@@ -4286,6 +4286,37 @@ matrices changed, exactly the attention `o_proj` of layers 8-19 and the
 `down_proj` of 13-23 that the trial's two kernels reach; every one within
 2.5e-06 of the rank-3 optimum of the exact edit.
 
+## Abliteration: summary
+
+One trial each on a real-weight cut; "maths" is the worst excess over the best
+rank-3 approximation of the exact edit (f32 export) or over `bf16(W + D₃)`'s
+own error (bf16 export); "export" is the reference (transformers, or the
+release's own code where transformers has none) against `ditch probe` on the
+export, worst residual and first-token logits relative to the range.
+
+| family | weights | edited per layer | maths | export: residuals / logits | found |
+| --- | --- | --- | ---: | ---: | --- |
+| gpt-oss | MXFP4 stacked experts | `o_proj`, stacked `down_proj` | 1.4e-09 (f32) | 2.6e-06 / 8.9e-07 | |
+| Gemma 4 | bf16, per-layer inputs, KV sharing | `o_proj`, `down_proj` | 7.4e-08 (f32) | 1.5e-06 / 2.5e-06 | bug 69 |
+| Mistral Small 4 | FP8 per-tensor / per-expert, MLA | `o_proj`, stacked and shared `down_proj` | 1.0e-06 (f32) | 5.6e-07 / 1.5e-06 | bug 70 |
+| Llama 4 | bf16 stacked `[E, in, out]` | `o_proj`, stacked and shared `down_proj` | rounding floor (bf16) | 3.1e-07 / 5.3e-07 | |
+| Kimi-Linear | bf16, KDA + MLA | `o_proj`, experts' `w2`, shared `down_proj` | 1.2e-06 (f32) | 3.0e-06 / 9.3e-07 | |
+| Kimi K3 | MXFP4 experts, latent MoE, KDA + MLA | `o_proj`, `routed_expert_up_proj`, shared `down_proj` | 9.9e-08 (bf16) | 9.1e-07 / 9.4e-07 | bug 71 |
+| GLM-5.3 | FP8 blocks, MLA + DSA | `o_proj`, dense / experts' / shared `down_proj` | 1.4e-06 (f32) | 7.9e-07 / 7.0e-07 | bug 72 |
+| GLM-5.3-Flash | FP8 blocks, KDA + MLA, mHC | `o_proj`, dense / experts' / shared `down_proj` | 1.6e-06 (f32) | 5.2e-06 / 1.6e-06 | |
+| Qwen3.8-2.4T | bf16 stacked, DeltaNet + gated attention | `out_proj` / `o_proj`, stacked and shared `down_proj` | 6.4e-07 (bf16) | 5.3e-06 / 2.2e-06 | |
+| Qwen3.8-Flash-Next | bf16 stacked, DeltaNet + QSA, hyper-connections | `out_proj` / `o_proj`, stacked and shared `down_proj` | 1.1e-05 (f32) | 2.3e-06 / 1.4e-06 | |
+| MiniMax M3 | bf16, block-sparse attention | `o_proj`, dense / experts' `w2` / shared `down_proj` | 4.7e-07 (bf16) | 3.1e-07 / 4.8e-07 | |
+| MiMo V2.6 | per-shard FP8 attention, MXFP4 experts | `o_proj`, experts' `down_proj` | 1.1e-05 (bf16) | 3.1e-07 / 4.4e-07 | |
+| DeepSeek V4.1 | FP8 trunk, FP4 experts, DeepSeek's names | `wo_b`, experts' / shared `w2` | 3.3e-06 (f32) | 8.3e-07 / 4.1e-07 | bug 73 |
+
+No family edits a matrix outside its intended set: in every one the edited
+matrices are exactly the projections writing into the residual stream (for K3's
+latent MoE, the latent-to-hidden projection; for DeepSeek V4, the second half of
+the grouped output projection), each expert of an MoE layer, and the shared
+expert, while routers, gates, norms, indexers, hyper-connections and every
+input-side projection stay bit-identical to their (dequantised) originals.
+
 ## Abliteration: gpt-oss (`gpt_oss`), MXFP4 experts
 
 `openai/gpt-oss-20b`, first layer, experts MXFP4.
