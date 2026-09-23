@@ -27,7 +27,7 @@ jobs:
           ./zig-out/bin/ditch selftest --device cpu
       - name: Cross-compile all release targets
         run: |
-          for t in x86_64-linux-musl aarch64-linux-musl x86_64-macos aarch64-macos x86_64-windows-gnu; do
+          for t in x86_64-linux-musl aarch64-linux-musl x86_64-linux-gnu.2.28 x86_64-macos aarch64-macos x86_64-windows-gnu; do
             zig build -Doptimize=ReleaseFast -Dtarget=$t --prefix "zig-out/$t"
           done
 
@@ -63,6 +63,51 @@ jobs:
         with:
           name: metal-selftest-log
           path: metal.log
+
+  # Vulkan on Mesa's lavapipe, a conformant software Vulkan driver: no GPU, so
+  # this proves correctness (every kernel against the CPU reference, on both
+  # memory paths, and whole abliterations compared with the CPU), not speed.
+  # Here a missing device is a failure: the driver is installed by the job.
+  vulkan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Vulkan loader, lavapipe and the shader tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers vulkan-tools glslang-tools spirv-tools
+          vulkaninfo --summary
+      - name: Committed SPIR-V matches the GLSL sources
+        run: bash tools/gen_spirv.sh --check
+      - name: Unit tests against a live Vulkan device
+        run: zig build test --summary all -Dtest-filter=Vulkan -Dtest-filter=resident -Dtest-filter="row reductions"
+      - name: Vulkan backend, kernels and pipeline against the CPU reference
+        run: |
+          set -o pipefail
+          status=0
+          bash tests/vulkan_e2e.sh 2>&1 | tee vulkan.log || status=$?
+          if [ "$status" != "0" ]; then
+            echo "### Vulkan (lavapipe): FAILED" >> "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          fi
+          echo "### Vulkan (lavapipe): verified against the CPU reference" >> "$GITHUB_STEP_SUMMARY"
+          sed -n '/^Device: /,/kernels ran on the device/p' vulkan.log >> "$GITHUB_STEP_SUMMARY"
+      - name: The static release binary runs without Vulkan and says why
+        run: |
+          zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl --prefix zig-out/musl
+          ./zig-out/musl/bin/ditch selftest --device cpu > /dev/null
+          status=0
+          ./zig-out/musl/bin/ditch selftest --device vulkan 2> musl.err || status=$?
+          cat musl.err
+          [ "$status" = "2" ] && grep -q "statically linked" musl.err
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vulkan-selftest-log
+          path: vulkan.log
 
   # Apple Silicon: the NEON kernel shape, the performance-core thread pool and
   # the Accelerate path only exist on this runner, so they are tested here.
