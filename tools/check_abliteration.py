@@ -150,3 +150,11 @@ if EXP_BF16:
     print(f'bf16 export: worst share of elements equal to bf16(W + D3): {min(b[1] for b in bits) if bits else 1:.6f}; elements more than one bf16 step (and 1e-5 of mean |W|) apart: {sum(b[2][0] for b in bits) if bits else 0}; largest difference {max(b[2][1] for b in bits) if bits else 0:.1e} of mean |W|; over {len(bits)} matrices; (E-W) against the exact edit: worst excess over the error of bf16(W + D3) itself {worst:.2e}; scope {scope}')
 else:
     print(f'worst excess over the rank-3 optimum: {worst:.2e} over {len(checks)} matrices; scope {scope}')
+if json_out:
+    # For `ditch verify`: what changed, and each edit against its recomputation.
+    summary = dict(changed=changed, unchanged=unchanged, matrices=len(checks),
+                   unchecked=[c[0] for c in checks if c[4] is None], worst_excess=worst, scope=scope, bf16=bool(EXP_BF16))
+    if EXP_BF16 and bits:
+        summary.update(bits_equal_min=min(b[1] for b in bits), bits_far=sum(b[2][0] for b in bits),
+                       bits_max_rel=max(b[2][1] for b in bits))
+    json.dump(summary, open(json_out, 'w'), indent=1)
