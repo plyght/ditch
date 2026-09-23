@@ -4193,3 +4193,72 @@ episode. `tools/range_server.py` serves a `/ratelimit-<n>/` prefix whose
 first n range requests get a 429. Regression test: "remote source: a
 rate-limited server is waited out, the concurrent readers backing off
 together" (`src/remote_test.zig`).
+
+# Abliteration on the new families
+
+The forward pass of every family is checked above; this section checks the
+edit itself: which matrices a trial changes, whether the change is the
+orthogonalisation it should be, and whether the export carries it faithfully.
+
+## Method
+
+**One trial on a cut.** `ditch CUT --n-trials 1 --n-startup-trials 1` with 8
+harmful and 8 harmless prompts (also as the refusal and KL scorer prompts),
+`--max-response-length 8`, `--expert-selection broad` (every expert of an MoE
+layer in scope, so the intended set is the full one), and the new
+`--dump-directions FILE`, which writes the refusal directions and the good /
+bad residual means per layer entry to a safetensors file.
+
+**Independent recomputation** (`tools/check_abliteration.py`). The original
+weights are dequantised (FP8 blocks, MXFP4, packed INT4, with transformers' or
+compressed-tensors' own decoders where they exist) and rounded to bf16, as
+ditch does on load. For every tensor the export changed, the exact edit is
+recomputed from the dumped direction (per layer, or interpolated at the trial's
+`direction_index`) and the trial's per-layer weight λ: heretic's
+norm-preserving projection, `W' = n ⊙ rownorm(W/n − λ v (vᵀ W/n))` with `n`
+the row norms. ditch stores `W' − W` as a rank-3 delta (randomised SVD), so the
+reference point is the best rank-3 approximation of the exact edit: a correct
+implementation sits on it. A float32 export is compared directly; a bf16 export
+(the default for bf16 and quantised sources) is compared bit for bit with
+`bf16(W + D₃)`, `D₃` the optimal rank-3 delta.
+
+Two things this settled about reading a trial. The printed `min_weight` is a
+fraction of `max_weight` (heretic's parameterisation: the kernel's minimum is
+`min_weight × max_weight`); with it read as absolute, edits away from the
+kernel's peak looked 20-40% off. And the rank-3 delta leaves 2-7% of the exact
+edit's norm unapplied on every matrix: that is the design (`row_normalization
+= full`, `full_normalization_lora_rank = 3`, as in heretic), not an error.
+
+**The export.** ditch validates every export by reloading it and comparing
+first-token logits with the in-memory model; transformers (or the release's own
+code) then loads the export and is compared with `ditch probe` on it.
+
+A dense baseline, `Qwen/Qwen2.5-0.5B-Instruct` (whole model, f32 export): 23
+matrices changed, exactly the attention `o_proj` of layers 8-19 and the
+`down_proj` of 13-23 that the trial's two kernels reach; every one within
+2.5e-06 of the rank-3 optimum of the exact edit.
+
+## gpt-oss (`gpt_oss`): MXFP4 experts
+
+`openai/gpt-oss-20b`, first layer, experts MXFP4.
+
+* **Edited set:** `self_attn.o_proj.weight` and the stacked
+  `mlp.experts.down_proj` (all 32 experts, stored `[E, in, out]` as in the bf16
+  gpt-oss checkpoints); nothing else (`gate_up_proj`, biases, sinks and the
+  router untouched).
+* **Arithmetic, f32 export:** every matrix within 1.4e-09 of the rank-3
+  optimum; the experts' edit is applied to the MXFP4 values decoded exactly as
+  transformers' `convert_moe_packed_tensors` decodes them.
+* **bf16 export of the same trial:** 99.97-99.99% of the elements equal
+  `bf16(W + D₃)` bit for bit; the rest are one-step rounding ties (for example
+  `0.46777` between `0.46875` and `0.46680`) and near-cancellations (`-0.0625 +
+  0.0625003`), 25 elements in all more than one bf16 step and 1e-5 of the mean
+  weight apart, each by under 5e-7.
+* **Export:** ditch's reload validation 0.0063 max first-token logit
+  difference (bf16), argmax 100%; transformers on the export against `ditch
+  probe` on it: residuals within 2.6e-06, logits 8.9e-07.
+
+A two-layer run of another trial first showed the bf16 comparison off by more
+than rounding; exporting that trial in f32 showed the edit exact, and the bf16
+differences all ties or cancellations of this kind (its λ was 0.12, so the
+delta was small against the weights and the ties relatively many).
