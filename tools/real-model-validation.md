@@ -3318,3 +3318,18 @@ block, which is exactly the same sum and reads only the routed experts.
 One prompt: the second's experts would not fit on the disk. The NoPE
 layers' attention temperature and the 8192-token chunks only differ from
 plain attention past 8192 tokens.
+
+## MiniMax M3 (`minimax_m3_vl`): verified on real weights
+
+`MiniMaxAI/MiniMax-M3` (854 GB, bf16), layers 0 and 3: a dense layer with full
+attention, and the first MoE layer (128 experts plus a shared one, sigmoid
+routing with a bias, the clamped SwiGLU) with the block-sparse attention and
+its index heads (exact for prompts inside the 16 selected 128-token blocks).
+Per-head q/k norms, Gemma-style norms, partial RoPE. `truncate_checkpoint.py`
+now cuts the per-layer lists inside `sparse_attention_config`. Reference:
+transformers' `minimax_m3_vl` through `tools/ref_lazy_moe.py` (113 MB experts,
+lazy).
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (5) | all 3 agree, worst 9.82e-07 | 5.00e-07 | match (2 tokens) |
