@@ -172,7 +172,7 @@ n_trials=$(grep -c '"type":"trial"' "$CKPT")
 [ "$(tail -n 1 "$CKPT")" = '{"type":"finished"}' ] || fail "resumed study not marked finished"
 
 echo "==> Interactive menus and chat over stdin"
-printf '1\n1\n2\nHello, who are you?\n\n4\n' | "$DITCH" "${COMMON[@]}" --n-trials 4 --interactive 2>&1 | tee "$TMP/chat.log"
+printf '1\n1\n3\nHello, who are you?\n\n5\n' | "$DITCH" "${COMMON[@]}" --n-trials 4 --interactive 2>&1 | tee "$TMP/chat.log"
 grep -q "Show the results from the previous run" "$TMP/chat.log" || fail "checkpoint menu not shown"
 grep -q "Which trial do you want to use?" "$TMP/chat.log" || fail "trial menu not shown"
 grep -q "Assistant: " "$TMP/chat.log" || fail "chat did not produce a response"
