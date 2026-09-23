@@ -3166,7 +3166,9 @@ projection is square and its shape cannot tell).
 | "The capital of France is" | match (5) | all 3 agree, worst 4.87e-07 | 4.67e-07 | match |
 | "Explain how rainbows form, …" | match (14) | all 3 agree, worst 2.59e-06 | 7.01e-07 | match |
 | the printing-press passage (past the 128-token window) | match (311) | all 3 agree, worst 1.62e-06 | 5.65e-07 | match (1 token) |
-The same sweep, continued (routed experts lazy where marked):
+## The older families, continued
+
+The float32 sweep of the older families, continued (routed experts lazy where marked):
 
 | checkpoint | family | N | tokens | residuals (worst) | first-token logits |
 | --- | --- | ---: | :---: | ---: | ---: |
