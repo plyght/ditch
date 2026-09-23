@@ -73,7 +73,9 @@ fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime
 // ---------------------------------------------------------------------------
 
 var interrupted = std.atomic.Value(bool).init(false);
-/// The model argument, for the `ditch add-model` suggestion on an unknown model_type.
+/// The model argument, for the `ditch add-model` suggestion on an unknown
+/// model_type; a copy, since the settings are freed before the error is reported.
+var model_arg_buf: [std.fs.max_path_bytes]u8 = undefined;
 var model_arg: []const u8 = "";
 
 fn onSigint(_: std.posix.SIG) callconv(.c) void {
@@ -1484,7 +1486,10 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     // Lua model definitions of the user, then of --models-dir; they shadow
     // built-in definitions of the same model_type.
     try loadUserModels(arena, io, settings, env, out);
-    model_arg = settings.model;
+    if (settings.model.len <= model_arg_buf.len) {
+        @memcpy(model_arg_buf[0..settings.model.len], settings.model);
+        model_arg = model_arg_buf[0..settings.model.len];
+    }
 
     // Accelerate (macOS): resolved once, before any kernel runs.
     tensor.accelerate_enabled = settings.accelerate;
