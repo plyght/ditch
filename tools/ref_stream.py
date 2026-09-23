@@ -292,7 +292,7 @@ class LazyExperts:
                 sd[self.expert_re.sub(".experts.0.", k, count=1)] = t
         if stacked:
             sd.update(self.s.src.tensors(stacked, slab=(e, self.n)))
-        return sd
+        return self.s.prepare(sd) if self.s.prepare else sd
 
     def get(self, e):
         hit = self.cache.pop(e, None)
@@ -399,6 +399,35 @@ def mimo_attn_shards(shards, block, qdtype):
     return prepare
 
 
+def fp8_partial_blocks(block, qdtype, then=None):
+    """transformers' `Fp8Dequantize` takes the block from the scale grid
+    (`rows // scale_rows`) and refuses a weight whose rows or columns are not
+    a multiple of it. A tensor blocked with the configured `weight_block_size`
+    and a partial last block (GLM's `kv_a_proj_with_mqa`: 576 rows, 5 scale
+    rows of 128) is the convention of the releases (DeepSeek's and vLLM's
+    loaders), so such a tensor is dequantised here with the configured block,
+    in the same arithmetic (fp8 x scale in float32, then the release's bf16),
+    and handed to the loader without a scale. Tensors whose grid divides them
+    go through transformers untouched. `then` runs after (MiMo's shards)."""
+    br, bc = block
+
+    def prepare(sd):
+        if then is not None:
+            sd = then(sd)
+        for k in [k for k in sd if k.endswith(".weight") and k + "_scale_inv" in sd]:
+            w, sc = sd[k], sd[k + "_scale_inv"]
+            if w.dim() != 2 or sc.dim() != 2:
+                continue
+            rows, cols = w.shape
+            if not (rows % br or cols % bc) or tuple(sc.shape) != (-(-rows // br), -(-cols // bc)):
+                continue
+            grid = sc.float().repeat_interleave(br, 0)[:rows].repeat_interleave(bc, 1)[:, :cols]
+            sd[k] = (w.float() * grid).to(qdtype)
+            del sd[k + "_scale_inv"]
+        return sd
+    return prepare
+
+
 class Streamer:
     def __init__(self, model, load_config, src, key_target, units, qdtype, quantised):
         self.model, self.load_config, self.src = model, load_config, src
@@ -450,6 +479,7 @@ class Streamer:
                 setattr(unit.get_submodule(parent) if parent else unit, attr, table)
                 lazy_targets.add(full)
         self.unit_keys = {i: [k for k in ks if key_target[k] not in lazy_targets] for i, ks in by_unit.items()}
+        self.key_target = key_target
         self.prefetched = {}
         self.fetch_pool = cf.ThreadPoolExecutor(1)
         for i, (prefix, unit) in enumerate(units):
@@ -635,8 +665,12 @@ def load(model, dtype=torch.float32):
                              state["qdtype"], state["quantised"])
     qcfg = getattr(config, "quantization_config", None) or getattr(text, "quantization_config", None) or {}
     qcfg = qcfg if isinstance(qcfg, dict) else qcfg.to_dict()
-    if text.model_type in ("mimo_v2", "mimo_v2_flash") and qcfg.get("weight_block_size"):
-        m._ref_stream.prepare = mimo_attn_shards(text.num_key_value_heads, tuple(qcfg["weight_block_size"]), state["qdtype"])
+    if qcfg.get("weight_block_size"):
+        block = tuple(qcfg["weight_block_size"])
+        shards = None
+        if text.model_type in ("mimo_v2", "mimo_v2_flash"):
+            shards = mimo_attn_shards(text.num_key_value_heads, block, state["qdtype"])
+        m._ref_stream.prepare = fp8_partial_blocks(block, state["qdtype"], shards)
     return m
 
 
