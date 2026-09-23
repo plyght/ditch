@@ -4913,6 +4913,77 @@ with 128 x 128 blocks; float32 export (its config now says float32, bug 72).
   check used, builds the routed experts empty for a lazy file and now also
   keeps a sharded directory's index when there is no lazy file.
 
+## Abliteration: Qwen3.8-Flash-Next (`qwen4_exp`), hyper-connections and stacked experts
+
+`Qwen/Qwen3.8-Flash-Next`, layers 0 and 3 (Gated DeltaNet, then full
+attention with the QSA indexer), the first 8 of 512 experts
+(`--experts 8`), 4 hyper-connection streams; float32 export. Layer 1, whose
+n-gram embedding (PLE) is 102 GB, is left out: `ple_layer_ids` is 1-based,
+and `tools/truncate_checkpoint.py` now remaps it with the kept layers (it had
+kept `[2]`, which in a two-layer cut names the full-attention layer, whose
+n-gram tensors are not there).
+
+* **Edited set:** `linear_attn.out_proj` in layer 0, `self_attn.o_proj` in
+  layer 1, the stacked `mlp.experts.down_proj` (all 8 slabs) and
+  `shared_expert.down_proj` in both. `gate_up_proj`, the router, the shared
+  expert's gate, the DeltaNet and indexer projections and every
+  hyper-connection tensor are untouched.
+* **Maths:** 20 matrices (the stacked experts slab by slab) within 1.0e-06 of
+  the best rank-3 approximation of the exact edit, except layer 0's expert 0 at
+  1.1e-05 (5.680e-02 against 5.679e-02): the randomised SVD's shortfall on
+  that slab, not λ or the direction, which the other 19 would share. The
+  checker now prints each matrix's excess.
+* **Export:** transformers' `qwen4_exp` (`tools/ref_plain.py`) on the export
+  against `ditch probe`: residuals within 2.3e-06, logits 1.4e-06 of range,
+  argmax and top-5 equal. ditch's reload check 0.0000.
+
+## Abliteration: Qwen3.8-2.4T-A95B (`qwen3_5_moe`), stacked experts
+
+`Qwen/Qwen3.8-2.4T-A95B`, layers 0 and 3 (Gated DeltaNet, then gated full
+attention), the first 2 of 512 experts (`--experts 2`) and no MTP layer
+(`--drop mtp.`): with 8 experts the cut is 13.7 GB, and a bf16 export does
+not fit beside it. bf16 export; the 8.1 GB embedding and LM head leave no room
+for float32.
+
+* **Edited set:** `linear_attn.out_proj` in layer 0, `self_attn.o_proj` in
+  layer 1, the stacked `mlp.experts.down_proj` (both slabs) and
+  `shared_expert.down_proj` in both layers; `gate_up_proj`, the router, the
+  shared expert's gate, the DeltaNet projections and the attention output
+  gate are untouched.
+* **Maths (bf16 export):** 99.79-99.98% of the elements bit-equal to
+  `bf16(W + D₃)`, the error against the exact edit at most 6.4e-07 over that
+  rounded floor (per matrix, from -1.9e-06 to 6.4e-07). The least bit-equal
+  matrix is layer 0's expert 0, as in Qwen3.8-Flash-Next. Reload check 0.0106.
+* **Export:** transformers' `qwen3_5_moe` on the export (`tools/ref_plain.py`
+  with `REF_F32_ARITH=1`: bf16 weights, float32 arithmetic through
+  `ref_lazy_moe`'s `f32_arithmetic`, which a 21 GB float32 copy would not fit
+  in memory for) against `ditch probe`: residuals within 5.3e-06, logits
+  2.2e-06 of range, argmax and top-5 equal. The same chat-templated prompt on
+  the unabliterated cut gives 1.0e-05 and 2.3e-06: the level belongs to the
+  prompt (64 chat tokens through the DeltaNet recurrence; the forward check's
+  2-token prompt gave 2.7e-07), not to the edit.
+
+## Abliteration: MiniMax M3 (`minimax_m3_vl`), block-sparse attention with per-expert tensors
+
+`MiniMaxAI/MiniMax-M3`, layers 0 and 3 (dense with full attention, then the
+first MoE layer with the block-sparse attention and its index heads), the
+first 8 of 128 experts (`--experts 8`), no MTP (`--drop mtp.`); bf16 export
+(a float32 one fits on the disk but not, as a float32 reference, in memory).
+
+* **Edited set:** `self_attn.o_proj` in both layers, layer 0's dense
+  `mlp.down_proj`, every routed expert's `w2` and `shared_experts.down_proj`.
+  `w1`/`w3`, the router and its bias, the index heads and the q/k norms are
+  untouched.
+* **Maths (bf16 export):** 99.95% or more of the elements bit-equal to
+  `bf16(W + D₃)` in every matrix, the error against the exact edit at most
+  4.7e-07 over that rounded floor. Reload check 0.0121.
+* **Export:** transformers' `minimax_m3_vl` (`tools/ref_plain.py`,
+  `REF_F32_ARITH=1`) on the export against `ditch probe`: residuals within
+  3.1e-07, logits 4.8e-07 of range, argmax and top-5 equal. The export holds
+  exactly the cut's 98 tensors; transformers reports the vision encoder's
+  layers 2-31 missing because `truncate_checkpoint.py` cuts the encoder's
+  `layers.N` with the decoder's, which a text-only comparison never reads.
+
 ## Exact ranges for scattered experts: gpt-oss-20b with a cache below its experts
 
 After the account of gpt-oss-120b's decode above (whole 8 MB chunks per

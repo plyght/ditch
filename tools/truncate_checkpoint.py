@@ -109,6 +109,9 @@ for key in ('kv_source_layer_ids', 'index_source_layer_ids', 'engram_layer_ids',
         for p in paired.get(key, []):
             if isinstance(tc.get(p), list): tc[p] = [tc[p][j] for j in keep]
         tc[key] = [new_id[tc[key][j]] for j in keep]
+# Qwen4-Exp's per-layer n-gram embedding layers are 1-based ids.
+if isinstance(tc.get('ple_layer_ids'), list):
+    tc['ple_layer_ids'] = [new_id[x - 1] + 1 for x in tc['ple_layer_ids'] if x - 1 in new_id]
 # Kimi-Linear / Kimi K3 name their layer kinds with 1-based ids,
 # GLM-5.3-Flash with 0-based ones (its lists contain a 0).
 lac = tc.get('linear_attn_config')
