@@ -4805,3 +4805,23 @@ and a decode step is bound less by bytes than by the largest piece each
 layer waits for at the per-connection rate (~1-3 MB/s here), which the
 exact ranges do not shorten. They matter where a step is bandwidth-bound
 (gpt-oss-120b's ~6.3 GB a step) and for the Hub's request and byte budget.
+
+## Bug 71 — exports left out the remote code (fixed)
+
+**Symptom.** The abliterated export of a `trust_remote_code` model did not
+load: Kimi K3's export kept `auto_map` in `config.json`, but
+`configuration_kimi_k3.py`, `modeling_kimi_k3.py`, `modeling_kimi_linear.py`,
+`tokenization_kimi.py` and the modules they import were not in it
+(`OSError: out-k3 does not appear to have a file named tokenization_kimi.py`).
+
+**Cause.** Only `tokenization_*.py` was meant to be copied, and only for
+tiktoken vocabularies; even that never ran. The source directory was opened
+without `.iterate = true`, so iterating it failed (EBADF on the O_PATH
+descriptor), which the loop took as the end of the listing. A debug build
+panics there; a release build copied nothing.
+
+**Fix.** `saveModel` opens the source for iteration, and `copySideFiles`
+copies every top-level `*.py` beside the tokenizer and processor files: the
+modules `auto_map` names and the ones they import, as transformers'
+`save_pretrained` does for remote code. Test: `saveModel carries the remote
+code` exports the qwen2 fixture with Kimi K3's file names beside it.
