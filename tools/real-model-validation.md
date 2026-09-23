@@ -3414,3 +3414,39 @@ cut), no q/k norm. Same reference as Scout.
 | prompt | tokens | residuals | first-token logits | greedy |
 | --- | :---: | :---: | ---: | :---: |
 | "The capital of France is" | match (5) | all 3 agree, worst 1.20e-06 | 5.95e-07 | match (2 tokens) |
+## Bug 65 — sequential Falcon (RefinedWeb) lost its MLP norm and mis-scaled ALiBi (fixed)
+
+`facebook/opt-125m` and `tiiuae/falcon-rw-1b` ship `pytorch_model.bin` only;
+both were re-saved as safetensors with `save_pretrained(safe_serialization=True)`
+(a user would have to do the same) and compared whole, `--raw`. OPT matched at
+once (all 13 residuals within 9.5e-07, logits 2.6e-07). Falcon-RW-1B, the
+ALiBi variant the `falcon` entry called "implemented but unverified", did not.
+
+**Symptom.** Falcon-RW-1B's layer 0 differed by 5.1e-01 and the argmax
+disagreed; most of the difference was in the MLP.
+
+**Causes.** (1) The `falcon` names set `pre_ff_norm = null`: right for the
+parallel layouts (7B: one norm; 40B: `ln_attn` / `ln_mlp`), but the sequential
+layout (`parallel_attn: false`, RefinedWeb) normalises the MLP input with
+`post_attention_layernorm`, so ditch fed the MLP an unnormalised residual.
+(2) Falcon adds the ALiBi bias to the raw `q·k` and then scales the sum by
+1/√head_dim (transformers folds `alibi / sqrt(head_dim)` into the mask);
+ditch added it after the scaling, as BLOOM and MPT do, so Falcon's bias was
+√head_dim (8×) too large. The fixture covered only the 7B layout.
+
+**Fix.** `pre_ff_norm` names `post_attention_layernorm` (optional in the
+parallel layouts, which lack it); `Config.alibi_scale`, 1/√head_dim for
+Falcon with ALiBi, multiplies the slopes. New fixture `falcon_rw`
+(sequential, per-head interleaved qkv with biases, scaled ALiBi) fails on
+the old code (logits off by 11.9) and passes.
+
+| model | tokens | residuals (worst) | first-token logits |
+| --- | :---: | ---: | ---: |
+| falcon-rw-1b, "The capital of France is" | match (5, raw) | 3.51e-05 | 5.08e-06 |
+| falcon-rw-1b, "Explain how rainbows form, …" | match (11, raw) | 2.23e-04 | 1.50e-05 |
+| same, reference ALiBi built in float32 | | 2.70e-06 | 5.69e-07 |
+
+The remaining 2e-04 is transformers': `build_alibi_tensor` rounds the slopes
+(and their products with the positions) to bf16, and Falcon-RW's 32 heads
+have slopes that are not powers of two. With the reference's ALiBi built in
+float32, every layer agrees to 3e-06. ditch keeps float32 slopes.

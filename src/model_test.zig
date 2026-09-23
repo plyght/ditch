@@ -129,6 +129,10 @@ test "gpt2 fixture" {
 test "falcon fixture" {
     try checkFixture("falcon");
 }
+
+test "falcon_rw fixture (sequential, interleaved qkv, scaled ALiBi)" {
+    try checkFixture("falcon_rw");
+}
 test "stablelm fixture" {
     try checkFixture("stablelm");
 }

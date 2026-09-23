@@ -711,6 +711,9 @@ pub const Config = struct {
     has_conv: bool,
     conv_kernel: usize,
     positional: Positional,
+    /// Factor on the ALiBi bias: Falcon adds it before scaling the scores by
+    /// 1/sqrt(head_dim), so its bias is divided by sqrt(head_dim); BLOOM and MPT add it after.
+    alibi_scale: f32 = 1.0,
     /// Per layer: true for Gated DeltaNet linear-attention layers (Qwen
     /// hybrids); false for full-attention layers.
     linear_layers: []bool,
@@ -1945,7 +1948,10 @@ fn extraFalcon(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
         c.qkv_layout = .heads_interleaved;
         c.num_kv_heads = c.num_heads;
     }
-    if (getBool(obj, "alibi", false)) c.positional = .alibi;
+    if (getBool(obj, "alibi", false)) {
+        c.positional = .alibi;
+        c.alibi_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.head_dim)));
+    }
 }
 
 fn extraStableLm(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
@@ -3967,7 +3973,9 @@ pub const registry = [_]Arch{
             .layer = "{p}h.{i}.",
             .input_norm = &.{ "input_layernorm.weight", "ln_attn.weight" },
             .mlp_norm = "ln_mlp.weight",
-            .pre_ff_norm = null,
+            // Sequential Falcon (`parallel_attn: false`, the RefinedWeb models)
+            // normalises the MLP input with it; the parallel layouts have none.
+            .pre_ff_norm = "post_attention_layernorm.weight",
             .q = null,
             .k = null,
             .v = null,

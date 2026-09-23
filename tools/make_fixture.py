@@ -429,7 +429,7 @@ def base(**kw):
         q="self_attn.q_proj.weight", k="self_attn.k_proj.weight", v="self_attn.v_proj.weight", qkv=None, qkv_layout="concat", o="self_attn.o_proj.weight",
         attn_bias=False, o_bias=None, conv1d=False,
         mlp="gated", gate="mlp.gate_proj.weight", up="mlp.up_proj.weight", gate_up=None, down="mlp.down_proj.weight", mlp_bias=False, act="silu",
-        parallel=False, pos="rope", rope_style="neox", rotary_dim=None, theta=10000.0, scaling=None, rope_layers=None, attn_scale=None,
+        parallel=False, pos="rope", alibi_scale=1.0, rope_style="neox", rotary_dim=None, theta=10000.0, scaling=None, rope_layers=None, attn_scale=None,
         # `tanh` softcap on the attention logits, applied to the scaled scores
         # before the causal / sliding mask (Gemma 2).
         attn_softcap=None,
@@ -541,6 +541,16 @@ spec("falcon", NKV=1, I=64, prefix="transformer.", layer="h.{i}.", embed="word_e
      mlp="dense", up="mlp.dense_h_to_4h.weight", down="mlp.dense_4h_to_h.weight", act="gelu", tok="falcon",
      config={"model_type": "falcon", "hidden_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4, "layer_norm_epsilon": 1e-5,
              "ffn_hidden_size": 64, "multi_query": True, "parallel_attn": True, "new_decoder_architecture": False, "bias": False, "alibi": False, "rope_theta": 10000.0,
+             "max_position_embeddings": 128, "tie_word_embeddings": True, "vocab_size": 0})
+# Falcon-RW (RefinedWeb): sequential residual with post_attention_layernorm,
+# per-head interleaved qkv with biases, ALiBi added before the 1/sqrt(head_dim)
+# score scaling (so the bias is divided by it too).
+spec("falcon_rw", NKV=4, I=64, prefix="transformer.", layer="h.{i}.", embed="word_embeddings.weight", final_norm="ln_f.weight", lm_head=None,
+     norm="ln", eps=1e-5, qkv="self_attention.query_key_value.weight", qkv_layout="heads", attn_bias=True, o="self_attention.dense.weight",
+     mlp="dense", up="mlp.dense_h_to_4h.weight", down="mlp.dense_4h_to_h.weight", mlp_bias=True, act="gelu", tok="falcon", pos="alibi",
+     alibi_scale=1 / np.sqrt(8),
+     config={"model_type": "falcon", "hidden_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4, "layer_norm_epsilon": 1e-5,
+             "ffn_hidden_size": 64, "multi_query": False, "parallel_attn": False, "new_decoder_architecture": False, "bias": True, "alibi": True,
              "max_position_embeddings": 128, "tie_word_embeddings": True, "vocab_size": 0})
 spec("stablelm", norm="ln", eps=1e-5, attn_bias=True, o_bias=False, rotary_dim=2, lm_head=None,
      config={"model_type": "stablelm", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
@@ -2244,7 +2254,7 @@ def generate_generic(family, out_dir):
                 cap = np.float32(s["attn_softcap"])
                 sc_ = cap * np.tanh(sc_ / cap)
             if slopes:
-                sc_ = sc_ + slopes[hh] * np.arange(T)[None, :]
+                sc_ = sc_ + slopes[hh] * s["alibi_scale"] * np.arange(T)[None, :]
             mask = np.triu(np.ones((T, T), dtype=bool), k=1)
             if sliding_layers[li]:
                 mask |= np.tril(np.ones((T, T), dtype=bool), k=-s["sliding"])

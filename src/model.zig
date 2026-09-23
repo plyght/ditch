@@ -2898,7 +2898,7 @@ fn attentionWorker(ctx: *const AttnCtx, start: usize, end: usize) void {
         }
         const n_keys = row.pos + 1 - lo;
         const scores = scores_buf[0..n_keys];
-        const slope: f32 = if (model.alibi_slopes.len > 0) model.alibi_slopes[h] else 0;
+        const slope: f32 = if (model.alibi_slopes.len > 0) model.alibi_slopes[h] * c.alibi_scale else 0;
         const kbase = ctx.cache.kSlot(ctx.layer, row.b, lo).ptr + kvh * hd;
         const vbase = ctx.cache.vSlot(ctx.layer, row.b, lo).ptr + kvh * hd;
         if (vectorised) {
