@@ -338,10 +338,45 @@ class LazyRows(torch.nn.Module):
         return out.view(*ids.shape, self.dim)
 
 
+def mimo_attn_shards(shards, block, qdtype):
+    """MiMo V2's fp8 attention projections are quantised per tensor-parallel
+    shard (`shards` = the full layers' KV heads): each row shard is blocked
+    from its own first row, with its own partial last block (see Bug F5).
+    transformers' `Fp8Dequantize` takes the block from the scale grid and
+    applies it to the whole tensor, which misplaces every scale after the
+    first shard; SGLang's loader splits by shard. So a projection whose grid
+    is the per-shard one is dequantised here, shard by shard (the same
+    arithmetic as `Fp8Dequantize`: fp8 x scale in float32, then the release's
+    bf16), and handed to the loader without a scale, which then loads it as
+    it is. Every other tensor goes through transformers untouched."""
+    br, bc = block
+    pat = re.compile(r"self_attn\.(qkv|q|k|v)_proj\.weight$")
+
+    def prepare(sd):
+        for k in [k for k in sd if pat.search(k)]:
+            sk = k + "_scale_inv"
+            if sk not in sd:
+                continue
+            w, sc = sd[k], sd[sk]
+            rows = w.shape[0]
+            per_shard = rows % shards == 0 and sc.shape[0] == shards * -(-(rows // shards) // br)
+            if not per_shard or sc.shape[0] == -(-rows // br):
+                continue
+            parts = []
+            for pw, ps in zip(w.chunk(shards, 0), sc.chunk(shards, 0)):
+                grid = ps.float().repeat_interleave(br, 0)[: pw.shape[0]].repeat_interleave(bc, 1)[:, : pw.shape[1]]
+                parts.append(pw.float() * grid)
+            sd[k] = torch.cat(parts, 0).to(qdtype)
+            del sd[sk]
+        return sd
+    return prepare
+
+
 class Streamer:
     def __init__(self, model, load_config, src, key_target, units, qdtype, quantised):
         self.model, self.load_config, self.src = model, load_config, src
         self.qdtype, self.quantised = qdtype, quantised
+        self.prepare = None
         self.units = units  # [(prefix, module)]
         self.expert_cache_bytes = float(os.environ.get("REF_STREAM_EXPERT_CACHE_GB", "3")) * 1e9
         self.expert_bytes, self.expert_lru = 0, []
@@ -403,7 +438,8 @@ class Streamer:
             raise SystemExit(f"ref_stream: loading {what}: unexpected {sorted(info.unexpected_keys)[:8]}")
 
     def _fetch(self, i):
-        return self.src.tensors(self.unit_keys[i])
+        sd = self.src.tensors(self.unit_keys[i])
+        return self.prepare(sd) if self.prepare else sd
 
     def materialise(self, i):
         prefix, unit = self.units[i]
@@ -568,4 +604,8 @@ def load(model, dtype=torch.float32):
         raise SystemExit(f"ref_stream: trunk parameters with no checkpoint tensor: {leftover[:8]}")
     m._ref_stream = Streamer(m, state["load_config"], src, state["key_target"], state["units"],
                              state["qdtype"], state["quantised"])
+    qcfg = getattr(config, "quantization_config", None) or getattr(text, "quantization_config", None) or {}
+    qcfg = qcfg if isinstance(qcfg, dict) else qcfg.to_dict()
+    if text.model_type in ("mimo_v2", "mimo_v2_flash") and qcfg.get("weight_block_size"):
+        m._ref_stream.prepare = mimo_attn_shards(text.num_key_value_heads, tuple(qcfg["weight_block_size"]), state["qdtype"])
     return m

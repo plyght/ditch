@@ -3905,6 +3905,7 @@ whole by `from_pretrained` in float32, same ids, 5 greedy tokens):
 | `Qwen/Qwen2.5-0.5B-Instruct` | dense bf16 | all 25 identical | 0.0 | match |
 | `yujiepan/qwen3-moe-tiny-random` | per-expert tensors fused by `MergeModulelist`; experts lazy | identical | 0.0 | match |
 | `yujiepan/gpt-oss-tiny-random-mxfp4` | stacked MXFP4 `_blocks`/`_scales`; experts lazy and not | ≤ 3.0e-08 | 4.5e-08 | match |
+| `Qwen/Qwen3-0.6B-FP8` | fine-grained FP8, 128 x 128 blocks, through `Fp8Dequantize` (`REF_STREAM_DEQUANT_DTYPE=float32`, as the float32 whole load dequantises) | all 29 identical | 0.0 | match |
 
 The MXFP4 stub's 3e-08 is a last-bit difference, the same with lazy and with
 whole-layer experts.
