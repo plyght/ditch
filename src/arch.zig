@@ -714,6 +714,8 @@ pub const Config = struct {
     /// Factor on the ALiBi bias: Falcon adds it before scaling the scores by
     /// 1/sqrt(head_dim), so its bias is divided by sqrt(head_dim); BLOOM and MPT add it after.
     alibi_scale: f32 = 1.0,
+    /// The LM head normalises each row to unit length at inference (Baichuan 2's `NormHead`).
+    lm_head_l2norm: bool = false,
     /// Per layer: true for Gated DeltaNet linear-attention layers (Qwen
     /// hybrids); false for full-attention layers.
     linear_layers: []bool,
@@ -2245,6 +2247,9 @@ fn extraGptBigcode(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
 }
 
 fn extraBaichuan(c: *Config, _: Allocator, obj: std.json.ObjectMap) !void {
+    // Baichuan 2 (vocabulary 125696; Baichuan 1 has 64000) normalises its LM
+    // head rows at inference (`NormHead`); llama.cpp tells the two apart the same way.
+    c.lm_head_l2norm = c.vocab_size == 125696;
     // Baichuan 13B checkpoints carry `model_max_length` instead of
     // `max_position_embeddings` and use ALiBi; 7B uses RoPE.
     if (obj.get("max_position_embeddings") == null and getNum(obj, "model_max_length") != null) {
@@ -5934,4 +5939,17 @@ test "parseConfig: a config without model_type takes its family from architectur
     );
     try std.testing.expectEqualStrings("minicpm", c.arch.model_type);
     try std.testing.expectEqual(@as(f32, 12), c.embed_scale);
+}
+
+test "parseConfig: Baichuan 2 normalises its LM head, Baichuan 1 does not" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const b2 = try parseConfig(arena.allocator(),
+        \\{"model_type":"baichuan","hidden_size":64,"num_attention_heads":4,"num_hidden_layers":2,"vocab_size":125696,"max_position_embeddings":4096}
+    );
+    try std.testing.expect(b2.lm_head_l2norm);
+    const b1 = try parseConfig(arena.allocator(),
+        \\{"model_type":"baichuan","hidden_size":64,"num_attention_heads":4,"num_hidden_layers":2,"vocab_size":64000,"max_position_embeddings":4096}
+    );
+    try std.testing.expect(!b1.lm_head_l2norm);
 }

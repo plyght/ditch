@@ -42,7 +42,7 @@ const Which = enum { gate, up, down };
 const Src = union(enum) {
     /// A `[rows][cols]` matrix, optionally with a delta (rows indexed in Hugging
     /// Face order) and llama.cpp's head permutation (`n_head`).
-    matrix: struct { ref: moe.MatrixRef, delta: ?tensor.Delta = null, n_head: ?usize = null },
+    matrix: struct { ref: moe.MatrixRef, delta: ?tensor.Delta = null, n_head: ?usize = null, row_scale: ?[]const f32 = null },
     /// A 1-D tensor written as f32, optionally `+ 1` (gemma norms) or permuted (llama q/k biases).
     vector: struct { ref: stream.WeightRef, plus_one: bool = false, n_head: ?usize = null },
     /// The routed experts of a MoE layer, stacked `[E][rows][cols]`.
@@ -150,6 +150,9 @@ const Planner = struct {
         try self.addVector("output_norm.weight", try self.hfName("{s}norm.weight", .{p}), gemma);
         if (!std.mem.eql(u8, model.lm_head_ref.name, model.embed_ref.name)) {
             try self.addMatrix("output.weight", model.lm_head_ref.name, null, null, true);
+            // Baichuan 2's NormHead: llama.cpp runs a plain head, so the rows are
+            // written normalised (as its converter does).
+            if (model.lm_head_inv_norm) |inv| self.entries.items[self.entries.items.len - 1].src.matrix.row_scale = inv;
         }
         if (ropeFactors(self.a, c)) |factors| {
             const shape = try self.a.alloc(usize, 1);
@@ -420,7 +423,7 @@ fn rowsPerChunk(model: *const Model, src_dtype: DType, out_dtype: DType, rows: u
 /// Streams one `[rows][cols]` matrix: rows of `mref` (Hugging Face order) are
 /// converted, the delta merged, the head permutation applied and the result
 /// quantised chunk by chunk.
-fn writeMatrix(ctx: Ctx, mref: moe.MatrixRef, delta: ?tensor.Delta, n_head: ?usize, out_dtype: DType) !void {
+fn writeMatrix(ctx: Ctx, mref: moe.MatrixRef, delta: ?tensor.Delta, n_head: ?usize, out_dtype: DType, row_scale: ?[]const f32) !void {
     const store: *stream.WeightStore = @constCast(&ctx.model.store);
     const gpa = ctx.gpa;
     const rows = mref.rows();
@@ -429,7 +432,7 @@ fn writeMatrix(ctx: Ctx, mref: moe.MatrixRef, delta: ?tensor.Delta, n_head: ?usi
     const hd: usize = if (n_head) |h| rows / h else 1;
     if (n_head != null and (rows % (2 * n_head.?) != 0)) return error.InvalidConfig;
     const per = rowsPerChunk(ctx.model, src_dtype, out_dtype, rows, cols, if (n_head != null) hd else 1);
-    const plain = delta == null and out_dtype == src_dtype;
+    const plain = delta == null and row_scale == null and out_dtype == src_dtype;
     const out_rb = out_dtype.rowBytes(cols);
     const chunk: []u8 = if (plain) &.{} else try gpa.alloc(u8, per * out_rb);
     defer if (chunk.len > 0) gpa.free(chunk);
@@ -468,6 +471,7 @@ fn writeMatrix(ctx: Ctx, mref: moe.MatrixRef, delta: ?tensor.Delta, n_head: ?usi
             const row = f[j * cols ..][0..cols];
             w.row(hf_row - r0, row);
             if (delta) |d| for (0..d.rank) |k| tensor.axpy(row, d.b[hf_row * d.rank + k], d.a[k * cols ..][0..cols]);
+            if (row_scale) |rs| tensor.scale(row, rs[hf_row]);
         }
         tensor.convertFromF32(out_dtype, f[0 .. n * cols], chunk);
         try ctx.out.writeAll(chunk[0 .. n * out_rb]);
@@ -508,7 +512,7 @@ fn writeRaw(ctx: Ctx, t: gguf.TensorInfo) !void {
 
 fn writeEntry(ctx: Ctx, e: Entry) !void {
     switch (e.src) {
-        .matrix => |m| try writeMatrix(ctx, m.ref, m.delta, m.n_head, e.dtype),
+        .matrix => |m| try writeMatrix(ctx, m.ref, m.delta, m.n_head, e.dtype, m.row_scale),
         .vector => |v| try writeVector(ctx, v.ref, v.plus_one, v.n_head),
         .experts => |x| {
             const m = &ctx.model.layers[x.layer].moe.?;
@@ -518,7 +522,7 @@ fn writeEntry(ctx: Ctx, e: Entry) !void {
                     .up => ex.up_ref,
                     .down => ex.down_ref,
                 };
-                try writeMatrix(ctx, mref, if (x.which == .down) ex.down_delta else null, null, e.dtype);
+                try writeMatrix(ctx, mref, if (x.which == .down) ex.down_delta else null, null, e.dtype, null);
             }
         },
         .raw => |t| try writeRaw(ctx, t),

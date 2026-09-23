@@ -3650,3 +3650,34 @@ transformers 5), `baichuan` and `persimmon` (`.bin` and no `tokenizer.json`),
 (refused by design: the release quantises activations at run time), and
 `gemma3n`'s audio/vision towers and any family's behaviour beyond the cut
 layers (by construction of the method).
+
+## The blocked families, once more (mirrors, conversions, stubs)
+
+A search of the Hub for every blocked family, and what each find allowed:
+
+| family | what exists besides the release | what it allowed |
+| --- | --- | --- |
+| `persimmon` | `hf-tiny-v2/tiny-random-PersimmonForCausalLM` (safetensors, `tokenizer.json`); OpenVINO IR and GGUF conversions of the 8B | stub vs transformers: all 3 residuals within 2.5e-07, logits 1.9e-07. The 8B release still has only `.bin` and no `tokenizer.json`. |
+| `jais2` | `hf-tiny-v2/tiny-random-Jais2ForCausalLM`; NVFP4 / MXFP4 / AWQ re-uploads of the 8B (formats ditch does not decode) | stub vs transformers: all 3 residuals within 1.5e-07, logits 1.5e-07. The releases stay gated. |
+| `bitnet` | `hf-tiny-v2/tiny-random-BitNetForCausalLM` (plain weights) | stub vs transformers: all 3 residuals within 4.2e-07, logits 2.2e-07, which is the plain-weights layout the entry claims. The releases stay refused (run-time activation quantisation). |
+| `internlm2` | `optimum-intel-internal-testing/tiny-random-internlm2`, whose `tokenizer.json` is a correct conversion of InternLM2's 92544-token SentencePiece vocabulary | the stub's tokenizer on the **real** `internlm2_5-1_8b-chat` (first 4 layers, `--raw`): ditch's ids equal `tokenizers`'; every residual within 1.3e-06 and logits within 7.7e-07 of a float32 re-implementation of the release's `modeling_internlm2.py` (grouped `wqkv`, RoPE base 1e6; the dynamic NTK scaling only acts beyond 32768 tokens). The release's own code fails under transformers 5 (`rope_scaling["type"]`, then 6e-01 off even on the stub, where the re-implementation agrees with ditch to 1.6e-07). |
+| `baichuan` | `katuni4ka/tiny-random-baichuan2` (random weights, remote code, no `tokenizer.json`); `hiyouga/*-LLaMAfied` (Llama-format conversions with the same `tokenizer.model`) | a `tokenizer.json` converted by transformers' `LlamaTokenizerFast` differs from SentencePiece on the first token (`▁You` against `You`: the converter prepends the word marker Baichuan does not), so no faithful tokenizer; the stub's remote code fails under transformers 5 (meta tensor). The stub against a float32 re-implementation of `modeling_baichuan.py` found bug 68. |
+
+### Bug 68 — Baichuan 2's LM head was not normalised (fixed)
+
+**Symptom.** On the Baichuan 2 stub every residual agreed with the
+re-implementation to 4e-07, but the logits differed by 2.5e-01 of their range
+(argmax still equal).
+
+**Cause.** Baichuan 2's `NormHead` L2-normalises every LM-head row at
+inference (`F.normalize(self.weight)`); ditch used the stored rows. Baichuan 1
+has a plain head.
+
+**Fix.** `Config.lm_head_l2norm`, set for `baichuan` with the Baichuan 2
+vocabulary (125696 tokens, the rule llama.cpp uses); the model computes the
+rows' inverse norms once at load and scales the logits by them, so the stored
+weights (and a safetensors export, which transformers normalises again) are
+untouched. The GGUF export writes the head's rows normalised, since
+llama.cpp runs a plain head (its converter normalises too); normalising them
+again on import changes nothing. Logits now agree to 3.2e-07. A parse test
+covers the flag.

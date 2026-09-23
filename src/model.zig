@@ -662,6 +662,9 @@ pub const Model = struct {
     embed_ref: WeightRef,
     lm_head_ref: WeightRef,
     lm_head_bias: ?[]const f32,
+    /// 1 / ||row|| of every LM-head row, for a head that normalises its rows
+    /// at inference (Baichuan 2's `NormHead`); null otherwise.
+    lm_head_inv_norm: ?[]const f32 = null,
     /// Learned absolute position table (GPT-2, OPT).
     pos_embed_ref: ?WeightRef,
     /// Sinusoidal position table `[positions][hidden]` (XGLM), computed on load.
@@ -1403,6 +1406,21 @@ pub const Model = struct {
         }
         self.lm_head_ref = lm orelse self.embed_ref;
         self.lm_head = try self.loadMat(self.lm_head_ref.name);
+        self.lm_head_inv_norm = null;
+        if (c.lm_head_l2norm) {
+            const rows = self.lm_head_ref.rows;
+            const inv = try arena.alloc(f32, rows);
+            const row = try arena.alloc(f32, c.hidden_size);
+            const store: *stream.WeightStore = @constCast(&self.store);
+            for (inv, 0..) |*v, i| {
+                try store.readRow(self.lm_head_ref, i, row);
+                var ss: f64 = 0;
+                for (row) |x| ss += @as(f64, x) * x;
+                // torch's F.normalize: w / max(||w||, 1e-12).
+                v.* = @floatCast(1.0 / @max(@sqrt(ss), 1e-12));
+            }
+            self.lm_head_inv_norm = inv;
+        }
 
         // Per-layer input embeddings and AltUp projections (Gemma 3n / 4).
         self.ple_embed_ref = null;
@@ -4778,6 +4796,11 @@ pub fn forward(model: *const Model, ws: *Workspace, cache: *KvCache, tokens: []c
         defer store.release(lm);
         try compute.matmulT(model.pool, gpa, ws.logits, h, opts.logit_rows.len, lm.weight, null);
         const logits = ws.logits[0 .. opts.logit_rows.len * c.vocab_size];
+        if (model.lm_head_inv_norm) |inv| {
+            for (0..opts.logit_rows.len) |r| {
+                for (logits[r * c.vocab_size ..][0..c.vocab_size], inv[0..c.vocab_size]) |*l, s| l.* *= s;
+            }
+        }
         if (model.lm_head_bias) |b| addBias(logits, opts.logit_rows.len, c.vocab_size, b);
         if (c.logit_scale != 1.0) tensor.scale(logits, c.logit_scale);
         if (c.final_logit_softcapping) |cap| compute.softcap(logits, cap);
