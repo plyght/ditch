@@ -3707,6 +3707,55 @@ machine with ~60 GB of disk for the cache would hold every expert after one
 pass; the RAM side fits (7.5 GB). Not a correctness result: gpt-oss-120b's
 arithmetic is verified on its truncated cut above.
 
+Why: the 87-token prompt routes to most of the 4608 experts, about 57 GB of
+MXFP4, while this machine's disk leaves room for an 18 GB chunk cache, so
+the prefill's working set cannot stay on disk: at ~19 MB/s the first pass
+alone needs ~50 minutes, and experts evicted before a later layer or token
+reads them again are fetched again. No warm-cache number is possible here
+for the same reason (the warm working set is three times the cache). A
+machine with ~60 GB of disk for the cache would hold every expert after one
+pass; the RAM side fits (7.5 GB). Not a correctness result: gpt-oss-120b's
+arithmetic is verified on its truncated cut above.
+
+## gpt-oss-20b at full depth over `hf://`: cold (network) and warm cache
+
+The same run as above, after the speedups, split into a first pass with an
+empty chunk cache and a second pass with the model on disk (`--max-ram 10GB
+--remote-cache-size 16GB`, ReleaseFast, "What is the capital of France?",
+87 prompt tokens, 16 greedy tokens).
+
+| pass | load to exit | 16 tokens with the prefill | fetched from the Hub | chunk reads from disk | peak RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| cold | 1066 s | 1006.7 s, 0.016 tokens/s | 1510 ranges, 11.78 GB (~11.7 MB/s) | 0 | 7.08 GB |
+| warm | 70 s | 65.3 s, 0.245 tokens/s | 0 | 1509 | 7.03 GB |
+
+Dry-run estimate for comparison: warp mode min 2.03 GB, with prefetch and all
+caches 11.68 GB (the budget allowed 9 GB; measured peak 7.08 GB), trunk
+3.35 GB and 9.47 GB of experts on disk (measured chunk cache 11.77 GB, every
+expert the prompt touched). Both passes print `<|channel|>analysis<|message|>We
+need to answer: "What is the capital of France?"`. The cold pass is bound by
+the Hub's bandwidth here (the prefill touches 645 of the 768 experts); once
+they are on disk the run is bound by decoding them into the 5.67 GB expert
+cache (29% hits, 56 misses a decode step). 0.245 tokens/s here against
+0.289 above: 16 tokens amortise the 87-token prefill less than 24 did.
+
+## Mistral Small 4 at full depth over `hf://`: dry run only
+
+`ditch --dry-run hf://mistralai/Mistral-Small-4-119B-2603 --max-ram 10GB
+--remote-cache-size 18GB`:
+
+    weights total 222.40GB (36 layers), trunk per layer 102.5MB
+    routed expert 48.0MB decoded / 24.0MB stored (fp8), 4608 experts, 108GB stored
+    warp mode: min 6.61GB, with prefetch + expert cache + RAM caches 24.28GB
+    expert cache 5.75GB = 122 experts; trunk 4.62GB stored, stays cached; 558 experts fit beside it
+
+Not run: at top-4 of 128 experts in 36 layers, a short prompt's prefill
+routes to most of the 108 GB of experts and each generated token fetches
+~144 of them (~3.4 GB), which at the ~12-19 MB/s the Hub serves here is
+hours for the first pass, with the working set 6x the 18 GB of chunk cache
+this disk allows (the same limit as gpt-oss-120b). The RAM side fits (6.6 GB
+minimum). Its arithmetic is verified on the truncated cut above.
+
 # Full-depth reference
 
 Until now every frontier family was compared with its reference on a cut: the
