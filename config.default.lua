@@ -52,8 +52,11 @@ return {
   -- (default: $DITCH_CACHE, else $XDG_CACHE_HOME/ditch, else ~/.cache/ditch).
   -- cache_dir = home .. "/.cache/ditch",
 
-  -- Chat template family to use instead of detecting it from the model's
-  -- chat_template / model_type. One of: chatml, llama3, llama2, mistral, gemma, raw.
+  -- Prompts are rendered with the model's own chat template (chat_template.jinja,
+  -- tokenizer_config.json or GGUF metadata), as transformers renders it. A
+  -- family name forces one of ditch's built-in formats instead: chatml, llama3,
+  -- llama2, mistral, gemma, raw and the others in src/chat.zig. "model" is the
+  -- default behaviour, spelled out.
   -- chat_template = "chatml",
 
   -- Number of input sequences to process in parallel (0 = auto).

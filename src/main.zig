@@ -17,6 +17,7 @@ const tensor = @import("tensor.zig");
 const model_mod = @import("model.zig");
 const engine_mod = @import("engine.zig");
 const chat = @import("chat.zig");
+const render_template = @import("render_template.zig");
 const hf = @import("hf.zig");
 const abliterate = @import("abliterate.zig");
 const search = @import("search.zig");
@@ -272,7 +273,6 @@ const App = struct {
     budget: *budget_mod.Budget,
     model: *Model,
     engine: *Engine,
-    template: chat.Template,
     evaluator: *scorers.Evaluator,
     dirs: []const f32,
     space: *search.Space,
@@ -768,7 +768,7 @@ const App = struct {
         const manifest = try reproduce.build(sa, self.io, .{
             .settings = self.settings,
             .model = self.model,
-            .template = @tagName(self.template),
+            .template = self.engine.format.name(),
             .good_prompts = self.good_prompts,
             .bad_prompts = self.bad_prompts,
             .keyword_rate_prompts = reproduce.scorerPrompts(self.evaluator, .keyword_rate),
@@ -875,7 +875,7 @@ const App = struct {
         const c = &model.config;
         const max_new: usize = 1024;
 
-        const body = try chat.render(gpa, self.template, messages);
+        const body = try self.engine.format.chat(gpa, messages, .{});
         defer gpa.free(body);
         // The same BOS rules as the study's prompts (see `Engine`).
         const text = try std.mem.concat(gpa, u8, &.{ self.engine.bos_prefix, body });
@@ -1028,7 +1028,7 @@ fn detectResponsePrefix(gpa: Allocator, arena: Allocator, engine: *Engine, setti
 
     // Does the chat template itself open a chain-of-thought block?
     const dummy_msgs = [_]chat.Message{.{ .role = .user, .content = "This is a dummy prompt." }};
-    const dummy = try chat.render(gpa, engine.template, &dummy_msgs);
+    const dummy = try engine.format.chat(gpa, &dummy_msgs, .{});
     defer gpa.free(dummy);
     const dummy_trimmed = std.mem.trimEnd(u8, dummy, " \t\r\n");
     var cot_skip_applied = false;
@@ -1371,6 +1371,8 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     const raw_args = try init.minimal.args.toSlice(arena);
     var args = try arena.alloc([]const u8, raw_args.len);
     for (raw_args, 0..) |a, i| args[i] = a;
+    // A debugging command for tools/chat_template_check.py, outside the settings.
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "render-template")) return render_template.run(gpa, arena, io, args[2..], con.result);
     // `ditch verify` has options of its own and runs ditch as child processes.
     if (args.len > 1 and std.mem.eql(u8, args[1], "verify")) {
         const code = try verify.run(gpa, arena, io, init.environ_map, args[2..], con.out, con.result);
@@ -1627,18 +1629,20 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     }
     if (model.gguf) |g| try out.print("* Source: GGUF file {s} (architecture {s}, {s} tokenizer)\n", .{ g.file_name, g.arch, if (g.embedded_tokenizer) "embedded Hugging Face" else "rebuilt from the ggml vocabulary" });
     if (manifest) |*m| try reproduce.verifyModelFiles(arena, io, m, model, settings.ignore_mismatches, out);
-    var template: chat.Template = undefined;
-    if (settings.chat_template) |name| {
-        template = chat.Template.parse(name) orelse {
-            std.log.err("unknown chat template: {s} (expected chatml, llama3, llama2, mistral, gemma or raw)", .{name});
-            return error.InvalidChatTemplate;
-        };
-        try out.print("* Chat template: {s} (from settings)\n", .{@tagName(template)});
+    if (settings.chat_template) |name| if (!std.mem.eql(u8, name, "model") and chat.Template.parse(name) == null) {
+        std.log.err("unknown chat template: {s} (expected model, or a family such as chatml, llama3, mistral, gemma or raw)", .{name});
+        return error.InvalidChatTemplate;
+    };
+    var format = try engine_mod.modelFormat(rt_gpa, model, settings.chat_template);
+    defer format.deinit();
+    if (format.template != null) {
+        try out.print("* Chat template: the model's own{s}{s}\n", .{ if (format.content_parts) ", contents as text parts" else "", if (format.fold_system) ", with the system prompt in the first user message" else "" });
+    } else if (settings.chat_template != null) {
+        try out.print("* Chat template: {s} (from settings)\n", .{@tagName(format.family)});
     } else {
-        template = chat.detect(model.chat_template, c.model_type);
-        try out.print("* Chat template: {s} ({s})\n", .{ @tagName(template), if (model.chat_template != null) "detected from the model's chat template" else "inferred from the model type" });
+        try out.print("* Chat template: {s} ({s})\n", .{ @tagName(format.family), if (model.chat_template != null) "the model's own could not be rendered" else "the model ships none; inferred from the model type" });
     }
-    var engine = Engine.init(rt_gpa, model, settings, template);
+    var engine = Engine.init(rt_gpa, model, settings, format);
     defer engine.deinit();
 
     // Prompts.
@@ -1725,7 +1729,9 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
             },
             else => return err,
         };
-        var eval_engine = Engine.init(rt_gpa, eval_model, settings, template);
+        var eval_format = try engine_mod.modelFormat(rt_gpa, eval_model, settings.chat_template);
+        defer eval_format.deinit();
+        var eval_engine = Engine.init(rt_gpa, eval_model, settings, eval_format);
         defer eval_engine.deinit();
         eval_engine.batch_size = engine.batch_size;
         try out.writeAll("* Evaluating...\n");
@@ -1807,7 +1813,7 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     try out.flush();
 
     if (manifest) |*m| {
-        try runReproduction(gpa, rt_gpa, arena, io, con, settings, &http, cache_root, pool, &budget, model, &engine, template, &evaluator, dirs, model_dir, good_prompts, bad_prompts, m);
+        try runReproduction(gpa, rt_gpa, arena, io, con, settings, &http, cache_root, pool, &budget, model, &engine, &evaluator, dirs, model_dir, good_prompts, bad_prompts, m);
         try out.flush();
         return;
     }
@@ -1879,7 +1885,6 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         .budget = &budget,
         .model = model,
         .engine = &engine,
-        .template = template,
         .evaluator = &evaluator,
         .dirs = dirs,
         .space = &space,
@@ -1923,7 +1928,6 @@ fn runReproduction(
     budget: *budget_mod.Budget,
     model: *Model,
     engine: *Engine,
-    template: chat.Template,
     evaluator: *scorers.Evaluator,
     dirs: []const f32,
     model_dir: []const u8,
@@ -1952,7 +1956,6 @@ fn runReproduction(
         .budget = budget,
         .model = model,
         .engine = engine,
-        .template = template,
         .evaluator = evaluator,
         .dirs = dirs,
         .space = &space,

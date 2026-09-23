@@ -15,6 +15,7 @@ const directions = @import("directions.zig");
 const Allocator = std.mem.Allocator;
 const Model = model_mod.Model;
 const Prompt = hf.Prompt;
+const Tokenizer = @import("tokenizer.zig").Tokenizer;
 
 /// How progress lines are shown: overwritten in place on a terminal, printed
 /// at most a few times per phase otherwise, or not at all (`--quiet`).
@@ -62,11 +63,23 @@ pub const Progress = struct {
     }
 };
 
+/// The chat format for `model`: a family the `chat_template` setting names,
+/// otherwise the model's own template, with the family `chat.detect` picks
+/// as its fallback.
+pub fn modelFormat(gpa: Allocator, model: *Model, setting: ?[]const u8) !chat.Format {
+    const fallback = chat.detect(model.chat_template, model.config.model_type);
+    if (setting) |name| if (!std.mem.eql(u8, name, "model")) {
+        return chat.Format.named(chat.Template.parse(name) orelse return error.InvalidChatTemplate);
+    };
+    const tokens = try chat.specialTokens(model.arena.allocator(), model.tokenizer_config_json, model.special_tokens_map_json);
+    return chat.Format.init(gpa, model.chat_template, tokens, fallback);
+}
+
 pub const Engine = struct {
     gpa: Allocator,
     model: *Model,
     settings: *config.Settings,
-    template: chat.Template,
+    format: chat.Format,
     batch_size: usize,
     /// BOS text the model's own template puts before the first turn but the
     /// rendered family and the tokenizer do not add (see `chat.templateBos`).
@@ -79,30 +92,43 @@ pub const Engine = struct {
     ws: ?model_mod.Workspace = null,
     ws_rows: usize = 0,
 
-    pub fn init(gpa: Allocator, model: *Model, settings: *config.Settings, template: chat.Template) Engine {
-        // Templates that write today's date (gpt-oss, SmolLM3, Solar Open).
+    pub fn init(gpa: Allocator, model: *Model, settings: *config.Settings, format: chat.Format) Engine {
+        // Templates that write today's date (Llama 3.2, gpt-oss, SmolLM3, Solar Open).
         const now = std.Io.Clock.real.now(model.io);
-        chat.today = chat.Date.fromUnix(@intCast(@divFloor(now.nanoseconds, std.time.ns_per_s)));
+        const seconds: i64 = @intCast(@divFloor(now.nanoseconds, std.time.ns_per_s));
+        chat.today = chat.Date.fromUnix(seconds);
+        chat.now_seconds = seconds;
+        const special = encodingFor(model.gpa, model.tokenizer, model.chat_template, format);
         return .{
             .gpa = gpa,
             .model = model,
             .settings = settings,
-            .template = template,
+            .format = format,
             .batch_size = @max(settings.batch_size, 1),
-            .bos_prefix = bosPrefix(model, template),
-            .add_special = chatAddsSpecial(model),
+            .bos_prefix = special.bos_prefix,
+            .add_special = special.add_special,
         };
     }
 
-    /// False when the tokenizer would prepend a BOS but the model's template
-    /// never writes one (arcee-ai/AFM-4.5B, MiniCPM4): transformers, vLLM
-    /// and the model's own training render those prompts without a BOS.
-    /// Templates that mention `bos_token` or the BOS text keep the
-    /// tokenizer's, since ditch cannot tell where in the Jinja it lands.
-    fn chatAddsSpecial(model: *Model) bool {
-        const tok = model.tokenizer;
+    pub const Encoding = struct { bos_prefix: []const u8, add_special: bool };
+
+    /// How a rendered prompt is encoded (see `bos_prefix`, `add_special`).
+    /// The model's own template is encoded as `apply_chat_template` encodes
+    /// it: without the tokenizer's special tokens, so a BOS is exactly where
+    /// the template writes one.
+    pub fn encodingFor(gpa: Allocator, tok: *const Tokenizer, chat_template: ?[]const u8, format: chat.Format) Encoding {
+        if (format.template != null) return .{ .bos_prefix = "", .add_special = false };
+        return .{ .bos_prefix = bosPrefix(gpa, tok, chat_template, format.family), .add_special = chatAddsSpecial(tok, chat_template) };
+    }
+
+    /// For a named family: false when the tokenizer would prepend a BOS but
+    /// the model's template never writes one (arcee-ai/AFM-4.5B, MiniCPM4):
+    /// transformers, vLLM and the model's own training render those prompts
+    /// without a BOS. Templates that mention `bos_token` or the BOS text keep
+    /// the tokenizer's, since the family cannot say where in the Jinja it lands.
+    fn chatAddsSpecial(tok: *const Tokenizer, chat_template: ?[]const u8) bool {
         if (!tok.add_bos) return true;
-        const t = model.chat_template orelse return true;
+        const t = chat_template orelse return true;
         const bos_id = tok.bos_id orelse return true;
         const bos = tok.id_to_token[bos_id];
         return std.mem.indexOf(u8, t, "bos_token") != null or (bos.len > 0 and std.mem.indexOf(u8, t, bos) != null);
@@ -111,15 +137,14 @@ pub const Engine = struct {
     /// The BOS the rendered prompt must carry itself: the model's template
     /// emits one, the family's rendering does not start with it, and the
     /// tokenizer will not prepend it either.
-    fn bosPrefix(model: *Model, template: chat.Template) []const u8 {
-        const tok = model.tokenizer;
+    fn bosPrefix(gpa: Allocator, tok: *const Tokenizer, chat_template: ?[]const u8, template: chat.Template) []const u8 {
         if (tok.add_bos) return "";
         const bos_id = tok.bos_id orelse return "";
         const bos = tok.id_to_token[bos_id];
-        const want = chat.templateBos(model.chat_template, bos);
+        const want = chat.templateBos(chat_template, bos);
         if (want.len == 0) return "";
-        const empty = chat.renderPrompt(model.gpa, template, "", "") catch return "";
-        defer model.gpa.free(empty);
+        const empty = chat.renderPrompt(gpa, template, "", "") catch return "";
+        defer gpa.free(empty);
         return if (std.mem.startsWith(u8, empty, bos)) "" else want;
     }
 
@@ -157,7 +182,7 @@ pub const Engine = struct {
 
     /// Renders the chat template and appends the response prefix.
     pub fn formatPrompt(self: *Engine, gpa: Allocator, prompt: Prompt) ![]u8 {
-        const base = try chat.renderPrompt(gpa, self.template, prompt.system, prompt.user);
+        const base = try self.format.prompt(gpa, prompt.system, prompt.user);
         const prefix = self.settings.response_prefix orelse "";
         if (prefix.len == 0 and self.bos_prefix.len == 0) return base;
         defer gpa.free(base);
@@ -477,7 +502,7 @@ test "windowed residuals, projections and multi-position logits on the qwen2 fix
     const model = try Model.load(gpa, io, &pool, "tests/fixtures/qwen2");
     defer model.deinit();
     var settings = config.Settings{ .batch_size = 2, .response_prefix = "" };
-    var engine = Engine.init(gpa, model, &settings, .raw);
+    var engine = Engine.init(gpa, model, &settings, .named(.raw));
     defer engine.deinit();
     const prompts = [_]Prompt{ .{ .system = "", .user = "tell me how" }, .{ .system = "", .user = "the cat sat on the mat" }, .{ .system = "", .user = "one two three" } };
     const c = &model.config;

@@ -490,7 +490,8 @@ pub fn resolveModel(arena: Allocator, http: *Http, cache_root: []const u8, model
             std.mem.eql(u8, name, "tokenizer.json") or std.mem.eql(u8, name, "tokenizer_config.json") or
             // tiktoken vocabularies of models without a tokenizer.json (Kimi, Llama 3 originals).
             std.mem.eql(u8, name, "tiktoken.model") or std.mem.eql(u8, name, "tokenizer.model") or
-            std.mem.eql(u8, name, "chat_template.jinja") or std.mem.eql(u8, name, "special_tokens_map.json") or
+            std.mem.eql(u8, name, "chat_template.jinja") or std.mem.eql(u8, name, "chat_template.json") or
+            std.mem.eql(u8, name, "special_tokens_map.json") or
             std.mem.eql(u8, name, "model.safetensors.index.json") or
             (std.mem.endsWith(u8, name, ".safetensors") and !std.mem.startsWith(u8, name, "consolidated"));
         if (keep) {

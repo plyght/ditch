@@ -1,9 +1,12 @@
-//! Chat prompt formatting. Instead of a Jinja engine, ditch ships the handful
-//! of template families used by supported models and detects which one a
-//! model's `chat_template` corresponds to.
+//! Chat prompt formatting. A model is prompted with its own `chat_template`,
+//! rendered by `jinja.zig` the way transformers' `apply_chat_template` renders
+//! it (`Format`). The named template families below are the fallback, for a
+//! model that ships no template or one that cannot be rendered, and can be
+//! forced with the `chat_template` setting.
 
 const std = @import("std");
 const arch = @import("arch.zig");
+const jinja = @import("jinja.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Template = enum {
@@ -881,6 +884,278 @@ pub fn renderPrompt(gpa: Allocator, template: Template, system: []const u8, user
     return render(gpa, template, &msgs);
 }
 
+/// Seconds since the Unix epoch for templates that call `strftime_now`; the
+/// engine sets it from the real clock with `today`.
+pub var now_seconds: i64 = 1735689600;
+
+/// A model's own chat template, chosen as transformers chooses it:
+/// `chat_template.jinja`, else `tokenizer_config.json`'s `chat_template` (a
+/// string, or a list of named templates of which "default" is taken), else
+/// a processor's `chat_template.json`.
+pub fn pickTemplate(arena: Allocator, tokenizer_config_json: ?[]const u8, jinja_file: ?[]const u8, processor_json: ?[]const u8) !?[]const u8 {
+    if (jinja_file) |t| return t;
+    if (tokenizer_config_json) |tc| {
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, tc, .{}) catch null;
+        if (parsed) |v| if (v == .object) if (v.object.get("chat_template")) |ct| switch (ct) {
+            .string => |t| return t,
+            .array => |list| {
+                var first: ?[]const u8 = null;
+                for (list.items) |item| {
+                    if (item != .object) continue;
+                    const t = item.object.get("template") orelse continue;
+                    if (t != .string) continue;
+                    if (first == null) first = t.string;
+                    if (item.object.get("name")) |n| if (n == .string and std.mem.eql(u8, n.string, "default")) return t.string;
+                }
+                if (first) |t| return t;
+            },
+            else => {},
+        };
+    }
+    if (processor_json) |pj| {
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, pj, .{}) catch return null;
+        if (parsed == .object) if (parsed.object.get("chat_template")) |t| if (t == .string) return t.string;
+    }
+    return null;
+}
+
+/// The special tokens transformers passes to a chat template: every
+/// top-level `*_token` of `tokenizer_config.json` that is a string or an
+/// added token (`{"content": ...}`), and the named `extra_special_tokens`.
+/// `special_tokens_map.json` overrides them when the config is the legacy
+/// kind without `added_tokens_decoder`, as transformers reads it.
+pub fn specialTokens(arena: Allocator, tokenizer_config_json: ?[]const u8, special_tokens_map_json: ?[]const u8) ![]const jinja.Var {
+    var out = std.ArrayList(jinja.Var).empty;
+    const Add = struct {
+        fn content(v: std.json.Value) ?[]const u8 {
+            return switch (v) {
+                .string => |s| s,
+                .object => |o| if (o.get("content")) |c| (if (c == .string) c.string else null) else null,
+                else => null,
+            };
+        }
+        fn put(a: Allocator, list: *std.ArrayList(jinja.Var), name: []const u8, value: []const u8) !void {
+            for (list.items) |*x| if (std.mem.eql(u8, x.name, name)) {
+                x.value = .{ .string = value };
+                return;
+            };
+            try list.append(a, .{ .name = name, .value = .{ .string = value } });
+        }
+        fn fromObject(a: Allocator, list: *std.ArrayList(jinja.Var), o: std.json.ObjectMap) !void {
+            var it = o.iterator();
+            while (it.next()) |e| {
+                if (!std.mem.endsWith(u8, e.key_ptr.*, "_token")) continue;
+                if (content(e.value_ptr.*)) |c| try put(a, list, e.key_ptr.*, c);
+            }
+            if (o.get("extra_special_tokens")) |x| if (x == .object) {
+                var xi = x.object.iterator();
+                while (xi.next()) |e| if (content(e.value_ptr.*)) |c| try put(a, list, e.key_ptr.*, c);
+            };
+        }
+    };
+    var legacy = true;
+    if (tokenizer_config_json) |tc| {
+        const v = std.json.parseFromSliceLeaky(std.json.Value, arena, tc, .{}) catch null;
+        if (v) |cfg| if (cfg == .object) {
+            try Add.fromObject(arena, &out, cfg.object);
+            legacy = cfg.object.get("added_tokens_decoder") == null;
+        };
+    }
+    if (legacy) if (special_tokens_map_json) |sm| {
+        const v = std.json.parseFromSliceLeaky(std.json.Value, arena, sm, .{}) catch null;
+        if (v) |m| if (m == .object) try Add.fromObject(arena, &out, m.object);
+    };
+    return out.items;
+}
+
+/// How ditch prompts a model: its own chat template when it has one that
+/// renders, otherwise a named family.
+pub const Format = struct {
+    family: Template,
+    template: ?*jinja.Template = null,
+    /// The tokenizer's named special tokens, passed to the template as
+    /// transformers passes `special_tokens_map`.
+    tokens: []const jinja.Var = &.{},
+    /// The template refuses a system message (Gemma 2, Mistral v0.1 raise):
+    /// the system prompt opens the first user message instead, followed by a
+    /// blank line, as Gemma 3's own template does.
+    fold_system: bool = false,
+    /// The template reads message content only as a list of parts
+    /// (`[{"type": "text", "text": ...}]`, MiniMax-Text-01 and M1), as a
+    /// processor passes it; plain strings are wrapped that way.
+    content_parts: bool = false,
+
+    /// A named family only.
+    pub fn named(family: Template) Format {
+        return .{ .family = family };
+    }
+
+    /// Parses `source` (the model's `chat_template`, if any) and checks that
+    /// it renders the system + user conversation ditch builds. A template
+    /// that cannot be parsed or rendered is dropped for `fallback`, with a
+    /// warning saying why.
+    pub fn init(gpa: Allocator, source: ?[]const u8, tokens: []const jinja.Var, fallback: Template) !Format {
+        var f: Format = .{ .family = fallback, .tokens = tokens };
+        const src = source orelse return f;
+        var diag: jinja.Diagnostic = .{};
+        f.template = jinja.Template.parse(gpa, src, &diag) catch |e| {
+            if (e == error.OutOfMemory) return e;
+            std.log.warn("the model's chat template could not be parsed ({s}); prompting with the {s} template instead", .{ diag.message(), @tagName(fallback) });
+            return f;
+        };
+        // The first of: as is, contents as parts, the system prompt folded
+        // into the user message, both.
+        const probe = [_]Message{ .{ .role = .system, .content = "S" }, .{ .role = .user, .content = "U" } };
+        var first_error: ?[]const u8 = null;
+        defer if (first_error) |m| gpa.free(m);
+        for ([_][2]bool{ .{ false, false }, .{ false, true }, .{ true, false }, .{ true, true } }) |mode| {
+            f.fold_system = mode[0];
+            f.content_parts = mode[1];
+            if (f.renderJinja(gpa, &probe, .{}, &diag)) |text| {
+                gpa.free(text);
+                if (f.fold_system) std.log.warn("the model's chat template refuses a system message (\"{s}\"); the system prompt opens the first user message instead", .{first_error.?});
+                return f;
+            } else |e| if (e == error.OutOfMemory) return e;
+            if (first_error == null) first_error = try gpa.dupe(u8, diag.message());
+        }
+        std.log.warn("the model's chat template failed to render ({s}); prompting with the {s} template instead", .{ first_error.?, @tagName(fallback) });
+        f.template.?.deinit();
+        f.template = null;
+        f.fold_system = false;
+        f.content_parts = false;
+        return f;
+    }
+
+    pub fn deinit(self: *Format) void {
+        if (self.template) |t| t.deinit();
+        self.template = null;
+    }
+
+    /// The name recorded in manifests and accepted by the `chat_template`
+    /// setting: "model" for the model's own template, else the family's.
+    pub fn name(self: *const Format) []const u8 {
+        return if (self.template != null) "model" else @tagName(self.family);
+    }
+
+    pub const Options = struct {
+        add_generation_prompt: bool = true,
+        /// Extra template variables (`enable_thinking`, ...), overriding the defaults.
+        kwargs: []const jinja.Var = &.{},
+    };
+
+    /// Renders a conversation. A render error with the model's template
+    /// (a conversation shape it refuses) falls back to the family, with a
+    /// warning the first time.
+    pub fn chat(self: *const Format, gpa: Allocator, messages: []const Message, options: Options) ![]u8 {
+        if (self.template != null) {
+            var diag: jinja.Diagnostic = .{};
+            if (self.renderJinja(gpa, messages, options, &diag)) |text| return text else |e| {
+                if (e == error.OutOfMemory) return e;
+                if (!warned_render_failure.swap(true, .monotonic))
+                    std.log.warn("the model's chat template failed to render a conversation ({s}); using the {s} template for it", .{ diag.message(), @tagName(self.family) });
+            }
+        }
+        return render(gpa, self.family, messages);
+    }
+
+    /// The common system + user prompt with the generation prompt.
+    pub fn prompt(self: *const Format, gpa: Allocator, system: []const u8, user: []const u8) ![]u8 {
+        const msgs = [_]Message{ .{ .role = .system, .content = system }, .{ .role = .user, .content = user } };
+        return self.chat(gpa, &msgs, .{});
+    }
+
+    fn renderJinja(self: *const Format, gpa: Allocator, messages: []const Message, options: Options, diag: *jinja.Diagnostic) ![]u8 {
+        var arena_state: std.heap.ArenaAllocator = .init(gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        var list = std.ArrayList(jinja.Value).empty;
+        for (messages) |m| {
+            const d = try a.create(jinja.Dict);
+            d.* = .{};
+            try d.putStr(a, "role", .{ .string = @tagName(m.role) });
+            try d.putStr(a, "content", .{ .string = m.content });
+            try list.append(a, .{ .dict = d });
+        }
+        const text = try self.renderValues(a, try jinja.Value.listOf(a, list.items), options, diag);
+        return gpa.dupe(u8, text);
+    }
+
+    /// Renders `messages` (a list of message dicts, built with `arena`) as
+    /// transformers does: the special tokens, `messages`, `tools` and
+    /// `documents` (none), `add_generation_prompt`, then the kwargs.
+    pub fn renderValues(self: *const Format, arena: Allocator, messages: jinja.Value, options: Options, diag: *jinja.Diagnostic) ![]const u8 {
+        const t = self.template orelse return error.TemplateError;
+        var msgs = messages;
+        if (self.fold_system) msgs = try foldSystem(arena, msgs);
+        if (self.content_parts) msgs = try contentParts(arena, msgs);
+        var vars = std.ArrayList(jinja.Var).empty;
+        try vars.appendSlice(arena, self.tokens);
+        try vars.appendSlice(arena, &.{
+            .{ .name = "messages", .value = msgs },
+            .{ .name = "tools", .value = .none },
+            .{ .name = "documents", .value = .none },
+            .{ .name = "add_generation_prompt", .value = .{ .boolean = options.add_generation_prompt } },
+        });
+        try vars.appendSlice(arena, options.kwargs);
+        return t.render(arena, vars.items, .{ .now = now_seconds }, diag);
+    }
+};
+
+var warned_render_failure: std.atomic.Value(bool) = .init(false);
+
+/// Wraps every string `content` as `[{"type": "text", "text": content}]`.
+fn contentParts(a: Allocator, messages: jinja.Value) !jinja.Value {
+    if (messages != .list) return messages;
+    var out = std.ArrayList(jinja.Value).empty;
+    for (messages.list.items.items) |m| {
+        const content = if (m == .dict) m.dict.getStr("content") else null;
+        if (content == null or content.? != .string) {
+            try out.append(a, m);
+            continue;
+        }
+        const part = try a.create(jinja.Dict);
+        part.* = .{};
+        try part.putStr(a, "type", .{ .string = "text" });
+        try part.putStr(a, "text", content.?);
+        const d = try a.create(jinja.Dict);
+        d.* = .{};
+        for (m.dict.keys.items, m.dict.values.items) |k, v| try d.put(a, k, v);
+        try d.putStr(a, "content", try jinja.Value.listOf(a, &.{.{ .dict = part }}));
+        try out.append(a, .{ .dict = d });
+    }
+    return jinja.Value.listOf(a, out.items);
+}
+
+/// Moves a leading system message into the first user message ("{system}\n\n{user}").
+fn foldSystem(a: Allocator, messages: jinja.Value) !jinja.Value {
+    if (messages != .list) return messages;
+    const items = messages.list.items.items;
+    if (items.len == 0 or items[0] != .dict) return messages;
+    const role = items[0].dict.getStr("role") orelse return messages;
+    if (role != .string or !std.mem.eql(u8, role.string, "system")) return messages;
+    const system = items[0].dict.getStr("content") orelse return messages;
+    if (system != .string) return messages;
+    var out = std.ArrayList(jinja.Value).empty;
+    var folded = false;
+    for (items[1..]) |m| {
+        if (!folded and m == .dict) if (m.dict.getStr("role")) |r| if (r == .string and std.mem.eql(u8, r.string, "user")) {
+            const content = m.dict.getStr("content") orelse jinja.Value{ .string = "" };
+            if (content == .string) {
+                const d = try a.create(jinja.Dict);
+                d.* = .{};
+                for (m.dict.keys.items, m.dict.values.items) |k, v| try d.put(a, k, v);
+                const merged = if (system.string.len > 0) try std.fmt.allocPrint(a, "{s}\n\n{s}", .{ system.string, content.string }) else content.string;
+                try d.putStr(a, "content", .{ .string = merged });
+                try out.append(a, .{ .dict = d });
+                folded = true;
+                continue;
+            }
+        };
+        try out.append(a, m);
+    }
+    return jinja.Value.listOf(a, out.items);
+}
+
 test "template detection and rendering" {
     const gpa = std.testing.allocator;
     try std.testing.expectEqual(Template.chatml, detect("{% ... <|im_start|> ... %}", "qwen2"));
@@ -1064,4 +1339,74 @@ test "falcon template: detection from the release, stripped and collapsed conten
     defer gpa.free(out);
     // Python: 'a\r\n\r\nb\n\n\nc' -> 'a\n\nb\n\n\nc' -> 'a\nb\n\nc'
     try std.testing.expectEqualStrings("S\n\nUser: a\nb\n\nc\n\nAssistant: x\n\nUser: y\n\nAssistant:", out);
+}
+
+test "the model's own template: where it comes from and its special tokens" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const cfg =
+        \\{"chat_template": [{"name": "tool_use", "template": "T"}, {"name": "default", "template": "D"}],
+        \\ "bos_token": {"content": "<s>", "lstrip": false}, "eos_token": "</s>", "pad_token": null,
+        \\ "image_token": "<img>", "extra_special_tokens": {"audio_token": "<aud>"}}
+    ;
+    try std.testing.expectEqualStrings("J", (try pickTemplate(a, cfg, "J", null)).?);
+    try std.testing.expectEqualStrings("D", (try pickTemplate(a, cfg, null, "{\"chat_template\": \"P\"}")).?);
+    try std.testing.expectEqualStrings("P", (try pickTemplate(a, "{}", null, "{\"chat_template\": \"P\"}")).?);
+    try std.testing.expectEqual(null, try pickTemplate(a, null, null, null));
+
+    const toks = try specialTokens(a, cfg, "{\"bos_token\": \"<B>\"}");
+    const want = [_][2][]const u8{ .{ "bos_token", "<B>" }, .{ "eos_token", "</s>" }, .{ "image_token", "<img>" }, .{ "audio_token", "<aud>" } };
+    try std.testing.expectEqual(want.len, toks.len);
+    for (want) |w| {
+        var found = false;
+        for (toks) |t| if (std.mem.eql(u8, t.name, w[0])) {
+            try std.testing.expectEqualStrings(w[1], t.value.string);
+            found = true;
+        };
+        try std.testing.expect(found);
+    }
+    // A config with `added_tokens_decoder` is not overridden by special_tokens_map.json.
+    const modern = try specialTokens(a, "{\"bos_token\": \"<s>\", \"added_tokens_decoder\": {}}", "{\"bos_token\": \"<B>\"}");
+    try std.testing.expectEqualStrings("<s>", modern[0].value.string);
+}
+
+test "the model's own template: rendering, refusals and the fallback" {
+    const gpa = std.testing.allocator;
+    const tokens = [_]jinja.Var{.{ .name = "bos_token", .value = .{ .string = "<s>" } }};
+    const chatml_src = "{{ bos_token }}{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+    var own = try Format.init(gpa, chatml_src, &tokens, .chatml);
+    defer own.deinit();
+    try std.testing.expectEqualStrings("model", own.name());
+    const p = try own.prompt(gpa, "Sys.", "Hi");
+    defer gpa.free(p);
+    try std.testing.expectEqualStrings("<s><|im_start|>system\nSys.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n", p);
+
+    // Gemma 2 raises on a system message: it is folded into the user turn.
+    const gemma2_src = "{{ bos_token }}{% if messages[0]['role'] == 'system' %}{{ raise_exception('System role not supported') }}{% endif %}{% for m in messages %}<start_of_turn>{{ m.role }}\n{{ m.content | trim }}<end_of_turn>\n{% endfor %}<start_of_turn>model\n";
+    var folded = try Format.init(gpa, gemma2_src, &tokens, .gemma);
+    defer folded.deinit();
+    try std.testing.expect(folded.fold_system);
+    const g = try folded.prompt(gpa, "Sys.", "Hi");
+    defer gpa.free(g);
+    // The final line break of a template is dropped (keep_trailing_newline=False).
+    try std.testing.expectEqualStrings("<s><start_of_turn>user\nSys.\n\nHi<end_of_turn>\n<start_of_turn>model", g);
+
+    // MiniMax-Text-01 reads contents as lists of parts.
+    const parts_src = "{% for m in messages %}{{ m.role }}:{% for p in m.content %}{{ p.text + ';' }}{% endfor %}{% endfor %}";
+    var parts = try Format.init(gpa, parts_src, &tokens, .raw);
+    defer parts.deinit();
+    try std.testing.expect(parts.content_parts and !parts.fold_system);
+    const mp = try parts.prompt(gpa, "Sys.", "Hi");
+    defer gpa.free(mp);
+    try std.testing.expectEqualStrings("system:Sys.;user:Hi;", mp);
+
+    // A template that cannot be parsed (or never renders) falls back to the family.
+    var broken = try Format.init(gpa, "{% if %}", &tokens, .chatml);
+    defer broken.deinit();
+    try std.testing.expect(broken.template == null);
+    try std.testing.expectEqualStrings("chatml", broken.name());
+    const b = try broken.prompt(gpa, "Sys.", "Hi");
+    defer gpa.free(b);
+    try std.testing.expectEqualStrings("<|im_start|>system\nSys.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n", b);
 }

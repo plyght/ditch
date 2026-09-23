@@ -368,7 +368,7 @@ pub const help_sections = [_]HelpSection{
     \\  --evaluate-model <id|path>     Only evaluate this model against the base model's scorers.
     \\  --threads <n>                  Worker threads (default: number of CPUs; also DITCH_THREADS).
     \\  --cache-dir <path>             Download cache (default: $DITCH_CACHE or ~/.cache/ditch).
-    \\  --chat-template <name>         Force a chat template: chatml, llama3, llama2, mistral, gemma, raw.
+    \\  --chat-template <name>         Use a built-in chat format (chatml, llama3, gemma, raw, ...), not the model's template.
     \\  --device <auto|cpu|metal>      Compute backend (default: cpu, the reference implementation;
     \\                                 auto probes for a GPU and falls back to the CPU with a note;
     \\                                 metal needs a -Dmetal build on Apple silicon). Also DITCH_DEVICE.
