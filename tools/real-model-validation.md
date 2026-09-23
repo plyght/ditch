@@ -2627,3 +2627,13 @@ q/k/v biases), routed experts lazy.
 | --- | :---: | :---: | ---: | :---: |
 | "The capital of France is" | match (18) | all 3 agree, worst 6.51e-07 | 8.74e-07 | match |
 | "Explain how rainbows form, …" | match (24) | all 3 agree, worst 8.26e-07 | 8.97e-07 | match |
+
+## EXAONE 4.0.1 32B (`exaone4`): verified
+
+`LGAI-EXAONE/EXAONE-4.0.1-32B`, first 4 layers (three sliding-window layers
+with RoPE, then a global layer without it; post-norms and q/k norms).
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (27) | all 5 agree, worst 5.93e-07 | 1.34e-06 | match |
+| "Explain how rainbows form, …" | match (33) | all 5 agree, worst 1.01e-06 | 7.57e-07 | match |
