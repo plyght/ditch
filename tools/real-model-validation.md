@@ -3281,3 +3281,19 @@ Reference: transformers' `gemma4` through `tools/ref_lazy_moe.py`.
 
 `gemma-4-26B-A4B` (`enable_moe_block`) is refused by ditch by design (its MoE
 block is not implemented, see the registry note), so it was not cut.
+
+## Mistral Small 4 (`mistral4`): verified on real weights
+
+`mistralai/Mistral-Small-4-119B-2603`, first 2 layers (MLA with YaRN and the
+Llama-4 attention scaling, 128-expert MoE with a shared expert), fp8 with one
+scale per tensor (`weight_block_size: null`, `activation_scheme: static`: the
+activation scales are for fp8 kernels, the weights are what both sides
+dequantise) and stacked fp8 experts with one scale each (`[128, 1, 1]`),
+lazy in the cut. Reference: transformers' `mistral4` through
+`tools/ref_lazy_moe.py`, which now takes a tensor-wide fp8 scale and the
+stacked per-expert ones.
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (5) | all 3 agree, worst 3.21e-07 | 1.28e-06 | match (2 tokens) |
+| "Explain how rainbows form, …" | match (16) | all 3 agree, worst 6.17e-07 | 1.70e-06 | match (2 tokens) |

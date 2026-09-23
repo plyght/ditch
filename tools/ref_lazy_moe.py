@@ -63,6 +63,8 @@ def dequant_expert(store, module, cfg_q):
         w = store.tensor(module + ".weight")
         if module + ".weight_scale_inv" in k:  # FP8 blocks, dequantised to bf16 as the integrations do
             s = store.tensor(module + ".weight_scale_inv").float()
+            if s.numel() == 1:  # one scale for the tensor (Mistral 4)
+                return (w.float() * s.reshape(())).to(torch.bfloat16).float()
             # The configured block, the last one partial (GLM-5.3's kv_a_proj
             # is 576 rows in 5 blocks of 128); only without one is it derived.
             br, bc = FP8_BLOCK or (-(-w.shape[0] // s.shape[0]), -(-w.shape[1] // s.shape[1]))
@@ -389,6 +391,9 @@ def load(model_dir, dtype=torch.float32):
                 t = t.transpose(0, 1).contiguous()
             else:
                 t = store.rows(name, [e])[0].float()
+                if store.header[name]["dtype"].startswith("F8") and name + "_scale_inv" in store.keys():
+                    # Stacked fp8 experts with one scale each (Mistral 4's `[E, 1, 1]`).
+                    t = (t * store.rows(name + "_scale_inv", [e])[0].float().reshape(())).to(torch.bfloat16).float()
             if tuple(t.shape) != want:
                 if tuple(t.shape[::-1]) == want:
                     t = t.transpose(0, 1).contiguous()
