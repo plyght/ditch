@@ -261,6 +261,38 @@ class LazyExperts:
         self.keys = keys  # checkpoint keys whose target is one of `params`
         self.cache = {}  # e -> {param: tensor}, most recent last
         self.expert_re = re.compile(r"\.experts\.(\d+)\.")
+        self.pending, self.inflight = [], {}  # experts routed to but not yet fetched; e -> future
+        stored = sum(streamer.src.entries[k][2] for k in keys)
+        self.expert_stored = max(1, stored // self.n)
+        # The experts forward's routing argument names the experts it will
+        # read: fetch them all now, in parallel, a bounded number ahead.
+        module.register_forward_pre_hook(self._routed, with_kwargs=True)
+
+    def _routed(self, mod, args, kwargs):
+        for v in list(args[1:]) + list(kwargs.values()):
+            if torch.is_tensor(v) and not v.is_floating_point() and v.numel():
+                routed = sorted(e for e in torch.unique(v).tolist() if 0 <= e < self.n)
+                self.pending = [e for e in routed if e not in self.cache and e not in self.inflight]
+                self._top_up()
+                return None
+        return None
+
+    def _top_up(self):
+        window = max(2, int(self.s.prefetch_bytes // self.expert_stored))
+        while self.pending and len(self.inflight) < window:
+            e = self.pending.pop(0)
+            self.inflight[e] = self.s.expert_pool.submit(self._fetch, e)
+
+    def _fetch(self, e):
+        per_expert = [k for k in self.keys if (m := self.expert_re.search(k)) and int(m.group(1)) == e]
+        stacked = [k for k in self.keys if not self.expert_re.search(k)]
+        sd = {}
+        if per_expert:
+            for k, t in self.s.src.tensors(per_expert).items():
+                sd[self.expert_re.sub(".experts.0.", k, count=1)] = t
+        if stacked:
+            sd.update(self.s.src.tensors(stacked, slab=(e, self.n)))
+        return sd
 
     def get(self, e):
         hit = self.cache.pop(e, None)
@@ -282,14 +314,9 @@ class LazyExperts:
 
     def _load(self, e):
         STATS["expert_loads"] += 1
-        per_expert = [k for k in self.keys if (m := self.expert_re.search(k)) and int(m.group(1)) == e]
-        stacked = [k for k in self.keys if not self.expert_re.search(k)]
-        sd = {}
-        if per_expert:
-            for k, t in self.s.src.tensors(per_expert).items():
-                sd[self.expert_re.sub(".experts.0.", k, count=1)] = t
-        if stacked:
-            sd.update(self.s.src.tensors(stacked, slab=(e, self.n)))
+        fut = self.inflight.pop(e, None)
+        sd = fut.result() if fut is not None else self._fetch(e)
+        self._top_up()
         for p, (shape, dtype) in self.params.items():
             self.module.__dict__.pop(p, None)
             self.module._parameters[p] = _meta_like(None, self.s.meta_dtype(f"{self.prefix}.{p}"), [1] + list(shape[1:]))
@@ -380,6 +407,8 @@ class Streamer:
         self.units = units  # [(prefix, module)]
         self.expert_cache_bytes = float(os.environ.get("REF_STREAM_EXPERT_CACHE_GB", "3")) * 1e9
         self.expert_bytes, self.expert_lru = 0, []
+        self.prefetch_bytes = float(os.environ.get("REF_STREAM_PREFETCH_GB", "2")) * 1e9
+        self.expert_pool = cf.ThreadPoolExecutor(8)
         by_unit = {i: [] for i in range(len(units))}
         for k, tgt in key_target.items():
             for i, (prefix, _) in enumerate(units):
@@ -609,3 +638,91 @@ def load(model, dtype=torch.float32):
     if text.model_type in ("mimo_v2", "mimo_v2_flash") and qcfg.get("weight_block_size"):
         m._ref_stream.prepare = mimo_attn_shards(text.num_key_value_heads, tuple(qcfg["weight_block_size"]), state["qdtype"])
     return m
+
+
+# ---------------------------------------------------------------------------
+# For references built from a release's own code, whose parameter names are
+# the checkpoint's (tools/ref_deepseek_v41.py, tools/ref_kimi_k3.py, ...):
+# the same remote reads, a LazyCheckpoint-style store, and per-layer
+# materialisation by name.
+# ---------------------------------------------------------------------------
+
+class Store:
+    """tools/lazy_checkpoint.py's interface (`keys`, `header`, `tensor`, `rows`, `flush`) over a `Source`."""
+
+    def __init__(self, src):
+        self.src = src
+        self.header = {k: {"dtype": e[3], "shape": e[4]} for k, e in src.entries.items()}
+        self.lazy = {"holes": {}, "filled": {}}
+        self.pool = cf.ThreadPoolExecutor(8)
+        self.futures = {}  # prefix -> future of {name: tensor}
+
+    def keys(self):
+        return self.src.entries.keys()
+
+    def flush(self):
+        pass
+
+    def tensor(self, name):
+        return self.src.tensors([name])[name]
+
+    def tensors(self, names):
+        return self.src.tensors(list(names))
+
+    def rows(self, name, idx):
+        _, _, nb, dt, shape = self.src.entries[name]
+        row = nb // shape[0]
+        idx = [int(r) for r in torch.as_tensor(idx).reshape(-1).tolist()]
+        raw = self.src.read_many([(name, r * row, row) for r in idx])
+        out = torch.empty(len(idx), row, dtype=torch.uint8)
+        for i, b in enumerate(raw):
+            out[i] = torch.frombuffer(b, dtype=torch.uint8)
+        return out.view(DTYPES[dt]).reshape(len(idx), *shape[1:])
+
+    def prefetch(self, prefix, names):
+        """Starts reading `names` (those that exist) in the background, keyed by `prefix`."""
+        if prefix not in self.futures:
+            names = [n for n in names if n in self.src.entries]
+            self.futures[prefix] = self.pool.submit(self.tensors, names)
+
+    def take(self, prefix):
+        """What `prefetch(prefix, ...)` read, or None if it was never asked for."""
+        fut = self.futures.pop(prefix, None)
+        return fut.result() if fut is not None else None
+
+
+class LayerStreamer:
+    """Materialises `layers[i]`'s parameters by name before it runs and returns them to the meta device after.
+
+    `fetch(i)` returns {parameter name within the layer: float tensor}. The
+    next layer is fetched in the background while one runs.
+    """
+
+    def __init__(self, layers, fetch):
+        self.layers, self.fetch = layers, fetch
+        self.pool = cf.ThreadPoolExecutor(1)
+        self.prefetched = {}
+        for layer in layers:
+            for name, p in list(layer.named_parameters()):
+                _set_param(layer, name, _meta_like(p, torch.float32))
+
+    def materialise(self, i):
+        fut = self.prefetched.pop(i, None)
+        values = fut.result() if fut is not None else self.fetch(i)
+        nxt = (i + 1) % len(self.layers)
+        if nxt not in self.prefetched:
+            self.prefetched[nxt] = self.pool.submit(self.fetch, nxt)
+        layer = self.layers[i]
+        for name, p in list(layer.named_parameters()):
+            v = values.pop(name, None)
+            if v is None:
+                raise SystemExit(f"ref_stream: layer {i}: {name} was not fetched")
+            if tuple(v.shape) != tuple(p.shape):
+                raise SystemExit(f"ref_stream: layer {i}: {name} is {tuple(v.shape)} in the checkpoint, {tuple(p.shape)} in the model")
+            _set_param(layer, name, torch.nn.Parameter(v, requires_grad=False))
+        STATS["layer_loads"] += 1
+
+    def release(self, i):
+        layer = self.layers[i]
+        for name, p in list(layer.named_parameters()):
+            _set_param(layer, name, _meta_like(p, torch.float32))

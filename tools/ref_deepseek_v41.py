@@ -2,6 +2,11 @@
 
     python3 tools/probe_reference.py MODEL probe.json --dtype float32 --raw --factory tools/ref_deepseek_v41.py
 
+MODEL is a truncated checkpoint directory (tools/truncate_checkpoint.py), or a
+Hub id for the whole release at full depth: its layers are then read from the
+Hub one at a time before they run and dropped after (tools/ref_stream.py),
+and the routed experts the gate picks are read in parallel as it picks them.
+
 transformers has no DeepSeek V4.1, so the reference is the one the release
 ships: `inference/model.py` and `inference/engram.py` from
 deepseek-ai/DeepSeek-V4.1-Flash, fetched here and imported unmodified. Only
@@ -186,26 +191,33 @@ def make_lazy(ref, store):
             super().__init__()
             self.swiglu_limit = swiglu_limit
             self.prefix = None
+            self._got = None
 
-        def w(self, n):
+        def w(self, n, got=None):
             name = f"{self.prefix}.{n}.weight"
-            t = store.tensor(name)
             sname = f"{self.prefix}.{n}.scale"
+            t = got[name] if got else store.tensor(name)
             if sname in store.keys():
-                t = dequant(t, store.tensor(sname))
+                t = dequant(t, got[sname] if got else store.tensor(sname))
             return t.float()
 
         def forward(self, x, weights=None):
             dtype = x.dtype
-            gate = F.linear(x, self.w("w1")).float()
-            up = F.linear(x, self.w("w3")).float()
+            # A streamed store has read this expert already when the gate routed to it.
+            got = store.take(self.prefix) if hasattr(store, "take") else None
+            if got is not None:
+                self._got = got
+            gate = F.linear(x, self.w("w1", self._got)).float()
+            up = F.linear(x, self.w("w3", self._got)).float()
             if self.swiglu_limit > 0:
                 up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
                 gate = torch.clamp(gate, max=self.swiglu_limit)
             x = F.silu(gate) * up
             if weights is not None:
                 x = weights * x
-            return F.linear(x.to(dtype), self.w("w2"))
+            out = F.linear(x.to(dtype), self.w("w2", self._got))
+            self._got = None
+            return out
 
     class LazyEngramEmbedding(torch.nn.Module):
         """`ParallelEngramEmbedding.forward` (world size 1), reading only the hashed rows."""
@@ -230,9 +242,9 @@ def make_lazy(ref, store):
 class Reference(torch.nn.Module):
     """The interface tools/probe_reference.py needs: logits, per-layer residuals, greedy decoding."""
 
-    def __init__(self, ref, model, store):
+    def __init__(self, ref, model, store, stream=None):
         super().__init__()
-        self.ref, self.model, self.store = ref, model, store
+        self.ref, self.model, self.store, self.stream = ref, model, store, stream
 
     def run(self, ids):
         m = self.model
@@ -241,12 +253,19 @@ class Reference(torch.nn.Module):
         h = h.unsqueeze(2).repeat(1, 1, m.hc_mult, 1)
         pre_mix = self.ref.make_identity_pre_mix(h, m.hc_mult)
         residuals = []
-        for layer in m.layers:
+        last = len(m.layers) - 1
+        for i, layer in enumerate(m.layers):
+            if self.stream:
+                self.stream.materialise(i)
             if layer.engram is not None:
                 h = layer.engram(h, hashes[:, :, layer.engram.layer_hash_index, :])
             residuals.append(layer.hc_pre(h, pre_mix))
             h, pre_mix = layer(h, 0, pre_mix, None)
+            if self.stream and i != last:
+                self.stream.release(i)
         final = m.layers[-1].hc_pre(h, pre_mix)
+        if self.stream:
+            self.stream.release(last)
         logits = m.head(m.norm(final), full_logits=True)
         self.store.flush()
         return logits, residuals + [final]
@@ -265,8 +284,70 @@ class Reference(torch.nn.Module):
         return ids
 
 
+def dequant_named(store, name, t, got=None):
+    """A parameter's float32 value: FP8 / FP4 codes times their block scales, or the stored value."""
+    base = name[: -len(".weight")] if name.endswith(".weight") else None
+    if base and base + ".scale" in store.keys() and t.dtype in (torch.int8, torch.float8_e4m3fn):
+        t = dequant(t, got[base + ".scale"] if got else store.tensor(base + ".scale"))
+    return t.float()
+
+
+def load_streamed(repo):
+    """The whole released model, read from the Hub a layer at a time (tools/ref_stream.py)."""
+    from accelerate import init_empty_weights
+    from transformers import AutoTokenizer
+    import ref_stream
+
+    ref = import_reference()
+    store = ref_stream.Store(ref_stream.Source(repo, os.environ.get("REF_STREAM_REVISION")))
+    cfg = json.load(open(hf_hub_download(repo, "config.json")))
+    tc = cfg.get("text_config", cfg)
+    args = model_args(ref, tc)
+    LazyExpert, LazyEngramEmbedding = make_lazy(ref, store)
+    ref.Expert, ref.ParallelEngramEmbedding = LazyExpert, LazyEngramEmbedding
+    tok = AutoTokenizer.from_pretrained(repo)
+    torch.set_default_dtype(torch.float32)
+    # Parameters on the meta device, buffers (caches, rotary tables) real.
+    with init_empty_weights(include_buffers=False):
+        model = ref.Transformer(args, tok)
+    ref.linear = lambda x, weight, bias=None: F.linear(x.float(), weight.float())
+    with torch.no_grad():
+        trunk = [n for n, _ in model.named_parameters() if not n.startswith("layers.")]
+        got = store.tensors(trunk + [n[: -len(".weight")] + ".scale" for n in trunk if n.endswith(".weight")
+                                     and n[: -len(".weight")] + ".scale" in store.keys()])
+        for name in trunk:
+            ref_stream._set_param(model, name, torch.nn.Parameter(dequant_named(store, name, got[name], got), requires_grad=False))
+
+    def fetch(i):
+        layer = model.layers[i]
+        names = [f"layers.{i}.{n}" for n, _ in layer.named_parameters()]
+        scales = [n[: -len(".weight")] + ".scale" for n in names if n.endswith(".weight")]
+        got = store.tensors(names + [n for n in scales if n in store.keys()])
+        return {n[len(f"layers.{i}."):]: dequant_named(store, n, got[n], got) for n in names}
+
+    stream = ref_stream.LayerStreamer(list(model.layers), fetch)
+    for i, layer in enumerate(model.layers):
+        for e, ex in enumerate(layer.ffn.experts):
+            ex.prefix = f"layers.{i}.ffn.experts.{e}"
+        layer.ffn.shared_experts.prefix = f"layers.{i}.ffn.shared_experts"
+        if layer.engram is not None:
+            layer.engram.embed.name = f"layers.{i}.engram.embed"
+
+        def routed(gate, inp, out, i=i):
+            # Every expert the gate picked (and the shared one) is read now, in parallel.
+            for e in ["shared_experts"] + [f"experts.{e}" for e in torch.unique(out[1]).tolist()]:
+                p = f"layers.{i}.ffn.{e}"
+                store.prefetch(p, [f"{p}.{w}.{k}" for w in ("w1", "w2", "w3") for k in ("weight", "scale")])
+        layer.ffn.gate.register_forward_hook(routed)
+    model.eval()
+    return Reference(ref, model, store, stream)
+
+
 def load(model_dir, dtype=torch.float32):
     from transformers import AutoTokenizer
+
+    if not os.path.isdir(model_dir):
+        return load_streamed(model_dir)
 
     ref = import_reference()
     store = LazyCheckpoint(model_dir)
