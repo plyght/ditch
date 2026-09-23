@@ -182,8 +182,9 @@ pub const Settings = struct {
     /// Accepted for CLI compatibility with heretic; unused (the memory budget
     /// of a GPU backend is `gpu_memory`).
     max_vram: u64 = 0,
-    /// Compute backend: "cpu" (the default and the reference), "metal", or
-    /// "auto" to probe for a GPU and fall back to the CPU. Also DITCH_DEVICE.
+    /// Compute backend: "cpu" (the default and the reference), "metal",
+    /// "vulkan", or "auto" to probe for a GPU and fall back to the CPU. Also
+    /// DITCH_DEVICE.
     device: []const u8 = "cpu",
     /// Device memory a GPU backend may keep hot weights in (0 = upload every
     /// tile, compute and drop it). Ignored by the CPU backend.
@@ -372,9 +373,12 @@ pub const help_sections = [_]HelpSection{
     \\  --threads <n>                  Worker threads (default: number of CPUs; also DITCH_THREADS).
     \\  --cache-dir <path>             Download cache (default: $DITCH_CACHE or ~/.cache/ditch).
     \\  --chat-template <name>         Use a built-in chat format (chatml, llama3, gemma, raw, ...), not the model's template.
-    \\  --device <auto|cpu|metal>      Compute backend (default: cpu, the reference implementation;
+    \\  --device <auto|cpu|metal|vulkan>
+    \\                                 Compute backend (default: cpu, the reference implementation;
     \\                                 auto probes for a GPU and falls back to the CPU with a note;
-    \\                                 metal needs a -Dmetal build on Apple silicon). Also DITCH_DEVICE.
+    \\                                 metal needs a -Dmetal build on Apple silicon; vulkan runs on
+    \\                                 NVIDIA, AMD and Intel GPUs on Linux and Windows, loading the
+    \\                                 system's Vulkan driver at run time). Also DITCH_DEVICE.
     \\  --gpu-memory <size>            Device memory a GPU backend may keep hot weights in, e.g. 4GB
     \\                                 (default: 0 = upload each weight tile, compute, drop it).
     \\                                 Also DITCH_GPU_MEMORY.
@@ -486,7 +490,10 @@ pub const help_sections = [_]HelpSection{
     \\  --bench-tokens <n>             Tokens decoded per prompt in the benchmark (default: 32).
     \\  --bench-output <file.md>       Also write the benchmark table to this file.
     \\  --kernels                      Per-kernel throughput only, no model needed: matmul, matvec,
-    \\                                 attention, activation and weight conversion.
+    \\                                 attention, activation and weight conversion. With --device
+    \\                                 metal|vulkan|auto, the matrix products are also measured on
+    \\                                 the GPU (uploading each tile, and resident) and checked
+    \\                                 against the CPU.
     \\  --accelerate <bool>, --no-accelerate
     \\                                 Use Apple's Accelerate framework for batched matrix products
     \\                                 on macOS (default: on where it is built in).
@@ -579,7 +586,10 @@ pub const bench_help_text =
     \\  --bench-tokens <n>             Tokens decoded per prompt in the benchmark (default: 32).
     \\  --bench-output <file.md>       Also write the benchmark table to this file.
     \\  --kernels                      Per-kernel throughput only, no model needed: matmul, matvec,
-    \\                                 attention, activation and weight conversion.
+    \\                                 attention, activation and weight conversion. With --device
+    \\                                 metal|vulkan|auto, the matrix products are also measured on
+    \\                                 the GPU (uploading each tile, and resident) and checked
+    \\                                 against the CPU.
     \\  --accelerate <bool>, --no-accelerate
     \\                                 Use Apple's Accelerate framework for batched matrix products
     \\                                 on macOS (default: on where it is built in).

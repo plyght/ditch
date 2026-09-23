@@ -17,6 +17,7 @@ const hf = @import("hf.zig");
 const abliterate = @import("abliterate.zig");
 const search = @import("search.zig");
 const scorers = @import("scorers.zig");
+const compute = @import("compute.zig");
 
 const Model = model_mod.Model;
 const Engine = engine_mod.Engine;
@@ -381,6 +382,8 @@ pub const KernelSetup = struct {
     accelerate_built: bool,
     accelerate_active: bool,
     cpu_arch: []const u8,
+    /// The GPU measured by the "device:" rows (`--device`), or "none".
+    device: []const u8 = "none",
 };
 
 pub fn kernelSetup(pool: *const tensor.Pool) KernelSetup {
@@ -606,9 +609,10 @@ pub fn writeKernels(setup: *const KernelSetup, rows: []const KernelRow, w: *Io.W
             try w.writeAll("\n");
         },
         .plain => {
-            try w.print("cpu_arch: {s}\nvector_lanes: {d}\ntile: {d}x{d}\nthreads: {d}\ncpus: {d}\nperformance_cores: {?d}\nefficiency_cores: {?d}\naccelerate_built: {}\naccelerate_active: {}\n", .{
+            try w.print("cpu_arch: {s}\nvector_lanes: {d}\ntile: {d}x{d}\nthreads: {d}\ncpus: {d}\nperformance_cores: {?d}\nefficiency_cores: {?d}\naccelerate_built: {}\naccelerate_active: {}\ndevice: {s}\n", .{
                 setup.cpu_arch, setup.vector_lanes,      setup.tile_inputs,      setup.tile_rows,        setup.threads,
                 setup.cpus,     setup.performance_cores, setup.efficiency_cores, setup.accelerate_built, setup.accelerate_active,
+                setup.device,
             });
             for (rows) |r| try w.print("kernel {s} ({s}): {d:.2} GFLOP/s, {d:.2} GB/s\n", .{ r.name, r.shape, r.gflops(), r.gbytes() });
         },
@@ -621,6 +625,7 @@ pub fn writeKernels(setup: *const KernelSetup, rows: []const KernelRow, w: *Io.W
                 try w.print(", Accelerate {s}", .{if (setup.accelerate_active) "active" else "built in but off"});
             }
             try w.print(" ({s}).\n", .{setup.cpu_arch});
+            if (!std.mem.eql(u8, setup.device, "none")) try w.print("Rows marked \"device\" ran on {s}.\n", .{setup.device});
         },
     }
 }
@@ -666,13 +671,146 @@ pub fn accelerateDifference(gpa: Allocator, pool: *const tensor.Pool) !?f64 {
 /// kernel: the two differ only in summation order over 2048 terms.
 pub const accelerate_tolerance: f64 = 1e-4;
 
+/// The weight-tile products the forward pass hands to a GPU, measured on
+/// `dev` in the two regimes a run can be in: "upload per call" is every tile
+/// copied to the device for each product (streamed or warp weights, or no
+/// `--gpu-memory`), "resident" is the tile kept on the device (memory-mapped
+/// weights with `--gpu-memory`). Same shapes as the CPU rows of `kernelRows`.
+pub fn deviceKernelRows(gpa: Allocator, io: Io, pool: *const tensor.Pool, dev_in: *const compute.Device, out: *std.ArrayList(KernelRow)) !void {
+    const cols: usize = 2048;
+    const rows_n: usize = 2048;
+    const prefill_n: usize = 64;
+    var dev = dev_in.*;
+    dev.min_macs = 0;
+
+    const wbytes = try gpa.alloc(u8, rows_n * cols * 2);
+    defer gpa.free(wbytes);
+    fillRandomBf16(wbytes, 1);
+    const w = tensor.Weight{ .data = wbytes, .dtype = .bf16, .rows = rows_n, .cols = cols };
+    const wf32 = try gpa.alloc(f32, rows_n * cols);
+    defer gpa.free(wf32);
+    tensor.convertToF32(.bf16, wbytes, wf32);
+    const wf = tensor.Weight{ .data = std.mem.sliceAsBytes(wf32), .dtype = .f32, .rows = rows_n, .cols = cols };
+    const x = try gpa.alloc(f32, prefill_n * cols);
+    defer gpa.free(x);
+    fillRandom(x, 2);
+    const y = try gpa.alloc(f32, prefill_n * rows_n);
+    defer gpa.free(y);
+    fillRandom(y, 3);
+
+    const Mm = struct {
+        dev: *const compute.Device,
+        gpa: Allocator,
+        pool: *const tensor.Pool,
+        out: []f32,
+        x: []const f32,
+        n: usize,
+        w: tensor.Weight,
+        fn call(c: *const @This()) anyerror!void {
+            try compute.matmulTOn(c.dev, c.pool, c.gpa, c.out, c.x, c.n, c.w, null);
+        }
+    };
+    const Mv = struct {
+        dev: *const compute.Device,
+        gpa: Allocator,
+        pool: *const tensor.Pool,
+        out: []f32,
+        w: tensor.Weight,
+        y: []const f32,
+        fn call(c: *const @This()) anyerror!void {
+            try compute.matvecTMultiOn(c.dev, c.pool, c.gpa, c.out, c.w, c.y, 1);
+        }
+    };
+    const prefill_flops = 2.0 * @as(f64, @floatFromInt(prefill_n * rows_n * cols));
+    const tile_flops = 2.0 * @as(f64, @floatFromInt(rows_n * cols));
+    const bf16_bytes: f64 = @floatFromInt(rows_n * cols * 2);
+
+    const stable_before = compute.weights_stable;
+    defer compute.weights_stable = stable_before;
+    compute.weights_stable = false;
+    const mm_up = Mm{ .dev = &dev, .gpa = gpa, .pool = pool, .out = y, .x = x, .n = prefill_n, .w = w };
+    try measure(io, out, gpa, "device: matmul prefill (bf16), upload per call", "64 x 2048 x 2048", prefill_flops, bf16_bytes, &mm_up, Mm.call);
+    const mv_up = Mm{ .dev = &dev, .gpa = gpa, .pool = pool, .out = y, .x = x, .n = 1, .w = w };
+    try measure(io, out, gpa, "device: matvec decode (bf16), upload per call", "1 x 2048 x 2048", tile_flops, bf16_bytes, &mv_up, Mm.call);
+
+    if (dev.memory_budget >= wf32.len * 4) {
+        compute.weights_stable = true;
+        try measure(io, out, gpa, "device: matmul prefill (bf16), resident", "64 x 2048 x 2048", prefill_flops, bf16_bytes, &mm_up, Mm.call);
+        const mm_f32 = Mm{ .dev = &dev, .gpa = gpa, .pool = pool, .out = y, .x = x, .n = prefill_n, .w = wf };
+        try measure(io, out, gpa, "device: matmul prefill (f32), resident", "64 x 2048 x 2048", prefill_flops, bf16_bytes * 2, &mm_f32, Mm.call);
+        try measure(io, out, gpa, "device: matvec decode (bf16), resident", "1 x 2048 x 2048", tile_flops, bf16_bytes, &mv_up, Mm.call);
+        const mm_b4 = Mm{ .dev = &dev, .gpa = gpa, .pool = pool, .out = y, .x = x, .n = 4, .w = w };
+        try measure(io, out, gpa, "device: matvec decode, batch 4, resident", "4 x 2048 x 2048", 4 * tile_flops, bf16_bytes, &mm_b4, Mm.call);
+        const mv = Mv{ .dev = &dev, .gpa = gpa, .pool = pool, .out = x, .w = w, .y = y };
+        try measure(io, out, gpa, "device: matvecT (abliteration apply), resident", "2048 x 2048", tile_flops, bf16_bytes, &mv, Mv.call);
+    }
+}
+
+/// The largest difference between `dev` and the CPU on a prefill-shaped bf16
+/// product, relative to the largest output magnitude. The two sum in a
+/// different order; anything above `device_tolerance` is a wrong result.
+pub fn deviceDifference(gpa: Allocator, pool: *const tensor.Pool, dev_in: *const compute.Device) !f64 {
+    var dev = dev_in.*;
+    dev.min_macs = 0;
+    const cols: usize = 2048;
+    const rows: usize = 512;
+    const n: usize = 16;
+    const wbytes = try gpa.alloc(u8, rows * cols * 2);
+    defer gpa.free(wbytes);
+    fillRandomBf16(wbytes, 11);
+    const w = tensor.Weight{ .data = wbytes, .dtype = .bf16, .rows = rows, .cols = cols };
+    const x = try gpa.alloc(f32, n * cols);
+    defer gpa.free(x);
+    fillRandom(x, 12);
+    const a = try gpa.alloc(f32, n * rows);
+    defer gpa.free(a);
+    const b = try gpa.alloc(f32, n * rows);
+    defer gpa.free(b);
+    try tensor.matmulT(pool, gpa, a, x, n, w, null);
+    try compute.matmulTOn(&dev, pool, gpa, b, x, n, w, null);
+    var worst: f64 = 0;
+    var scale: f64 = 1e-30;
+    for (a, b) |va, vb| {
+        worst = @max(worst, @abs(@as(f64, va) - @as(f64, vb)));
+        scale = @max(scale, @abs(@as(f64, va)));
+    }
+    return worst / scale;
+}
+
+/// Largest relative difference tolerated between a GPU and the CPU kernel.
+pub const device_tolerance: f64 = 1e-4;
+
 /// `ditch bench --kernels`: per-kernel throughput, no model needed.
 pub fn runKernels(gpa: Allocator, io: Io, settings: *const config.Settings, pool: *const tensor.Pool, out: *Io.Writer, result_out: *Io.Writer) !void {
     try out.writeAll("\nMeasuring the compute kernels...\n");
     try out.flush();
-    const rows = try kernelRows(gpa, io, pool);
+    var rows = try kernelRows(gpa, io, pool);
     defer gpa.free(rows);
-    const setup = kernelSetup(pool);
+    var setup = kernelSetup(pool);
+    // `--device X`: the same products on the GPU as well.
+    var device_difference: ?f64 = null;
+    const kind = settings.deviceKind() orelse .cpu;
+    if (kind != .cpu) {
+        // Room for the resident rows even without --gpu-memory.
+        var selected = compute.select(gpa, kind, .{ .io = io, .memory_budget = @max(settings.gpu_memory, 256 << 20) }) catch {
+            std.log.err("device {s} is not available: {s}", .{ settings.device, compute.unavailable_reason orelse "not in this build" });
+            std.process.exit(2);
+        };
+        defer selected.device.deinit();
+        if (selected.note) |n| try out.print("{s}\n", .{n});
+        if (!selected.device.isCpu()) {
+            try out.print("Measuring the same products on {s}...\n", .{selected.device.name});
+            try out.flush();
+            var list: std.ArrayList(KernelRow) = .fromOwnedSlice(rows);
+            rows = &.{};
+            errdefer list.deinit(gpa);
+            try deviceKernelRows(gpa, io, pool, &selected.device, &list);
+            rows = try list.toOwnedSlice(gpa);
+            setup.device = try gpa.dupe(u8, selected.device.name);
+            device_difference = try deviceDifference(gpa, pool, &selected.device);
+        }
+    }
+    defer if (!std.mem.eql(u8, setup.device, "none")) gpa.free(setup.device);
     // With Accelerate active, the same kernels are measured again with it
     // switched off, and the two paths are compared numerically.
     var zig_rows: []KernelRow = &.{};
@@ -698,6 +836,11 @@ pub fn runKernels(gpa: Allocator, io: Io, settings: *const config.Settings, pool
         try result_out.writeAll("\nThe same kernels with Accelerate switched off:\n\n");
         if (settings.plain) try writeKernels(&off, zig_rows, result_out, .plain) else try writeKernels(&off, zig_rows, result_out, .table);
         try result_out.flush();
+    }
+    if (device_difference) |d| {
+        try out.print("\n{s} vs the CPU kernel: largest relative difference {e:.3} (tolerance {e:.3}).\n", .{ setup.device, d, device_tolerance });
+        try out.flush();
+        if (!(d <= device_tolerance)) return error.DeviceMismatch;
     }
     if (difference) |d| {
         try out.print("\nAccelerate vs the built-in kernel: largest relative difference {e:.3} (tolerance {e:.3}).\n", .{ d, accelerate_tolerance });

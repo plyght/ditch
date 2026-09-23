@@ -12,8 +12,8 @@ Direction*, 2024, <https://arxiv.org/abs/2406.11717>) when you use the results.
 What ditch adds:
 
 * **One dependency-free binary.** No Python, no PyTorch, no GPU needed (there
-  is an optional Metal backend; see "GPU acceleration"). Linux, macOS and
-  Windows builds on every release.
+  are optional Vulkan and Metal backends; see "GPU acceleration"). Linux, macOS
+  and Windows builds on every release.
 * **Models bigger than RAM.** A memory budget streams weights layer by layer;
   for mixture-of-experts models, *warp mode* streams only the routed experts,
   and an `hf://` source fetches tensors on demand instead of downloading.
@@ -89,7 +89,7 @@ Useful flags (all also settable in `config.lua`; see `ditch --help`):
 | `--export-format hf\|gguf\|both`, `--gguf-dtype f16\|q8_0\|...` | output format |
 | `--checkpoint-action`, `--trial-index`, `--model-action`, `--save-directory` | answer the menus non-interactively |
 | `--evaluate-model DIR`, `--reproduce FILE`, `ditch bench MODEL` | evaluate, reproduce, measure |
-| `--device auto\|cpu\|metal`, `--gpu-memory 4GB`, `ditch selftest` | compute backend (see "GPU acceleration") |
+| `--device auto\|cpu\|metal\|vulkan`, `--gpu-memory 4GB`, `ditch selftest` | compute backend (see "GPU acceleration") |
 
 ## Supported models
 
@@ -198,19 +198,28 @@ with `ditch bench` before committing to a long run.
 ## GPU acceleration
 
 The CPU is still the default and the reference. `--device` selects a compute
-backend: `cpu` (default), `metal` (Apple silicon) or `auto`, which probes for a
-usable GPU and falls back to the CPU with one line on stderr. The same setting
-exists as `DITCH_DEVICE` and as `device` in `config.lua`, and the device that
-ran a study is recorded in `ditch-reproduce.lua`.
+backend: `cpu` (default), `vulkan` (NVIDIA, AMD and Intel GPUs on Linux and
+Windows), `metal` (Apple silicon) or `auto`, which probes for a usable GPU and
+falls back to the CPU with one line on stderr. The same setting exists as
+`DITCH_DEVICE` and as `device` in `config.lua`, and the device that ran a study
+is recorded in `ditch-reproduce.lua`.
 
 ```sh
-zig build -Doptimize=ReleaseFast -Dmetal    # on a Mac with Xcode's command line tools
-ditch selftest --device metal               # check every GPU kernel against the CPU
-ditch Qwen/Qwen2.5-0.5B-Instruct --device metal --gpu-memory 4GB
+ditch selftest --device vulkan              # check every GPU kernel against the CPU
+ditch Qwen/Qwen2.5-0.5B-Instruct --device vulkan --gpu-memory 4GB
+zig build -Doptimize=ReleaseFast -Dmetal    # Metal: on a Mac with Xcode's command line tools
+ditch selftest --device metal
 ```
 
+Vulkan needs only the GPU driver (`libvulkan.so.1` / `vulkan-1.dll`, which
+every NVIDIA, AMD and Intel driver installs); it is loaded at run time, so the
+same binary runs on machines without it. On Linux use the `*-linux-gnu` release
+archive or build from source: the static `*-linux-musl` binaries cannot load a
+driver and say so.
+
 **[docs/gpu.md](docs/gpu.md)** is the full description: the backend interface,
-the Metal kernels, the test harness and a table of what is verified where.
+the Metal and Vulkan kernels, the test harness and a table of what is verified
+where.
 
 All kernels go through a backend seam (`src/compute.zig`); a backend implements
 what it can and anything else falls through to the CPU kernel, so quantised
@@ -218,7 +227,7 @@ tiles, odd shapes and small work are never a special case. Only the
 weight-tile operations — the matrix products and row norms, which dominate the
 FLOPs — are actually dispatched to the GPU today; norms, softmax, rope, gated
 activations and per-head attention are computed per row inside the thread pool,
-where a device round trip would cost more than the arithmetic. Their Metal
+where a device round trip would cost more than the arithmetic. Their GPU
 kernels exist and are checked by the selftest, ready for a forward pass that
 keeps activations resident. The GPU never needs the whole model: a weight tile
 is uploaded (or, when it is page aligned, addressed in place through unified
@@ -245,7 +254,11 @@ it compiles the shaders with `xcrun metal`, runs `ditch selftest --device metal`
 and fails when a kernel is outside tolerance, and runs an abliteration on the
 fixture model on both devices and compares the exports. Until that job has run
 green on your change, treat the Metal path as unverified, and run the selftest
-on your own Mac before trusting it: it is one command and takes seconds.
+on your own Mac before trusting it: it is one command and takes seconds. The
+Vulkan backend is checked the same way in CI on Mesa's lavapipe, a software
+Vulkan driver: selftest and a full abliteration compared with the CPU. That
+proves the kernels correct as Vulkan defines them, not on every vendor's
+compiler, so run `ditch selftest --device vulkan` once on your GPU as well.
 
 ## GGUF
 
@@ -395,6 +408,8 @@ has the full table for every run.
 zig build test --summary all   # unit tests (NumPy fixtures in tests/fixtures)
 bash tests/e2e.sh              # end-to-end run of every feature on the fixtures
 zig build metal-check          # type-check the Metal backend for aarch64-macos
+bash tests/vulkan_e2e.sh       # Vulkan kernels and pipeline (a GPU, or apt install mesa-vulkan-drivers)
+bash tools/gen_spirv.sh        # recompile the Vulkan shaders after editing src/vulkan/shaders
 ditch selftest --device cpu    # the backend harness against itself (zero error)
 zig fmt --check src build.zig
 ```

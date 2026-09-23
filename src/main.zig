@@ -1527,7 +1527,11 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         return;
     }
     const device_note = compute.selectInto(gpa, device_kind, .{ .memory_budget = settings.gpu_memory, .io = pool.io, .min_macs = settings.device_min_macs }) catch {
-        std.log.err("device {s} is not available on this build or machine (build with -Dmetal on Apple silicon, or use --device auto)", .{settings.device});
+        if (compute.unavailable_reason) |why| {
+            std.log.err("device {s} is not available: {s} (use --device auto to fall back to the CPU)", .{ settings.device, why });
+        } else {
+            std.log.err("device {s} is not available on this build or machine (build with -Dmetal on Apple silicon, or use --device auto)", .{settings.device});
+        }
         std.process.exit(2);
     };
     defer compute.shutdown();
