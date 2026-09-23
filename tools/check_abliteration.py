@@ -51,6 +51,12 @@ cfg = json.load(open(os.path.join(cut, 'config.json')))
 IN_OUT_EXPERTS = (cfg.get('text_config', cfg).get('model_type') == 'gpt_oss')  # bf16 gpt-oss experts are x @ W
 q = cfg.get('quantization_config') or (cfg.get('text_config') or {}).get('quantization_config') or {}
 wq = next(iter((q.get('config_groups') or {}).values()), {}).get('weights', {}) if q.get('config_groups') else {}
+# MiMo V2's fp8 attention projections are blocked per tensor-parallel row shard
+# (bug F5): ref_lazy_moe's dequantiser does that when told the shard count.
+import ref_lazy_moe
+tcfg = cfg.get('text_config') or cfg
+ref_lazy_moe.FP8_BLOCK = tuple(q['weight_block_size']) if q.get('weight_block_size') else None
+ref_lazy_moe.ATTN_ROW_SHARDS = tcfg.get('num_key_value_heads', 1) if tcfg.get('model_type') in ('mimo_v2', 'mimo_v2_flash') else 1
 def orig(name):  # float32 view of a source tensor, dequantised (and rounded to bf16) as ditch does
     base = name[:-len('.weight')] if name.endswith('.weight') else name
     keys = src.keys()
@@ -59,6 +65,8 @@ def orig(name):  # float32 view of a source tensor, dequantised (and rounded to 
         return convert_moe_packed_tensors(src.tensor(base + '_blocks'), src.tensor(base + '_scales')).float()
     if name in keys and src.header[name]['dtype'] not in ('F8_E4M3', 'U8', 'I8', 'I32'):
         return src.tensor(name).float()
+    if name in keys and ref_lazy_moe.ATTN_ROW_SHARDS > 1 and re.search(r'self_attn\.(qkv|q|k|v)_proj$', base) and base + '.weight_scale_inv' in keys:
+        return dequant_expert(src, base, wq).to(torch.bfloat16).float()
     if name in keys and src.header[name]['dtype'] == 'F8_E4M3':
         # FP8 with a per-tensor, per-expert ([E, 1, 1]) or per-block scale
         sname = next((c for c in (base + '.weight_scale_inv', name + '_scale_inv', base + '.weight_scale', name + '_scale') if c in keys), None)
@@ -130,8 +138,13 @@ for fpath in exp_files:
                     # by more than 1e-5 of the mean |W| (cancellation leaves values near zero whose steps are tiny)
                     step = torch.exp2(torch.floor(torch.log2(torch.maximum(pred.abs(), Em.abs()).clamp_min(1e-30))) - 7)
                     dif = (pred - Em).abs()
-                    far = int(((dif > step * 1.0001) & (dif > 1e-5 * Om.abs().mean())).sum())
-                    ulp = (far, float(dif.max() / Om.abs().mean()))
+                    farm = (dif > step * 1.0001) & (dif > 1e-5 * Om.abs().mean())
+                    far = int(farm.sum())
+                    # The same on the weights that are not exactly zero: a zero weight (common in
+                    # MXFP4 / INT4 sources) holds only the delta, whose last bit any difference in
+                    # the rank-3 factorisation flips.
+                    nz = Om != 0
+                    ulp = (far, float(dif.max() / Om.abs().mean()), float((pred == Em)[nz].float().mean()), int(farm[nz].sum()), float((~nz).float().mean()))
                     err = float((D - De).norm() / De.norm())
                     opt = float(((pred.double() - Om.double()) - De).norm() / De.norm())  # the floor: bf16(W + D3) itself
                     checks.append((label, comp, li, lam, err, opt)); bits.append((label, same, ulp))
@@ -145,7 +158,7 @@ for label, comp, li, lam, err, opt in checks:
     if err is None: print(f'  ?? {label}: no kernel weight / not [hidden, *] (comp {comp}, layer {li})'); continue
     worst = max(worst, err - opt)
     if len(checks) <= 40 or err - opt > 1e-3: print(f'  {label}: {comp} layer {li} λ={lam:.4f}  |D-Dexact|/|Dexact| = {err:.2e}  (best rank-3{", rounded" if EXP_BF16 else ""}: {opt:.2e}, excess {err - opt:.1e})')
-for b in bits: print('   bits', b[0], 'equal %.6f' % b[1], 'far', b[2][0], 'max %.2e' % b[2][1])
+for b in bits: print('   bits', b[0], 'equal %.6f' % b[1], 'far', b[2][0], 'max %.2e' % b[2][1], '| W != 0: equal %.6f far %d (zeros %.4f)' % (b[2][2], b[2][3], b[2][4]))
 if EXP_BF16:
     print(f'bf16 export: worst share of elements equal to bf16(W + D3): {min(b[1] for b in bits) if bits else 1:.6f}; elements more than one bf16 step (and 1e-5 of mean |W|) apart: {sum(b[2][0] for b in bits) if bits else 0}; largest difference {max(b[2][1] for b in bits) if bits else 0:.1e} of mean |W|; over {len(bits)} matrices; (E-W) against the exact edit: worst excess over the error of bf16(W + D3) itself {worst:.2e}; scope {scope}')
 else:

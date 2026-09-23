@@ -4984,6 +4984,40 @@ first 8 of 128 experts (`--experts 8`), no MTP (`--drop mtp.`); bf16 export
   layers 2-31 missing because `truncate_checkpoint.py` cuts the encoder's
   `layers.N` with the decoder's, which a text-only comparison never reads.
 
+## Abliteration: MiMo V2.6 (`mimo_v2`), per-shard FP8 attention and MXFP4 experts
+
+`XiaomiMiMo/MiMo-V2.6-Flash-RL`, layers 0, 1 and 5 (dense full attention,
+sliding attention with sinks and the MoE, full attention with the MoE), the
+first 8 experts (`--experts 8`), no MTP; fp8 fused `qkv_proj` blocked per
+tensor-parallel shard (bug F5), MXFP4 experts (`store_dtype: mxfp4`); bf16
+export.
+
+* **Edited set:** `self_attn.o_proj` in layers 1 and 2 and every routed
+  expert's `down_proj` there; layer 0 lies outside both weight windows of the
+  trial (its distances 1.91 and 1.22 exceed 1.12 and the MLP's). `qkv_proj`,
+  `gate_proj`/`up_proj`, the router, the attention sinks and the layer-0 MLP
+  are untouched. The checker first listed layers 0 and 2's `qkv_proj` as edited
+  (6.7% bit-equal): it had dequantised them with one 128 x 128 grid, where
+  each of the `num_key_value_heads` row shards has its own; it now uses
+  `ref_lazy_moe`'s per-shard dequantiser, and every `qkv_proj` equals its
+  dequantised original (layer 1's sliding shards happen to align with the
+  single grid, which is why it alone had looked untouched).
+* **Maths (bf16 export):** `o_proj` 99.96-99.98% bit-equal to
+  `bf16(W + D₃)`. The experts are 96.7-99.4% bit-equal, and all 16,072
+  elements more than one bf16 step off sit on weights that are exactly zero
+  (7-25% of an MXFP4 expert): there the export holds only the delta, whose last
+  bits any difference in the rank-3 factorisation moves. On the non-zero
+  weights every expert is 99.98-99.998% bit-equal with none more than a step
+  off. The error against the exact edit is at most 1.1e-05 over the rounded
+  floor. The checker now reports this split for every bf16 export.
+* **Export:** `quantization_config` and `store_dtype` gone, `qkv_proj` in the
+  release's shard-interleaved row order (dequantised shard by shard), which
+  the release's loader regroups. The release's own `modeling_mimo_v2.py`
+  (`tools/ref_mimo_v2.py`) on the export against `ditch probe --raw`:
+  residuals within 3.1e-07, logits 4.4e-07 of range, argmax and top-5 equal.
+  (`tools/ref_kimi_k3.py`, whose helpers it borrows, now tolerates fla already
+  hidden.) Reload check 0.0118.
+
 ## Exact ranges for scattered experts: gpt-oss-20b with a cache below its experts
 
 After the account of gpt-oss-120b's decode above (whole 8 MB chunks per
