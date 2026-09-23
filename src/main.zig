@@ -1995,6 +1995,8 @@ fn printRemoteStats(out: *Io.Writer, s: *remote.Source) void {
     const st = s.stats();
     out.print("\nRemote source: fetched {d} ranges ({f}), {d} chunk reads served from the disk cache\n", .{ st.ranges_fetched, budget_mod.fmtBytes(st.bytes_fetched), st.chunks_from_disk }) catch {};
     out.print("Chunk cache: {f} on disk of a {f} bound (peak {f}), {d} chunks evicted, {d} served from RAM without being kept\n", .{ budget_mod.fmtBytes(st.cache_bytes), budget_mod.fmtBytes(st.cache_limit), budget_mod.fmtBytes(st.peak_cache_bytes), st.chunks_evicted, st.chunks_unpersisted }) catch {};
+    if (st.partial_ranges > 0)
+        out.print("Exact ranges: {d} fetched ({f}) for scattered experts instead of whole chunks, {d} reads served from them\n", .{ st.partial_ranges, budget_mod.fmtBytes(st.partial_bytes), st.partial_hits }) catch {};
     out.flush() catch {};
 }
 

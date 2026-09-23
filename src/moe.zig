@@ -1154,11 +1154,16 @@ pub fn forward(model: *const Model, m: *const MoeLayer, li: usize, out: []f32, h
     // connections: the ones beyond what the expert cache can prefetch are
     // then in the chunk cache (or on their way) by the time they are needed,
     // instead of each one being fetched on its own when its turn comes.
-    for (union_list[0..n_union]) |e| {
-        if (cache) |c| if (c.resident(li, e)) continue;
-        const ex = &m.experts[e];
+    if (model.warp()) {
+        var refs = std.ArrayList(stream.WeightRef).empty;
+        defer refs.deinit(gpa);
+        for (union_list[0..n_union]) |e| {
+            if (cache) |c| if (c.resident(li, e)) continue;
+            const ex = &m.experts[e];
+            refs.appendSlice(gpa, &.{ ex.gate_ref.ref, ex.up_ref.ref, ex.down_ref.ref }) catch break;
+        }
         const store: *stream.WeightStore = @constCast(&model.store);
-        store.prefetchRemote(&.{ ex.gate_ref.ref, ex.up_ref.ref, ex.down_ref.ref });
+        store.prefetchRemote(refs.items);
     }
     if (cache) |c| c.prefetch(li, m, union_list[0..n_union]);
 

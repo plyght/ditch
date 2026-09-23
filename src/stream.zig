@@ -439,14 +439,33 @@ pub const WeightStore = struct {
     }
 
     /// Hints that `refs` will be acquired soon: remote shards start fetching
-    /// their bytes into the chunk cache in the background (over many
-    /// connections), without holding any budget; local files ignore it.
+    /// their stored bytes in the background (over many connections), without
+    /// holding any budget; local files ignore it. The ranges are merged per
+    /// shard first, so that neighbouring pieces (the experts of a prefill,
+    /// most of a layer's) are fetched as whole chunks and scattered ones (a
+    /// decode step's few) as exact ranges (see `remote.RemoteFile.prefetchRange`).
     pub fn prefetchRemote(self: *WeightStore, refs: []const WeightRef) void {
         if (self.mode != .streamed) return;
-        for (refs, 0..) |r, i| {
-            if (i > 0 and refs[i - 1].file == r.file and refs[i - 1].offset == r.offset) continue; // fused gate/up
-            self.files[r.file].prefetchRange(r.offset, r.byteLen());
+        var ranges = std.ArrayList(safetensors.File.RawRange).empty;
+        defer ranges.deinit(self.gpa);
+        for (refs) |r| self.files[r.file].rawRanges(self.gpa, r.offset, r.byteLen(), &ranges) catch return;
+        if (ranges.items.len == 0) return;
+        std.mem.sort(safetensors.File.RawRange, ranges.items, {}, struct {
+            fn lt(_: void, a: safetensors.File.RawRange, b: safetensors.File.RawRange) bool {
+                if (a.file != b.file) return @intFromPtr(a.file) < @intFromPtr(b.file);
+                return a.offset < b.offset;
+            }
+        }.lt);
+        var cur = ranges.items[0];
+        for (ranges.items[1..]) |r| {
+            if (r.file == cur.file and r.offset <= cur.offset + cur.len) {
+                cur.len = @max(cur.len, r.offset + r.len - cur.offset);
+                continue;
+            }
+            cur.file.prefetchRange(cur.offset, cur.len);
+            cur = r;
         }
+        cur.file.prefetchRange(cur.offset, cur.len);
     }
 
     fn discardPending(self: *WeightStore) void {
