@@ -307,6 +307,7 @@ pub const usage_text =
     \\  ditch [OPTIONS] <MODEL>          run the abliteration study on a model
     \\  ditch bench [OPTIONS] <MODEL>    measure throughput, timings and memory
     \\  ditch probe [OPTIONS] <MODEL> --prompt TEXT   show tokens, first-token logits, greedy reply
+    \\  ditch verify [OPTIONS] <MODEL>   check it against the official implementation (see ditch verify --help)
     \\  ditch selftest [--device D]      check a compute backend against the CPU reference kernels
     \\  ditch help [bench]               this help (or the benchmark options)
     \\
@@ -690,7 +691,7 @@ fn applyConfigFile(gpa: Allocator, io: std.Io, a: Allocator, settings: *Settings
     return true;
 }
 
-pub const subcommands = [_][]const u8{ "bench", "probe", "selftest", "help" };
+pub const subcommands = [_][]const u8{ "bench", "probe", "verify", "selftest", "help" };
 
 /// Parses the configuration: the user file ($XDG_CONFIG_HOME/ditch/config.lua),
 /// the project file (./config.lua, ./config.toml or --config), the DITCH_*
