@@ -1700,7 +1700,7 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         std.log.err("unknown chat template: {s} (expected model, or a family such as chatml, llama3, mistral, gemma or raw)", .{name});
         return error.InvalidChatTemplate;
     };
-    var format = try engine_mod.modelFormat(rt_gpa, model, settings.chat_template);
+    var format = try engine_mod.modelFormat(gpa, model, settings.chat_template);
     defer format.deinit();
     if (format.template != null) {
         try out.print("* Chat template: the model's own{s}{s}\n", .{ if (format.content_parts) ", contents as text parts" else "", if (format.fold_system) ", with the system prompt in the first user message" else "" });
@@ -1796,7 +1796,7 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
             },
             else => return err,
         };
-        var eval_format = try engine_mod.modelFormat(rt_gpa, eval_model, settings.chat_template);
+        var eval_format = try engine_mod.modelFormat(gpa, eval_model, settings.chat_template);
         defer eval_format.deinit();
         var eval_engine = Engine.init(rt_gpa, eval_model, settings, eval_format);
         defer eval_engine.deinit();
