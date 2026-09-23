@@ -3681,3 +3681,157 @@ untouched. The GGUF export writes the head's rows normalised, since
 llama.cpp runs a plain head (its converter normalises too); normalising them
 again on import changes nothing. Logits now agree to 3.2e-07. A parse test
 covers the flag.
+
+# Full-depth reference
+
+Until now every frontier family was compared with its reference on a cut: the
+first *K* layers (or a few far-apart ones), because transformers holds the
+whole model in memory and this machine has 15 GB of RAM and ~28 GB of disk.
+ditch itself already runs these models at full depth, streamed over `hf://`.
+This pass makes the reference do the same: transformers' own model, built from
+the real config and run unchanged end to end, with each decoder layer's weights
+read from the Hub just before it runs and dropped after.
+
+Machine as before: 4 cores, 15 GiB RAM, ~28 GiB free disk, no GPU; torch
+2.14.0+cpu, transformers 5.17.0, accelerate 1.15.0, huggingface_hub 1.32.0,
+Zig 0.16.0.
+
+## How others run a model larger than the RAM
+
+A short survey, to find what can be reused and what cannot on a machine whose
+disk is also smaller than the model.
+
+* **accelerate big-model inference.** `init_empty_weights` builds the model on
+  the meta device. `device_map="auto"` / `infer_auto_device_map` then place
+  each module on the GPU, the CPU or `"disk"`. An `AlignDevicesHook`
+  (`add_hook_to_module`) loads an offloaded module's weights before its
+  forward and sends them back after. There is no prefetching. `disk_offload` /
+  `offload_weight` write a numpy memmap copy of every weight (bf16 as int16).
+  `OffloadedWeightsLoader` can instead point at a tensor inside a *local*
+  safetensors file, with no copy. Reusable: the hook pattern. Not usable here:
+  every path needs the checkpoint on local disk, which this machine cannot
+  hold.
+* **transformers 5 disk offload** (`offload_folder`) goes through accelerate.
+  It reuses the original safetensors entries for weights that load as stored,
+  but *re-saves as a memmap* every weight that passes through a
+  `WeightConverter` or a dequantiser, which is every fused MoE expert stack and
+  every quantised tensor. It needs the full local checkpoint and roughly as
+  much again in memmaps.
+* **AirLLM** runs a model one layer at a time. On first use it splits the
+  checkpoint into one file per layer on disk (the full download, then about as
+  much again), optionally compresses to 4/8 bits, and optionally prefetches
+  the next layer. Its own model code (Llama, Qwen, Mistral, DeepSeek, ...)
+  replaces the family's. Ruled out on both counts: the disk, and the reference
+  must be the official code.
+* **transformers 5 loading internals.** `from_pretrained` builds the model
+  under `torch.device("meta")`, runs the quantizer's `preprocess_model`, and
+  collects the family's weight transforms (`get_model_conversion_mapping`:
+  `WeightRenaming`s, and `WeightConverter`s such as
+  `MergeModulelist` + `Concatenate`, which fuse per-expert tensors into
+  `gate_up_proj [E, 2I, H]`) together with the quantizer's own transforms. For
+  a pre-quantised checkpoint loaded with `dequantize=True`, which is the CPU
+  default for MXFP4 and FP8, those are `Mxfp4Dequantize` and `Fp8Dequantize`.
+  All of it goes into a `LoadStateDictConfig` and then into
+  `convert_and_load_state_dict_in_model(model, state_dict, load_config)`.
+  That function takes *any* state dict: keys it does not see are just
+  "missing". Each loaded tensor replaces the meta parameter it targets
+  (`set_param_for_module`). So a partial state dict, for example one layer's
+  checkpoint tensors under their checkpoint names, goes through exactly the
+  official renames, converters and dequantisation. The one trap is that
+  `MergeModulelist` stacks whatever experts it was given. Feeding it a subset
+  mis-indexes the stack, unless the target parameter is also one expert wide.
+* **Remote safetensors.** `safe_open` needs a local file. A shard's header is
+  an 8-byte length plus JSON with `data_offsets`, so any tensor is one HTTP
+  `Range` request. A Xet-backed file's `resolve` URL redirects (302) to a CDN
+  URL that answers `Range` with 206. `HfFileSystem` does fsspec range reads.
+  `hf_transfer` is gone in huggingface_hub 1.x, and `hf_xet`'s
+  high-performance mode assumes ≥64 GB of RAM. `tools/truncate_checkpoint.py`
+  already reads this way.
+* **FlexGen, DeepSpeed ZeRO-Inference.** Both stream weights layer by layer
+  from NVMe or CPU memory, and both prefetch layer *i*+1 while layer *i*
+  computes; the prefetch is the idea worth keeping. **llama.cpp** mmaps the
+  weights and lets the page cache act as the weight cache. 671B–1T MoE models
+  run off an SSD below 1 token/s this way, their speed set by the active
+  parameters. Expert-streaming and PowerInfer-style work reuse hot experts
+  across tokens.
+
+What follows from that: none of the offload frameworks fits a checkpoint that
+cannot be on the disk. But transformers' own loader can be given one layer at
+a time, which keeps the reference exactly the official code.
+
+## Method: `tools/ref_stream.py`
+
+    ditch probe hf://REPO --prompt ... --residuals --json > p.json
+    python3 tools/probe_reference.py REPO p.json --dtype float32 --factory tools/ref_stream.py --per-layer
+
+The reference is transformers' own model class, built by its own
+`from_pretrained` from the release's config (all layers). Two of
+`from_pretrained`'s steps are replaced, and nothing in the model:
+
+1. **Only the trunk is loaded.** `from_pretrained` runs as usual: config,
+   quantizer (`dequantize=True`, its CPU default), meta-device init, the
+   family's conversion mapping, the `LoadStateDictConfig`. It is given a
+   placeholder weights file, and its `_load_pretrained_model` is swapped for
+   one that
+   * maps every checkpoint key to its target parameter with transformers'
+     own `rename_source_key`, and assigns it to a decoder layer by that name.
+     Keys whose target is not in the model are dropped: MTP layers, vision
+     towers.
+   * loads the rest (embeddings, final norm, LM head, anything outside the
+     layer stack) through `convert_and_load_state_dict_in_model`.
+   The layers' parameters stay on the meta device. The rest of
+   `from_pretrained` (missing-key init, weight tying, generation config) runs
+   unchanged.
+2. **Each decoder layer is materialised just before it runs.** A forward
+   pre-hook reads the layer's checkpoint tensors (HTTP `Range` requests on
+   the shards, 16 in parallel, in chunks of at most 32 MB) and passes them,
+   under their checkpoint names, through the same
+   `convert_and_load_state_dict_in_model` and load config. So the family's
+   renames, its expert-fusing converters and the quantizer's dequantisation
+   produce the weights, as in a whole-model load. A forward hook puts them
+   back on the meta device. The next layer is fetched in the background while
+   one runs.
+
+The model's own forward, generation loop and KV cache are untouched, so state
+that crosses layers (the cache, mHC streams, Kimi K3's attention over earlier
+layers' outputs, Gemma's KV sharing) behaves as in a whole-model run.
+
+**Routed experts.** When a layer's experts would take more than 2 GB as
+float32, the experts module's `gate_up_proj` / `down_proj` are replaced by
+objects whose `[e]` loads expert *e* on first use. transformers' eager
+experts forward indexes the stacks only for the experts a token is routed
+to. An expert is loaded through the same loader: its checkpoint tensors (its
+own per-expert tensors renumbered to expert 0, or slab *e* of a stacked
+tensor such as gpt-oss's `_blocks` / `_scales`) go into a one-expert-wide
+meta copy of the stacks. That way `MergeModulelist`, `Concatenate`,
+`Mxfp4Dequantize` and `Fp8Dequantize` run exactly as in a whole-model load.
+Dequantised experts are kept in a 3 GB LRU for the generated tokens.
+
+**Arithmetic.** Float32 on the stored values, as in the earlier passes:
+* Stored bf16 tensors load as float32 (exact). F32-stored tensors
+  (routers' correction biases, mHC weights) load as F32.
+* A quantised weight is dequantised into bf16, as a load in the release's
+  own dtype produces it (`Mxfp4Dequantize` always emits bf16;
+  `Fp8Dequantize` emits the parameter's dtype), then widened to float32.
+* The trunk is float32 unless it would exceed 6 GB. In that case tables of
+  more than 256M elements stay bf16 and their `Linear` / `Embedding`
+  compute in float32 a block of rows at a time.
+
+**Cache.** Fetched ranges go into `~/.cache/ref_stream` up to 12 GB
+(`REF_STREAM_CACHE_GB`) and are never evicted. Every generated token re-reads
+the layers in the same order, and for a cyclic scan that is as good as any
+eviction order. At exit the script prints the bytes fetched, the bytes read
+from the cache, the layer and expert loads, the peak RSS and the wall time.
+
+**Checks of the harness itself** (streamed model vs the same model loaded
+whole by `from_pretrained` in float32, same ids, 5 greedy tokens):
+
+| checkpoint | layout | hidden states | logits | greedy |
+| --- | --- | ---: | ---: | :---: |
+| `Qwen/Qwen2.5-0.5B-Instruct` | dense bf16 | all 25 identical | 0.0 | match |
+| `yujiepan/qwen3-moe-tiny-random` | per-expert tensors fused by `MergeModulelist`; experts lazy | identical | 0.0 | match |
+| `yujiepan/gpt-oss-tiny-random-mxfp4` | stacked MXFP4 `_blocks`/`_scales`; experts lazy and not | ≤ 3.0e-08 | 4.5e-08 | match |
+
+The MXFP4 stub's 3e-08 is a last-bit difference, the same with lazy and with
+whole-layer experts.
+
