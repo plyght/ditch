@@ -3166,3 +3166,27 @@ projection is square and its shape cannot tell).
 | "The capital of France is" | match (5) | all 3 agree, worst 4.87e-07 | 4.67e-07 | match |
 | "Explain how rainbows form, …" | match (14) | all 3 agree, worst 2.59e-06 | 7.01e-07 | match |
 | the printing-press passage (past the 128-token window) | match (311) | all 3 agree, worst 1.62e-06 | 5.65e-07 | match (1 token) |
+The same sweep, continued (routed experts lazy where marked):
+
+| checkpoint | family | N | tokens | residuals (worst) | first-token logits |
+| --- | --- | ---: | :---: | ---: | ---: |
+| THUDM/GLM-4-9B-0414 | `glm4` | 3 | match | 2.00e-06 | 8.77e-07 |
+| Qwen/Qwen1.5-MoE-A2.7B-Chat | `qwen2_moe` | 2, lazy | match | 7.66e-07 | 1.02e-06 |
+| Qwen/Qwen3-30B-A3B | `qwen3_moe` | 2, lazy | match | 6.50e-07 | 6.38e-07 |
+| deepseek-ai/DeepSeek-V2-Lite-Chat | `deepseek_v2` | 2, lazy | match | 3.02e-07 | 8.04e-07 |
+| mistralai/Mixtral-8x7B-Instruct-v0.1 | `mixtral` | 1, lazy | match | 9.67e-07 | 1.27e-06 |
+| THUDM/glm-4-9b-chat | `chatglm` | 3 | match | 4.79e-06 | 2.70e-06 |
+
+**`chatglm`.** The release's own modeling code does not run under transformers
+5 (`ChatGLMConfig` has no `max_length`), so the reference is transformers'
+native `glm` on `THUDM/glm-4-9b-chat-hf`, the same weights converted, cut the
+same way. Its config says `rope_theta: 10000`, where the original computes the
+base as `10000 * rope_ratio` = 5e6 (`rope_ratio: 500`), as ditch does; with
+that one value changed the two agree to 5e-06, and as released they differ by
+3.8e-01 from the first layer. The converted release therefore does not
+reproduce the original's positions; ditch follows the original.
+
+Not runnable here: `internlm/internlm2_5-1_8b-chat` ships a SentencePiece
+`tokenizer.model` and no `tokenizer.json` (refused, with the reason);
+`openbmb/MiniCPM-2B-sft-bf16` and `baichuan-inc/Baichuan2-7B-Chat` ship
+`.bin` weights only.
