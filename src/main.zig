@@ -35,6 +35,7 @@ const selftest = @import("selftest.zig");
 const directions = @import("directions.zig");
 const remote = @import("remote.zig");
 const logo = @import("logo.zig");
+const wrap = @import("wrap.zig");
 
 const Model = model_mod.Model;
 const Engine = engine_mod.Engine;
@@ -1333,6 +1334,13 @@ fn maxPromptTokens(gpa: Allocator, engine: *Engine, prompts: []const Prompt) !us
     return max;
 }
 
+/// The width to wrap help to: the terminal's, or the widest help line when
+/// stdout is not a terminal.
+fn stdoutColumns(io: Io, con: Console) usize {
+    if (!con.tty_out) return wrap.max_columns;
+    return logo.terminalColumns(io, .stdout()) orelse 80;
+}
+
 fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     const gpa = init.gpa;
     const arena = init.arena.allocator();
@@ -1379,11 +1387,19 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
             std.log.err("unknown help topic: {s} (try ditch help bench)", .{t});
             std.process.exit(2);
         };
-        if (bench_topic) try config.writeBenchHelp(con.result, bold_out) else try config.writeHelp(con.result, bold_out);
+        var help: Io.Writer.Allocating = .init(arena);
+        if (bench_topic) try config.writeBenchHelp(&help.writer, bold_out) else try config.writeHelp(&help.writer, bold_out);
+        try wrap.write(arena, con.result, help.written(), stdoutColumns(io, con.*));
         return;
     }
     if (args.len == 1) {
-        try config.writeConciseHelp(con.result, bold_out);
+        if (con.tty_out) {
+            try logo.write(con.result, bold_out, logo.terminalColumns(io, .stdout()));
+            try con.result.writeAll("\n");
+        }
+        var help: Io.Writer.Allocating = .init(arena);
+        try config.writeConciseHelp(&help.writer, bold_out);
+        try wrap.write(arena, con.result, help.written(), stdoutColumns(io, con.*));
         try con.result.flush();
         std.process.exit(2);
     }
@@ -1394,7 +1410,7 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         std.process.exit(2);
     }
     if (!settings.quiet) {
-        try logo.write(out, con.color);
+        try logo.write(out, con.color, if (con.tty) logo.terminalColumns(io, .stderr()) else null);
         try out.print("\n  v{s}  ditch censorship.  https://github.com/plyght/ditch\n", .{config.version});
         try out.writeAll("  Built on Heretic: https://github.com/p-e-w/heretic\n\n");
     }

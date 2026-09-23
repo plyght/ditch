@@ -39,6 +39,7 @@ comptime {
     _ = @import("metal/shaders_test.zig");
     _ = @import("expert_cache.zig");
     _ = @import("logo.zig");
+    _ = @import("wrap.zig");
     _ = @import("remote.zig");
     _ = @import("remote_test.zig");
 }
