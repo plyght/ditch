@@ -508,22 +508,40 @@ own loader as each plausible known family:
 * Families are ranked by how many of the checkpoint's tensor names their
   templates explain, then by the `architectures` class and the model_type's
   stem, then by plainness.
+* Before loading, a family whose embedding or layer path names nothing in
+  the checkpoint is given the best-named unindexed `[vocab, hidden]` tensor
+  and the one path numbered `0 .. num_hidden_layers - 1` (`blocks.{i}.`);
+  routed experts under another path are found the same way.
 * A trial load names the first tensor a family needs that the checkpoint
   lacks, and records which checkpoint tensors it never read. A missing
   tensor is matched to an unread one at the same place (model, layer,
   expert) with the shape ditch expects in that slot and a name that says
-  the same role (`w1` for `gate`, `attn_norm` for `input_norm`, …); the
-  load is retried with the new name, until it loads.
+  the same role (`w1` for `gate`, `attn_norm` for `input_norm`, …; never a
+  name that says another role, such as `dense` for `q`); the load is
+  retried with the new name, until it loads. A missing gate projection
+  beside one `[2 x intermediate, hidden]` tensor becomes `mlp =
+  "gated_fused"`.
+* A family that loads is also given, one at a time, unread tensors for its
+  empty optional slots (an untied output head, which the loader would
+  otherwise replace by the embedding), kept only when fewer tensors stay
+  unread; and every slot's shape is checked against the family's reading of
+  the config (the loader does not check every small tensor).
 * Among the families that load and read every tensor of the text model, the
   one with the fewest renames, then the tightest fit (fewest of its own
-  templates absent from the checkpoint), is the match.
+  templates absent from the checkpoint), then the one leaving the fewest
+  config.json keys unread, is the match.
+* Trial loads use a stand-in tokenizer; the checkpoint's own is checked
+  once and a tokenizer ditch cannot read is reported in the draft.
 * A config.json key is *read* when changing or removing it changes the
   parsed configuration; the keys nothing reads, less those that never
   matter to a forward pass (token ids, dropout, `torch_dtype`, …), are
   listed for review.
 
 The draft is written to `$XDG_CONFIG_HOME/ditch/models/<model_type>.lua`
-(or `--models-dir`), with a comment on every guess (each rename says which
+(or `--models-dir`). Its header says which family it is based on and how
+well it fits, which matrices abliteration will edit in this checkpoint, the
+weight format and the GGUF architecture; the definition has a comment on
+every guess (each rename says which
 tensor it took and why) and, at the end, everything it could not map: the
 unread tensors of the text model (grouped by pattern with their dtype,
 shape and count, and the family whose `names` would read them, if any),
