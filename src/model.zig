@@ -5228,6 +5228,8 @@ pub const GenerateKeep = struct {
     logits: ?[]f32 = null,
     /// As `prefill`'s `residuals` (single prompt).
     residuals: ?[]f32 = null,
+    /// Set to the prefill's wall time (the time to the first token).
+    prefill_seconds: ?*f64 = null,
 };
 
 /// `generate`, keeping the prefill's first-token logits and residuals (so a
@@ -5240,7 +5242,9 @@ pub fn generateKeep(model: *const Model, ws: *Workspace, cache: *KvCache, prompt
     const owned: []f32 = if (keep.logits == null) try gpa.alloc(f32, b * c.vocab_size) else &.{};
     defer if (keep.logits == null) gpa.free(owned);
     const logits = keep.logits orelse owned;
+    const t0 = std.Io.Timestamp.now(model.io, .awake);
     try prefill(model, ws, cache, prompts, logits[0 .. b * c.vocab_size], keep.residuals);
+    if (keep.prefill_seconds) |ps| ps.* = @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(model.io, .awake)).nanoseconds)) / 1e9;
 
     var outputs = try gpa.alloc(std.ArrayList(u32), b);
     defer gpa.free(outputs);
