@@ -529,9 +529,12 @@ unread tensors of the text model (grouped by pattern with their dtype,
 shape and count, and the family whose `names` would read them, if any),
 the tensors outside the text model (vision and audio towers, multi-token
 prediction heads), and the unread config keys. It is also printed on
-stdout. A model_type ditch already knows is drafted without its own
-definition and compared with it (the file is only written with `--force`),
-which is how add-model is checked against the built-in families.
+stdout. For a model_type ditch already knows, the draft is compared with the
+definition it has (and only written with `--force`). `--model-type NAME`
+drafts as if the checkpoint called itself NAME and named no `architectures`
+class, which is how add-model is checked on the built-in families: the
+draft for a renamed checkpoint of a known family must parse its config.json
+exactly as that family does.
 
 Then `ditch verify` runs on the model with the draft: a cut of real layers,
 ditch's forward pass, the comparison with the official implementation when

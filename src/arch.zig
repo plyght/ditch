@@ -1105,6 +1105,12 @@ fn typeFromArchitectures(arena: Allocator, obj: std.json.ObjectMap) ?[]const u8 
 }
 
 pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
+    return parseConfigAs(arena, json_text, null);
+}
+
+/// `parseConfig` with the family given instead of looked up (`ditch
+/// add-model` compares a draft with the definition it would replace).
+pub fn parseConfigAs(arena: Allocator, json_text: []const u8, family: ?*const Arch) !Config {
     var parsed = try std.json.parseFromSlice(std.json.Value, arena, try sanitizeJson(arena, json_text), .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidConfig;
@@ -1133,6 +1139,7 @@ pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
             }
         }
     } else arch_opt = lookup(model_type);
+    if (family) |f| arch_opt = f;
     const arch = arch_opt orelse {
         try rejectKnownHybrid(model_type);
         try rejectKnownHybrid(top_type);
