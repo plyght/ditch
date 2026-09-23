@@ -93,8 +93,8 @@ Useful flags (all also settable in `config.lua`; see `ditch --help`):
 
 ## Supported models
 
-Families are described by an architecture registry (`src/arch.zig`), one entry
-per Hugging Face `model_type`. **93 families** are registered, from GPT-2,
+Families are described by Lua model definitions (`src/models/*.lua`, compiled
+in), one per Hugging Face `model_type`. **93 families** are defined, from GPT-2,
 GPT-NeoX and BLOOM to Llama, Qwen, Gemma, Phi, GLM, Mistral, Granite, Kimi K3
 and DeepSeek V4.1 — dense and mixture-of-experts, Mamba and linear-attention
 hybrids, and quantised checkpoints. Every one has a fixture test against a
@@ -107,6 +107,9 @@ remaining 11 (`baichuan`, `bitnet`, `deepseek_v3`, `granite_swa`, `hy_v3`,
 random-weight stub: their releases are gated, lack a usable tokenizer, are
 refused by design or were never published, except `deepseek_v3`, `minimax` and
 `minimax_m2`, whose releases have only been config-checked so far.
+A family ditch does not know yet can be added without rebuilding, as a Lua
+file in `~/.config/ditch/models/` ([the
+schema](docs/models.md#model-definitions-in-lua)).
 **[docs/models.md](docs/models.md) is the full list**:
 every `model_type`, its aliases, what each fixture covers, which checkpoint
 verifies it on real weights, and every caveat; the numbers are in
@@ -132,13 +135,16 @@ Defaults are Heretic's: `mlabonne/harmless_alpaca`, `mlabonne/harmful_behaviors`
 
 ## Configuration
 
-Settings live in `config.lua` (or `--config FILE`), a sandboxed Lua 5.4 script
-returning a table keyed like the flags; every option is documented in
-[`config.default.lua`](config.default.lua), and Heretic `config.toml` files are
-accepted. Precedence, highest first: flags, `DITCH_*` environment variables
-(`DITCH_THREADS`, `DITCH_MAX_RAM`, `DITCH_CACHE`, `DITCH_DEVICE`,
-`DITCH_REMOTE_CACHE_SIZE`, `DITCH_NO_COLOR`),
-`./config.lua`, then `$XDG_CONFIG_HOME/ditch/config.lua`. Messages go to stderr
+Settings live in `~/.config/ditch/config.lua` (`$XDG_CONFIG_HOME/ditch`, or
+`--config FILE`), a sandboxed Lua 5.4 script returning a table keyed like the
+flags; every option is documented in [`config.default.lua`](config.default.lua),
+which the installer puts beside it. Settings for one model go in
+`~/.config/ditch/configs/<org>/<name>.lua` (for example
+`configs/Qwen/Qwen3-8B.lua`, or `configs/<name>.lua` for a local directory or
+GGUF) and apply whenever that model runs. Precedence, highest first: flags,
+`DITCH_*` environment variables (`DITCH_THREADS`, `DITCH_MAX_RAM`,
+`DITCH_CACHE`, `DITCH_DEVICE`, `DITCH_REMOTE_CACHE_SIZE`, `DITCH_NO_COLOR`), the
+model's config file, then the global `config.lua`. Messages go to stderr
 and results to stdout (`--json` for one JSON document, `--plain` for
 grep-friendly lines); `--no-input` turns every prompt into an error naming the
 flag to pass instead.
@@ -413,7 +419,12 @@ every layer, and `tools/probe_reference.py MODEL probe.json` compares all of it
 with transformers on the CPU, naming the layer a forward pass first diverges
 at. Config and tensor names can be checked without the weights: `ditch
 --dry-run hf://owner/name --max-ram 6GB` fetches the index and the shard
-headers only, runs the loader and stops at the memory estimate.
+headers only, runs the loader and stops at the memory estimate. For a model
+too large to check whole, `ditch truncate MODEL K OUT` writes a checkpoint of
+its first K decoder layers (`--layers 0,1,20` for chosen ones, renumbered;
+`--kinds` for the fewest layers covering every layer kind) by range-reading
+only those tensors, quantisation untouched and every per-layer list in
+config.json cut to match; `--drop mtp.` leaves out tensors by name prefix.
 
 Exit codes: 0 success (including `--dry-run` and a clean stop at
 `--time-limit`), 1 failure, 2 usage error or a memory budget too small for the

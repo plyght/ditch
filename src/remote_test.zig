@@ -10,6 +10,7 @@ const std = @import("std");
 const Io = std.Io;
 const hf = @import("hf.zig");
 const remote = @import("remote.zig");
+const safetensors = @import("safetensors.zig");
 const model_mod = @import("model.zig");
 const tensor = @import("tensor.zig");
 
@@ -602,6 +603,132 @@ test "remote source: a rate-limited server is waited out, the concurrent readers
     const text = try Io.Dir.cwd().readFileAlloc(io, log_path, gpa, .unlimited);
     defer gpa.free(text);
     try std.testing.expectEqual(@as(usize, 12), std.mem.count(u8, text, " 429 "));
+}
+
+test "remote source: rate-limited small files are waited for, not taken for missing ones" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const saved = hf.Http.rate_limited_base_ms;
+    hf.Http.rate_limited_base_ms = 20;
+    defer hf.Http.rate_limited_base_ms = saved;
+    // Both download paths: the native client, and curl (which exits 22 for a 404 and a 429 alike).
+    for ([_]bool{ true, false }) |native| {
+        var env: Env = undefined;
+        try env.init(gpa, io);
+        defer env.deinit();
+        env.http.native_ok = native;
+        const url = try std.fmt.allocPrint(gpa, "{s}ratelimitall-6/", .{env.base_url});
+        defer gpa.free(url);
+        const cache = try env.path("cache");
+        defer gpa.free(cache);
+        const src = try remote.Source.open(gpa, io, &env.http, cache, url, .{ .chunk_size = chunk }, &env.sink.writer);
+        defer src.deinit();
+        var dir = try Io.Dir.cwd().openDir(io, src.dir_path, .{});
+        defer dir.close(io);
+        // config.json, the tokenizer and the index were fetched; the optional
+        // files the fixture has were not marked missing.
+        for ([_][]const u8{ "config.json", "tokenizer.json", "model.safetensors.index.json" }) |name| try dir.access(io, name, .{});
+        try std.testing.expectError(error.FileNotFound, dir.access(io, "tokenizer_config.json.missing", .{}));
+        try std.testing.expectEqual(@as(usize, 2), src.shards.len);
+    }
+}
+
+test "remote source: a read that fails while loading is reported, not taken for a missing tensor" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const pool = tensor.Pool.init(io, 2);
+    var env: Env = undefined;
+    try env.init(gpa, io);
+    defer env.deinit();
+    const scratch = try env.path("scratch");
+    defer gpa.free(scratch);
+    // The range requests the shard headers take.
+    const header_ranges = blk: {
+        const cache = try env.path("cache_probe");
+        defer gpa.free(cache);
+        const src = try env.open(cache, null);
+        defer src.deinit();
+        for (src.shards) |n| {
+            const f = try safetensors.File.openRemote(gpa, io, try src.openFile(n));
+            f.close(gpa, io);
+        }
+        break :blk src.stats().ranges_fetched;
+    };
+    // The same load from a server that fails every range request after
+    // those: the norms (read at load) fail with the server's error.
+    const url = try std.fmt.allocPrint(gpa, "{s}failafter-{d}/", .{ env.base_url, header_ranges });
+    defer gpa.free(url);
+    const cache = try env.path("cache");
+    defer gpa.free(cache);
+    const src = try remote.Source.open(gpa, io, &env.http, cache, url, .{ .chunk_size = chunk }, &env.sink.writer);
+    defer src.deinit();
+    try std.testing.expectError(error.NotFound, loadRemote(gpa, io, &pool, src, scratch));
+}
+
+test "remote prefetchRange: sparse hints fetch exact ranges, served to the reads; logits unchanged" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const pool = tensor.Pool.init(io, 2);
+    var env: Env = undefined;
+    try env.init(gpa, io);
+    defer env.deinit();
+    const shard = "model-00001-of-00002.safetensors";
+    var dir = try Io.Dir.cwd().openDir(io, fixture, .{});
+    defer dir.close(io);
+    const file = try dir.openFile(io, shard, .{});
+    defer file.close(io);
+    {
+        const cache = try env.path("cache_sparse");
+        defer gpa.free(cache);
+        const src = try env.openWith(cache, std.math.maxInt(u64), 8);
+        defer src.deinit();
+        src.sparse_reads = true;
+        const rf = try src.openFile(shard);
+        const before = src.stats();
+        // Three small pieces in three chunks, and one that covers most of a chunk.
+        const small = [_]u64{ 5 * chunk + 100, 9 * chunk + 3000, 12 * chunk + 7 };
+        for (small) |o| rf.prefetchRange(o, 300);
+        rf.prefetchRange(20 * chunk + 10, chunk - 20);
+        src.awaitPrefetch();
+        const after = src.stats();
+        try std.testing.expectEqual(before.partial_ranges + 3, after.partial_ranges);
+        try std.testing.expectEqual(before.partial_bytes + 900, after.partial_bytes);
+        // The three exact ranges and one whole chunk: far less than four chunks.
+        try std.testing.expectEqual(before.bytes_fetched + 900 + chunk, after.bytes_fetched);
+        var want: [300]u8 = undefined;
+        var got: [300]u8 = undefined;
+        for (small) |o| {
+            try std.testing.expectEqual(@as(usize, 300), try file.readPositionalAll(io, &want, o));
+            try rf.readRange(io, o, &got);
+            try std.testing.expectEqualSlices(u8, &want, &got);
+            // A read inside a range is served by it too.
+            try rf.readRange(io, o + 50, got[0..100]);
+            try std.testing.expectEqualSlices(u8, want[50..150], got[0..100]);
+        }
+        const read = src.stats();
+        try std.testing.expectEqual(after.ranges_fetched, read.ranges_fetched);
+        try std.testing.expectEqual(after.partial_hits + 6, read.partial_hits);
+    }
+    // A prefill with exact ranges for its scattered experts: the same logits as the local model.
+    const local = try Model.load(gpa, io, &pool, fixture);
+    defer local.deinit();
+    const want = try firstTokenLogits(gpa, local, &long_ids);
+    defer gpa.free(want);
+    const scratch = try env.path("scratch");
+    defer gpa.free(scratch);
+    const cache = try env.path("cache_model");
+    defer gpa.free(cache);
+    const src = try env.open(cache, null);
+    defer src.deinit();
+    const model = try loadRemote(gpa, io, &pool, src, scratch);
+    defer model.deinit();
+    _ = try remote.planModel(src, gpa, model);
+    src.sparse_reads = true;
+    const got = try firstTokenLogits(gpa, model, &long_ids);
+    defer gpa.free(got);
+    try std.testing.expectEqualSlices(f32, want, got);
+    const st = src.stats();
+    try std.testing.expect(st.partial_ranges > 0 and st.partial_hits > 0);
 }
 
 test "remote chunk cache: size 0 keeps nothing on disk" {

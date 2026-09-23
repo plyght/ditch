@@ -1,0 +1,23 @@
+return {
+  model_type = "qwen3_next",
+  llama_cpp = nil,
+  chat = "chatml",
+  verified = true,
+  notes = "fixture: Gated DeltaNet linear layers (fused projections, full_attention_interval), sigmoid-gated full attention with per-head q/k norms, partial rotary, softmax MoE with shared expert.",
+  norm = "rms_gemma",
+  qk_norm = "head",
+  names = {
+    q_norm = "self_attn.q_norm.weight",
+    k_norm = "self_attn.k_norm.weight",
+    lin_qkvz = "linear_attn.in_proj_qkvz.weight",
+    lin_ba = "linear_attn.in_proj_ba.weight",
+    lin_conv = "linear_attn.conv1d.weight",
+    lin_dt_bias = { "linear_attn.dt_bias" },
+    lin_a_log = { "linear_attn.A_log" },
+    lin_norm = "linear_attn.norm.weight",
+    lin_out = "linear_attn.out_proj.weight",
+    shared_expert = "mlp.shared_expert.",
+    shared_expert_gate = "mlp.shared_expert_gate.weight",
+  },
+  hook = "qwen_hybrid",
+}

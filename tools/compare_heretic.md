@@ -21,8 +21,8 @@ Use the same values for both tools:
 | Row normalisation | `--row-normalization full` | `--row-normalization full` |
 | Seed | `--seed 42` | `--seed 42` |
 
-Both tools accept the same `config.toml` (ditch also reads `config.lua`), so
-the simplest way to keep the settings identical is one shared `--config`.
+Heretic reads `config.toml` and ditch reads `config.lua` with the same keys,
+so keep the two files side by side with identical values.
 
 The two implementations sample trials with a port of the same TPE, but the
 random streams are not bit-identical, so result quality has to be compared on
@@ -32,7 +32,7 @@ by trial.
 ## 2. Measure ditch
 
 ```sh
-ditch bench <model> --config config.toml --bench-prompts 16 --bench-tokens 32 \
+ditch bench <model> --config config.lua --bench-prompts 16 --bench-tokens 32 \
     --bench-output ditch-bench.md
 ```
 
@@ -43,7 +43,7 @@ refusal scoring + KL scoring with the configured prompt counts), the peak RSS
 study cost and result quality run the study itself:
 
 ```sh
-/usr/bin/time -v ditch <model> --config config.toml --checkpoint-action restart \
+/usr/bin/time -v ditch <model> --config config.lua --checkpoint-action restart \
     --trial-index 1 --model-action exit 2> ditch-time.txt
 ```
 
@@ -104,16 +104,16 @@ study optimised.
 
 ```sh
 # Reference: Heretic's method, N trials.
-ditch <model> --config config.toml --seed 42 --checkpoint-action restart \
+ditch <model> --config config.lua --seed 42 --checkpoint-action restart \
     --study-checkpoint-dir ck/base --trial-index 1 --model-action save --save-directory out/base
 # One option at a time, same seed, same trials, its own checkpoint directory.
-ditch <model> --config config.toml --seed 42 --checkpoint-action restart \
+ditch <model> --config config.lua --seed 42 --checkpoint-action restart \
     --study-checkpoint-dir ck/sep --direction-method separating --direction-range auto \
     --trial-index 1 --model-action save --save-directory out/sep
-ditch <model> --config config.toml --seed 42 --checkpoint-action restart \
+ditch <model> --config config.lua --seed 42 --checkpoint-action restart \
     --study-checkpoint-dir ck/fast --fast-search --trial-index 1 --model-action save --save-directory out/fast
 # The yardstick: default scorers on every export.
-for d in out/*; do ditch <model> --config config.toml --evaluate-model "$d"; done
+for d in out/*; do ditch <model> --config config.lua --evaluate-model "$d"; done
 ```
 
 Compare the whole Pareto fronts (the results menu lists them), not only the

@@ -1,0 +1,21 @@
+return {
+  model_type = "minimax_m2",
+  llama_cpp = "minimax-m2",
+  chat = "minimax_m2",
+  verified = true,
+  notes = "fixture: q/k RMSNorm over the whole projection, partial rotary (rotary_dim), sigmoid routing with e_score_correction_bias and renormalised top-k, Mixtral-style expert tensors.",
+  qk_norm = "full",
+  names = {
+    q_norm = "self_attn.q_norm.weight",
+    k_norm = "self_attn.k_norm.weight",
+    router = "block_sparse_moe.gate.weight",
+    router_correction_bias = "block_sparse_moe.e_score_correction_bias",
+    expert = "block_sparse_moe.experts.{e}.",
+    expert_gate = "w1.weight",
+    expert_up = "w3.weight",
+    expert_down = "w2.weight",
+    fused_gate_up = {},
+    fused_down = {},
+  },
+  hook = "minimax_m2",
+}

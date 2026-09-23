@@ -1,0 +1,21 @@
+return {
+  model_type = "gemma3",
+  aliases = { "gemma3_text" },
+  llama_cpp = "gemma3",
+  chat = "gemma",
+  verified = true,
+  notes = "fixture: (1+w) norms, pre/post norms, per-head (1+w) q/k norms, sqrt(H) embedding scale, sliding layers with a local rope base, query_pre_attn_scalar, linear rope scaling.",
+  norm = "rms_gemma",
+  activation = "gelu_tanh",
+  tie_word_embeddings = true,
+  embed_scale_sqrt = true,
+  qk_norm = "head",
+  names = {
+    post_attn_norm = "post_attention_layernorm.weight",
+    pre_ff_norm = "pre_feedforward_layernorm.weight",
+    post_ff_norm = "post_feedforward_layernorm.weight",
+    q_norm = "self_attn.q_norm.weight",
+    k_norm = "self_attn.k_norm.weight",
+  },
+  hook = "gemma",
+}

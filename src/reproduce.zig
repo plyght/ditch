@@ -13,7 +13,7 @@ const Allocator = std.mem.Allocator;
 const config = @import("config.zig");
 const compute = @import("compute.zig");
 const lua = @import("lua.zig");
-const toml = @import("toml.zig");
+const tree = @import("tree.zig");
 const hf = @import("hf.zig");
 const abliterate = @import("abliterate.zig");
 const directions = @import("directions.zig");
@@ -466,43 +466,43 @@ const Reader = struct {
         return error.InvalidManifest;
     }
 
-    fn table(_: Reader, t: *const toml.Table, key: []const u8) ?*const toml.Table {
+    fn table(_: Reader, t: *const tree.Table, key: []const u8) ?*const tree.Table {
         return t.getTable(key);
     }
 
-    fn reqTable(self: Reader, t: *const toml.Table, key: []const u8) ReadError!*const toml.Table {
+    fn reqTable(self: Reader, t: *const tree.Table, key: []const u8) ReadError!*const tree.Table {
         return self.table(t, key) orelse missing(key);
     }
 
-    fn str(self: Reader, t: *const toml.Table, key: []const u8) ReadError!?[]const u8 {
+    fn str(self: Reader, t: *const tree.Table, key: []const u8) ReadError!?[]const u8 {
         const v = t.get(key) orelse return null;
         if (v != .string) return missing(key);
         return try self.a.dupe(u8, v.string);
     }
 
-    fn reqStr(self: Reader, t: *const toml.Table, key: []const u8) ReadError![]const u8 {
+    fn reqStr(self: Reader, t: *const tree.Table, key: []const u8) ReadError![]const u8 {
         return (try self.str(t, key)) orelse missing(key);
     }
 
-    fn num(_: Reader, t: *const toml.Table, key: []const u8) ReadError!f64 {
+    fn num(_: Reader, t: *const tree.Table, key: []const u8) ReadError!f64 {
         const v = t.get(key) orelse return missing(key);
         return v.asFloat() orelse missing(key);
     }
 
-    fn int(self: Reader, t: *const toml.Table, key: []const u8) ReadError!usize {
+    fn int(self: Reader, t: *const tree.Table, key: []const u8) ReadError!usize {
         const f = try self.num(t, key);
         if (f < 0) return missing(key);
         return @intFromFloat(f);
     }
 
-    fn boolean(_: Reader, t: *const toml.Table, key: []const u8) ReadError!bool {
+    fn boolean(_: Reader, t: *const tree.Table, key: []const u8) ReadError!bool {
         const v = t.get(key) orelse return missing(key);
         if (v != .boolean) return missing(key);
         return v.boolean;
     }
 
     /// Array items of `key`; an empty Lua table is an empty array.
-    fn array(_: Reader, t: *const toml.Table, key: []const u8) ReadError![]const toml.Value {
+    fn array(_: Reader, t: *const tree.Table, key: []const u8) ReadError![]const tree.Value {
         const v = t.get(key) orelse return &.{};
         return switch (v) {
             .array => |arr| arr,
@@ -511,7 +511,7 @@ const Reader = struct {
         };
     }
 
-    fn scores(self: Reader, t: *const toml.Table, key: []const u8) ReadError![]const study_mod.ScoreRecord {
+    fn scores(self: Reader, t: *const tree.Table, key: []const u8) ReadError![]const study_mod.ScoreRecord {
         const items = try self.array(t, key);
         const out = try self.a.alloc(study_mod.ScoreRecord, items.len);
         for (items, 0..) |v, i| {
@@ -521,7 +521,7 @@ const Reader = struct {
         return out;
     }
 
-    fn dataset(self: Reader, t: *const toml.Table, key: []const u8) ReadError!?Dataset {
+    fn dataset(self: Reader, t: *const tree.Table, key: []const u8) ReadError!?Dataset {
         const d = self.table(t, key) orelse return null;
         return .{
             .spec = .{
@@ -540,7 +540,7 @@ const Reader = struct {
 };
 
 /// Converts a parsed manifest table into a `Manifest` (strings copied into `a`).
-pub fn fromTable(a: Allocator, root: *const toml.Table) ReadError!Manifest {
+pub fn fromTable(a: Allocator, root: *const tree.Table) ReadError!Manifest {
     const r = Reader{ .a = a };
     const model = try r.reqTable(root, "model");
     const settings = try r.reqTable(root, "settings");

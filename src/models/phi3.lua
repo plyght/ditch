@@ -1,0 +1,21 @@
+return {
+  model_type = "phi3",
+  aliases = { "phi4" },
+  llama_cpp = "phi3",
+  chat = "phi3",
+  verified = true,
+  notes = "fixture: fused qkv_proj and gate_up_proj, longrope (short factors + attention factor). Phi-3 / 3.5 / 4-mini.",
+  default_norm_eps = 1e-5,
+  qkv = "concat",
+  mlp = "gated_fused",
+  names = {
+    q = false,
+    k = false,
+    v = false,
+    qkv = "self_attn.qkv_proj.weight",
+    gate = false,
+    up = false,
+    gate_up = "mlp.gate_up_proj.weight",
+  },
+  hook = "phi3",
+}

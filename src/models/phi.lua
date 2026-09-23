@@ -1,0 +1,22 @@
+return {
+  model_type = "phi",
+  llama_cpp = "phi2",
+  verified = true,
+  notes = "fixture: LayerNorm with biases, parallel residual, partial rotary, fc1/fc2 with biases, lm_head bias. Phi-1 / 1.5 / 2.",
+  norm = "layer",
+  parallel_residual = true,
+  mlp = "dense",
+  activation = "gelu_tanh",
+  attention_bias = true,
+  names = {
+    final_norm = "{p}final_layernorm.weight",
+    pre_ff_norm = false,
+    q_norm = "self_attn.q_layernorm.weight",
+    k_norm = "self_attn.k_layernorm.weight",
+    o = "self_attn.dense.weight",
+    gate = false,
+    up = "mlp.fc1.weight",
+    down = "mlp.fc2.weight",
+  },
+  hook = "phi",
+}

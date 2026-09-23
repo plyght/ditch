@@ -17,7 +17,7 @@ comptime {
     _ = @import("abliterate.zig");
     _ = @import("directions.zig");
     _ = @import("tpe.zig");
-    _ = @import("toml.zig");
+    _ = @import("tree.zig");
     _ = @import("config.zig");
     _ = @import("chat.zig");
     _ = @import("jinja.zig");
@@ -28,12 +28,14 @@ comptime {
     _ = @import("export.zig");
     _ = @import("search.zig");
     _ = @import("lua.zig");
+    _ = @import("models.zig");
     _ = @import("budget.zig");
     _ = @import("stream.zig");
     _ = @import("stream_test.zig");
     _ = @import("reproduce.zig");
     _ = @import("bench.zig");
     _ = @import("probe.zig");
+    _ = @import("verify.zig");
     _ = @import("pool_test.zig");
     _ = @import("compute.zig");
     _ = @import("selftest.zig");
@@ -43,4 +45,6 @@ comptime {
     _ = @import("wrap.zig");
     _ = @import("remote.zig");
     _ = @import("remote_test.zig");
+    _ = @import("truncate.zig");
+    _ = @import("truncate_test.zig");
 }

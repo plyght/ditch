@@ -1,0 +1,20 @@
+return {
+  model_type = "apertus",
+  llama_cpp = nil,
+  chat = "apertus",
+  verified = true,
+  notes = "fixture: attention/feedforward norm names, per-head q/k RMSNorm, the two-projection xIELU MLP (learned alpha_p / alpha_n). Apertus (Swiss AI).",
+  default_norm_eps = 1e-5,
+  default_rope_theta = 12000000.0,
+  mlp = "dense",
+  qk_norm = "head",
+  names = {
+    input_norm = { "attention_layernorm.weight" },
+    pre_ff_norm = "feedforward_layernorm.weight",
+    q_norm = "self_attn.q_norm.weight",
+    k_norm = "self_attn.k_norm.weight",
+    xielu_alpha_p = "mlp.act_fn.alpha_p",
+    xielu_alpha_n = "mlp.act_fn.alpha_n",
+    gate = false,
+  },
+}

@@ -1,0 +1,23 @@
+return {
+  model_type = "minimax",
+  aliases = { "minimax_text_01", "minimax_m1", "MiniMaxText01", "MiniMaxM1" },
+  llama_cpp = "minimax-01",
+  verified = true,
+  notes = "fixture: lightning attention layers (`hidden_act` on the fused qkv, silu on the releases; per-head decay recurrence, RMSNorm, sigmoid output gate) alternating with softmax attention with partial rotary, the renormalised residual layout with α/β scales, softmax top-k MoE. MiniMax-Text-01 / M1 (`layer_types` or `attn_type_list`). The recurrence runs sequentially.",
+  default_norm_eps = 1e-5,
+  linear = "lightning",
+  names = {
+    light_qkv = "self_attn.qkv_proj.weight",
+    light_gate = "self_attn.output_gate.weight",
+    light_norm = "self_attn.norm.weight",
+    light_out = "self_attn.out_proj.weight",
+    router = "block_sparse_moe.gate.weight",
+    expert = "block_sparse_moe.experts.{e}.",
+    expert_gate = "w1.weight",
+    expert_up = "w3.weight",
+    expert_down = "w2.weight",
+    fused_gate_up = {},
+    fused_down = {},
+  },
+  hook = "minimax",
+}

@@ -1,0 +1,121 @@
+name: New models
+
+# Weekly: model types added in the latest transformers release and trending
+# text-generation models on the Hub, each checked with `ditch verify` on a
+# truncated checkpoint. Failures and unsupported models go to one issue
+# labelled new-models, which is closed again when everything passes.
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      models:
+        description: "Hub ids to check, space separated (default: new and trending models)"
+        required: false
+        default: ""
+      k:
+        description: "Layers kept in the truncated checkpoint"
+        required: false
+        default: "4"
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: new-models
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    env:
+      NEW_MODELS: ${{ github.event.inputs.models }}
+      NEW_MODELS_K: ${{ github.event.inputs.k || '4' }}
+      NEW_MODELS_MAX: "12"
+      NEW_MODELS_TIMEOUT: "40"
+      NEW_MODELS_BUDGET: "300"
+      NEW_MODELS_OUT: results
+      HF_HUB_DISABLE_PROGRESS_BARS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Build (ReleaseFast)
+        run: |
+          zig build -Doptimize=ReleaseFast
+          ./zig-out/bin/ditch --version
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-py311-new-models-${{ github.run_id }}
+          restore-keys: pip-${{ runner.os }}-py311-new-models-
+      - name: Reference stack (torch CPU, latest transformers)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --upgrade transformers accelerate safetensors huggingface_hub numpy compressed-tensors
+          python -c 'import torch, transformers; print("torch", torch.__version__, "transformers", transformers.__version__)'
+      - name: Verify
+        id: verify
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash tools/new_models.sh
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f results/summary.md ]; then
+            cat results/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### New models: no results (the verify step did not finish)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: new-models-results
+          path: results/
+          if-no-files-found: ignore
+      - name: Update the tracking issue
+        # Only after a complete run, so a crashed run never closes the issue.
+        if: always() && steps.verify.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          label="new-models"
+          title="New and trending models: ditch verify failures"
+          gh label create "$label" --color d4c5f9 \
+            --description "Weekly ditch verify run on new and trending models" 2>/dev/null || true
+          number=$(gh issue list --label "$label" --state all --limit 50 --json number,title \
+            --jq "map(select(.title == \"$title\")) | .[0].number // empty")
+          if [ -f results/issue.md ]; then
+            if [ -z "$number" ]; then
+              gh issue create --title "$title" --label "$label" --body-file results/issue.md
+            else
+              gh issue edit "$number" --body-file results/issue.md
+              if [ "$(gh issue view "$number" --json state --jq .state)" = "CLOSED" ]; then
+                gh issue reopen "$number"
+              fi
+            fi
+          elif [ -n "$number" ]; then
+            {
+              echo "All models in the latest run passed \`ditch verify\`."
+              echo
+              echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            } > all-passed.md
+            gh issue edit "$number" --body-file all-passed.md
+            if [ "$(gh issue view "$number" --json state --jq .state)" = "OPEN" ]; then
+              gh issue close "$number" --comment "All models passed in ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+            fi
+          fi

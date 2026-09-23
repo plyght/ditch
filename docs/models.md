@@ -1,11 +1,15 @@
 # Supported models
 
-ditch describes every model family it can run with one entry in the
-architecture registry, `src/arch.zig`. **There are 93 entries**, one per
-Hugging Face `model_type`, each with the tensor-name templates, norm and
-residual layout, attention and MLP layouts, positional encoding and MoE
-routing of that family. This page is the full reference; the README carries
-only the summary.
+ditch describes every model family it can run with one Lua model definition,
+`src/models/<model_type>.lua`, compiled into the binary. **There are 93
+definitions**, one per Hugging Face `model_type`, each with the tensor-name
+templates, norm and residual layout, attention and MLP layouts, positional
+encoding and MoE routing of that family, in terms of the building blocks
+ditch implements in Zig. Your own definitions go in
+`$XDG_CONFIG_HOME/ditch/models/` (see [Model definitions in
+Lua](#model-definitions-in-lua), and `ditch add-model`, which drafts one from
+a checkpoint). This page is the full reference; the README carries only the
+summary.
 
 How a checkpoint is matched:
 
@@ -16,9 +20,9 @@ How a checkpoint is matched:
   are unwrapped first, so the text model is what runs. A wrapper that has its
   own entry (Kimi K3, Kimi K2.5, MiMo V2, DeepSeek V4.1, GLM-5.3-Flash,
   Qwen3.8-Flash-Next) wins over the family of its text config.
-* An unknown `model_type` is an error that names the supported list. Unknown
-  layer types, quantisation formats and activations are errors too, never
-  silent fallbacks.
+* An unknown `model_type` is an error that names the related families and
+  suggests `ditch add-model`. Unknown layer types, quantisation formats and
+  activations are errors too, never silent fallbacks.
 
 Two kinds of evidence, in two columns:
 
@@ -431,3 +435,199 @@ Approximations ditch does make, and says so: `dynamic` and `longrope` rope
 scaling beyond the original context are treated as static / short factors
 (longrope warns), chunked attention (Llama 4) runs as full attention, and the
 sparse indexers run dense within the bounds above.
+
+## Model definitions in Lua
+
+A model definition is a Lua file that returns one family table (or a list of
+them). It describes a `model_type` entirely in terms of what ditch already
+implements: the layout of each block, the tensor names, and how config.json
+maps onto ditch's parameters. The built-in definitions are
+`src/models/*.lua`; ditch also reads every `*.lua` file in
+`$XDG_CONFIG_HOME/ditch/models/` (`~/.config/ditch/models/`) and in
+`--models-dir <dir>`, in that order and in file-name order, and a definition
+loaded later wins over an earlier one with the same `model_type` or alias. A
+file that fails to load is skipped with a warning naming the file, the family
+and the field.
+
+Definitions run in the same sandbox as `config.lua` (no files, no `require`,
+no `load`); each file has its own globals.
+
+### A worked example
+
+Say a release ships `model_type: "acme_lm"`. Its config.json and tensor names
+show the Qwen3 layout (grouped-query attention, a per-head q/k RMSNorm, a
+SwiGLU MLP), except that the MLP projections are called `w1`/`w3`/`w2`, the
+config has a `residual_scale` that multiplies every sublayer's output, and
+every fourth layer attends globally while the others use a sliding window:
+
+```lua
+-- ~/.config/ditch/models/acme_lm.lua
+return {
+  model_type = "acme_lm",
+  base = "qwen3", -- start from the Qwen3 definition
+  chat = "chatml", -- used when the model's own template is not recognised
+  notes = "Acme LM: Qwen3 layout, renamed MLP, residual scale, 3:1 local/global.",
+  names = {
+    gate = "mlp.w1.weight",
+    up = "mlp.w3.weight",
+    down = "mlp.w2.weight",
+  },
+  config = function(cfg, c)
+    c.residual_multiplier = num(cfg.residual_scale, 1.0)
+    if c.sliding_window then
+      each_layer(c.sliding_layers, function(i) return (i + 1) % 4 ~= 0 end)
+    end
+  end,
+}
+```
+
+`base` copies the named family's layout, names, hook and config function;
+the new family's own fields then override them, and `names` is merged field
+by field. The `model_type`, aliases, notes and `verified` flag are not
+inherited. With the file in place, `ditch <acme checkpoint>` runs, and `ditch
+--dry-run` plus `ditch probe` check the definition on real weights (see
+`ditch add-model`, which writes this kind of file for you).
+
+A family that is an existing one under a new name needs only the first
+two lines: `return { model_type = "acme_lm", base = "qwen3" }`.
+
+### Family fields
+
+Every field is optional except `model_type`. Enumerations are strings.
+
+| Field | Meaning (default) |
+| --- | --- |
+| `model_type` | The Hugging Face `model_type` this definition runs. |
+| `aliases` | Other `model_type` spellings of the same layout, e.g. multimodal wrappers' text configs. |
+| `base` | A known `model_type` to start from (built-in definitions and earlier files). |
+| `llama_cpp` | llama.cpp architecture name, used by the GGUF writer and to recognise GGUF input (nil: no GGUF path). |
+| `chat` | Template family used when the model's own chat template is not recognised: one of the names in `src/chat.zig` (`chatml`, `llama3`, `gemma`, `mistral`, …; `raw` = no template). A recognised template in the checkpoint always wins. |
+| `verified`, `notes` | Whether a reference forward pass checks the family, and what it covers. |
+| `norm` | `rms`, `rms_gemma` (`(1 + w)` scale), `layer`, `layer_1p` (Nemotron), `none` (weightless LayerNorm), `rms_none` (weightless RMSNorm). (`rms`) |
+| `default_norm_eps`, `default_rope_theta` | Values when config.json has none (1e-6 for RMS norms, else 1e-5; 10000). |
+| `positional` | `rope`, `learned`, `alibi`, `none`, `sinusoidal`. (`rope`) |
+| `rope_style` | `neox` (rotate halves) or `gptj` (rotate pairs). (`neox`) |
+| `parallel_residual` | Attention and MLP read the same input and are summed. (false) |
+| `qkv` | Fused q/k/v row layout: `separate`, `concat`, `heads_interleaved`, `grouped`, `mp_blocks`. (`separate`) |
+| `mlp` | `gated` (`down(act(gate) * up)`), `gated_fused` (one `[2I][H]` gate/up tensor), `dense` (`down(act(up))`). (`gated`) |
+| `activation` | `silu`, `gelu_tanh`, `gelu`, `relu`, `relu2`, `quick_gelu`, when config.json names none. (`silu`) |
+| `conv1d` | Weights stored `[in][out]` (GPT-2 Conv1D). (false) |
+| `attention_bias`, `tie_word_embeddings` | Defaults for the config keys of the same name. (false) |
+| `embed_scale_sqrt` | Embeddings scaled by `sqrt(hidden_size)`. (false) |
+| `qk_norm` | `none`, `head` (one `[head_dim]` weight), `heads` (per head), `full` (over the projection), `l2` (weightless). (`none`) |
+| `ssm` | Mamba flavour of the state-space layers: `none`, `mamba2`, `mamba1`. (`none`) |
+| `single_mixer` | Every layer holds exactly one block behind one norm, named by `layer_types` (Mamba2, Nemotron-H). (false) |
+| `parallel_ssm` | A Mamba block runs beside attention in every layer (Falcon-H1). (false) |
+| `linear` | Recurrence of `linear_attention` layers: `gated_deltanet`, `kda`, `lightning`. (`gated_deltanet`) |
+| `names` | Tensor-name templates (below). |
+| `hook` | A Zig building block that reads family-specific config keys (below); `false` removes an inherited one. |
+| `config` | `function(cfg, c)` that maps config.json onto ditch's parameters (below); runs after the hook. |
+
+### Tensor names
+
+`names` gives the templates of the tensors the family uses, relative to the
+layer prefix unless they start with `{p}`: `{p}` is the model prefix (the
+first of `prefixes` that matches the checkpoint), `{i}` the layer index and
+`{e}` an expert index. Biases are found by replacing a trailing `.weight`
+with `.bias`, and are optional. Set a name to `false` to say the family has no
+such tensor. List-valued names hold alternative spellings; the first one
+present wins. The fields are the ones of `Names` in `src/arch.zig`; the
+defaults are the Llama / Hugging Face ones:
+
+| Block | Names (default) |
+| --- | --- |
+| Model | `prefixes` (`model.`, `language_model.model.`, `model.language_model.`, `thinker.model.`, `language_model.`, none), `embed` (`{p}embed_tokens.weight`), `pos_embed`, `embed_norm`, `final_norm` (`{p}norm.weight`), `lm_head` (`lm_head.weight`), `layer` (`{p}layers.{i}.`) |
+| Norms | `input_norm` (`input_layernorm.weight`), `post_attn_norm`, `pre_ff_norm` (`post_attention_layernorm.weight`), `post_ff_norm`, `mlp_norm`, `q_norm`, `k_norm`, `attn_sub_norm`, `ffn_sub_norm` |
+| Attention | `q`, `k`, `v` (`self_attn.{q,k,v}_proj.weight`), `qkv` (fused), `o` (`self_attn.o_proj.weight`), `sinks`, `attn_gate` |
+| MLA | `q_a`, `q_a_norm`, `q_b`, `kv_a`, `kv_a_norm`, `kv_b` |
+| MLP | `gate`, `up`, `down` (`mlp.{gate,up,down}_proj.weight`), `gate_up` (fused) |
+| MoE | `router` (`mlp.gate.weight`), `router_correction_bias`, `expert` (`mlp.experts.{e}.`), `expert_gate`/`expert_up`/`expert_down`, `fused_gate_up`/`fused_down` (stacked experts), `shared_expert` (prefix), `shared_expert_gate`, `shared_gate`/`shared_up`/`shared_down`/`shared_gate_up`, `latent_down`/`latent_up`/`latent_norm`, `moe_alt` (a second `names` table for an older checkpoint layout) |
+| Linear attention | `lin_qkvz`, `lin_qkv`, `lin_z`, `lin_b`, `lin_a`, `lin_ba`, `lin_q`, `lin_k`, `lin_v`, `lin_f_a`, `lin_f_b`, `lin_g_a`, `lin_g_b`, `lin_g`, `lin_conv`, `lin_conv_split`, `lin_dt_bias`, `lin_a_log`, `lin_norm`, `lin_out`, and MiniMax lightning `light_qkv`, `light_gate`, `light_norm`, `light_out` |
+| Mamba | `ssm` (the block prefix, e.g. `mixer.`; the tensors under it keep their Hugging Face names) |
+| Short convolution | `conv_in`, `conv_kernel`, `conv_out` |
+| Gemma 3n / 4 | `ple_*` (per-layer embeddings), `altup_*`, `laurel_*`, `layer_scale` |
+| Kimi K3 | `attn_res_norm`, `attn_res_proj`, `mlp_res_norm`, `mlp_res_proj`, `output_res_norm`, `output_res_proj` |
+| Other | `xielu_alpha_p`, `xielu_alpha_n` (Apertus), `hc_attn`, `hc_ffn`, `hc_attn_flat`, `hc_ffn_flat` (hyper-connection sites) |
+
+**What abliteration edits** follows from the names: the matrices that write
+into the residual stream. `attn.o_proj` is the layer's `o` (or, on a layer
+without attention, `lin_out`, `light_out`, `conv_out` or the Mamba block's
+`out_proj`, and beside attention on Falcon-H1 both); `mlp.down_proj` is
+`down`, every routed expert's `expert_down` and the shared expert's
+`shared_down` (on a latent MoE, `latent_up` instead of the routed experts'
+downs). A definition therefore says what is edited by saying which tensor
+fills each of those slots.
+
+### How config.json is read
+
+Every family goes through the same parser first; a definition only adds
+what its family does differently. The generic parser reads, for every
+family:
+
+| Parameter | config.json keys (first present wins) |
+| --- | --- |
+| family | `model_type`, else the `architectures[0]` class (`FooForCausalLM` → `foo`); `thinker_config` and `text_config` are unwrapped |
+| size | `hidden_size`/`n_embd`/`n_embed`/`d_model`, `num_attention_heads`/`n_head`/`n_heads`/…, `num_hidden_layers`/`n_layer`/… (else the length of `layer_types`/`layers_block_type`/`hybrid_override_pattern`), `num_key_value_heads`/`num_kv_heads`/`n_head_kv`/`multi_query_group_num` (`multi_query` = 1), `head_dim`/`attention_head_dim`/`kv_channels`, `intermediate_size` (a per-layer list too)/`n_inner`/`ffn_dim`/`ffn_hidden_size`, `vocab_size`/`padded_vocab_size` |
+| MLA | `kv_lora_rank` with `qk_rope_head_dim`: `q_lora_rank`, `qk_nope_head_dim`, `v_head_dim` |
+| RoPE | `rope_theta`/`rotary_emb_base`/`rope_base` or `rope_parameters` (flat or per layer type), `layer_rope_theta`, `partial_rotary_factor`/`rotary_pct`/`rotary_dim`, `rope_scaling` (`linear`, `llama3`, `yarn`, `longrope`, `dynamic`) |
+| layer kinds | `layer_types`/`layers_block_type` entries `full_attention`, `attention`, `sliding_attention`, `chunked_attention`, `linear_attention`, `mamba`, `conv`, `mlp`, `moe`, `indexed_attention`, …; else `full_attention_interval` (every Nth layer full, the rest linear) or `sliding_window_pattern` (every Nth layer global); `sliding_window` alone makes every layer slide |
+| MoE | `num_experts`/`num_local_experts`/`n_routed_experts`, `num_experts_per_tok`, `norm_topk_prob`, `moe_intermediate_size`, which layers: `decoder_sparse_step`/`interleave_moe_layer_step`/`moe_layer_freq`, `first_k_dense_replace`/`num_dense_layers`, `mlp_only_layers`, `moe_layers`, `mlp_layer_types` |
+| other | `rms_norm_eps` (and the other epsilon spellings), `hidden_act`/`hidden_activation`/`activation_function`, `max_position_embeddings`, `tie_word_embeddings`, `attention_bias`, `attn_logit_softcapping`, `final_logit_softcapping`, `query_pre_attn_scalar`, `clip_qkv`, `use_parallel_residual`/`parallel_attn`, `linear_num_key_heads` and the other `linear_*` sizes, `conv_L_cache`, `quantization_config`, `expert_dtype` |
+
+Then the family's `hook` runs, then its `config` function.
+
+**Quantisation.** The checkpoint's `quantization_config` (FP8 blocks, MXFP4,
+pack-quantized INT4, …) is read for every family; a definition only adds a
+hint when the format needs one, by setting `c.quant` in its config function
+(MiMo V2's `attn_row_shards`, for instance). `llama_cpp` names the GGUF
+architecture a quantised GGUF export is written as.
+
+### Config functions
+
+`config = function(cfg, c) ... end` receives the config.json object as `cfg`
+(the text config for a wrapper; JSON objects and arrays are Lua tables,
+arrays 1-based; a JSON null is `null`, distinct from a missing key) and the
+parsed configuration as `c`, which it changes in place. `c` holds every field
+of `Config` in `src/arch.zig` under the same name: numbers, booleans,
+enumerations as strings, optional values as nil, nested settings as tables
+(`c.moe.scoring`, `c.mla.kv_lora_rank`, `c.rope_scaling.type`), and per-layer
+tables with one entry per layer (`c.sliding_layers[1]` is layer 0). A
+config function cannot change the number of layers.
+
+Helpers every definition sees:
+
+| Helper | |
+| --- | --- |
+| `num(v, d)`, `int(v, d)`, `flag(v, d)`, `str(v)`, `obj(v)` | A number, a non-negative integer (truncated), a boolean (or a non-zero integer), a string, a table, or the default `d` when `v` is missing, null or of another type: how ditch reads every key. |
+| `present(v)` | The key exists, even as null. |
+| `len(v)` | Length of a JSON array (0 otherwise). |
+| `each_layer(list, f)` | `list[i + 1] = f(i)` for every zero-based layer `i`. |
+| `f32(x)` | `x` rounded to single precision (ditch's scalars are f32). |
+| `warn(msg)` | Print a warning. |
+| `unsupported(msg)`, `invalid(msg)` | Refuse the checkpoint: an unsupported layout, or an inconsistent config.json. |
+
+### Zig building blocks
+
+A layout or a computation Lua cannot express (a new kind of layer math, a
+routing rule, a recurrence) is implemented in Zig and exposed to definitions
+two ways: as a value of a layout field (`norm`, `qkv`, `mlp`, `qk_norm`,
+`ssm`, `linear`, `positional`, …) that the forward pass switches on, and as a
+named **hook** for config.json keys whose reading is entangled with that math
+(`hooks` in `src/arch.zig`). The hooks are:
+`afmoe`, `baichuan`, `biogpt`, `chatglm`, `codegen`, `cohere`, `deepseek`,
+`deepseek_v32`, `deepseek_v4`, `deepseek_v41`, `dense_mlp`, `dots1`,
+`ernie`, `ernie_moe`, `exaone4`, `exaone_moe`, `falcon`, `falcon_h1`,
+`gemma`, `gemma3n`, `gemma4`, `glm4`, `glm4_moe`, `glm4_moe_lite`,
+`glm5_next`, `glm_moe_dsa`, `gpt_bigcode`, `gpt_neo`, `gpt_oss`, `gptj`,
+`granite`, `granite_hybrid`, `granite_moe`, `granite_moe_swa`,
+`granite_swa`, `hunyuan_dense`, `hunyuan_moe`, `hy_v3`, `jamba`,
+`kimi_linear`, `laguna`, `lfm2`, `llama4`, `mamba2`, `mellum`, `mimo_v2`,
+`minicpm`, `minimax`, `minimax_m2`, `minimax_m3`, `ministral3`,
+`mistral4`, `mixtral`, `mpt`, `nanochat`, `nemotron`, `nemotron_h`, `neox`,
+`olmo2`, `olmoe`, `opt`, `persimmon`, `phi`, `phi3`, `qwen4_exp`,
+`qwen_hybrid`, `qwen_vl`, `smollm3`, `solar_open`, `stablelm`,
+`starcoder2`, `xglm`, `axk1`.
+
+A new family whose layers are all made of existing blocks needs no Zig. One
+that needs new maths gets a new layout value or hook in Zig and a
+definition that names it.

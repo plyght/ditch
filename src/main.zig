@@ -31,12 +31,15 @@ const stream = @import("stream.zig");
 const reproduce = @import("reproduce.zig");
 const bench = @import("bench.zig");
 const probe = @import("probe.zig");
+const verify = @import("verify.zig");
 const compute = @import("compute.zig");
 const selftest = @import("selftest.zig");
+const truncate_mod = @import("truncate.zig");
 const directions = @import("directions.zig");
 const remote = @import("remote.zig");
 const logo = @import("logo.zig");
 const wrap = @import("wrap.zig");
+const models = @import("models.zig");
 
 const Model = model_mod.Model;
 const Engine = engine_mod.Engine;
@@ -66,6 +69,8 @@ fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime
 // ---------------------------------------------------------------------------
 
 var interrupted = std.atomic.Value(bool).init(false);
+/// The model argument, for the `ditch add-model` suggestion on an unknown model_type.
+var model_arg: []const u8 = "";
 
 fn onSigint(_: std.posix.SIG) callconv(.c) void {
     if (interrupted.load(.seq_cst)) {
@@ -1288,6 +1293,7 @@ pub fn main(init: std.process.Init) !void {
             error.BudgetTooSmall => std.log.err("memory budget too small (see above)", .{}),
             error.Interrupted => std.log.err("interrupted", .{}),
             error.NoInput, error.DirectoryNotEmpty => {},
+            error.UnknownModelType => std.log.err("add a definition for it: ditch add-model {s} drafts one from the checkpoint (see docs/models.md)", .{if (model_arg.len > 0) model_arg else "<model>"}),
             else => std.log.err("{s}", .{@errorName(err)}),
         }
         std.process.exit(if (err == error.BudgetTooSmall) 2 else 1);
@@ -1304,6 +1310,21 @@ fn estimateFor(model: *const Model, settings: *const config.Settings, threads: u
         .lora_rank = settings.full_normalization_lora_rank,
         .export_dtype = if (settings.export_dtype) |d| App.parseExportDtype(d) else null,
     });
+}
+
+/// Loads `$XDG_CONFIG_HOME/ditch/models/*.lua` (`~/.config/ditch/models`)
+/// and `--models-dir`.
+fn loadUserModels(arena: Allocator, io: Io, settings: *const config.Settings, env: *std.process.Environ.Map, out: *Io.Writer) !void {
+    var dirs: [2]?[]const u8 = .{ null, settings.models_dir };
+    if (try config.configDir(arena, env)) |d| dirs[0] = try std.fs.path.join(arena, &.{ d, "models" });
+    for (dirs) |d| if (d) |dir| {
+        const n = try models.loadDir(io, arena, dir, reportModelFile);
+        if (n > 0) try out.print("Loaded {d} model definition{s} from {s}\n", .{ n, if (n == 1) "" else "s", dir });
+    };
+}
+
+fn reportModelFile(path: []const u8, msg: []const u8) void {
+    std.log.warn("model definition {s} skipped: {s}", .{ path, msg });
 }
 
 /// True when the environment variable is present and non-empty.
@@ -1352,6 +1373,13 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     for (raw_args, 0..) |a, i| args[i] = a;
     // A debugging command for tools/chat_template_check.py, outside the settings.
     if (args.len >= 2 and std.mem.eql(u8, args[1], "render-template")) return render_template.run(gpa, arena, io, args[2..], con.result);
+    // `ditch verify` has options of its own and runs ditch as child processes.
+    if (args.len > 1 and std.mem.eql(u8, args[1], "verify")) {
+        const code = try verify.run(gpa, arena, io, init.environ_map, args[2..], con.out, con.result);
+        con.out.flush() catch {};
+        con.result.flush() catch {};
+        std.process.exit(code);
+    }
     var loaded = try config.load(gpa, io, args, init.environ_map);
     defer loaded.deinit();
     const settings = &loaded.settings;
@@ -1416,6 +1444,15 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         try out.print("\n  v{s}  ditch censorship.  https://github.com/plyght/ditch\n", .{config.version});
         try out.writeAll("  Built on Heretic: https://github.com/p-e-w/heretic\n\n");
     }
+    if (settings.add_model) {
+        std.log.err("ditch add-model is not available in this build yet; write the definition by hand (docs/models.md)", .{});
+        std.process.exit(2);
+    }
+    // Lua model definitions of the user, then of --models-dir; they shadow
+    // built-in definitions of the same model_type.
+    try loadUserModels(arena, io, settings, env, out);
+    model_arg = settings.model;
+
     // Accelerate (macOS): resolved once, before any kernel runs.
     tensor.accelerate_enabled = settings.accelerate;
     if (tensor.have_accelerate and settings.accelerate) {
@@ -1428,6 +1465,15 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         kpool.* = tensor.Pool.initPersistent(gpa, io, settings.threads);
         defer kpool.deinit();
         try bench.runKernels(gpa, io, settings, kpool, out, con.result);
+        return;
+    }
+
+    // `ditch truncate`: range-reads a few layers into a new checkpoint; no
+    // threads, device or memory budget.
+    if (settings.truncate) {
+        var http = try hf.Http.initWithOptions(gpa, io, arena, init.environ_map, .{ .token_file = settings.token_file, .timeout_seconds = settings.http_timeout_seconds });
+        defer http.deinit();
+        try truncate_mod.runCli(gpa, arena, io, &http, settings, out, con.result);
         return;
     }
 
@@ -1447,7 +1493,7 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         try out.flush();
         std.process.exit(1);
     }
-    if (settings.config_path) |p| try out.print("Using configuration file {s}\n", .{p});
+    if (settings.config_path) |p| try out.print("Using configuration {s}\n", .{p});
     if (settings.seed == null) {
         var b: [8]u8 = undefined;
         io.random(&b);
@@ -1961,6 +2007,8 @@ fn printRemoteStats(out: *Io.Writer, s: *remote.Source) void {
     const st = s.stats();
     out.print("\nRemote source: fetched {d} ranges ({f}), {d} chunk reads served from the disk cache\n", .{ st.ranges_fetched, budget_mod.fmtBytes(st.bytes_fetched), st.chunks_from_disk }) catch {};
     out.print("Chunk cache: {f} on disk of a {f} bound (peak {f}), {d} chunks evicted, {d} served from RAM without being kept\n", .{ budget_mod.fmtBytes(st.cache_bytes), budget_mod.fmtBytes(st.cache_limit), budget_mod.fmtBytes(st.peak_cache_bytes), st.chunks_evicted, st.chunks_unpersisted }) catch {};
+    if (st.partial_ranges > 0)
+        out.print("Exact ranges: {d} fetched ({f}) for scattered experts instead of whole chunks, {d} reads served from them\n", .{ st.partial_ranges, budget_mod.fmtBytes(st.partial_bytes), st.partial_hits }) catch {};
     out.flush() catch {};
 }
 

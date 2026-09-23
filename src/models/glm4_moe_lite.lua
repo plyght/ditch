@@ -1,0 +1,20 @@
+return {
+  model_type = "glm4_moe_lite",
+  aliases = { "glm_moe_lite" },
+  llama_cpp = nil,
+  chat = "glm4",
+  verified = true,
+  notes = "fixture: GLM-4.7-Flash: DeepSeek V3 MLA with interleaved partial rotary, sigmoid MoE with correction bias, top-2 group scores over n_group groups, floored renormalisation and routed_scaling_factor, shared experts, stacked expert tensors, mlp_layer_types with a dense first layer.",
+  default_norm_eps = 1e-5,
+  names = {
+    q_a = "self_attn.q_a_proj.weight",
+    q_a_norm = "self_attn.q_a_layernorm.weight",
+    q_b = "self_attn.q_b_proj.weight",
+    kv_a = "self_attn.kv_a_proj_with_mqa.weight",
+    kv_a_norm = "self_attn.kv_a_layernorm.weight",
+    kv_b = "self_attn.kv_b_proj.weight",
+    router_correction_bias = "mlp.gate.e_score_correction_bias",
+    shared_expert = "mlp.shared_experts.",
+  },
+  hook = "glm4_moe_lite",
+}

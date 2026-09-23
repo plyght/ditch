@@ -115,7 +115,7 @@ def install_remote_code_shims():
 PER_LAYER = False
 
 
-def compare_residuals(entry, out, pre_norm, tolerance, collapsed=None):
+def compare_residuals(entry, out, pre_norm, tolerance, collapsed=None, rec=None):
     """Compares ditch's per-layer residuals with transformers' hidden states.
 
     Entry L is the vector layer L reads, so entry 0 is the embedding output
@@ -136,6 +136,8 @@ def compare_residuals(entry, out, pre_norm, tolerance, collapsed=None):
         hidden = [(h[0, 0, -1] if h.dim() == 4 else h[0, -1]).float().numpy() for h in out.hidden_states]
     if len(got) != len(hidden):
         print(f"  residuals: ditch has {len(got)} entries, transformers {len(hidden)}")
+        if rec is not None:
+            rec["residual_entries"] = [len(got), len(hidden)]
         return False
     # A stacked (Gemma 3n) last entry is recorded before the streams are
     # combined and normalised, so it is already the pre-norm residual.
@@ -148,12 +150,17 @@ def compare_residuals(entry, out, pre_norm, tolerance, collapsed=None):
         # Relative to the layer's own magnitude, so a bf16 reference (which a
         # model too big for a float32 one needs) is judged on the same scale.
         rel = float(np.abs(a - b).max()) / scale
+        if rec is not None:
+            rec.setdefault("residuals", []).append(rel)
         if PER_LAYER:
             print(f"    layer {i}: {rel:.2e}")
         if rel > worst:
             worst, worst_layer = rel, i
         if first_bad is None and rel > tolerance:
             first_bad = (i, rel, float(np.abs(a - b).max()), scale)
+    if rec is not None:
+        rec["residual_worst"], rec["residual_worst_layer"] = worst, worst_layer
+        rec["residual_first_bad"] = None if first_bad is None else first_bad[0]
     if first_bad is not None:
         i, rel, d, scale = first_bad
         print(f"  residuals diverge first at layer {i}: max |difference| {d:.5f} = {rel:.2e} of |reference| {scale:.4f}")
@@ -178,6 +185,7 @@ def main():
                     help="the probe was run with --raw: no chat template and no BOS")
     ap.add_argument("--factory", help="Python file whose load(model_dir, dtype) returns the reference model")
     ap.add_argument("--per-layer", action="store_true", help="print every layer's relative residual difference")
+    ap.add_argument("--json-out", help="also write every comparison's numbers to this file as JSON")
     ap.add_argument("--residual-tolerance", type=float, default=1e-3,
                     help="max |difference| of a per-layer residual, relative to that layer's own"
                          " magnitude, before it counts as a mismatch")
@@ -190,6 +198,10 @@ def main():
     if trc:
         install_remote_code_shims()
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=trc)
+    if not args.raw and not getattr(tok, "chat_template", None):
+        # A base model without a template: ditch probes it as raw text too.
+        print("the tokenizer has no chat template; comparing raw prompts")
+        args.raw = True
     if args.factory:
         import importlib.util
         spec = importlib.util.spec_from_file_location("reference_factory", args.factory)
@@ -234,7 +246,10 @@ def main():
     mixers = [m for n, m in model.named_modules() if n.endswith("hyper_connection_mixer") and "mtp" not in n]
     if mixers:
         mixers[-1].register_forward_hook(lambda mod, inp, outp: captured.__setitem__("pre_norm", outp))
+    report = {"model": args.model, "prompts": []}
     for entry in probe["prompts"]:
+        rec = {"user": entry["user"]}
+        report["prompts"].append(rec)
         messages = [{"role": "system", "content": args.system_prompt}, {"role": "user", "content": entry["user"]}]
         if args.raw:
             text = entry["user"]
@@ -253,11 +268,15 @@ def main():
         bos = tok.bos_token or ""
         if bos and text.startswith(bos) and not entry["text"].startswith(bos):
             text = text[len(bos) :]  # ditch adds the BOS id, not the literal
+        rec["text_match"] = text == entry["text"]
+        rec["text_reference"], rec["text_ditch"] = text, entry["text"]
         if text != entry["text"]:
             print("  rendered text differs:")
             print("    transformers:", repr(text))
             print("    ditch:       ", repr(entry["text"]))
             ok = False
+        rec["ids_match"] = ids == entry["ids"]
+        rec["n_tokens"] = len(entry["ids"])
         if ids != entry["ids"]:
             print(f"  token ids differ: transformers {ids}\n                    ditch        {entry['ids']}")
             ok = False
@@ -277,7 +296,7 @@ def main():
         if want_residuals:
             hc = captured.get("hc")
             collapsed = [hc[i] for i in sorted(hc)] if hc else None
-            ok &= compare_residuals(entry, out, captured.get("pre_norm"), args.residual_tolerance, collapsed)
+            ok &= compare_residuals(entry, out, captured.get("pre_norm"), args.residual_tolerance, collapsed, rec)
         got = np.asarray(entry["logits"], dtype=np.float32)
         if got.shape != ref.shape:
             n = min(got.shape[0], ref.shape[0])
@@ -286,6 +305,7 @@ def main():
         scale = float(ref.max() - ref.min())
         rel = float(np.abs(got - ref).max()) / scale
         print(f"  first-token logits: max |diff| = {np.abs(got - ref).max():.4f}, relative to range {scale:.2f}: {rel:.2e}; argmax ditch {int(got.argmax())} vs transformers {int(ref.argmax())}")
+        rec["logits_rel"], rec["argmax_ditch"], rec["argmax_reference"] = rel, int(got.argmax()), int(ref.argmax())
         top_ref = np.argsort(-ref)[:5].tolist()
         top_got = np.argsort(-got)[:5].tolist()
         print(f"  top-5 transformers {top_ref} {[tok.decode([t]) for t in top_ref]}")
@@ -299,7 +319,13 @@ def main():
                     # forward pass (a full-depth streamed reference reads the model again).
                     gen = torch.cat([input_ids, torch.tensor([[int(ref.argmax())]])], dim=1)
                 else:
-                    gen = model.generate(input_ids, max_new_tokens=args.max_new_tokens, do_sample=False)
+                    # Plain greedy. A release's generation_config.json can carry a
+                    # repetition penalty (Qwen2.5-Instruct: 1.1) or n-gram blocking,
+                    # which `generate` merges into any config it is given and applies
+                    # even without sampling; ditch's greedy reply is the argmax. So the
+                    # neutral values are passed explicitly.
+                    gen = model.generate(input_ids, max_new_tokens=args.max_new_tokens, do_sample=False,
+                                         repetition_penalty=1.0, no_repeat_ngram_size=0, min_new_tokens=0)
             except Exception:
                 if not trc:
                     raise
@@ -315,7 +341,27 @@ def main():
         if isinstance(resp, list):  # bytes that are not valid UTF-8 on their own
             resp = bytes(resp).decode("utf-8", errors="replace")
         print(f"  greedy ditch:        {resp!r}")
+        rec["greedy_reference"], rec["greedy_ditch"] = ref_text, resp
+        # ditch stops at an end-of-turn token the reference keeps generating past.
+        n = min(len(ref_text), len(resp))
+        rec["greedy_match"] = ref_text[:n] == resp[:n]
+        ref_ids, got_ids = gen[0, input_ids.shape[1]:].tolist(), entry.get("generated_ids") or []
+        k = next((i for i, (a, b) in enumerate(zip(ref_ids, got_ids)) if a != b), None)
+        if k is not None:
+            # Where the two greedy paths part: the reference's own logit margin
+            # between its token and ditch's, after the tokens they share. A near
+            # tie (a cut's flat logits) is not an error; a decode bug is not a tie.
+            with torch.no_grad():
+                prefix = torch.cat([input_ids, torch.tensor([ref_ids[:k]], dtype=input_ids.dtype)], dim=1)
+                lg = model(input_ids=prefix).logits[0, -1].float()
+            margin = float(lg[ref_ids[k]] - lg[got_ids[k]]) / float(lg.max() - lg.min())
+            rec["greedy_first_difference"], rec["greedy_margin"] = k, margin
+            print(f"  greedy paths part at token {k}: the reference's margin of its token over ditch's is {margin:.2e} of the logit range")
     print("\nRESULT:", "OK" if ok else "MISMATCH")
+    if args.json_out:
+        report["ok"] = bool(ok)
+        with open(args.json_out, "w") as f:
+            json.dump(report, f, indent=1)
     sys.exit(0 if ok else 1)
 
 

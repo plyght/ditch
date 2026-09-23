@@ -1,0 +1,21 @@
+return {
+  model_type = "deepseek_v41",
+  aliases = { "deepseek_v41_text" },
+  llama_cpp = nil,
+  chat = "deepseek",
+  verified = true,
+  notes = "fixture: single-pass hyper-connections, CSA2 shared compressed KV (kv_source groups, ratio 1 and pooled branches, indexer as dense), FP8/FP4 fake quantisation of the window KV and latents, engram n-gram hash layers (lazy table rows, tokenizer-derived compressed ids), gate_temp routing, nested text_config with vision tensors passed through. The released checkpoints (DeepSeek's own tensor names, FP8 with ue8m0 block scales, FP4 e2m1 experts) are renamed and dequantised on load.",
+  rope_style = "gptj",
+  names = {
+    o = "self_attn.o_b_proj.weight",
+    sinks = "self_attn.sinks",
+    q_a = "self_attn.q_a_proj.weight",
+    q_a_norm = "self_attn.q_a_norm.weight",
+    q_b = "self_attn.q_b_proj.weight",
+    kv_a = "self_attn.kv_proj.weight",
+    kv_a_norm = "self_attn.kv_norm.weight",
+    router_correction_bias = "mlp.gate.e_score_correction_bias",
+    shared_expert = "mlp.shared_experts.",
+  },
+  hook = "deepseek_v41",
+}
