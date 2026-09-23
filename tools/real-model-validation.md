@@ -2604,3 +2604,15 @@ largest entry, which one massive-activation channel dominates. The result above
 still verifies the experts, with the difference ~500 times below that, but a
 pass at 1e-3 alone would not have: for a short cut of a model with massive
 activations, read the worst residual difference, not only the verdict.
+
+## Solar-Open-100B (`solar_open`): verified
+
+`upstage/Solar-Open-100B`, first 2 layers (both the 128-expert top-8 sigmoid
+MoE with a shared expert; `first_k_dense_replace` is 0), MTP dropped, routed
+experts lazy. The chat template's long default system block makes both prompts
+80+ tokens.
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (83) | all 3 agree, worst 1.81e-06 | 1.09e-06 | match |
+| "Explain how rainbows form, …" | match (88) | all 3 agree, worst 2.97e-06 | 9.83e-07 | match |
