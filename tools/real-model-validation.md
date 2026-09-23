@@ -3756,6 +3756,49 @@ hours for the first pass, with the working set 6x the 18 GB of chunk cache
 this disk allows (the same limit as gpt-oss-120b). The RAM side fits (6.6 GB
 minimum). Its arithmetic is verified on the truncated cut above.
 
+## Parallel `hf://` fetching: gpt-oss-20b cold pass before and after
+
+A remote shard was read one chunk at a time: a read spanning many chunks
+fetched them in turn, and an expert the cache had no room to prefetch was
+fetched on its own when its turn came, each on a single connection. Two
+changes, both measured on the cold pass above (empty chunk cache, `--max-ram
+10GB --remote-cache-size 16GB`, ReleaseFast, "What is the capital of
+France?", 87 prompt tokens, 16 greedy tokens):
+
+1. `readRange` fetches the chunks of a span concurrently, up to
+   `--remote-connections` (config `remote_connections`, default 16) range
+   requests in flight; the expert cache's and the weight store's background
+   loads run on threads of their own (`Io.Group.concurrent`) instead of the
+   async pool's cores - 1, so they no longer wait on each other's downloads.
+2. As soon as a MoE layer has routed its tokens, every routed expert that is
+   not resident is queued for download (`WeightStore.prefetchRemote` ->
+   `RemoteFile.prefetchRange`, dequantised tensors through their stored
+   codes and scales) in the order the layer runs them, and up to
+   `--remote-connections` workers fetch the queue into the chunk cache while
+   the first experts compute. At most half the cache bound is queued ahead;
+   nothing is queued without a disk cache.
+
+The dry run now also prints the bytes one decoded token fetches once warm
+(the trunk again when the cache cannot hold it, plus the share of the routed
+experts it cannot hold, assuming uniform routing) and the time that takes at
+100 MB/s.
+
+| build | load to exit | 16 tokens with the prefill | fetched from the Hub | peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| one connection (before) | 1066 s | 1006.7 s, 0.016 tokens/s | 1510 ranges, 11.78 GB (~11.7 MB/s) | 7.08 GB |
+| 16 concurrent chunk reads | 532 s | 472.5 s, 0.034 tokens/s | 1509 ranges, 11.77 GB (~25 MB/s) | 7.94 GB |
+| and the routed-expert prefetch queue | 506 s | 444.8 s, 0.036 tokens/s | 1509 ranges, 11.77 GB (~26 MB/s) | 8.17 GB |
+
+All three print the same text (`<|channel|>analysis<|message|>We need to
+answer: "What is the capital of France?"`) and fetch the same chunks, none
+twice. The cold pass halves; what is left is the link: the proxy in front of
+the Hub gives this container about 25 MB/s however many requests are in
+flight (the reference measured ~110 MB/s on 16 streams from another host), so
+on gpt-oss-20b, whose expert cache already prefetches most of each layer's
+experts, the queue adds only 5%. It is there for the models whose routed
+experts overflow the expert cache (gpt-oss-120b below), where the overflow
+used to be fetched one expert at a time.
+
 # Full-depth reference
 
 Until now every frontier family was compared with its reference on a cut: the
@@ -4040,6 +4083,7 @@ gpt-oss's experts load in parallel. With a cache smaller than the trunk
 (20 of 22.3 GB), every later token would fetch ~2.3 GB again; with 23 GB of
 cache disk the second pass would read only local chunks. The RAM side is
 small (3.2 GB). Its arithmetic is verified on the truncated cut above.
+
 ## gpt-oss-120b at full depth: verified
 
 `openai/gpt-oss-120b`, all 36 layers (alternating 128-token sliding and full

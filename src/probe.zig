@@ -100,7 +100,8 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings,
         const ws = try engine.ensureWorkspace(ids.len, 1, engine.kvBytes(1, ids.len + max_new + 1));
         var cache = try model_mod.KvCache.initFor(model, gpa, 1, ids.len + max_new + 1);
         defer cache.deinit();
-        const generated = try model_mod.generateKeep(model, ws, &cache, &prompts, max_new, .{ .logits = logits, .residuals = residuals });
+        var prefill_seconds: f64 = 0;
+        const generated = try model_mod.generateKeep(model, ws, &cache, &prompts, max_new, .{ .logits = logits, .residuals = residuals, .prefill_seconds = &prefill_seconds });
         const gen_seconds = @as(f64, @floatFromInt(start.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds)) / 1e9;
         defer {
             for (generated) |g| model.gpa.free(g);
@@ -137,6 +138,8 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings,
             try js.write(generated[0]);
             try js.objectField("response");
             try js.write(response);
+            try js.objectField("prefill_seconds");
+            try js.write(prefill_seconds);
             try js.objectField("generate_seconds");
             try js.write(gen_seconds);
             try js.objectField("logits");
@@ -156,6 +159,9 @@ pub fn run(gpa: Allocator, arena: Allocator, io: Io, settings: *config.Settings,
             for (top) |t| try result_out.print("  {d:>8}  {d:>10.4}  {s}\n", .{ t.id, t.logit, tokenText(model, t.id) });
             const tps = if (gen_seconds > 0) @as(f64, @floatFromInt(generated[0].len)) / gen_seconds else 0;
             try result_out.print("Greedy ({d} tokens in {d:.1} s with the prefill, {d:.3} tokens/s): {s}\n", .{ generated[0].len, gen_seconds, tps, response });
+            const decode_s = gen_seconds - prefill_seconds;
+            const decode_tps = if (decode_s > 0 and generated[0].len > 1) @as(f64, @floatFromInt(generated[0].len - 1)) / decode_s else 0;
+            try result_out.print("First token after {d:.1} s (the prefill), then {d:.3} tokens/s\n", .{ prefill_seconds, decode_tps });
             if (residuals) |r| {
                 try result_out.writeAll("Residual norm per layer (last token):\n");
                 var l: usize = 0;

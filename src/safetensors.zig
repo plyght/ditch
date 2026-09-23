@@ -397,6 +397,25 @@ pub const File = struct {
         gpa.destroy(self);
     }
 
+    /// Hints that `[offset, offset + len)` will be read soon: a remote shard
+    /// starts fetching the bytes in the background (a dequantised tensor, its
+    /// source pieces); a local or mapped one ignores it.
+    pub fn prefetchRange(self: *const File, offset: u64, len: u64) void {
+        if (len == 0) return;
+        if (offset >= self.len) {
+            const o = self.overlayAt(offset) orelse return;
+            switch (o.kind) {
+                .dequant => |dq| dq.prefetch(offset - o.offset, len),
+                else => {},
+            }
+            return;
+        }
+        switch (self.source) {
+            .remote => |rf| rf.prefetchRange(offset, len),
+            .local => {},
+        }
+    }
+
     pub fn isRemote(self: *const File) bool {
         return self.source == .remote;
     }

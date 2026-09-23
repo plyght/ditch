@@ -265,7 +265,11 @@ const Env = struct {
     }
 
     fn open(self: *Env, cache: []const u8, cache_size: ?u64) !*remote.Source {
-        return remote.Source.open(self.gpa, self.io, &self.http, cache, self.base_url, .{ .chunk_size = chunk, .cache_size = cache_size }, &self.sink.writer);
+        return self.openWith(cache, cache_size, 0);
+    }
+
+    fn openWith(self: *Env, cache: []const u8, cache_size: ?u64, connections: u32) !*remote.Source {
+        return remote.Source.open(self.gpa, self.io, &self.http, cache, self.base_url, .{ .chunk_size = chunk, .cache_size = cache_size, .connections = connections }, &self.sink.writer);
     }
 };
 
@@ -360,6 +364,15 @@ test "remote chunk cache: bounded below the model, LRU with the trunk kept, bit-
         defer dry.deinit();
         try fp.print(&dry.writer);
         try std.testing.expect(std.mem.indexOf(u8, dry.written(), "the trunk stays cached") != null);
+        // Per decoded token: at most the routed experts, none of the trunk.
+        try std.testing.expect(std.mem.indexOf(u8, dry.written(), "per decoded token") != null);
+        var routed: u64 = 0;
+        for (model.layers) |*l| if (l.moe) |*m| {
+            routed += m.top_k;
+        };
+        try std.testing.expect(routed > 0);
+        try std.testing.expectEqual(routed, fp.experts_per_token);
+        try std.testing.expect(fp.bytesPerToken() <= fp.experts_per_token * fp.expert_bytes);
         const got = try firstTokenLogits(gpa, model, &long_ids);
         defer gpa.free(got);
         try std.testing.expectEqualSlices(f32, want, got);
@@ -419,6 +432,8 @@ test "remote chunk cache: bounded below the model, LRU with the trunk kept, bit-
         try fp.print(&note.writer);
         try std.testing.expect(std.mem.indexOf(u8, note.written(), "too small for the trunk") != null);
         try std.testing.expect(fp.suggestedLimit() >= fp.trunk_chunk_bytes);
+        // Without the trunk cached, every token fetches it and all its experts.
+        try std.testing.expectEqual(fp.trunk_chunk_bytes + fp.experts_per_token * fp.expert_bytes, fp.bytesPerToken());
         const got = try firstTokenLogits(gpa, model, &long_ids);
         defer gpa.free(got);
         try std.testing.expectEqualSlices(f32, want, got);
@@ -454,6 +469,77 @@ test "remote footprint: dequantised tensors' codes and scales are counted (gpt-o
             try std.testing.expectEqual(fp.total_expert_bytes, fp.expert_bytes * fp.num_experts);
         }
     }
+}
+
+test "remote readRange: a span of many chunks, fetched one at a time or concurrently, reads the same bytes" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var env: Env = undefined;
+    try env.init(gpa, io);
+    defer env.deinit();
+    const shard = "model-00001-of-00002.safetensors";
+    // The reference bytes, read straight from the fixture.
+    var dir = try Io.Dir.cwd().openDir(io, fixture, .{});
+    defer dir.close(io);
+    const file = try dir.openFile(io, shard, .{});
+    defer file.close(io);
+    const len: usize = 40 * chunk + 123;
+    const offset: u64 = chunk / 2 + 7; // straddles chunk boundaries at both ends
+    const want = try gpa.alloc(u8, len);
+    defer gpa.free(want);
+    try std.testing.expectEqual(len, try file.readPositionalAll(io, want, offset));
+    for ([_]u32{ 1, 16 }) |connections| {
+        const cache = try env.path(if (connections == 1) "cache_1" else "cache_16");
+        defer gpa.free(cache);
+        const src = try env.openWith(cache, std.math.maxInt(u64), connections);
+        defer src.deinit();
+        const rf = try src.openFile(shard);
+        const got = try gpa.alloc(u8, len);
+        defer gpa.free(got);
+        try rf.readRange(io, offset, got);
+        try std.testing.expectEqualSlices(u8, want, got);
+        // Each chunk of the span fetched once: 41 of them (plus the header's).
+        const st = src.stats();
+        try std.testing.expect(st.ranges_fetched >= 41 and st.ranges_fetched <= 43);
+        // And read again, all from the disk cache.
+        try rf.readRange(io, offset, got);
+        try std.testing.expectEqualSlices(u8, want, got);
+        try std.testing.expectEqual(st.ranges_fetched, src.stats().ranges_fetched);
+    }
+}
+
+test "remote prefetchRange: queued chunks are fetched in the background, then read from disk" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var env: Env = undefined;
+    try env.init(gpa, io);
+    defer env.deinit();
+    const shard = "model-00001-of-00002.safetensors";
+    var dir = try Io.Dir.cwd().openDir(io, fixture, .{});
+    defer dir.close(io);
+    const file = try dir.openFile(io, shard, .{});
+    defer file.close(io);
+    const len: usize = 24 * chunk + 5;
+    const offset: u64 = 3 * chunk + 11;
+    const want = try gpa.alloc(u8, len);
+    defer gpa.free(want);
+    try std.testing.expectEqual(len, try file.readPositionalAll(io, want, offset));
+    const cache = try env.path("cache");
+    defer gpa.free(cache);
+    const src = try env.openWith(cache, std.math.maxInt(u64), 16);
+    defer src.deinit();
+    const rf = try src.openFile(shard);
+    const before = src.stats().ranges_fetched;
+    rf.prefetchRange(offset, len);
+    rf.prefetchRange(offset, len); // queued twice, fetched once
+    src.awaitPrefetch();
+    const fetched = src.stats().ranges_fetched - before;
+    try std.testing.expect(fetched >= 25 and fetched <= 26);
+    const got = try gpa.alloc(u8, len);
+    defer gpa.free(got);
+    try rf.readRange(io, offset, got);
+    try std.testing.expectEqualSlices(u8, want, got);
+    try std.testing.expectEqual(before + fetched, src.stats().ranges_fetched);
 }
 
 test "remote chunk cache: size 0 keeps nothing on disk" {
