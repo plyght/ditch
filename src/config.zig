@@ -121,6 +121,9 @@ pub const Settings = struct {
     model: []const u8 = "",
     model_commit: ?[]const u8 = null,
     evaluate_model: ?[]const u8 = null,
+    /// Writes the refusal directions and the good / bad residual means to this
+    /// safetensors file after calibration (for checking an edit independently).
+    dump_directions: ?[]const u8 = null,
     threads: ?usize = null,
     cache_dir: ?[]const u8 = null,
     chat_template: ?[]const u8 = null,
@@ -485,6 +488,8 @@ pub const help_sections = [_]HelpSection{
     \\  --interactive                  Prompt even when stdin is not a terminal (scripted answers).
     \\  -d, --debug                    Print extra diagnostics (= --print-debug-information).
     \\  --print-residual-geometry      Print per-layer residual geometry statistics.
+    \\  --dump-directions <file>       Write the refusal directions and the good / bad residual means
+    \\                                 ([entries][hidden] f32, entry 0 = embedding) to a safetensors file.
     \\  --keyword-rate-print-responses Print every evaluated prompt/response pair.
     \\
     },
@@ -920,7 +925,7 @@ fn applyDatasetOption(a: Allocator, spec: *DatasetSpec, field: []const u8, value
 
 fn applyOption(a: Allocator, s: *Settings, key: []const u8, value: []const u8) !void {
     const eql = std.mem.eql;
-    if (eql(u8, key, "model")) s.model = try a.dupe(u8, value) else if (eql(u8, key, "model_commit")) s.model_commit = try a.dupe(u8, value) else if (eql(u8, key, "evaluate_model")) s.evaluate_model = try a.dupe(u8, value) else if (eql(u8, key, "threads")) s.threads = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "cache_dir")) s.cache_dir = try a.dupe(u8, value) else if (eql(u8, key, "chat_template")) s.chat_template = try a.dupe(u8, value) else if (eql(u8, key, "batch_size")) s.batch_size = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "max_batch_size")) s.max_batch_size = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "max_response_length")) s.max_response_length = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "response_prefix")) s.response_prefix = try a.dupe(u8, value) else if (eql(u8, key, "system_prompt")) s.system_prompt = try a.dupe(u8, value) else if (eql(u8, key, "print_debug_information")) s.print_debug_information = try parseBool(value) else if (eql(u8, key, "print_residual_geometry")) s.print_residual_geometry = try parseBool(value) else if (eql(u8, key, "orthogonalize_direction")) s.orthogonalize_direction = try parseBool(value) else if (eql(u8, key, "row_normalization")) s.row_normalization = abliterate.RowNormalization.parse(value) orelse return error.InvalidEnum else if (eql(u8, key, "full_normalization_lora_rank")) s.full_normalization_lora_rank = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "expert_selection")) s.expert_selection = abliterate.ExpertSelection.parse(value) orelse return error.InvalidEnum else if (eql(u8, key, "winsorization_quantile")) s.winsorization_quantile = try std.fmt.parseFloat(f32, value) else if (eql(u8, key, "n_directions")) {
+    if (eql(u8, key, "model")) s.model = try a.dupe(u8, value) else if (eql(u8, key, "model_commit")) s.model_commit = try a.dupe(u8, value) else if (eql(u8, key, "evaluate_model")) s.evaluate_model = try a.dupe(u8, value) else if (eql(u8, key, "dump_directions")) s.dump_directions = try a.dupe(u8, value) else if (eql(u8, key, "threads")) s.threads = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "cache_dir")) s.cache_dir = try a.dupe(u8, value) else if (eql(u8, key, "chat_template")) s.chat_template = try a.dupe(u8, value) else if (eql(u8, key, "batch_size")) s.batch_size = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "max_batch_size")) s.max_batch_size = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "max_response_length")) s.max_response_length = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "response_prefix")) s.response_prefix = try a.dupe(u8, value) else if (eql(u8, key, "system_prompt")) s.system_prompt = try a.dupe(u8, value) else if (eql(u8, key, "print_debug_information")) s.print_debug_information = try parseBool(value) else if (eql(u8, key, "print_residual_geometry")) s.print_residual_geometry = try parseBool(value) else if (eql(u8, key, "orthogonalize_direction")) s.orthogonalize_direction = try parseBool(value) else if (eql(u8, key, "row_normalization")) s.row_normalization = abliterate.RowNormalization.parse(value) orelse return error.InvalidEnum else if (eql(u8, key, "full_normalization_lora_rank")) s.full_normalization_lora_rank = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "expert_selection")) s.expert_selection = abliterate.ExpertSelection.parse(value) orelse return error.InvalidEnum else if (eql(u8, key, "winsorization_quantile")) s.winsorization_quantile = try std.fmt.parseFloat(f32, value) else if (eql(u8, key, "n_directions")) {
         s.n_directions = try std.fmt.parseInt(usize, value, 10);
         if (s.n_directions == 0) return error.InvalidValue;
     } else if (eql(u8, key, "direction_method")) s.direction_method = directions.Method.parse(value) orelse return error.InvalidEnum else if (eql(u8, key, "direction_token_window")) {
@@ -1242,4 +1247,14 @@ test "cli aliases, subcommands, order and suggestions" {
     try std.testing.expectEqual(@as(usize, 2), editDistance("bench", "bnech"));
     try std.testing.expectEqualStrings("n-trials", (try suggestOption(r6.arena.allocator(), "ntrials")).?);
     try std.testing.expect(std.mem.indexOf(u8, help_text, "Exit codes:") != null);
+}
+
+test "dump directions option" {
+    const gpa = std.testing.allocator;
+    const args = [_][]const u8{ "ditch", "--dump-directions", "dirs.safetensors", "m" };
+    var r = try load(gpa, std.testing.io, &args, null);
+    defer r.deinit();
+    try std.testing.expectEqual(@as(usize, 0), r.errors.len);
+    try std.testing.expectEqualStrings("dirs.safetensors", r.settings.dump_directions.?);
+    try std.testing.expectEqual(@as(?[]const u8, null), (Settings{}).dump_directions);
 }

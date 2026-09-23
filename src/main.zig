@@ -1725,6 +1725,10 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     if (settings.n_directions > 1) try out.print("* Extracting {d} orthonormal directions per layer...\n", .{settings.n_directions});
     const dirs = try directions.computeBasisFrom(rt_gpa, first, good_means, entries, c.hidden_size, settings.n_directions, settings.orthogonalize_direction, if (sketch) |*s| s else null);
     defer rt_gpa.free(dirs);
+    if (settings.dump_directions) |path| {
+        try dumpDirections(rt_gpa, io, path, dirs, good_means, bad_means, entries, c.hidden_size, settings.n_directions);
+        try out.print("* Wrote the directions and residual means to {s}\n", .{path});
+    }
     // Separation scores need one more pass (the projections of every prompt
     // onto the final directions); only when something uses them.
     var sep: ?directions.Separation = null;
@@ -1945,4 +1949,19 @@ fn printRemoteStats(out: *Io.Writer, s: *remote.Source) void {
     out.print("\nRemote source: fetched {d} ranges ({f}), {d} chunk reads served from the disk cache\n", .{ st.ranges_fetched, budget_mod.fmtBytes(st.bytes_fetched), st.chunks_from_disk }) catch {};
     out.print("Chunk cache: {f} on disk of a {f} bound (peak {f}), {d} chunks evicted, {d} served from RAM without being kept\n", .{ budget_mod.fmtBytes(st.cache_bytes), budget_mod.fmtBytes(st.cache_limit), budget_mod.fmtBytes(st.peak_cache_bytes), st.chunks_evicted, st.chunks_unpersisted }) catch {};
     out.flush() catch {};
+}
+
+/// `--dump-directions`: `directions` `[entries][n_directions * hidden]`,
+/// `good_means` and `bad_means` `[entries][hidden]`, all f32; entry 0 is the
+/// embedding output and entry `l + 1` the output of layer `l`.
+fn dumpDirections(gpa: std.mem.Allocator, io: std.Io, path: []const u8, dirs: []const f32, good: []const f32, bad: []const f32, entries: usize, hidden: usize, k: usize) !void {
+    const st = @import("safetensors.zig");
+    const shape_d = [_]usize{ entries, k * hidden };
+    const shape_m = [_]usize{ entries, hidden };
+    const tensors = [_]st.OutTensor{
+        .{ .name = "directions", .dtype = .f32, .shape = &shape_d, .data = std.mem.sliceAsBytes(dirs) },
+        .{ .name = "good_means", .dtype = .f32, .shape = &shape_m, .data = std.mem.sliceAsBytes(good) },
+        .{ .name = "bad_means", .dtype = .f32, .shape = &shape_m, .data = std.mem.sliceAsBytes(bad) },
+    };
+    try st.writeFile(gpa, io, std.Io.Dir.cwd(), path, &tensors, "ditch");
 }
