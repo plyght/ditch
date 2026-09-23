@@ -1,0 +1,5 @@
+[
+ {"swiglu_limit": "$delete"},
+ {"compress_rates": "$delete"},
+ {"rope_parameters": {"compress": {"rope_type": "yarn", "factor": 16}}}
+]
