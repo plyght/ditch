@@ -5091,3 +5091,20 @@ connection for a while once `after` range requests were served,
   thirds into its requests (and reports the outage and its end), and a probe
   killed (SIGKILL) part-way through its load and run again over the same
   cache prints the same, without fetching any chunk the killed run had kept.
+
+## Bug 72 — a float32 export's config still said bfloat16 (fixed)
+
+**Symptom.** GLM-5.3's `--export-dtype f32` export held float32 tensors, but
+its `config.json` kept the release's `"dtype": "bfloat16"`. transformers'
+default `from_pretrained(..., dtype="auto")` takes the dtype from there, so
+the float32 export was loaded rounded to bf16 unless the caller passed
+`dtype=torch.float32` (the comparisons here always do, which hid it).
+
+**Cause.** `saveModel` wrote the source config (less `quantization_config`)
+whatever `export_dtype` was.
+
+**Fix.** With an `export_dtype`, every floating-point `dtype` / `torch_dtype`
+in `config.json` (top level and nested text / vision configs) names it; other
+`dtype` keys (a quantisation scheme's) are left alone. Tests:
+`withConfigDtype names the export dtype`, and `saveModel carries the remote
+code and names the export dtype` exports the qwen2 fixture as float32.
