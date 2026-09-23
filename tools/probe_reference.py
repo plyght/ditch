@@ -294,7 +294,12 @@ def main():
             ok = False
         with torch.no_grad():
             try:
-                gen = model.generate(input_ids, max_new_tokens=args.max_new_tokens, do_sample=False)
+                if args.max_new_tokens <= 1:
+                    # One greedy token is the argmax of the logits above: no second
+                    # forward pass (a full-depth streamed reference reads the model again).
+                    gen = torch.cat([input_ids, torch.tensor([[int(ref.argmax())]])], dim=1)
+                else:
+                    gen = model.generate(input_ids, max_new_tokens=args.max_new_tokens, do_sample=False)
             except Exception:
                 if not trc:
                     raise
