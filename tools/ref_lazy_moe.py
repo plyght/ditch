@@ -28,7 +28,14 @@ import sys
 import tempfile
 
 import torch
-from transformers import AutoConfig, AutoModelForCausalLM
+
+# transformers binds flash-linear-attention's Triton kernels at import time
+# whenever fla is importable, and they cannot run on a CPU: hide it, so the
+# linear-attention families take transformers' own torch paths.
+if "fla" not in sys.modules:
+    sys.modules["fla"] = None
+
+from transformers import AutoConfig, AutoModelForCausalLM  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lazy_checkpoint import LazyCheckpoint  # noqa: E402
@@ -100,10 +107,20 @@ def f32_arithmetic(model, store):
     bf16 load rounded them."""
     import types
     import torch.nn.functional as F
+    # Checkpoint names go through transformers' own renames for the family
+    # (GLM-5.3-Flash's `hc_attn_base` is the model's `attn_hc.base`).
+    from transformers import conversion_mapping as cm
+    renames = []
+    for c in (model.config, getattr(model.config, "text_config", None)):
+        if c is not None:
+            renames += [r for r in (cm.get_checkpoint_conversion_mapping(c.model_type) or []) if type(r).__name__ == "WeightRenaming"]
     f32_names = {}
     for k in store.keys():
         if store.header[k]["dtype"] == "F32" and k not in store.lazy["holes"]:
-            for cand in (k, k.split(".", 1)[1] if "." in k else k):
+            name = k
+            for r in renames:
+                name = r.rename_source_key(name)[0]
+            for cand in (name, name.split(".", 1)[1] if "." in name else name):
                 f32_names[cand] = k
     sd_names = dict(model.named_parameters())
     sd_names.update(dict(model.named_buffers()))

@@ -2809,3 +2809,30 @@ Warp mode over `hf://` with the chunk cache bounded to this disk:
 So on a 16 GB machine altar-1 needs 12.4 GB resident and, to avoid
 re-fetching the INT4 trunk on every forward pass, 28 GB of cache disk; with
 the 18 GB that fits here it runs, fetching the trunk each pass.
+
+## GLM-5.3-Flash: verified on real weights (within the bar, not to 1e-6)
+
+`zai-org/GLM-5.3-Flash`, first 4 layers: three Kimi Delta Attention layers
+with the dense MLP, then a NoPE MLA layer with the DSA indexer and the first
+MoE layer; mHC hyper-connections (4 streams) around every block, FP8 with
+128 x 128 blocks. Its `linear_attn_config` layer lists are 0-based, where
+Kimi's are 1-based, which `tools/truncate_checkpoint.py` now tells apart.
+Reference: transformers' `modeling_glm5_next.py` through
+`tools/ref_lazy_moe.py`, with flash-linear-attention hidden from transformers
+(installed for the K3 reference, its Triton kernels cannot run on a CPU) so
+the torch paths run, and F32-stored tensors restored under transformers'
+renamed names (`hc_attn_base` is `attn_hc.base`; restoring by checkpoint name
+first left them bf16-rounded in the reference, a 1.7e-04 error at entry 0).
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (5) | all 5 agree, worst 2.48e-05 | 2.98e-06 | match |
+| "Explain how rainbows form, …" | match (15) | all 5 agree, worst 4.20e-05 | 1.67e-05 | match |
+
+This is the one family of the pass that agrees to 1e-5 rather than 1e-6: the
+entries grow 1.3e-06 → 8.8e-06 → 2.5e-05 → 4.2e-05 over the KDA layers.
+Recomputing layer 1 in float64 with transformers' own module puts the float32
+reference within 3.9e-07 of it and ditch within 4.6e-06, so the excess is
+ditch's, and small: every epsilon (the hyper-connection RMS, the L2 norm of q
+and k, the gated output norm, the latent norms) and the lower-bound gate
+match the reference. Left open, 25x inside the 1e-3 bar.

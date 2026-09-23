@@ -84,12 +84,15 @@ for key in ('kv_source_layer_ids', 'index_source_layer_ids', 'engram_layer_ids',
         for p in paired.get(key, []):
             if isinstance(tc.get(p), list): tc[p] = [tc[p][j] for j in keep]
         tc[key] = [new_id[tc[key][j]] for j in keep]
-# Kimi-Linear / Kimi K3 name their layer kinds with 1-based ids.
+# Kimi-Linear / Kimi K3 name their layer kinds with 1-based ids,
+# GLM-5.3-Flash with 0-based ones (its lists contain a 0).
 lac = tc.get('linear_attn_config')
 if isinstance(lac, dict):
+    ids = [x for key in ('kda_layers', 'full_attn_layers') for x in (lac.get(key) or [])]
+    one = 0 if 0 in ids else 1
     for key in ('kda_layers', 'full_attn_layers'):
         if isinstance(lac.get(key), list):
-            lac[key] = [new_id[x - 1] + 1 for x in lac[key] if x - 1 in new_id]
+            lac[key] = [new_id[x - one] + one for x in lac[key] if x - one in new_id]
 # The dense-prefix count, for a cut that skips layers: the kept layers that
 # were dense (DeepSeek V3.2 --layers 0,3 keeps one dense layer, not three).
 if isinstance(tc.get('first_k_dense_replace'), int):
