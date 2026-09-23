@@ -33,8 +33,7 @@ return {
     each_layer(c.sliding_layers, function() return false end)
     local types = nil
     local al = cfg.attention_layers
-    -- A JSON array (a non-empty object is not one).
-    if type(al) == "table" and al ~= null and (#al > 0 or next(al) == nil) then
+    if is_array(al) then
       types = {}
       for i = 1, #al do types[i] = str(al[i]) or "global" end
     end
@@ -44,9 +43,9 @@ return {
       local at = cfg.attention_types
       for k = 1, len(at) do
         local item = at[k]
-        if type(item) == "table" and item ~= null and #item == 2 then
+        if is_array(item) and #item == 2 then
           local names_v, rep = item[1], item[2]
-          if type(names_v) == "table" and names_v ~= null and math.type(rep) == "integer" then
+          if is_array(names_v) and math.type(rep) == "integer" then
             for _ = 1, rep do
               for _, nv in ipairs(names_v) do
                 if type(nv) == "string" then list[#list + 1] = nv end

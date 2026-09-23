@@ -1,1 +1,1 @@
-[{"rotary_dim": "$delete"}, {"rotary_dim": null}, {"n_head": 8}]
+[{"rotary_dim": "$delete"}, {"rotary_dim": null}, {"n_head": 8}, {"n_head": 2}, {"n_head": 6, "n_embd": 48}]

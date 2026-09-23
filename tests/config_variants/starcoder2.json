@@ -1,1 +1,1 @@
-[{"use_bias": false}, {"use_bias": "$delete"}, {"norm_type": "$delete"}, {"norm_type": null}, {"norm_type": 1}]
+[{"use_bias": false}, {"use_bias": "$delete"}, {"norm_type": "$delete"}, {"norm_type": null}, {"norm_type": 1}, {"norm_type": "rms_norm"}]
