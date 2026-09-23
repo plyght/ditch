@@ -23,5 +23,5 @@ return {
     ple_norm = "post_per_layer_input_norm.weight",
     layer_scale = "layer_scalar",
   },
-  hook = "gemma4",
+  config = require("gemma").config_gemma4,
 }
