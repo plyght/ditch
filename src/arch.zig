@@ -646,6 +646,10 @@ pub const Arch = struct {
     /// ... and a Lua `config` function run after it (a reference into the
     /// definitions' Lua state, see models.zig).
     script: ?c_int = null,
+    /// The family a definition was derived from with `base`: its hook and
+    /// config function see this as `model_type`, so that one shared by
+    /// several families (Gemma 2 and 3) takes the base family's branch.
+    inherits: ?[]const u8 = null,
 };
 
 pub const Config = struct {
@@ -1590,8 +1594,11 @@ fn parseConfigIn(arena: Allocator, json_text: []const u8, comptime find: Finder)
         if (v == .bool) c.parallel_residual = v.bool;
     }
     if (getBool(attn_cfg, "alibi", false)) c.positional = .alibi;
+    const own_type = c.model_type;
+    if (arch.inherits) |t| c.model_type = t;
     if (arch.extra) |f| try f(&c, arena, obj);
     if (arch.script) |ref| try models.runConfig(ref, &c, arena, obj);
+    c.model_type = own_type;
     // Hooks may mark linear / Mamba layers after the fact (Kimi Linear's
     // kda_layers, the Jamba periods): those layers hold no attention block
     // unless the family runs both side by side.
