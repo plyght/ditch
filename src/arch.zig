@@ -1083,12 +1083,29 @@ pub fn sanitizeJson(arena: Allocator, text: []const u8) ![]const u8 {
     return out.toOwnedSlice();
 }
 
+/// The family of a remote-code config that names no `model_type` (MiniCPM4
+/// writes only `architectures` and `auto_map`): `MiniCPMForCausalLM` ->
+/// `minicpm`, when the lowercased class prefix is a registered model type.
+/// Without it such a config would be read as Llama and lose its family's
+/// scalings.
+fn typeFromArchitectures(arena: Allocator, obj: std.json.ObjectMap) ?[]const u8 {
+    const archs = obj.get("architectures") orelse return null;
+    if (archs != .array or archs.array.items.len == 0 or archs.array.items[0] != .string) return null;
+    const name = archs.array.items[0].string;
+    for ([_][]const u8{ "ForCausalLM", "LMHeadModel", "ForConditionalGeneration" }) |suffix| {
+        if (!std.mem.endsWith(u8, name, suffix)) continue;
+        const lower = std.ascii.allocLowerString(arena, name[0 .. name.len - suffix.len]) catch return null;
+        if (lookup(lower)) |a| return a.model_type;
+    }
+    return null;
+}
+
 pub fn parseConfig(arena: Allocator, json_text: []const u8) !Config {
     var parsed = try std.json.parseFromSlice(std.json.Value, arena, try sanitizeJson(arena, json_text), .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidConfig;
     var obj = parsed.value.object;
-    const top_type = getStr(obj, "model_type") orelse "llama";
+    const top_type = getStr(obj, "model_type") orelse typeFromArchitectures(arena, obj) orelse "llama";
     var model_type = top_type;
     // Omni wrappers (Qwen2.5-Omni, Qwen3-Omni) nest the language model under
     // the thinker; the talker and vocoder tensors are passed through.
@@ -5899,4 +5916,14 @@ test "parseConfig: BLOOM's n_embed spelling of the hidden size" {
     );
     try std.testing.expectEqual(@as(usize, 64), c.hidden_size);
     try std.testing.expectEqual(@as(usize, 2), c.num_layers);
+}
+
+test "parseConfig: a config without model_type takes its family from architectures" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const c = try parseConfig(arena.allocator(),
+        \\{"architectures":["MiniCPMForCausalLM"],"hidden_size":64,"num_attention_heads":4,"num_key_value_heads":2,"num_hidden_layers":2,"vocab_size":100,"scale_emb":12,"scale_depth":1.4,"dim_model_base":16}
+    );
+    try std.testing.expectEqualStrings("minicpm", c.arch.model_type);
+    try std.testing.expectEqual(@as(f32, 12), c.embed_scale);
 }

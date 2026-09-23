@@ -213,6 +213,11 @@ def main():
             cls = getattr(transformers, AutoConfig.from_pretrained(args.model, trust_remote_code=trc).architectures[0])
             model = cls.from_pretrained(args.model, dtype=getattr(torch, args.dtype))
     model.eval()
+    if trc:
+        # Remote code written for the tuple cache (MiniCPM4) refuses to start
+        # one itself; the comparison needs no cache, and generation passes a
+        # Cache object of its own.
+        model.config.use_cache = False
     ok = True
     captured = {}
     final_norm = find_final_norm(model)

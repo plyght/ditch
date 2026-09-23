@@ -3376,3 +3376,29 @@ RoPE, after Bug F8). Reference: transformers' `gemma4_unified` through
 | "The capital of France is" | match (5) | all 3 agree, worst 8.73e-07 | 4.02e-06 | match |
 | "Explain how rainbows form, …" | match (13) | all 3 agree, worst 1.57e-06 | 5.45e-06 | match |
 | the printing-press passage | match (310) | all 3 agree, worst 1.17e-06 | 4.95e-06 | match (1 token) |
+## Bug 64 — a config without `model_type` was run as Llama (fixed)
+
+**Symptom.** `openbmb/MiniCPM4-0.5B` loaded as `* Architecture: llama`.
+
+**Cause.** MiniCPM4's config.json has no `model_type`, only `architectures`
+(`MiniCPMForCausalLM`) and an `auto_map` to its own code. ditch defaulted a
+missing `model_type` to `llama`, which ran the model without MiniCPM's
+embedding scale (`scale_emb` 12), residual scale (`scale_depth / sqrt(layers)`)
+and logit scale (`hidden_size / dim_model_base`): a different model, with no
+error.
+
+**Fix.** Without `model_type`, the family is taken from `architectures[0]`
+when its lowercased class prefix (before `ForCausalLM`, `LMHeadModel` or
+`ForConditionalGeneration`) is a registered model type; a parse test covers
+MiniCPM4's config.
+
+**Check.** The release's remote code does not run faithfully under
+transformers 5, even with `tools/probe_reference.py`'s shims (now also
+`use_cache = False` for remote code, since this one refuses to start the tuple
+cache it was written for): it answers every prompt with `<|im_end|>` and
+differs from ditch by 8e-02 at layer 0. A float32 re-implementation of layer 0
+straight from `modeling_minicpm.py` (embedding × 12, RMSNorm, GQA with the
+LongRoPE short factors and scaling factor 1, residual × 1.4/√24, SwiGLU)
+agrees with ditch to 1.9e-07, and to 2.6e-02 without the short factors. So
+MiniCPM4 is verified against its own code by hand, one layer deep, not
+against a running reference.
