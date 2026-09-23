@@ -3190,6 +3190,7 @@ The float32 sweep of the older families, continued (routed experts lazy where ma
 | deepseek-ai/DeepSeek-V2-Lite-Chat | `deepseek_v2` | 2, lazy | match | 3.02e-07 | 8.04e-07 |
 | mistralai/Mixtral-8x7B-Instruct-v0.1 | `mixtral` | 1, lazy | match | 9.67e-07 | 1.27e-06 |
 | THUDM/glm-4-9b-chat | `chatglm` | 3 | match | 4.79e-06 | 2.70e-06 |
+| nvidia/NVIDIA-Nemotron-Nano-9B-v2 | `nemotron_h` | layers 0, 1, 14 (Mamba2, MLP, attention) | match | 7.85e-06 | 2.69e-06 |
 
 **`chatglm`.** The release's own modeling code does not run under transformers
 5 (`ChatGLMConfig` has no `max_length`), so the reference is transformers'
@@ -3204,7 +3205,6 @@ Not runnable here: `internlm/internlm2_5-1_8b-chat` ships a SentencePiece
 `tokenizer.model` and no `tokenizer.json` (refused, with the reason);
 `openbmb/MiniCPM-2B-sft-bf16` and `baichuan-inc/Baichuan2-7B-Chat` ship
 `.bin` weights only.
-| nvidia/NVIDIA-Nemotron-Nano-9B-v2 | `nemotron_h` | layers 0, 1, 14 (Mamba2, MLP, attention) | match | 7.85e-06 | 2.69e-06 |
 
 **Nemotron Nano 2 and the reference's BOS.** `tools/probe_reference.py` used
 to add the tokenizer's BOS whenever the rendered template did not start with
