@@ -42,14 +42,27 @@ function Install-Ditch {
         return
     }
 
-    Write-Host @'
-     _ _ _       _
-  __| (_) |_ ___| |__
- / _` | | __/ __| '_ \
-| (_| | | || (__| | | |
- \__,_|_|\__\___|_| |_|
-'@ -ForegroundColor White
-    Write-Host "  abliteration for every open model`n" -ForegroundColor DarkGray
+    # The wordmark (src/logo.txt): {W} starts the letters, {R} the thread, {0} resets.
+    $logo = @'
+            {W}.::::   .:.                     :::::{0}
+            {W}.*@@%  .%@@-                    .*@@#{0}
+             {W}+@@%   -+=.    +*.              +@@#        {R}/-`'`-\         __-`{0}
+        {W}-=++=*@@% .====. .-#@@+=:   :=+++=-  +@@#.-=+=:  {R}\     |    ___-`'{0}
+      {W}:%@%-..+@@%  .@@@= .-@@@-:. :%@%-..+#  +@@%-:=@@@= {R}\\__/____-`'{0}
+     {R}__{W}@@+   +@@%{R}___{W}@@@=  :@{R}______{W}%@@-   .: {R}______  {W}#@@+  {R}__'''{0}
+{R}-``'''''`--__-{W}@@%  {R}'{W}@{R}--__--'{W}@@:  {R}'{W}@@@{R}___--`''{W}+@@#{R}''``--``'{0}
+      {W}#@@*   +@@%   @@@=  :@@@:   #@@+       +@@#   #@@+{0}
+      {W}.*@@*=+#@@%-.-@@@*: .#@@#+= .+%@#++++ :#@@%- :%@@#:{0}
+         {W}.::. .... ......   .::.     ..::.  ...... ......{0}
+'@
+    if ($Host.UI.SupportsVirtualTerminal) {
+        $e = [char]27
+        $logo = $logo -replace '\{W\}', "$e[38;5;252m" -replace '\{R\}', "$e[38;5;174m" -replace '\{0\}', "$e[0m"
+    } else {
+        $logo = $logo -replace '\{[WR0]\}', ''
+    }
+    Write-Host $logo
+    Write-Host "`n  ditch censorship.`n" -ForegroundColor DarkGray
 
     $arch = $env:PROCESSOR_ARCHITEW6432
     if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }

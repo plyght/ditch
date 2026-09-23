@@ -34,6 +34,7 @@ const compute = @import("compute.zig");
 const selftest = @import("selftest.zig");
 const directions = @import("directions.zig");
 const remote = @import("remote.zig");
+const logo = @import("logo.zig");
 
 const Model = model_mod.Model;
 const Engine = engine_mod.Engine;
@@ -57,14 +58,6 @@ fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime
     // The process may exit right after an error: do not leave it in the buffer.
     t.writer.flush() catch {};
 }
-
-const banner =
-    \\    _ _ _       _
-    \\ __| (_) |_ __| |_
-    \\/ _` | |  _/ _| ' \
-    \\\__,_|_|\__\__|_||_|
-    \\
-;
 
 // ---------------------------------------------------------------------------
 // Ctrl+C handling
@@ -1401,7 +1394,8 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         std.process.exit(2);
     }
     if (!settings.quiet) {
-        try out.print("{s}  v{s}  ditch censorship.  https://github.com/plyght/ditch\n", .{ banner, config.version });
+        try logo.write(out, con.color);
+        try out.print("\n  v{s}  ditch censorship.  https://github.com/plyght/ditch\n", .{config.version});
         try out.writeAll("  Built on Heretic: https://github.com/p-e-w/heretic\n\n");
     }
     // Accelerate (macOS): resolved once, before any kernel runs.
