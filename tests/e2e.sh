@@ -672,8 +672,19 @@ grep -q " 0 0$" "$TMP/net.log" || fail "the server dropped no connection"
 # A run killed part-way through its load, then run again over the same cache:
 # the same output, and no chunk that was on disk fetched a second time.
 : > "$TMP/net.log"
-timeout -s KILL 3 "$DITCH" probe "http://127.0.0.1:$NPORT/slow-100/" --prompt "hello world" --max-response-length 6 \
-    --cache-dir "$TMP/net_kill" --remote-chunk-size 4KB --threads 4 > /dev/null 2>&1 && fail "the slow probe finished before it was killed"
+# (No `timeout`: macOS has none. The run is killed once it has kept 20 chunks.)
+"$DITCH" probe "http://127.0.0.1:$NPORT/slow-100/" --prompt "hello world" --max-response-length 6 \
+    --cache-dir "$TMP/net_kill" --remote-chunk-size 4KB --threads 4 > /dev/null 2>&1 &
+KILL_PID=$!
+for _ in $(seq 1 1200); do
+    kept=$( (find "$TMP/net_kill" -path '*/chunks/*' -type f ! -name '*.part' 2>/dev/null || true) | wc -l | tr -d ' ')
+    [ "$kept" -ge 20 ] && break
+    kill -0 "$KILL_PID" 2>/dev/null || break
+    sleep 0.1
+done
+kill -0 "$KILL_PID" 2>/dev/null || fail "the slow probe finished (or failed) before it was killed"
+kill -9 "$KILL_PID"
+wait "$KILL_PID" 2>/dev/null || true
 chunks_dir=$(echo "$TMP"/net_kill/models/*/main/chunks)
 [ -d "$chunks_dir" ] || fail "the killed run left no chunk directory"
 ( cd "$chunks_dir" && find . -type f ! -name '*.part' | sed 's|^[.]/||' | sort ) > "$TMP/net_kept.txt"
