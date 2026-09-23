@@ -4842,6 +4842,29 @@ float32 export.
   probe` on the export: residuals within 7.9e-07, logits 7.0e-07 of range,
   argmax and top-5 equal. ditch's reload check 0.0000.
 
+## Abliteration: GLM-5.3-Flash (`glm5_next`), KDA and MLA under mHC, FP8 blocks
+
+`zai-org/GLM-5.3-Flash`, layers 0 and 3 (KDA with the dense MLP, then NoPE
+MLA with the DSA indexer and the first MoE layer), the first 8 experts
+(`--experts 8`), mHC hyper-connections (4 streams) around every block, FP8
+with 128 x 128 blocks; float32 export (its config now says float32, bug 72).
+
+* **Edited set:** `self_attn.o_proj` in both layers (the KDA one, then the
+  MLA one), layer 0's `mlp.down_proj`, every routed expert's `down_proj` and
+  `shared_experts.down_proj`. The hyper-connection tensors (`attn_hc.*`,
+  `mlp_hc.*`, `hc_head`), the KDA gates, the indexer, the MLA projections and
+  the vision tower are untouched: a block writes into the streams only
+  through its output projection, which is where the direction is taken out.
+* **Maths:** FP8 originals dequantised by the checker; all 12 edited matrices
+  within 1.6e-06 of the best rank-3 approximation of the exact edit.
+* **Export:** transformers' `modeling_glm5_next.py` (torch KDA path) on the
+  export against `ditch probe`: residuals within 5.2e-06 (this family's
+  forward check sits at the same level, from the mHC mixing), logits 1.6e-06
+  of range, argmax and top-5 equal. The reference is the new
+  `tools/ref_plain.py`; `tools/ref_lazy_moe.py`, which this family's forward
+  check used, builds the routed experts empty for a lazy file and now also
+  keeps a sharded directory's index when there is no lazy file.
+
 ## Exact ranges for scattered experts: gpt-oss-20b with a cache below its experts
 
 After the account of gpt-oss-120b's decode above (whole 8 MB chunks per
