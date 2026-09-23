@@ -3333,3 +3333,33 @@ lazy).
 | prompt | tokens | residuals | first-token logits | greedy |
 | --- | :---: | :---: | ---: | :---: |
 | "The capital of France is" | match (5) | all 3 agree, worst 9.82e-07 | 5.00e-07 | match (2 tokens) |
+## Bug 63 — Falcon instruct was prompted in ditch's generic format (fixed)
+
+**Symptom.** `tiiuae/falcon-7b-instruct`, first 2 layers: the forward pass
+agreed to 2e-06 on ditch's ids, but the rendered prompt was
+`SYS\n\nUser: …\nAssistant:` where the release's template gives
+`SYS\n\nUser: …\n\nAssistant:`.
+
+**Cause.** ditch had no template for Falcon's: `system.strip()`, then
+`'\n\nUser: '` / `'\n\nAssistant: '` before each turn's content (stripped, with
+`\r\n` → `\n` and then `\n\n` → `\n`), then `'\n\nAssistant:'`. Nothing matched
+it, so ditch fell back to its generic `raw` rendering, which is close but not
+the same.
+
+**Fix.** A `falcon` template, detected from the release's markers (whether the
+Jinja source spells the line breaks as escapes or as the characters), with the
+content replacements applied in Python's order; tests cover the detection, the
+render and the replacements.
+
+| checkpoint | family | N | tokens | residuals (worst) | first-token logits |
+| --- | --- | ---: | :---: | ---: | ---: |
+| tiiuae/falcon-7b-instruct | `falcon` | 2 | match (after the fix) | 2.34e-06 | 2.77e-06 |
+| Qwen/Qwen3-0.6B | `qwen3` | 28 (all) | match | 5.64e-06 | 1.38e-06 |
+| allenai/FlexOlmo-7x7B-1T | `flex_olmo` | 2, lazy | match | 1.12e-06 | 8.31e-07 |
+| ibm-granite/granite-4.0-h-tiny | `granitemoehybrid` (MoE) | 6 | match | 1.84e-06 | 1.11e-06 |
+
+`unsloth/gemma-3n-E2B-it` cannot be cut this way: its per-layer embedding
+table (`embed_tokens_per_layer`, [vocab, layers x 256], 4 GB) has to be sliced
+by columns, which range requests on a row-major tensor cannot do in one piece,
+and ditch (like transformers) refuses a table sized for 30 layers in a
+5-layer model. Gemma 3n stays verified on the transformers stub only.

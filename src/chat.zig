@@ -105,6 +105,9 @@ pub const Template = enum {
     /// (a default system message is inserted when the conversation has none;
     /// `</think>` is the non-thinking generation prompt).
     laguna,
+    /// Falcon (7B/40B instruct): `{system}\n\nUser: ...\n\nAssistant:`, contents
+    /// stripped and with blank lines collapsed to single line breaks.
+    falcon,
     raw,
 
     pub fn parse(name: []const u8) ?Template {
@@ -171,6 +174,7 @@ pub fn detect(chat_template: ?[]const u8, model_type: []const u8) Template {
         if (has(t, "<|user|>")) return .olmo;
         if (has(t, "<<SYS>>")) return .llama2;
         if (has(t, "[INST]")) return if (has(t, "[SYSTEM_PROMPT]")) .mistral_v7 else if (has(t, "' [INST] '")) .mistral_spaced else .mistral;
+        if ((has(t, "'\n\nUser: '") and has(t, "'\n\nAssistant:'")) or (has(t, "'\\n\\nUser: '") and has(t, "'\\n\\nAssistant:'"))) return .falcon;
         if (has(t, "'User: '") and has(t, "'Assistant:'")) return .deepseek_v2;
     }
     if (arch.lookup(model_type)) |a| {
@@ -225,6 +229,28 @@ pub const Date = struct {
 pub var today: Date = .{};
 
 const month_names = [_][]const u8{ "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" };
+
+/// Falcon's `.replace('\r\n', '\n').replace('\n\n', '\n')`, applied in that order
+/// (one left-to-right pass each, as Python's replace does).
+fn writeFalconContent(w: *std.Io.Writer, s: []const u8) !void {
+    var crlf: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer crlf.deinit();
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        if (s[i] == '\r' and i + 1 < s.len and s[i + 1] == '\n') {
+            try crlf.writer.writeByte('\n');
+            i += 1;
+        } else try crlf.writer.writeByte(s[i]);
+    }
+    const t = crlf.written();
+    i = 0;
+    while (i < t.len) : (i += 1) {
+        if (t[i] == '\n' and i + 1 < t.len and t[i + 1] == '\n') {
+            try w.writeByte('\n');
+            i += 1;
+        } else try w.writeByte(t[i]);
+    }
+}
 
 fn trim(s: []const u8) []const u8 {
     return std.mem.trim(u8, s, " \t\r\n");
@@ -790,6 +816,18 @@ pub fn render(gpa: Allocator, template: Template, messages: []const Message) ![]
             }
             try w.writeAll("<|open|>message role=\"assistant\"<|sep|>");
         },
+        .falcon => {
+            var rest = messages;
+            if (rest.len > 0 and rest[0].role == .system) {
+                try w.writeAll(trim(rest[0].content));
+                rest = rest[1..];
+            }
+            for (rest) |m| {
+                try w.writeAll(if (m.role == .assistant) "\n\nAssistant: " else "\n\nUser: ");
+                try writeFalconContent(w, trim(m.content));
+            }
+            try w.writeAll("\n\nAssistant:");
+        },
         .raw => {
             for (messages) |m| {
                 switch (m.role) {
@@ -923,6 +961,7 @@ test "template detection and rendering" {
         .{ .t = .phi4, .want = "<|im_start|>system<|im_sep|>SYS<|im_end|><|im_start|>user<|im_sep|>U1<|im_end|><|im_start|>assistant<|im_sep|>" }, // microsoft/phi-4
         .{ .t = .phi4_mini, .want = "<|system|>SYS<|end|><|user|>U1<|end|><|assistant|>" }, // microsoft/Phi-4-mini-instruct
         .{ .t = .dots, .want = "<|system|>SYS<|endofsystem|><|userprompt|>U1<|endofuserprompt|><|response|>" }, // rednote-hilab/dots.llm1.inst
+        .{ .t = .falcon, .want = "SYS\n\nUser: U1\n\nAssistant:" }, // tiiuae/falcon-7b-instruct
         .{ .t = .llama32, .want = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 22 Sep 2026\n\nSYS<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nU1<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n" }, // unsloth/Llama-3.2-1B-Instruct
         .{ .t = .llama31, .want = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\nSYS<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nU1<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n" }, // unsloth/Meta-Llama-3.1-8B-Instruct, unsloth/Llama-3.3-70B-Instruct
         .{ .t = .hunyuan_moe, .want = "<|startoftext|>SYS<|extra_4|>U1<|extra_0|>" }, // tencent/Hunyuan-A13B-Instruct
@@ -961,4 +1000,13 @@ test "template detection and rendering" {
     try std.testing.expectEqualStrings("<|begin_of_text|>", templateBos("{{bos_token}}\n{%- if tools %}<|im_start|>", "<|begin_of_text|>"));
     try std.testing.expectEqualStrings("", templateBos("{% for m in messages %}<|im_start|>{{ bos_token }}", "<|begin_of_text|>"));
     try std.testing.expectEqualStrings("", templateBos("{{bos_token}}<|im_start|>", null));
+}
+
+test "falcon template: detection from the release, stripped and collapsed contents" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectEqual(Template.falcon, detect("{% for message in loop_messages %}{% if loop.index0 == 0 %}{{ system_message.strip() }}{% endif %}{% if message['role'] == 'user' %}{{ '\n\nUser: ' + message['content'].strip().replace('\r\n', '\n').replace('\n\n', '\n') }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '\n\nAssistant:' }}{% endif %}", "falcon"));
+    const out = try render(gpa, .falcon, &.{ .{ .role = .system, .content = " S " }, .{ .role = .user, .content = " a\r\n\r\nb\n\n\nc " }, .{ .role = .assistant, .content = "x" }, .{ .role = .user, .content = "y" } });
+    defer gpa.free(out);
+    // Python: 'a\r\n\r\nb\n\n\nc' -> 'a\n\nb\n\n\nc' -> 'a\nb\n\nc'
+    try std.testing.expectEqualStrings("S\n\nUser: a\nb\n\nc\n\nAssistant: x\n\nUser: y\n\nAssistant:", out);
 }
