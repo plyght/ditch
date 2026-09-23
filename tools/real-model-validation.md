@@ -5018,6 +5018,30 @@ export.
   (`tools/ref_kimi_k3.py`, whose helpers it borrows, now tolerates fla already
   hidden.) Reload check 0.0118.
 
+## Abliteration: DeepSeek V4.1 (`deepseek_v41`), FP4 experts, compressed KV, hyper-connections
+
+`deepseek-ai/DeepSeek-V4.1-Flash`, layers 0 and 2 (sliding window only, then
+the ratio-2 compressed-KV source with the indexer; layer 1's engram, a 98 GB
+table, is left out), the first 8 experts (`--experts 8`), FP8 trunk and FP4
+experts with ue8m0 `.scale`s in DeepSeek's own naming; float32 export.
+
+* **Edited set:** `attn.wo_b` in both layers (the grouped output projection's
+  second half, the one writing the residual; `wo_a` is untouched), every
+  routed expert's `w2` and `shared_experts.w2`. `wq_a/wq_b/wkv`, the
+  compressor, the indexer, the attention sinks, `w1`/`w3`, the gate and the
+  hyper-connection tensors are untouched; every FP4 `w1`/`w3` equals its
+  dequantised original.
+* **Maths:** the checker dequantises DeepSeek's FP8 / FP4 with their `.scale`s
+  itself (`ref_deepseek_v4.dequant`); all 20 edited matrices within 3.3e-06 of
+  the best rank-3 approximation of the exact edit. Found by this check: bug 73.
+* **Export:** the release's `inference/model.py` (`tools/ref_deepseek_v41.py`,
+  quantisation-aware rounding on, as released) on the export against `ditch
+  probe --raw`: residuals within 8.3e-07, logits 4.1e-07 of range, argmax and
+  top-5 equal. ditch's reload check is 0.0001 rather than 0.0000: the merged
+  float32 weights differ from `W x + B(A x)` in the last bits, and the FP8
+  rounding V4.1 applies to its window KV turns such differences into a flipped
+  code now and then (see the forward check above).
+
 ## Exact ranges for scattered experts: gpt-oss-20b with a cache below its experts
 
 After the account of gpt-oss-120b's decode above (whole 8 MB chunks per
@@ -5402,3 +5426,26 @@ Limits:
   report is truncate, load and forward, and chat template (Jinja) passed, the
   reference skipped with its `pip install` line, exit 0.
 
+
+## Bug 73 — DeepSeek V4 exports were written under ditch's internal names (fixed)
+
+**Symptom.** An abliterated export of DeepSeek V4.1 (as released: DeepSeek's
+own tensor names, `layers.N.attn.wo_b.weight`, `layers.N.ffn.experts.E.w2`,
+`embed.weight`) came out as `model.layers.N.self_attn.o_b_proj.weight`,
+`model.layers.N.mlp.experts.E.down_proj.weight`, `model.embed_tokens.weight`:
+the transformers-style spelling ditch renames them to on load. transformers
+has no V4.1, and the release's own `inference/model.py` (and the engines that
+read the release) know only DeepSeek's names, so nothing but ditch could load
+the export. The abliteration checker, matching tensors by name, found "0
+changed" against the cut.
+
+**Cause.** `deepseek_v4.renameNative` renames the tensors in place in the
+files' indexes, and `saveModel` writes each tensor under the name the model
+knows it by. Every other family's export keeps its checkpoint's names because
+no other family is renamed.
+
+**Fix.** `renameNative` records each new name's checkpoint name in
+`Model.export_names`, and the export writes that name. Test: `saveModel writes
+DeepSeek V4's own tensor names back` exports the `deepseek_v4_native` fixture,
+reloads it (which renames it again, so it was written in DeepSeek's names) and
+compares a weight row.

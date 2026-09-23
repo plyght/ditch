@@ -65,6 +65,10 @@ def orig(name):  # float32 view of a source tensor, dequantised (and rounded to 
         return convert_moe_packed_tensors(src.tensor(base + '_blocks'), src.tensor(base + '_scales')).float()
     if name in keys and src.header[name]['dtype'] not in ('F8_E4M3', 'U8', 'I8', 'I32'):
         return src.tensor(name).float()
+    if name in keys and base + '.scale' in keys and src.header[name]['dtype'] in ('I8', 'F8_E4M3'):
+        # DeepSeek V4's own naming: FP8 / FP4 (int8 nibble pairs) with a ue8m0 `.scale`
+        from ref_deepseek_v4 import dequant as dsv4_dequant
+        return dsv4_dequant(src.tensor(name), src.tensor(base + '.scale')).to(torch.bfloat16).float()
     if name in keys and ref_lazy_moe.ATTN_ROW_SHARDS > 1 and re.search(r'self_attn\.(qkv|q|k|v)_proj$', base) and base + '.weight_scale_inv' in keys:
         return dequant_expert(src, base, wq).to(torch.bfloat16).float()
     if name in keys and src.header[name]['dtype'] == 'F8_E4M3':

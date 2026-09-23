@@ -73,7 +73,7 @@ pub fn peakBytes(model: *const Model, export_dtype: ?tensor.DType) u64 {
         while (it.next()) |kv| {
             const info = kv.value_ptr.*;
             const out_dtype = if (!info.dtype.isFloat() and !info.dtype.isQuantized()) info.dtype else export_dtype orelse hfDtype(info.dtype);
-            const e = Entry{ .name = info.name, .info = info, .ref = model.store.refFor(fi, info), .out_dtype = out_dtype, .byte_len = info.numel() * out_dtype.size(), .edit = modifiedDelta(model, info.name) };
+            const e = Entry{ .name = model.export_names.get(info.name) orelse info.name, .info = info, .ref = model.store.refFor(fi, info), .out_dtype = out_dtype, .byte_len = info.numel() * out_dtype.size(), .edit = modifiedDelta(model, info.name) };
             const rows = rowsPerChunk(model, e);
             const cols = e.ref.cols;
             peak = @max(peak, @as(u64, rows) * (e.ref.dtype.rowBytes(cols) + 4 * cols + out_dtype.rowBytes(cols)));
@@ -292,6 +292,40 @@ fn stringEnd(json: []const u8, start: usize) ?usize {
     return null;
 }
 
+test "saveModel writes DeepSeek V4's own tensor names back" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const pool = tensor.Pool.init(io, 1);
+    const model = try Model.load(gpa, io, &pool, "tests/fixtures/deepseek_v4_native");
+    defer model.deinit();
+    try std.testing.expect(model.export_names.count() > 0);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path_buf);
+    const out_dir = try std.fs.path.join(gpa, &.{ path_buf[0..n], "out" });
+    defer gpa.free(out_dir);
+    var sink: Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try saveModel(gpa, io, model, out_dir, .{}, &sink.writer);
+    // The export is in the checkpoint's own naming (the FP8 weights now bf16,
+    // without their scales), and loads back to the same model.
+    const reloaded = try Model.load(gpa, io, &pool, out_dir);
+    defer reloaded.deinit();
+    // Loading the export renamed it again: it was written in DeepSeek's names.
+    try std.testing.expectEqualStrings("embed.weight", reloaded.export_names.get("model.embed_tokens.weight").?);
+    try std.testing.expectEqual(model.export_names.count() > 0, reloaded.export_names.count() > 0);
+    const w0 = model.componentWeight(0, .attn_o_proj);
+    const w1 = reloaded.componentWeight(0, .attn_o_proj);
+    const r0 = try gpa.alloc(f32, w0.cols);
+    defer gpa.free(r0);
+    const r1 = try gpa.alloc(f32, w1.cols);
+    defer gpa.free(r1);
+    w0.row(1, r0);
+    w1.row(1, r1);
+    try std.testing.expectEqualSlices(f32, r0, r1);
+}
+
 test "withConfigDtype names the export dtype" {
     const gpa = std.testing.allocator;
     const json =
@@ -338,7 +372,7 @@ fn saveModelInner(gpa: Allocator, io: Io, model: *const Model, dir: Io.Dir, opts
             // Integer tables (DeepSeek V4's `tid2eid`) are never converted.
             const out_dtype = if (!info.dtype.isFloat() and !info.dtype.isQuantized()) info.dtype else opts.export_dtype orelse hfDtype(info.dtype);
             const byte_len = info.numel() * out_dtype.size();
-            try entries.append(gpa, .{ .name = info.name, .info = info, .ref = model.store.refFor(fi, info), .out_dtype = out_dtype, .byte_len = byte_len, .edit = modifiedDelta(model, info.name) });
+            try entries.append(gpa, .{ .name = model.export_names.get(info.name) orelse info.name, .info = info, .ref = model.store.refFor(fi, info), .out_dtype = out_dtype, .byte_len = byte_len, .edit = modifiedDelta(model, info.name) });
             total += byte_len;
         }
     }
