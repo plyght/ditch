@@ -1089,7 +1089,6 @@ pub fn dumpFamily(a: Allocator, f: *const Arch) ![]u8 {
     return out.toOwnedSlice();
 }
 
-
 test "a family written as Lua loads back unchanged" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

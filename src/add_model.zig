@@ -128,8 +128,8 @@ const Checkpoint = struct {
 };
 
 const small_names = [_][]const u8{
-    "config.json",           "generation_config.json", "tokenizer.json",          "tokenizer_config.json", "tiktoken.model",
-    "tokenizer.model",       "chat_template.jinja",    "special_tokens_map.json", "model.safetensors.index.json",
+    "config.json",     "generation_config.json", "tokenizer.json",          "tokenizer_config.json",        "tiktoken.model",
+    "tokenizer.model", "chat_template.jinja",    "special_tokens_map.json", "model.safetensors.index.json",
 };
 
 /// Shard file names from an index's `weight_map` (sorted, unique).
@@ -436,10 +436,10 @@ fn tryLoad(ctx: Ctx, ck: *const Checkpoint, dir_path: []const u8, f: *const Arch
 /// Tensors that are not part of the text model a definition describes.
 fn outsideTextModel(name: []const u8) ?[]const u8 {
     const parts = [_]struct { []const u8, []const u8 }{
-        .{ "vision", "vision tower" },      .{ "visual", "vision tower" },         .{ "image", "vision tower" },
-        .{ "vit.", "vision tower" },        .{ "patch_embed", "vision tower" },    .{ "multi_modal_projector", "multimodal projector" },
-        .{ "mm_projector", "multimodal projector" }, .{ "audio", "audio tower" }, .{ "speech", "audio tower" },
-        .{ "talker", "speech decoder" },   .{ "token2wav", "speech decoder" },    .{ "mtp", "multi-token prediction head" },
+        .{ "vision", "vision tower" },               .{ "visual", "vision tower" },                        .{ "image", "vision tower" },
+        .{ "vit.", "vision tower" },                 .{ "patch_embed", "vision tower" },                   .{ "multi_modal_projector", "multimodal projector" },
+        .{ "mm_projector", "multimodal projector" }, .{ "audio", "audio tower" },                          .{ "speech", "audio tower" },
+        .{ "talker", "speech decoder" },             .{ "token2wav", "speech decoder" },                   .{ "mtp", "multi-token prediction head" },
         .{ "nextn", "multi-token prediction head" }, .{ "rotary_emb.inv_freq", "precomputed RoPE table" },
     };
     for (parts) |p| if (std.mem.indexOf(u8, name, p[0]) != null) return p[1];
@@ -628,18 +628,18 @@ fn expectedShape(a: Allocator, c: *const arch.Config, field: []const u8, li: usi
     const I = c.intermediate_size;
     const Im = c.moe_intermediate_size;
     const table = [_]struct { []const u8, [2]usize }{
-        .{ "embed", .{ c.vocab_size, H } },    .{ "lm_head", .{ c.vocab_size, H } },
-        .{ "q", .{ nh * hd, H } },             .{ "k", .{ kvh * hd, H } },
+        .{ "embed", .{ c.vocab_size, H } },      .{ "lm_head", .{ c.vocab_size, H } },
+        .{ "q", .{ nh * hd, H } },               .{ "k", .{ kvh * hd, H } },
         .{ "v", .{ kvh * c.layerVDim(li), H } }, .{ "o", .{ H, nh * c.layerVDim(li) } },
-        .{ "gate", .{ I, H } },                .{ "up", .{ I, H } },
-        .{ "down", .{ H, I } },                .{ "gate_up", .{ 2 * I, H } },
-        .{ "router", .{ c.num_experts, H } },  .{ "expert_gate", .{ Im, H } },
-        .{ "expert_up", .{ Im, H } },          .{ "expert_down", .{ H, Im } },
+        .{ "gate", .{ I, H } },                  .{ "up", .{ I, H } },
+        .{ "down", .{ H, I } },                  .{ "gate_up", .{ 2 * I, H } },
+        .{ "router", .{ c.num_experts, H } },    .{ "expert_gate", .{ Im, H } },
+        .{ "expert_up", .{ Im, H } },            .{ "expert_down", .{ H, Im } },
     };
     for (table) |e| if (std.mem.eql(u8, e[0], field)) return try a.dupe(usize, &e[1]);
     const vectors = [_]struct { []const u8, usize }{
-        .{ "final_norm", H }, .{ "input_norm", H }, .{ "pre_ff_norm", H }, .{ "post_attn_norm", H },
-        .{ "post_ff_norm", H }, .{ "mlp_norm", H }, .{ "q_norm", hd }, .{ "k_norm", hd },
+        .{ "final_norm", H },   .{ "input_norm", H }, .{ "pre_ff_norm", H }, .{ "post_attn_norm", H },
+        .{ "post_ff_norm", H }, .{ "mlp_norm", H },   .{ "q_norm", hd },     .{ "k_norm", hd },
     };
     for (vectors) |e| if (std.mem.eql(u8, e[0], field)) return try a.dupe(usize, &.{e[1]});
     return null;
@@ -779,17 +779,17 @@ fn affinity(a: Allocator, config_text: []const u8, own_type: []const u8, f: *con
 /// Keys that do not describe the computation (generation defaults, token
 /// ids, training settings, bookkeeping).
 const ignorable_keys = [_][]const u8{
-    "architectures",     "auto_map",               "model_type",          "torch_dtype",          "dtype",                 "transformers_version",
-    "_name_or_path",     "bos_token_id",           "eos_token_id",        "pad_token_id",         "sep_token_id",          "decoder_start_token_id",
-    "use_cache",         "initializer_range",      "attention_dropout",   "hidden_dropout",       "dropout",               "embd_pdrop",
-    "resid_pdrop",       "attn_pdrop",             "summary_type",        "summary_use_proj",     "summary_activation",    "summary_proj_to_labels",
-    "summary_first_dropout", "output_attentions",  "output_hidden_states", "return_dict",         "pretraining_tp",        "is_decoder",
-    "is_encoder_decoder", "tokenizer_class",       "router_aux_loss_coef", "output_router_logits", "router_z_loss_coef",   "aux_loss_alpha",
-    "seq_aux",           "use_flash_attn",         "_attn_implementation", "attn_implementation", "image_token_id",       "video_token_id",
-    "vision_start_token_id", "vision_end_token_id", "vision_token_id",    "chunk_size_feed_forward", "gradient_checkpointing", "num_nextn_predict_layers",
-    "mtp_num_layers",    "task_specific_params",   "id2label",            "label2id",             "problem_type",          "use_return_dict",
-    "ffn_dropout",       "hidden_dropout_prob",    "attention_probs_dropout_prob", "classifier_dropout", "layerdrop",       "mlp_dropout",
-    "quantization_config", "vision_config",        "audio_config",        "text_config",          "thinker_config",        "talker_config",
+    "architectures",         "auto_map",             "model_type",                   "torch_dtype",             "dtype",                  "transformers_version",
+    "_name_or_path",         "bos_token_id",         "eos_token_id",                 "pad_token_id",            "sep_token_id",           "decoder_start_token_id",
+    "use_cache",             "initializer_range",    "attention_dropout",            "hidden_dropout",          "dropout",                "embd_pdrop",
+    "resid_pdrop",           "attn_pdrop",           "summary_type",                 "summary_use_proj",        "summary_activation",     "summary_proj_to_labels",
+    "summary_first_dropout", "output_attentions",    "output_hidden_states",         "return_dict",             "pretraining_tp",         "is_decoder",
+    "is_encoder_decoder",    "tokenizer_class",      "router_aux_loss_coef",         "output_router_logits",    "router_z_loss_coef",     "aux_loss_alpha",
+    "seq_aux",               "use_flash_attn",       "_attn_implementation",         "attn_implementation",     "image_token_id",         "video_token_id",
+    "vision_start_token_id", "vision_end_token_id",  "vision_token_id",              "chunk_size_feed_forward", "gradient_checkpointing", "num_nextn_predict_layers",
+    "mtp_num_layers",        "task_specific_params", "id2label",                     "label2id",                "problem_type",           "use_return_dict",
+    "ffn_dropout",           "hidden_dropout_prob",  "attention_probs_dropout_prob", "classifier_dropout",      "layerdrop",              "mlp_dropout",
+    "quantization_config",   "vision_config",        "audio_config",                 "text_config",             "thinker_config",         "talker_config",
 };
 
 const KeyReport = struct { unread: []const []const u8, read: usize };
