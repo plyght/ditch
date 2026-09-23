@@ -145,6 +145,23 @@ fn makePrompts(gpa: std.mem.Allocator, texts: []const []const u8) ![]hf.Prompt {
     return out;
 }
 
+test "warp-mode estimate: a layer is its trunk plus the top-k experts, not every expert" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const pool = tensor.Pool.init(io, 2);
+    const params: budget_mod.EstimateParams = .{ .batch_size = 1, .max_prompt_tokens = 16, .max_response_length = 4, .threads = 2 };
+    const plain = try Model.loadWithOptions(gpa, io, &pool, "tests/fixtures/qwen3_moe_big", .{ .store = .streamed, .expert_cache = 0 });
+    const all = budget_mod.estimate(plain, params);
+    plain.deinit();
+    const warp = try Model.loadWithOptions(gpa, io, &pool, "tests/fixtures/qwen3_moe_big", .{ .store = .streamed });
+    defer warp.deinit();
+    try std.testing.expect(warp.warp());
+    const est = budget_mod.estimate(warp, params);
+    try std.testing.expectEqual(warp.largest_layer_bytes, est.largest_layer_bytes);
+    try std.testing.expect(est.largest_layer_bytes < all.largest_layer_bytes);
+    try std.testing.expect(est.min_streamed_bytes < all.min_streamed_bytes);
+}
+
 test "calibration, two trials, export and reload stay under the memory budget" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

@@ -4145,3 +4145,14 @@ all three.
             Qwen3.8-Flash-Next   warp mode min 3.23GB; trunk 14.91GB stored; row-read tables 95.37GB
             gpt-oss-120b         unchanged (min 4.45GB, trunk 3.96GB)
 
+## Bug F11 — the warp-mode largest tensor counted stacked routed experts (fixed)
+
+`--dry-run` on `hf://moonshotai/Kimi-K3` refused `--max-ram 10GB` with a
+56 GB minimum: the by-name layer sum counted all 896 experts of a layer,
+which the fix above (row tables and unselected experts) also closes. The
+largest tensor had the same flaw where a layer's experts are one stacked
+tensor (gpt-oss's `experts.gate_up_proj`, 4.2 GB decoded on gpt-oss-120b
+against its 1.16 GB LM head): warp mode never holds it whole. Routed-expert
+tensors are now left out of the largest tensor in warp mode. Regression
+test: "warp-mode estimate: a layer is its trunk plus the top-k experts, not
+every expert" (`src/stream_test.zig`).
