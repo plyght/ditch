@@ -2585,3 +2585,22 @@ runs its PyTorch fallbacks for the causal conv and the chunked delta rule.
 | --- | :---: | :---: | ---: | :---: |
 | "The capital of France is" | match (24) | all 5 agree, worst 3.23e-07 | 5.15e-07 | match |
 | "Explain how rainbows form, …" | match (30) | all 5 agree, worst 1.68e-07 | 5.90e-07 | match |
+
+## dots.llm1 (`dots1`): verified
+
+`rednote-hilab/dots.llm1.inst`, first 2 layers (layer 0 dense, layer 1 the
+128-expert top-6 sigmoid MoE with correction bias and a shared expert), routed
+experts lazy.
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (16) | all 3 agree, worst 8.53e-07 | 1.40e-06 | match |
+| "Explain how rainbows form, …" | match (22) | all 3 agree, worst 2.29e-07 | 1.34e-06 | match |
+
+A caution on the tolerance. The first run, with ditch reading the routed
+experts as zeros (holes not yet filled), also passed the 1e-3 check: with every
+routed expert zeroed, layer 1's output moves by only 4.5e-04 of the residual's
+largest entry, which one massive-activation channel dominates. The result above
+still verifies the experts, with the difference ~500 times below that, but a
+pass at 1e-3 alone would not have: for a short cut of a model with massive
+activations, read the worst residual difference, not only the verdict.
