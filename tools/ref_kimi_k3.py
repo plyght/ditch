@@ -2,6 +2,11 @@
 
     python3 tools/probe_reference.py MODEL probe.json --dtype float32 --raw --trust-remote-code --factory tools/ref_kimi_k3.py
 
+MODEL is a truncated checkpoint directory, or the Hub id `moonshotai/Kimi-K3`
+for the whole release at full depth: each decoder layer is then read from the
+Hub before it runs and dropped after (tools/ref_stream.py), and the experts
+the gate picks are read in parallel as it picks them.
+
 transformers has no Kimi K3, so the reference is the release's
 `modeling_kimi_linear.py` (the text model inside KimiK3ForConditionalGeneration),
 run unmodified except for what needs a GPU: its flash-linear-attention (fla)
@@ -103,10 +108,25 @@ def shim_transformers():
         generic.OutputRecorder = OutputRecorder
 
 
+def a_log_heads(t, p):
+    """The release stores A_log with head_dim (128) entries for num_heads (96)
+    heads, which its own code cannot load; the first num_heads are taken, as
+    ditch does (an assumption: no released loader was available to confirm it)."""
+    return t[: p.shape[0]].clone() if t.shape[0] > p.shape[0] else t
+
+
 def load(model_dir, dtype=torch.float32):
     shim_transformers()
-    store = LazyCheckpoint(model_dir)
-    cfg = json.load(open(os.path.join(model_dir, "config.json")))
+    # A Hub id streams the whole release a layer at a time (tools/ref_stream.py).
+    streamed = not os.path.isdir(model_dir)
+    if streamed:
+        import ref_stream
+        from huggingface_hub import hf_hub_download
+        store = ref_stream.Store(ref_stream.Source(model_dir, os.environ.get("REF_STREAM_REVISION")))
+        cfg = json.load(open(hf_hub_download(model_dir, "config.json")))
+    else:
+        store = LazyCheckpoint(model_dir)
+        cfg = json.load(open(os.path.join(model_dir, "config.json")))
     cls = get_class_from_dynamic_module("modeling_kimi_linear.KimiLinearForCausalLM", model_dir)
     cfg_cls = get_class_from_dynamic_module("configuration_kimi_k3.KimiLinearConfig", model_dir)
     mod = sys.modules[cls.__module__]
@@ -154,17 +174,15 @@ def load(model_dir, dtype=torch.float32):
                 name = f"{mname}.{pname}" if mname else pname
                 if ".experts." in name and ".shared_experts." not in name:
                     continue
+                if streamed and name.startswith("model.layers."):
+                    continue  # read when the layer runs
                 key = PREFIX + name
                 if key not in store.keys():
                     missing.append(name)
                     continue
                 t = store.tensor(key)
-                if pname == "A_log" and t.shape[0] > p.shape[0]:
-                    # The release stores A_log with head_dim (128) entries for
-                    # num_heads (96) heads, which its own code cannot load; the
-                    # first num_heads are taken, as ditch does (an assumption:
-                    # no released loader was available to confirm it).
-                    t = t[: p.shape[0]].clone()
+                if pname == "A_log":
+                    t = a_log_heads(t, p)
                 if tuple(t.shape) != tuple(p.shape):
                     raise SystemExit(f"reference: {name} is {tuple(t.shape)} in the checkpoint, {tuple(p.shape)} in the model")
                 m._parameters[pname] = nn.Parameter(t, requires_grad=False)
@@ -181,6 +199,14 @@ def load(model_dir, dtype=torch.float32):
         for e, ex in enumerate(moe.experts):
             base = f"{PREFIX}model.layers.{i}.block_sparse_moe.experts.{e}."
             ex.w1, ex.w2, ex.w3 = (LazyLinear(store, base + n) for n in ("w1", "w2", "w3"))
+        if streamed:
+            def routed(gate, inp, out, i=i):
+                # Every expert the gate picked is read now, in parallel.
+                for e in torch.unique(out[0]).tolist():
+                    base = f"{PREFIX}model.layers.{i}.block_sparse_moe.experts.{e}."
+                    store.prefetch(base, [base + n + sfx for n in ("w1", "w2", "w3") for sfx in
+                                          (".weight", ".weight_packed", ".weight_scale", ".weight_shape", ".weight_zero_point")])
+            moe.gate.register_forward_hook(routed)
     # Float32 arithmetic on the stored values.
     def f32_linear(self, x):
         # In blocks of output rows, so a large weight (the LM head) is never
@@ -203,6 +229,27 @@ def load(model_dir, dtype=torch.float32):
         for p in model.parameters():
             if id(p) not in linears and p.is_floating_point() and p.device.type != "meta":
                 p.data = p.data.float()
+    if streamed:
+        layers = list(model.model.layers)
+        linear_names = [{n + ".weight" for n, m in layer.named_modules() if isinstance(m, nn.Linear)} for layer in layers]
+
+        def fetch(i):
+            # As stored, Linear weights in their stored dtype (they compute in
+            # float32 as above), everything else float32.
+            params = dict(layers[i].named_parameters())
+            got = store.tensors([f"{PREFIX}model.layers.{i}.{n}" for n in params])
+            out = {}
+            for n, p in params.items():
+                t = got[f"{PREFIX}model.layers.{i}.{n}"]
+                if n.endswith("A_log"):
+                    t = a_log_heads(t, p)
+                out[n] = t if n in linear_names[i] or not t.is_floating_point() else t.float()
+            return out
+
+        stream = ref_stream.LayerStreamer(layers, fetch)
+        for i, layer in enumerate(layers):
+            layer.register_forward_pre_hook(lambda m, a, i=i: stream.materialise(i))
+            layer.register_forward_hook(lambda m, a, o, i=i: stream.release(i))
     return Reference(model, store)
 
 

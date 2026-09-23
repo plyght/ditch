@@ -656,6 +656,7 @@ class Store:
         self.lazy = {"holes": {}, "filled": {}}
         self.pool = cf.ThreadPoolExecutor(8)
         self.futures = {}  # prefix -> future of {name: tensor}
+        self.by_name = {}  # name -> that future, for `tensor`
 
     def keys(self):
         return self.src.entries.keys()
@@ -664,6 +665,9 @@ class Store:
         pass
 
     def tensor(self, name):
+        fut = self.by_name.pop(name, None)
+        if fut is not None:
+            return fut.result()[name]
         return self.src.tensors([name])[name]
 
     def tensors(self, names):
@@ -683,12 +687,19 @@ class Store:
         """Starts reading `names` (those that exist) in the background, keyed by `prefix`."""
         if prefix not in self.futures:
             names = [n for n in names if n in self.src.entries]
-            self.futures[prefix] = self.pool.submit(self.tensors, names)
+            fut = self.futures[prefix] = self.pool.submit(self.tensors, names)
+            for n in names:
+                self.by_name[n] = fut
 
     def take(self, prefix):
         """What `prefetch(prefix, ...)` read, or None if it was never asked for."""
         fut = self.futures.pop(prefix, None)
-        return fut.result() if fut is not None else None
+        if fut is None:
+            return None
+        got = fut.result()
+        for n in got:
+            self.by_name.pop(n, None)
+        return got
 
 
 class LayerStreamer:
