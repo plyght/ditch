@@ -2637,3 +2637,13 @@ with RoPE, then a global layer without it; post-norms and q/k norms).
 | --- | :---: | :---: | ---: | :---: |
 | "The capital of France is" | match (27) | all 5 agree, worst 5.93e-07 | 1.34e-06 | match |
 | "Explain how rainbows form, …" | match (33) | all 5 agree, worst 1.01e-06 | 7.57e-07 | match |
+
+## Granite 3.3 2B (`granite`): verified
+
+`ibm-granite/granite-3.3-2b-instruct`, first 4 layers (embedding, residual,
+attention and logit multipliers).
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (24) | all 5 agree, worst 5.45e-07 | 1.31e-06 | match |
+| "Explain how rainbows form, …" | match (30) | all 5 agree, worst 2.41e-07 | 7.58e-07 | match |
