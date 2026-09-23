@@ -422,8 +422,31 @@ fn familySource(a: Allocator, name: []const u8, f: *const Arch, overrides: []con
     return out.written();
 }
 
-/// The first slot whose tensor at layer 0 does not have the shape the
-/// family's reading of config.json implies.
+/// The first layer where a slot is used (null: none, or a slot whose shape
+/// is not checked): attention slots on a full-attention layer (not with
+/// MLA, whose projections are low-rank), dense MLP slots on a dense layer,
+/// the router on an MoE layer.
+fn slotLayer(c: *const arch.Config, field: []const u8) ?usize {
+    const attn = [_][]const u8{ "q", "k", "v", "o", "q_norm", "k_norm" };
+    const dense = [_][]const u8{ "gate", "up", "down", "gate_up" };
+    if (contains(&attn, field)) {
+        if (c.mla != null) return null;
+        for (c.attn_layers, 0..) |on, i| if (on) return i;
+        return null;
+    }
+    if (contains(&dense, field)) {
+        for (c.mlp_layers, c.moe_layers, 0..) |mlp, moe, i| if (mlp and !moe) return i;
+        return null;
+    }
+    if (std.mem.eql(u8, field, "router")) {
+        for (c.moe_layers, 0..) |moe, i| if (moe) return i;
+        return null;
+    }
+    return 0;
+}
+
+/// The first slot whose tensor does not have the shape the family's
+/// reading of config.json implies, at a layer where the slot is used.
 fn shapeMismatch(a: Allocator, ck: *const Checkpoint, f: *const Arch, c: *const arch.Config) !?[]const u8 {
     @setEvalBranchQuota(20000);
     const names = &f.names;
@@ -431,7 +454,7 @@ fn shapeMismatch(a: Allocator, ck: *const Checkpoint, f: *const Arch, c: *const 
     inline for (@typeInfo(Names).@"struct".fields) |nf| {
         const T = nf.type;
         if (comptime (T == []const u8 or T == ?[]const u8 or T == []const []const u8) and !std.mem.eql(u8, nf.name, "prefixes") and !std.mem.eql(u8, nf.name, "layer") and !std.mem.eql(u8, nf.name, "expert") and !std.mem.startsWith(u8, nf.name, "expert_") and !std.mem.startsWith(u8, nf.name, "shared_")) {
-            if (try expectedShape(a, c, nf.name, 0)) |want| {
+            if (slotLayer(c, nf.name)) |li| if (try expectedShape(a, c, nf.name, li)) |want| {
                 const v = @field(names.*, nf.name);
                 var list: []const []const u8 = &.{};
                 if (T == []const u8) list = &.{v} else if (T == ?[]const u8) {
@@ -439,7 +462,7 @@ fn shapeMismatch(a: Allocator, ck: *const Checkpoint, f: *const Arch, c: *const 
                 } else list = v;
                 const model_level = contains(&model_fields, nf.name);
                 for (list) |tpl| {
-                    const full = if (std.mem.indexOf(u8, tpl, "{p}") != null or model_level) try expand(a, tpl, prefix, 0, null) else try std.fmt.allocPrint(a, "{s}{s}", .{ try expand(a, names.layer, prefix, 0, null), tpl });
+                    const full = if (std.mem.indexOf(u8, tpl, "{p}") != null or model_level) try expand(a, tpl, prefix, li, null) else try std.fmt.allocPrint(a, "{s}{s}", .{ try expand(a, names.layer, prefix, li, null), tpl });
                     if (ck.find(full)) |t| {
                         // A Conv1D family stores [in][out]; either orientation is its own.
                         const ok = t.is(want) or (f.conv1d and want.len == 2 and t.is(&.{ want[1], want[0] }));
@@ -448,7 +471,7 @@ fn shapeMismatch(a: Allocator, ck: *const Checkpoint, f: *const Arch, c: *const 
                         }
                     }
                 }
-            }
+            };
         }
     }
     return null;
