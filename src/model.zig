@@ -1,8 +1,9 @@
 //! Transformer model loading and inference for decoder-only Hugging Face
 //! checkpoints. The family-specific knowledge (tensor names, norm and
 //! residual layout, attention/MLP layouts, positional encoding, MoE routing)
-//! lives in the architecture registry (`arch.zig`); this module is the
-//! generic loader and forward pass driven by a `Config`.
+//! lives in the model definitions (`src/models/*.lua`, read into an
+//! `arch.Arch` by models.zig); this module is the generic loader and forward
+//! pass driven by a `Config`.
 //!
 //! Weights are accessed through a `stream.WeightStore`: memory-mapped by
 //! default, or streamed layer by layer from disk under a memory budget

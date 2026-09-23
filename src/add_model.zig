@@ -1180,13 +1180,15 @@ fn match(ctx: Ctx, ck: *const Checkpoint, work: []const u8, own_type: []const u8
         while (round < 24) : (round += 1) {
             trial_no += 1;
             const trial_type = try std.fmt.allocPrint(a, "add_model_trial_{d}", .{trial_no});
+            const started = Io.Timestamp.now(ctx.io, .awake);
             const t = try tryLoad(ctx, ck, work, cand.family, overrides.items, trial_type);
+            const secs = @as(f64, @floatFromInt(started.durationTo(Io.Timestamp.now(ctx.io, .awake)).nanoseconds)) / 1e9;
             if (t.ok) {
                 var trial = t;
                 trial.absent = try absentTemplates(a, ck, t.used, &cand.cfg);
                 trial.keys_unread = if (classifyKeys(a, try retype(a, config_text, t.used.model_type))) |k| k.unread.len else |_| std.math.maxInt(usize);
                 trial.affinity = affinity(a, config_text, own_type, cand.family);
-                try out.print("  {s}{s}: loads; {d} tensor(s) of the text model unread, {d} of its names absent, {d} config key(s) unread\n", .{ cand.family.model_type, if (overrides.items.len > 0) " (renamed)" else "", countText(t.unread), trial.absent, trial.keys_unread });
+                try out.print("  {s}{s}: loads ({d:.1}s); {d} tensor(s) of the text model unread, {d} of its names absent, {d} config key(s) unread\n", .{ cand.family.model_type, if (overrides.items.len > 0) " (renamed)" else "", secs, countText(t.unread), trial.absent, trial.keys_unread });
                 if (best == null or better(trial, best.?)) best = trial;
                 break;
             }

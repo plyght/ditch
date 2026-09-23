@@ -336,7 +336,7 @@ Nine families have a GGUF path, for reading a `.gguf` model and for
 `gemma2`, `gemma3`.
 
 Every other family loads from safetensors only; `--export-format gguf` on one
-of them is an error. The registry carries the llama.cpp architecture name of
+of them is an error. Each definition carries the llama.cpp architecture name of
 each family regardless, so adding a family to the GGUF path is a matter of
 tensor-name mapping.
 
