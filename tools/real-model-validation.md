@@ -2511,3 +2511,13 @@ route to, then both sides are run again on the filled file.
 | --- | :---: | :---: | ---: | :---: |
 | "The capital of France is" | match (14) | all 3 agree, worst 6.36e-07 | 7.67e-07 | match |
 | "Explain how rainbows form, …" | match (20) | all 3 agree, worst 6.51e-07 | 8.04e-07 | match |
+
+## Seed-OSS-36B (`seed_oss`): verified
+
+`ByteDance-Seed/Seed-OSS-36B-Instruct`, first 2 layers (dense, GQA with q/k/v
+biases and an o_proj without one).
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (23) | all 3 agree, worst 1.48e-06 | 1.50e-06 | match |
+| "Explain how rainbows form, …" | match (29) | all 3 agree, worst 1.37e-06 | 1.58e-06 | match |
