@@ -252,7 +252,7 @@ EOF2
 	fi
 	info "$dir/ditch"
 
-	# The documented example of every setting, next to where a user config.lua goes.
+	# The documented example of every setting, next to where config.lua goes.
 	conf="${XDG_CONFIG_HOME:-$HOME/.config}/ditch"
 	if mkdir -p "$conf" 2>/dev/null && [ -f "$tmp/$name/config.default.lua" ]; then
 		cp "$tmp/$name/config.default.lua" "$conf/config.default.lua"

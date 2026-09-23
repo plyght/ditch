@@ -135,13 +135,29 @@ Defaults are Heretic's: `mlabonne/harmless_alpaca`, `mlabonne/harmful_behaviors`
 
 ## Configuration
 
-Settings live in `config.lua` (or `--config FILE`), a sandboxed Lua 5.4 script
-returning a table keyed like the flags; every option is documented in
-[`config.default.lua`](config.default.lua), and Heretic `config.toml` files are
-accepted. Precedence, highest first: flags, `DITCH_*` environment variables
-(`DITCH_THREADS`, `DITCH_MAX_RAM`, `DITCH_CACHE`, `DITCH_DEVICE`,
-`DITCH_REMOTE_CACHE_SIZE`, `DITCH_NO_COLOR`),
-`./config.lua`, then `$XDG_CONFIG_HOME/ditch/config.lua`. Messages go to stderr
+Settings live in `~/.config/ditch/config.lua` (`$XDG_CONFIG_HOME/ditch`, or
+`--config FILE`), a sandboxed Lua 5.4 script returning a table keyed like the
+flags; every option is documented in [`config.default.lua`](config.default.lua),
+which the installer puts beside it. Settings for one model go in its `models`
+table, keyed by id or by pattern:
+
+```lua
+return {
+  max_ram = "12GB",
+  models = {
+    ["Qwen/Qwen3-8B"] = { max_ram = "8GB", seed = 7 },
+    ["openai/gpt-oss-*"] = { expert_cache = "4GB" },
+  },
+}
+```
+
+A model whose settings outgrow an entry can have a file of its own,
+`~/.config/ditch/configs/<org>/<name>.lua` (`configs/<name>.lua` for a local
+directory or GGUF). Precedence, highest first: flags, `DITCH_*` environment
+variables (`DITCH_THREADS`, `DITCH_MAX_RAM`, `DITCH_CACHE`, `DITCH_DEVICE`,
+`DITCH_REMOTE_CACHE_SIZE`, `DITCH_NO_COLOR`), the model's own file, its
+`models` entries (an exact id over a pattern, a more specific pattern over a
+looser one), then the general settings. Messages go to stderr
 and results to stdout (`--json` for one JSON document, `--plain` for
 grep-friendly lines); `--no-input` turns every prompt into an error naming the
 flag to pass instead.
@@ -416,7 +432,12 @@ every layer, and `tools/probe_reference.py MODEL probe.json` compares all of it
 with transformers on the CPU, naming the layer a forward pass first diverges
 at. Config and tensor names can be checked without the weights: `ditch
 --dry-run hf://owner/name --max-ram 6GB` fetches the index and the shard
-headers only, runs the loader and stops at the memory estimate.
+headers only, runs the loader and stops at the memory estimate. For a model
+too large to check whole, `ditch truncate MODEL K OUT` writes a checkpoint of
+its first K decoder layers (`--layers 0,1,20` for chosen ones, renumbered;
+`--kinds` for the fewest layers covering every layer kind) by range-reading
+only those tensors, quantisation untouched and every per-layer list in
+config.json cut to match; `--drop mtp.` leaves out tensors by name prefix.
 
 Exit codes: 0 success (including `--dry-run` and a clean stop at
 `--time-limit`), 1 failure, 2 usage error or a memory budget too small for the

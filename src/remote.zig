@@ -279,7 +279,7 @@ pub const Source = struct {
             std.log.err("no tokenizer.json, tiktoken.model or tokenizer.model at {s}", .{self.base_url});
             return error.ModelNotFound;
         }
-        const optional = [_][]const u8{ "tokenizer_config.json", "generation_config.json", "special_tokens_map.json", "chat_template.jinja", "model.safetensors.index.json" };
+        const optional = [_][]const u8{ "tokenizer_config.json", "generation_config.json", "special_tokens_map.json", "chat_template.jinja", "chat_template.json", "model.safetensors.index.json" };
         for (optional) |name| try self.fetchSmall(dir, name, false, out);
 
         // Shard list from the index (or the single-file layout).

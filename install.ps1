@@ -137,7 +137,7 @@ function Install-Ditch {
         Copy-Item -Force $exe (Join-Path $dir 'ditch.exe')
         Info (Join-Path $dir 'ditch.exe')
 
-        # The documented example of every setting, next to where a user config.lua goes.
+        # The documented example of every setting, next to where config.lua goes.
         $conf = Join-Path $env:USERPROFILE '.config\ditch'
         $example = Join-Path $tmp "$name\config.default.lua"
         if (Test-Path $example) {

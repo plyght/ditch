@@ -189,7 +189,7 @@ test "calibration, two trials, export and reload stay under the memory budget" {
     try budget_mod.check(est, &budget, &sink.writer);
 
     var settings = config.Settings{ .batch_size = 1, .max_response_length = 4, .threads = 2, .max_ram = limit };
-    var engine = engine_mod.Engine.init(budget.allocator(), model, &settings, .raw);
+    var engine = engine_mod.Engine.init(budget.allocator(), model, &settings, .named(.raw));
     defer engine.deinit();
     const good = try makePrompts(gpa, &.{ "hello world", "the cat sat", "one two three four five" });
     defer gpa.free(good);

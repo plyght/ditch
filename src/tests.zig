@@ -17,9 +17,10 @@ comptime {
     _ = @import("abliterate.zig");
     _ = @import("directions.zig");
     _ = @import("tpe.zig");
-    _ = @import("toml.zig");
+    _ = @import("tree.zig");
     _ = @import("config.zig");
     _ = @import("chat.zig");
+    _ = @import("jinja.zig");
     _ = @import("hf.zig");
     _ = @import("engine.zig");
     _ = @import("scorers.zig");
@@ -44,4 +45,6 @@ comptime {
     _ = @import("wrap.zig");
     _ = @import("remote.zig");
     _ = @import("remote_test.zig");
+    _ = @import("truncate.zig");
+    _ = @import("truncate_test.zig");
 }
