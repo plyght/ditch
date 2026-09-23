@@ -983,7 +983,13 @@ pub const RemoteFile = struct {
                 if (body.len > src.chunk_size or body.len < in_chunk + dest.len) {
                     src.gpa.free(body);
                     self.abandon(index);
-                    return error.UnexpectedEndOfFile;
+                    // Before the shard length is known (its header), a body
+                    // shorter than the read needs is taken for a transfer cut
+                    // short and fetched again; a few times over, it is the end
+                    // of the file.
+                    retries += 1;
+                    if (retries > 3 or body.len > src.chunk_size) return error.UnexpectedEndOfFile;
+                    continue;
                 }
                 @memcpy(dest, body[@intCast(in_chunk)..][0..dest.len]);
                 self.keep(io, dir, index, name, body);
@@ -1149,7 +1155,19 @@ pub const RemoteFile = struct {
 
     fn fetchHeld(self: *RemoteFile, start: u64, last: u64) ![]u8 {
         const src = self.src;
-        const body = try src.http.getRange(self.url, start, last);
+        // The whole range, clipped at the end of the shard: a shorter body
+        // is a transfer cut short, and is retried. The shard length comes
+        // from its header, or from the first response's Content-Range.
+        src.lockAcquire();
+        const known: ?u64 = if (self.len > 0) self.len else null;
+        src.lockRelease();
+        const got = try src.http.getRangeChecked(self.url, start, last, known);
+        const body = got.body;
+        if (known == null) if (got.total) |t| {
+            src.lockAcquire();
+            if (self.len == 0) self.len = t;
+            src.lockRelease();
+        };
         _ = src.ranges_fetched.fetchAdd(1, .monotonic);
         _ = src.bytes_fetched.fetchAdd(body.len, .monotonic);
         return body;

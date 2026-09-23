@@ -1509,7 +1509,7 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     // `ditch truncate`: range-reads a few layers into a new checkpoint; no
     // threads, device or memory budget.
     if (settings.truncate) {
-        var http = try hf.Http.initWithOptions(gpa, io, arena, init.environ_map, .{ .token_file = settings.token_file, .timeout_seconds = settings.http_timeout_seconds });
+        var http = try hf.Http.initWithOptions(gpa, io, arena, init.environ_map, .{ .token_file = settings.token_file, .timeout_seconds = settings.http_timeout_seconds, .retry_timeout_seconds = settings.remote_retry_timeout_seconds });
         defer http.deinit();
         try truncate_mod.runCli(gpa, arena, io, &http, settings, out, con.result);
         return;
@@ -1527,7 +1527,7 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         }
         installSigint();
         try out.flush();
-        var http = try hf.Http.initWithOptions(gpa, io, arena, init.environ_map, .{ .token_file = settings.token_file, .timeout_seconds = settings.http_timeout_seconds });
+        var http = try hf.Http.initWithOptions(gpa, io, arena, init.environ_map, .{ .token_file = settings.token_file, .timeout_seconds = settings.http_timeout_seconds, .retry_timeout_seconds = settings.remote_retry_timeout_seconds });
         defer http.deinit();
         try push_mod.push(gpa, &http, settings.model, repo, .{ .private = settings.private }, con.log);
         return;
@@ -1623,7 +1623,7 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     }
 
     // Model.
-    var http = try hf.Http.initWithOptions(gpa, io, arena, init.environ_map, .{ .token_file = settings.token_file, .timeout_seconds = settings.http_timeout_seconds });
+    var http = try hf.Http.initWithOptions(gpa, io, arena, init.environ_map, .{ .token_file = settings.token_file, .timeout_seconds = settings.http_timeout_seconds, .retry_timeout_seconds = settings.remote_retry_timeout_seconds });
     defer http.deinit();
     // A push at the end of the run must not fail on what can be checked now.
     if (settings.push_to_hub) |repo| {

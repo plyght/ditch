@@ -4308,6 +4308,14 @@ after the first n. Regression test: "remote source: a read that fails while
 loading is reported, not taken for a missing tensor" (`src/remote_test.zig`;
 before the fix it fails with `MissingWeights`).
 
+
+Final behaviour (after the resilience change below): a failed read is still
+never taken for an absent tensor, and a transient failure no longer ends
+the run at all. The remote source waits for the network and resumes; only a
+permanent error (404 on a file the index names, 401/403, a server without
+range support, a size that stays wrong after refetches) or Ctrl+C reaches
+`loadVecOpt`, which passes it on.
+
 ## Bug F15 — a rate-limited small file was taken for a missing one, and remembered (fixed)
 
 The first dry run of `hf://MiniMaxAI/MiniMax-M3`, during the same
@@ -5014,3 +5022,49 @@ In both runs the last check, the independent recomputation of the edit
 (`check_abliteration.py`), exited 0 without writing its report and is marked
 failed by verify; that is verify's harness, the same for any model, and not
 the draft.
+
+
+## Network failures are waited out, and a killed run resumes
+
+With the owner's agreement after F13/F14, a transient failure of the remote
+source no longer ends a run. A timeout, a reset or refused connection, a DNS
+failure, a 5xx, a 429 or a body cut short is retried until it succeeds,
+backing off 2 s doubled per failure up to 3 minutes, each with up to a
+quarter of jitter; every request of the source waits out the same back-off
+(F13's shared cooldown), and one status line is printed per back-off step
+instead of a warning per request:
+
+    warning: hf: connection lost (HttpError); retrying in 2 s, Ctrl+C to stop
+    warning: hf: connection restored after 3 s; resuming
+
+Ctrl+C stops a run that is waiting (`error.Interrupted`), and
+`--remote-retry-timeout <time>` (config `remote_retry_timeout`, default
+none) ends a request that has kept failing that long, for scripted use.
+Only a permanent error ends a run: 404 on a file the index names, 401/403
+(with the HF_TOKEN hint), a server without range support, or a size that is
+still wrong after refetches. Two gaps found on the way are closed: curl's
+exit status was not checked, so a transfer cut after the status line (curl
+exit 18) returned a short body as a success; and the native client's `fetch`
+returns what arrived when a connection closes before the Content-Length. The
+native path now reads the response head itself (a short body is
+`TruncatedBody`, retried), both paths report the resource length from
+`Content-Range`, and a remote shard learns its length from its first range
+response, so that every body is checked against the whole range asked for,
+even before the shard header is parsed.
+
+Restarts already reused verified chunks and refetched leftover `.part`
+files; the study journal resumes with `--checkpoint-action`. Tests
+(`tools/range_server.py` gains `/outage-<after>-<ms>/`, which drops every
+connection for a while once `after` range requests were served,
+`/truncate-<n>/`, which cuts the first n bodies in half, and `/slow-<ms>/`):
+
+- unit (`src/remote_test.zig`): an outage mid-load and one mid-prefill, and
+  12 truncated transfers on the native client and on curl, each loading and
+  prefilling with logits bit-identical to the local model; the retry timeout
+  ending a read against a server that stays away after 1 s; Ctrl+C ending a
+  read that waits for the network within 5 s;
+- end to end (`tests/e2e.sh`): `ditch probe` over the range server prints
+  the same first-token logits and greedy text through a 1.5 s outage two
+  thirds into its requests (and reports the outage and its end), and a probe
+  killed (SIGKILL) part-way through its load and run again over the same
+  cache prints the same, without fetching any chunk the killed run had kept.

@@ -367,6 +367,10 @@ return {
   -- remote_weights = false,
   -- remote_chunk_size = "8MB",
   -- remote_connections = 16,
+  -- A transient network failure (a timeout, a lost connection, a 5xx or a
+  -- 429) is retried until the network comes back, all requests backing off
+  -- together; set a limit (e.g. "30m") to end the run instead.
+  -- remote_retry_timeout = nil,
   -- Disk bound of that chunk cache (per model and revision). When a new
   -- chunk would exceed it, least recently used chunks are evicted, chunks of
   -- the trunk (every tensor but the routed experts, re-read by every trial)

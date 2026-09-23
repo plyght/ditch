@@ -13,6 +13,7 @@ const remote = @import("remote.zig");
 const safetensors = @import("safetensors.zig");
 const model_mod = @import("model.zig");
 const tensor = @import("tensor.zig");
+const budget_mod = @import("budget.zig");
 
 const Model = model_mod.Model;
 const fixture = "tests/fixtures/qwen3_moe_big";
@@ -587,9 +588,9 @@ test "remote source: a rate-limited server is waited out, the concurrent readers
     var env: Env = undefined;
     try env.init(gpa, io);
     defer env.deinit();
-    const saved = hf.Http.rate_limited_base_ms;
-    hf.Http.rate_limited_base_ms = 20;
-    defer hf.Http.rate_limited_base_ms = saved;
+    const saved = hf.Http.retry_base_ms;
+    hf.Http.retry_base_ms = 20;
+    defer hf.Http.retry_base_ms = saved;
     const shard = "model-00001-of-00002.safetensors";
     var dir = try Io.Dir.cwd().openDir(io, fixture, .{});
     defer dir.close(io);
@@ -621,9 +622,9 @@ test "remote source: a rate-limited server is waited out, the concurrent readers
 test "remote source: rate-limited small files are waited for, not taken for missing ones" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const saved = hf.Http.rate_limited_base_ms;
-    hf.Http.rate_limited_base_ms = 20;
-    defer hf.Http.rate_limited_base_ms = saved;
+    const saved = hf.Http.retry_base_ms;
+    hf.Http.retry_base_ms = 20;
+    defer hf.Http.retry_base_ms = saved;
     // Both download paths: the native client, and curl (which exits 22 for a 404 and a 429 alike).
     for ([_]bool{ true, false }) |native| {
         var env: Env = undefined;
@@ -742,6 +743,163 @@ test "remote prefetchRange: sparse hints fetch exact ranges, served to the reads
     try std.testing.expectEqualSlices(f32, want, got);
     const st = src.stats();
     try std.testing.expect(st.partial_ranges > 0 and st.partial_hits > 0);
+}
+
+/// Short back-offs for the tests that make the server fail; restored by `restore`.
+const FastRetry = struct {
+    base: u64,
+    max: u64,
+
+    fn set() FastRetry {
+        const saved: FastRetry = .{ .base = hf.Http.retry_base_ms, .max = hf.Http.retry_max_ms };
+        hf.Http.retry_base_ms = 20;
+        hf.Http.retry_max_ms = 200;
+        return saved;
+    }
+
+    fn restore(self: FastRetry) void {
+        hf.Http.retry_base_ms = self.base;
+        hf.Http.retry_max_ms = self.max;
+    }
+};
+
+fn countStatus0(gpa: std.mem.Allocator, io: Io, env: *Env) !usize {
+    const log_path = try env.path("requests.log");
+    defer gpa.free(log_path);
+    const text = try Io.Dir.cwd().readFileAlloc(io, log_path, gpa, .unlimited);
+    defer gpa.free(text);
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        if (std.mem.endsWith(u8, line, " 0 0")) n += 1;
+    }
+    return n;
+}
+
+test "remote source: a server that goes away mid-load or mid-prefill is waited for, the logits unchanged" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const pool = tensor.Pool.init(io, 2);
+    const saved = FastRetry.set();
+    defer saved.restore();
+    const local = try Model.load(gpa, io, &pool, fixture);
+    defer local.deinit();
+    const want = try firstTokenLogits(gpa, local, &long_ids);
+    defer gpa.free(want);
+    // After 6 range requests the shard headers are being read; after 40 the
+    // prefill is fetching the trunk and experts. The server drops every
+    // connection for 600 ms, then serves again.
+    for ([_]u32{ 6, 40 }) |after| {
+        var env: Env = undefined;
+        try env.init(gpa, io);
+        defer env.deinit();
+        const scratch = try env.path("scratch");
+        defer gpa.free(scratch);
+        const url = try std.fmt.allocPrint(gpa, "{s}outage-{d}-600/", .{ env.base_url, after });
+        defer gpa.free(url);
+        const cache = try env.path("cache");
+        defer gpa.free(cache);
+        const src = try remote.Source.open(gpa, io, &env.http, cache, url, .{ .chunk_size = chunk }, &env.sink.writer);
+        defer src.deinit();
+        const model = try loadRemote(gpa, io, &pool, src, scratch);
+        defer model.deinit();
+        const got = try firstTokenLogits(gpa, model, &long_ids);
+        defer gpa.free(got);
+        try std.testing.expectEqualSlices(f32, want, got);
+        try std.testing.expect(try countStatus0(gpa, io, &env) > 0);
+    }
+}
+
+test "remote source: transfers cut short are fetched again, the logits unchanged" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const pool = tensor.Pool.init(io, 2);
+    const saved = FastRetry.set();
+    defer saved.restore();
+    const local = try Model.load(gpa, io, &pool, fixture);
+    defer local.deinit();
+    const want = try firstTokenLogits(gpa, local, &long_ids);
+    defer gpa.free(want);
+    // Both download paths: the native client, and curl.
+    for ([_]bool{ true, false }) |native| {
+        var env: Env = undefined;
+        try env.init(gpa, io);
+        defer env.deinit();
+        env.http.native_ok = native;
+        const scratch = try env.path("scratch");
+        defer gpa.free(scratch);
+        const url = try std.fmt.allocPrint(gpa, "{s}truncate-12/", .{env.base_url});
+        defer gpa.free(url);
+        const cache = try env.path("cache");
+        defer gpa.free(cache);
+        const src = try remote.Source.open(gpa, io, &env.http, cache, url, .{ .chunk_size = chunk }, &env.sink.writer);
+        defer src.deinit();
+        const model = try loadRemote(gpa, io, &pool, src, scratch);
+        defer model.deinit();
+        const got = try firstTokenLogits(gpa, model, &long_ids);
+        defer gpa.free(got);
+        try std.testing.expectEqualSlices(f32, want, got);
+        try std.testing.expectEqual(@as(usize, 12), try countStatus0(gpa, io, &env));
+        // No truncated chunk was kept: a second pass reads them all from disk intact.
+        const again = try firstTokenLogits(gpa, model, &long_ids);
+        defer gpa.free(again);
+        try std.testing.expectEqualSlices(f32, want, again);
+    }
+}
+
+test "remote source: --remote-retry-timeout ends a run whose server stays away" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const saved = FastRetry.set();
+    defer saved.restore();
+    var env: Env = undefined;
+    try env.init(gpa, io);
+    defer env.deinit();
+    env.http.retry_timeout_seconds = 1;
+    // Down from the first range request for a minute.
+    const url = try std.fmt.allocPrint(gpa, "{s}outage-0-60000/", .{env.base_url});
+    defer gpa.free(url);
+    const cache = try env.path("cache");
+    defer gpa.free(cache);
+    const t0 = Io.Timestamp.now(io, .awake);
+    const src = try remote.Source.open(gpa, io, &env.http, cache, url, .{ .chunk_size = chunk }, &env.sink.writer);
+    defer src.deinit();
+    var buf: [8]u8 = undefined;
+    const rf = try src.openFile("model-00001-of-00002.safetensors");
+    // The connection error of the last attempt (which one depends on the client).
+    if (rf.readRange(io, 0, &buf)) |_| return error.TestUnexpectedResult else |_| {}
+    const secs = @as(f64, @floatFromInt(t0.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds)) / 1e9;
+    try std.testing.expect(secs >= 1.0 and secs < 10.0);
+}
+
+test "remote source: Ctrl+C stops a read that is waiting for the network" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const saved = FastRetry.set();
+    defer saved.restore();
+    var env: Env = undefined;
+    try env.init(gpa, io);
+    defer env.deinit();
+    const url = try std.fmt.allocPrint(gpa, "{s}outage-0-60000/", .{env.base_url});
+    defer gpa.free(url);
+    const cache = try env.path("cache");
+    defer gpa.free(cache);
+    const src = try remote.Source.open(gpa, io, &env.http, cache, url, .{ .chunk_size = chunk }, &env.sink.writer);
+    defer src.deinit();
+    const rf = try src.openFile("model-00001-of-00002.safetensors");
+    defer budget_mod.interrupt_requested.store(false, .seq_cst);
+    const t = try std.Thread.spawn(.{}, struct {
+        fn press(i: Io) void {
+            i.sleep(Io.Duration.fromNanoseconds(300 * std.time.ns_per_ms), .awake) catch {};
+            budget_mod.interrupt_requested.store(true, .seq_cst);
+        }
+    }.press, .{io});
+    defer t.join();
+    const t0 = Io.Timestamp.now(io, .awake);
+    var buf: [8]u8 = undefined;
+    try std.testing.expectError(error.Interrupted, rf.readRange(io, 0, &buf));
+    const secs = @as(f64, @floatFromInt(t0.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds)) / 1e9;
+    try std.testing.expect(secs < 5.0);
 }
 
 test "remote chunk cache: size 0 keeps nothing on disk" {
