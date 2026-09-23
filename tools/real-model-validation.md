@@ -2616,3 +2616,14 @@ experts lazy. The chat template's long default system block makes both prompts
 | --- | :---: | :---: | ---: | :---: |
 | "The capital of France is" | match (83) | all 3 agree, worst 1.81e-06 | 1.09e-06 | match |
 | "Explain how rainbows form, …" | match (88) | all 3 agree, worst 2.97e-06 | 9.83e-07 | match |
+
+## GLM-4.5-Air (`glm4_moe`): verified
+
+`zai-org/GLM-4.5-Air`, first 2 layers (layer 0 dense, layer 1 the 128-expert
+top-8 sigmoid MoE with correction bias and a shared expert; partial rotary,
+q/k/v biases), routed experts lazy.
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (18) | all 3 agree, worst 6.51e-07 | 8.74e-07 | match |
+| "Explain how rainbows form, …" | match (24) | all 3 agree, worst 8.26e-07 | 8.97e-07 | match |
