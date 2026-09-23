@@ -73,7 +73,9 @@ fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime
 // ---------------------------------------------------------------------------
 
 var interrupted = std.atomic.Value(bool).init(false);
-/// The model argument, for the `ditch add-model` suggestion on an unknown model_type.
+/// The model argument, for the `ditch add-model` suggestion on an unknown
+/// model_type; a copy, since the settings are freed before the error is reported.
+var model_arg_buf: [std.fs.max_path_bytes]u8 = undefined;
 var model_arg: []const u8 = "";
 
 fn onSigint(_: std.posix.SIG) callconv(.c) void {
@@ -1484,7 +1486,10 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     // Lua model definitions of the user, then of --models-dir; they shadow
     // built-in definitions of the same model_type.
     try loadUserModels(arena, io, settings, env, out);
-    model_arg = settings.model;
+    if (settings.model.len <= model_arg_buf.len) {
+        @memcpy(model_arg_buf[0..settings.model.len], settings.model);
+        model_arg = model_arg_buf[0..settings.model.len];
+    }
 
     // Accelerate (macOS): resolved once, before any kernel runs.
     tensor.accelerate_enabled = settings.accelerate;
@@ -1504,7 +1509,7 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     // `ditch truncate`: range-reads a few layers into a new checkpoint; no
     // threads, device or memory budget.
     if (settings.truncate) {
-        var http = try hf.Http.initWithOptions(gpa, io, arena, init.environ_map, .{ .token_file = settings.token_file, .timeout_seconds = settings.http_timeout_seconds });
+        var http = try hf.Http.initWithOptions(gpa, io, arena, init.environ_map, .{ .token_file = settings.token_file, .timeout_seconds = settings.http_timeout_seconds, .retry_timeout_seconds = settings.remote_retry_timeout_seconds });
         defer http.deinit();
         try truncate_mod.runCli(gpa, arena, io, &http, settings, out, con.result);
         return;
@@ -1522,7 +1527,7 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         }
         installSigint();
         try out.flush();
-        var http = try hf.Http.initWithOptions(gpa, io, arena, init.environ_map, .{ .token_file = settings.token_file, .timeout_seconds = settings.http_timeout_seconds });
+        var http = try hf.Http.initWithOptions(gpa, io, arena, init.environ_map, .{ .token_file = settings.token_file, .timeout_seconds = settings.http_timeout_seconds, .retry_timeout_seconds = settings.remote_retry_timeout_seconds });
         defer http.deinit();
         try push_mod.push(gpa, &http, settings.model, repo, .{ .private = settings.private }, con.log);
         return;
@@ -1618,7 +1623,7 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     }
 
     // Model.
-    var http = try hf.Http.initWithOptions(gpa, io, arena, init.environ_map, .{ .token_file = settings.token_file, .timeout_seconds = settings.http_timeout_seconds });
+    var http = try hf.Http.initWithOptions(gpa, io, arena, init.environ_map, .{ .token_file = settings.token_file, .timeout_seconds = settings.http_timeout_seconds, .retry_timeout_seconds = settings.remote_retry_timeout_seconds });
     defer http.deinit();
     // A push at the end of the run must not fail on what can be checked now.
     if (settings.push_to_hub) |repo| {
@@ -1700,6 +1705,9 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         std.log.err("unknown chat template: {s} (expected model, or a family such as chatml, llama3, mistral, gemma or raw)", .{name});
         return error.InvalidChatTemplate;
     };
+    // The compiled chat template is metadata held for the whole run, like
+    // the model's arena: outside the budget, so that a budget too small for
+    // the weights is still explained by the feasibility check below.
     var format = try engine_mod.modelFormat(gpa, model, settings.chat_template);
     defer format.deinit();
     if (format.template != null) {

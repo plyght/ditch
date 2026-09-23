@@ -225,7 +225,7 @@ def main():
             cls = getattr(transformers, AutoConfig.from_pretrained(args.model, trust_remote_code=trc).architectures[0])
             model = cls.from_pretrained(args.model, dtype=getattr(torch, args.dtype))
     model.eval()
-    if trc:
+    if trc and hasattr(model, "config"):
         # Remote code written for the tuple cache (MiniCPM4) refuses to start
         # one itself; the comparison needs no cache, and generation passes a
         # Cache object of its own.
@@ -291,7 +291,7 @@ def main():
             # The Mamba families record each block's *output* and no embedding
             # entry: put the embedding first so entry L is what layer L reads (the
             # last block's output is then the pre-norm last entry; the normed one goes).
-            if want_residuals and getattr(model.config, "model_type", "") in ("mamba", "mamba2", "falcon_mamba"):
+            if want_residuals and getattr(getattr(model, "config", None), "model_type", "") in ("mamba", "mamba2", "falcon_mamba"):
                 out.hidden_states = (model.get_input_embeddings()(input_ids),) + tuple(out.hidden_states)[:-1]
         if want_residuals:
             hc = captured.get("hc")

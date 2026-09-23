@@ -4308,6 +4308,14 @@ after the first n. Regression test: "remote source: a read that fails while
 loading is reported, not taken for a missing tensor" (`src/remote_test.zig`;
 before the fix it fails with `MissingWeights`).
 
+
+Final behaviour (after the resilience change below): a failed read is still
+never taken for an absent tensor, and a transient failure no longer ends
+the run at all. The remote source waits for the network and resumes; only a
+permanent error (404 on a file the index names, 401/403, a server without
+range support, a size that stays wrong after refetches) or Ctrl+C reaches
+`loadVecOpt`, which passes it on.
+
 ## Bug F15 — a rate-limited small file was taken for a missing one, and remembered (fixed)
 
 The first dry run of `hf://MiniMaxAI/MiniMax-M3`, during the same
@@ -4778,6 +4786,62 @@ first 8 of 256 experts (`--experts 8`); float32 export.
   the export: residuals within 2.95e-06, logits 9.3e-07 of range, argmax and
   top-5 equal on both prompts.
 
+## Abliteration: Kimi K3 (`kimi_k3`), latent MoE with MXFP4 experts
+
+`moonshotai/Kimi-K3`, layers 0, 1 and 3 (KDA with the dense MLP, KDA with the
+latent MoE, MLA with the latent MoE), the first 8 of 896 experts
+(`--experts 8`), routed experts MXFP4 as released; bf16 export (the cut is
+9.6 GB, an f32 export does not fit beside it).
+
+* **Edited set:** `self_attn.o_proj` (KDA in layer 1, MLA in layer 2),
+  `shared_experts.down_proj` and `block_sparse_moe.routed_expert_up_proj` in
+  layers 1 and 2. K3's routed experts run in a 3584-wide latent space: their
+  `w2` writes the latent, and `routed_expert_up_proj` takes the weighted sum
+  back to the 7168-wide residual, so that projection, not each expert's `w2`,
+  is the one writing the refusal direction; the experts, the latent down
+  projection and its norm, the router and the KDA gates are untouched. Layer 0
+  sits outside both weight windows in both trials run. (The checker first
+  counted the latent up projection as an attention matrix and applied the
+  wrong λ; it now classes it with the MLP outputs.)
+* **MXFP4 experts:** exported dequantised to bf16 (the MXFP4 values are exact
+  in bf16), `quantization_config` dropped; the checker finds every expert
+  tensor equal to its dequantised original.
+* **Maths (bf16 export):** 99.93-99.97% of the elements bit-equal to
+  `bf16(W + D₃)`; the error against the exact edit exceeds that rounded
+  floor by at most 9.9e-08. Two trials (global scope, then per-layer scope)
+  both land there. Reload check 0.0132 (bf16 rounding of the merged weights).
+* **Export:** the release's own code (`tools/ref_kimi_k3.py`) on the export
+  against `ditch probe --raw`: residuals within 9.1e-07, logits 9.4e-07 of
+  range, argmax and top-5 equal. Loading it needed bug 71's fix (the export
+  had no `configuration_kimi_k3.py` / `modeling_*.py` / `tokenization_kimi.py`),
+  and two reference fixes: `ref_kimi_k3.py` imports fla before
+  `ref_lazy_moe.py`, which otherwise hides it from the release's modeling
+  file, and `probe_reference.py` no longer assumes a factory's model has a
+  `config`. This cut keeps the released `attn_res_block_size` of 12.
+
+## Abliteration: GLM-5.3 (`glm_moe_dsa`), FP8 blocks, MLA with the DSA indexer
+
+`zai-org/GLM-5.3`, layers 0 and 3 (dense, then the first MoE layer), the first
+8 of 256 experts (`--experts 8`), FP8 with 128 x 128 block scales throughout;
+float32 export.
+
+* **Edited set:** `self_attn.o_proj` in both layers, layer 0's dense
+  `mlp.down_proj`, every routed expert's `down_proj` and
+  `shared_experts.down_proj`. The MLA projections (`q_a/q_b/kv_a/kv_b`), the
+  DSA indexer (`indexer.*`), `gate_proj`/`up_proj`, the router and its
+  correction bias are untouched.
+* **Maths:** the checker dequantises the FP8 originals itself (128 x 128
+  blocks, partial last block); all 12 edited matrices within 1.35e-06 of the
+  best rank-3 approximation of the exact edit. The first trial drew
+  `mlp.down_proj.max_weight` = -0.0965, which the search clamps to 0 (its range
+  starts at -0.25, so a trial can leave the MLPs alone), and edited only the two
+  `o_proj`s (2.4e-08); the recorded trial is the next seed's, which edits the
+  MLPs with λ ≈ 0.05.
+* **Export:** float32, `quantization_config` dropped.
+  transformers' `modeling_glm_moe_dsa.py` loads it as it is; against `ditch
+  probe` on the export: residuals within 7.9e-07, logits 7.0e-07 of range,
+  argmax and top-5 equal. ditch's reload check 0.0000.
+
 ## Exact ranges for scattered experts: gpt-oss-20b with a cache below its experts
 
 After the account of gpt-oss-120b's decode above (whole 8 MB chunks per
@@ -4825,3 +4889,205 @@ copies every top-level `*.py` beside the tokenizer and processor files: the
 modules `auto_map` names and the ones they import, as transformers'
 `save_pretrained` does for remote code. Test: `saveModel carries the remote
 code` exports the qwen2 fixture with Kimi K3's file names beside it.
+
+# Lua model definitions and add-model
+
+The families moved from the Zig table in `src/arch.zig` to Lua definitions
+(`src/models/*.lua`), and `ditch add-model` drafts a definition from a
+checkpoint (docs/models.md, "Model definitions in Lua"). This section records
+how both were checked on real releases. Machine: the same 4-core, 15 GB
+cloud container; Hub access through the proxy; torch 2.14.0+cpu and
+transformers 5.17.0 for `ditch verify`'s reference.
+
+## The move itself
+
+Every family's Arch and config reading was compared between the Zig registry
+and the Lua definitions before the Zig side was removed: all 93 Arches
+field by field (tensor names, layout, hook), and the parsed configuration of
+the 114 fixture config.json files plus 1 758 variants of them
+(`tests/config_variants/*.json`, patches covering every key and branch the
+old hooks read, refusals included; 1 782 now). Each port was
+mutation-checked (one line broken at a time; about 140 mutations, all caught
+once the variants covered them except four that give the same result for
+every config). The recorded hashes are `tests/config_variants/snapshot.txt`.
+
+Three readings changed on purpose afterwards (commit "Honour Qwen's
+use_sliding_window, …"): Qwen2/Qwen3 now drop `sliding_window` unless
+`use_sliding_window` is set (it was applied to every layer, exact below the
+window only); Gemma 3 keeps its 5:1 default pattern (a generic "Gemma 2
+alternates" rule overwrote it); Qwen3.5-MoE honours an explicit
+`norm_topk_prob: false`. The first was found by add-model, which listed
+`use_sliding_window` and `max_window_layers` among Qwen2.5's unread keys.
+
+## Method
+
+`ditch add-model MODEL --dry-run` reads config.json, the tokenizer files,
+the chat template and every safetensors header over range requests, builds
+the shape-only copy (headers in front of sparse files) and matches it
+against the families; nothing else is downloaded. The largest footprint on
+disk was 38 MB (gemma-3-1b-it, mostly its tokenizer); Solar-Open2-250B took
+31 MB and DeepSeek-V3's 163 shards 28 MB.
+
+* **Known families** were drafted with `--model-type renamed_family`: as if
+  the checkpoint were an unknown family (and named no `architectures`
+  class), so the matcher has only the tensors and the config to go by. The
+  draft must parse the checkpoint's own config.json exactly as the built-in
+  family does (`* The draft parses this config.json exactly as the built-in
+  … does`: every field of the parsed configuration compared).
+* **New model_types** were taken from the Hub's trending and most-liked
+  text-generation models whose `model_type` no definition knows.
+
+## Known families under a new name
+
+| Checkpoint | Tensors | Family | Draft (`base`) | Parses as the built-in |
+| --- | ---: | --- | --- | --- |
+| TinyLlama/TinyLlama-1.1B-Chat-v1.0 | 201 | llama | llama | exactly |
+| Qwen/Qwen3-0.6B | 311 | qwen3 | qwen3 | exactly |
+| Qwen/Qwen3-30B-A3B | 18 867 | qwen3_moe | qwen3_moe | exactly |
+| deepseek-ai/DeepSeek-V3 (FP8) | 91 991 | deepseek_v3 | deepseek_v2 | exactly |
+| unsloth/gemma-3-1b-it | 340 | gemma3 | gemma3 | exactly |
+| tiiuae/Falcon-H1-0.5B-Instruct | 579 | falcon_h1 | falcon_h1 | exactly |
+| nvidia/NVIDIA-Nemotron-Nano-9B-v2 | 341 | nemotron_h | nemotron_h | exactly |
+| mistralai/Mistral-7B-Instruct-v0.3 | 291 | mistral | llama | exactly |
+| microsoft/Phi-3-mini-4k-instruct | 195 | phi3 | phi3 | exactly |
+| allenai/OLMo-2-0425-1B-Instruct | 179 | olmo2 | olmo2 | exactly |
+| ibm-granite/granite-3.3-2b-instruct | 362 | granite | granite | exactly |
+| openai-community/gpt2 | 160 | gpt2 | gpt2 | exactly |
+| zai-org/GLM-4.5-Air | 18 329 | glm4_moe | glm4_moe | exactly |
+| moonshotai/Kimi-Linear-48B-A3B-Instruct | 20 493 | kimi_linear | kimi_k3 | exactly |
+| LiquidAI/LFM2-350M | 148 | lfm2 | lfm2 | exactly |
+
+All 15 drafts are two lines (`model_type`, `base`) and parse the release's
+config exactly as the built-in family. Where the base is another family,
+that family reads this config identically (Mistral v0.3 has no sliding
+window, so it is Llama; DeepSeek V2 and V3 share one reading; Kimi K3 adds
+nothing Kimi Linear's config enables). A trial load of the shape-only copy
+takes 0.4–3.6 s for the small models and about 165 s for DeepSeek-V3 (its
+91 991 headers and FP8 block scales), so DeepSeek-V3's run took about 20
+minutes.
+
+Getting there fixed the matcher on these releases (each in its own commit):
+per-template allocation ran out of memory on Qwen3-30B-A3B's 18 867 tensors;
+FP8 scales and DeepSeek V3's multi-token-prediction layer 61 counted as
+unexplained tensors; OLMo-2's per-row q/k norms loaded as EXAONE 4's
+per-head ones because the loader does not check those shapes (slot shapes
+are now checked by the matcher, on a layer that uses the slot, which Kimi
+Linear's linear-attention layer 0 required); a dense family (qwen3) and its
+MoE twin tied on Qwen3-30B-A3B (the one whose name matches the experts wins,
+it decides the GGUF architecture); and gated keys (Qwen's
+`max_window_layers` only matters once `use_sliding_window` and
+`sliding_window` are set) were reported unread until keys were also tried
+with booleans flipped and nulls set.
+
+## New model_types
+
+| Checkpoint | `model_type` | Result |
+| --- | --- | --- |
+| learning-unit/L1-30B-A5B | gravity_moe | full match, `base = "deepseek_v2"`, zero edits |
+| sarvamai/sarvam-105b | sarvam_mla | full match, `base = "glm_moe_dsa"`, zero edits |
+| jdopensource/JoyAI-LLM-Flash | joyai_llm_flash | full match, `base = "deepseek_v2"`, zero edits; its chat template is one ditch's renderer refuses, so the draft sets the fallback `chat` and says to check it |
+| internlm/internlm3-8b-instruct | internlm3 | full match, `base = "llama"`; unread keys `bias`, `qkv_bias`; the tokenizer is SentencePiece-only (no tokenizer.json), which ditch cannot read: reported in the draft |
+| IQuestLab/IQuest-Coder-V1-40B-Instruct | iquestcoder | full match, `base = "qwen2"`; SentencePiece-only tokenizer, reported |
+| Nanbeige/Nanbeige4.2-3B | nanbeige | every tensor read as `llama`, but the unread keys `num_loops`, `loop_loss_weights`, `skip_loop_final_norm` say the layers are looped: a computation the draft cannot express, flagged by the key report |
+| Gensyn/open-1b-sft | open1b | layout mapped by renames alone: `layer = "{p}blocks.{i}."`, the embedding, final norm, untied head, q/k/v/o, norms, and `mlp = "gated_fused"`; left unread and listed: per-channel QAT `weight_scale` tensors and an embedding norm, with the config keys `quantized_forward`, `embedding_norm`, `qk_norm`, `swa_full_every` |
+| LiquidAI/LFM2-8B-A1B | lfm2_moe | on `lfm2`: router, expert path (`feed_forward.experts.{e}.`) and w1/w3/w2 found; stops at the dense MLP width, which LFM2's config function derives by its own formula (4 864) where the release's dense layers are 7 168 wide: named in the draft |
+| HITSZ-TMG/Xing4.0-29B-A4B-OR-SFT | xing4_0 | reads as `deepseek_v2` except 240 hyper-connection tensors (`attn_hc.hc_fn`, `ffn_hc.hc_base`, …), listed |
+| yandex/AliceAI-Foundation-80B-A3B-Base | alice_ai | no match: Kimi-style KDA linear attention, gated GQA full attention, Attention Residuals and a gated shared expert in one model; the draft lists every tensor `qwen3_5_moe` does not name, with the families whose names read some of them (`kimi_k3`'s `mlp_res_proj`); its tokenizer is SentencePiece-only |
+| upstage/Solar-Open2-250B | solar_open2 | no match: KDA layers beside full attention; unmapped tensors listed with `glm5_next`'s names for the KDA ones |
+| stepfun-ai/Step-3.5-Flash | step3p5 | no match (per-layer head counts); router and shared expert names listed |
+| inclusionAI/Ling-mini-2.0 | bailing_moe | no match: fused `attention.query_key_value` (a layout, not a rename), listed; the embedding is found |
+| inclusionAI/Ling-3.0-tiny | bailing_hybrid | no match: linear-attention layers with their own names, listed |
+| sarvamai/sarvam-30b | sarvam_moe | no match: fused qkv with q/k layer norms, listed |
+| huihui-ai/Huihui-Spark-X2.5-4B-abliterated | spark2_5 | no match: fused `q_k_v_proj`, listed; embedding found |
+| openbmb/MiniCPM-SALA | minicpm_sala | no match: sparse and linear attention mixed, listed |
+| ai-sage/GigaChat3.5-432B-A28B | gigachat3_5 | no match: MLA with a gated input norm (`input_layernorm.gate_down_projection`), listed |
+| primitive-ai/K2-Horizon-MoVA-36B-A4B-NVFP4 | k2_horizon | refused by every family: NVFP4 `compressed-tensors` weights cannot be dequantised (said so) |
+| Motif-Technologies/Motif-3 | Motif | refused by every family: its latent attention has a value head wider than the query/key head (said so; it also uses differential attention and mHC) |
+
+Five of the twenty are an existing family under a new name and give a
+working layout with zero edits (two of them wait on a tokenizer.json); one
+more is layout-complete but computes differently (Nanbeige's loops) and is
+caught by the unread-key report. The rest are genuinely new families: for
+those the draft maps what the known blocks cover and names every tensor and
+config key it could not, which is where a human (or a new Zig building
+block) takes over. Along the way the matcher learned to find a renamed layer
+path, embedding and expert path, a fused gate/up layout and an untied output
+head (open-1b, LFM2-8B-A1B), to skip a candidate whose name says another role
+(Sarvam's `attention.dense` was about to become `q`), to use a stand-in
+tokenizer for its trial loads (AliceAI's SentencePiece tokenizer had hidden
+its layout), and to say why a config is refused.
+
+## The check: `ditch verify` on drafts
+
+`ditch add-model` without `--dry-run` hands the draft to `ditch verify`
+(through `DITCH_MODELS_DIR`).
+
+* **The renamed-MLP Llama fixture** (`mlp.w1/w3/w2`, `attn_norm`,
+  `ffn_norm`, a new model_type): drafted with five renames on `llama`;
+  verify: truncate, load and forward, abliteration study, directions and
+  export pass (the reference was skipped: no torch at that point).
+* **Nanbeige/Nanbeige4.2-3B** (`base = "llama"`): truncate, load and forward,
+  the abliteration study, directions and the export round trip pass; the
+  rendered chat prompt and its token ids match the release's own code
+  exactly. The residual comparison is inconclusive: the release's remote
+  code returns NaN on the one-layer cut (its looped forward pass), and the
+  independent edit recomputation did not run for the same reason.
+* **learning-unit/L1-30B-A5B** (`gravity_moe`, a model_type ditch did not
+  know; the draft is `base = "deepseek_v2"` with zero edits), cut to layers
+  0 (dense) and 2 (MoE) of the release and compared with the release's own
+  code: the rendered chat prompt and its token ids are identical, the
+  residuals agree to 4.8e-7 relative, the first-token logits to 6.7e-7 of
+  their range with the same argmax, and the greedy tokens are identical on
+  both prompts. The abliteration study, the refusal directions and the
+  export round trip pass.
+
+In both runs the last check, the independent recomputation of the edit
+(`check_abliteration.py`), exited 0 without writing its report and is marked
+failed by verify; that is verify's harness, the same for any model, and not
+the draft.
+
+
+## Network failures are waited out, and a killed run resumes
+
+With the owner's agreement after F13/F14, a transient failure of the remote
+source no longer ends a run. A timeout, a reset or refused connection, a DNS
+failure, a 5xx, a 429 or a body cut short is retried until it succeeds,
+backing off 2 s doubled per failure up to 3 minutes, each with up to a
+quarter of jitter; every request of the source waits out the same back-off
+(F13's shared cooldown), and one status line is printed per back-off step
+instead of a warning per request:
+
+    warning: hf: connection lost (HttpError); retrying in 2 s, Ctrl+C to stop
+    warning: hf: connection restored after 3 s; resuming
+
+Ctrl+C stops a run that is waiting (`error.Interrupted`), and
+`--remote-retry-timeout <time>` (config `remote_retry_timeout`, default
+none) ends a request that has kept failing that long, for scripted use.
+Only a permanent error ends a run: 404 on a file the index names, 401/403
+(with the HF_TOKEN hint), a server without range support, or a size that is
+still wrong after refetches. Two gaps found on the way are closed: curl's
+exit status was not checked, so a transfer cut after the status line (curl
+exit 18) returned a short body as a success; and the native client's `fetch`
+returns what arrived when a connection closes before the Content-Length. The
+native path now reads the response head itself (a short body is
+`TruncatedBody`, retried), both paths report the resource length from
+`Content-Range`, and a remote shard learns its length from its first range
+response, so that every body is checked against the whole range asked for,
+even before the shard header is parsed.
+
+Restarts already reused verified chunks and refetched leftover `.part`
+files; the study journal resumes with `--checkpoint-action`. Tests
+(`tools/range_server.py` gains `/outage-<after>-<ms>/`, which drops every
+connection for a while once `after` range requests were served,
+`/truncate-<n>/`, which cuts the first n bodies in half, and `/slow-<ms>/`):
+
+- unit (`src/remote_test.zig`): an outage mid-load and one mid-prefill, and
+  12 truncated transfers on the native client and on curl, each loading and
+  prefilling with logits bit-identical to the local model; the retry timeout
+  ending a read against a server that stays away after 1 s; Ctrl+C ending a
+  read that waits for the network within 5 s;
+- end to end (`tests/e2e.sh`): `ditch probe` over the range server prints
+  the same first-token logits and greedy text through a 1.5 s outage two
+  thirds into its requests (and reports the outage and its end), and a probe
+  killed (SIGKILL) part-way through its load and run again over the same
+  cache prints the same, without fetching any chunk the killed run had kept.

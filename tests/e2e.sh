@@ -641,6 +641,50 @@ kl=$(grep "  \* KL divergence:" "$TMP/remote_eval.log" | tail -1 | awk '{print $
 awk -v kl="$kl" 'BEGIN { exit !(kl < 1.0) }' || fail "KL divergence of the remote-source export is implausible: $kl"
 kill $RANGE_PID 2>/dev/null || true
 
+echo "==> Remote weight source: network failures are waited out, a killed run resumes"
+python3 tools/range_server.py tests/fixtures/qwen3_moe_big "$TMP/net.log" > "$TMP/net_port.txt" &
+NET_PID=$!
+trap 'kill $NET_PID 2>/dev/null || true; rm -rf "$TMP"' EXIT
+for _ in $(seq 1 600); do
+    grep -q "^PORT " "$TMP/net_port.txt" 2>/dev/null && break
+    kill -0 "$NET_PID" 2>/dev/null || fail "range server exited before reporting its port"
+    sleep 0.1
+done
+NPORT=$(awk '/^PORT/ {print $2}' "$TMP/net_port.txt")
+[ -n "$NPORT" ] || fail "range server did not report a port within a minute"
+probe_remote() { # URL-PREFIX CACHE LOG
+    "$DITCH" probe "http://127.0.0.1:$NPORT/$1" --prompt "hello world" --max-response-length 6 \
+        --cache-dir "$2" --remote-chunk-size 4KB --threads 4 > "$3" 2>&1
+}
+# What a probe prints that must not change: the first-token logits and the greedy text.
+probe_sig() { grep -E '^ +[0-9]+ +-?[0-9]+[.][0-9]+ ' "$1"; sed -n 's/^Greedy ([0-9]* tokens in .*): //p' "$1"; }
+probe_remote "" "$TMP/net_ref" "$TMP/net_ref.log" || fail "the reference remote probe failed"
+probe_sig "$TMP/net_ref.log" > "$TMP/net_ref.sig"
+[ -s "$TMP/net_ref.sig" ] || fail "the reference remote probe printed no logits"
+ranges=$(grep -c " 206 " "$TMP/net.log")
+# The server goes away for 1.5 s after two thirds of the range requests of a
+# whole run (into the prefill): the run waits and prints the same.
+probe_remote "outage-$((ranges * 2 / 3))-1500/" "$TMP/net_outage" "$TMP/net_outage.log" || fail "a remote probe failed on a server outage"
+probe_sig "$TMP/net_outage.log" | cmp -s - "$TMP/net_ref.sig" || fail "a server outage changed the probe's output"
+grep -q "hf: connection lost" "$TMP/net_outage.log" || fail "the outage was not reported"
+grep -q "hf: connection restored" "$TMP/net_outage.log" || fail "the end of the outage was not reported"
+grep -q " 0 0$" "$TMP/net.log" || fail "the server dropped no connection"
+# A run killed part-way through its load, then run again over the same cache:
+# the same output, and no chunk that was on disk fetched a second time.
+: > "$TMP/net.log"
+timeout -s KILL 3 "$DITCH" probe "http://127.0.0.1:$NPORT/slow-100/" --prompt "hello world" --max-response-length 6 \
+    --cache-dir "$TMP/net_kill" --remote-chunk-size 4KB --threads 4 > /dev/null 2>&1 && fail "the slow probe finished before it was killed"
+chunks_dir=$(echo "$TMP"/net_kill/models/*/main/chunks)
+[ -d "$chunks_dir" ] || fail "the killed run left no chunk directory"
+( cd "$chunks_dir" && find . -type f ! -name '*.part' | sed 's|^[.]/||' | sort ) > "$TMP/net_kept.txt"
+[ -s "$TMP/net_kept.txt" ] || fail "the killed run left no chunk on disk"
+: > "$TMP/net.log"
+probe_remote "slow-100/" "$TMP/net_kill" "$TMP/net_rerun.log" || fail "the re-run after a kill failed"
+probe_sig "$TMP/net_rerun.log" | cmp -s - "$TMP/net_ref.sig" || fail "the re-run after a kill printed something else"
+awk '$4 == 206 && $2 ~ /safetensors$/ { split($3, r, /[=-]/); n = split($2, p, "/"); print p[n] "/" int(r[2] / 4096) }' "$TMP/net.log" | sort -u > "$TMP/net_refetched.txt"
+[ -z "$(comm -12 "$TMP/net_kept.txt" "$TMP/net_refetched.txt")" ] || fail "the re-run fetched chunks the killed run had kept"
+kill $NET_PID 2>/dev/null || true
+
 echo "==> Compute backend selftest (the CPU backend against the reference kernels)"
 "$DITCH" selftest --device cpu --json > "$TMP/selftest.json" 2> "$TMP/selftest.log" \
     || fail "ditch selftest --device cpu failed"
