@@ -1,0 +1,37 @@
+#version 450
+// RMS normalisation of n rows of len, one workgroup per row.
+// flags: bit 0 weighted, bit 1 (1 + w) scaling.
+
+#define RED 256
+layout(local_size_x = RED) in;
+
+layout(std430, binding = 0) writeonly buffer Out { float o[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) readonly buffer Wt { float weight[]; };
+layout(push_constant) uniform P { uint n; uint len; float eps; uint flags; } p;
+
+shared float red[RED];
+
+void main() {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint row = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    const bool live = row < p.n;
+    const uint base = row * p.len;
+    float acc = 0.0;
+    if (live) for (uint i = lid; i < p.len; i += RED) acc = fma(x[base + i], x[base + i], acc);
+    red[lid] = acc;
+    barrier();
+    for (uint s = RED / 2; s > 0; s >>= 1) {
+        if (lid < s) red[lid] += red[lid + s];
+        barrier();
+    }
+    if (!live) return;
+    const float inv = 1.0 / sqrt(red[0] / float(p.len) + p.eps);
+    const bool weighted = (p.flags & 1u) != 0u;
+    const bool one_plus = (p.flags & 2u) != 0u;
+    for (uint i = lid; i < p.len; i += RED) {
+        float v = x[base + i] * inv;
+        if (weighted) v *= one_plus ? (1.0 + weight[i]) : weight[i];
+        o[base + i] = v;
+    }
+}

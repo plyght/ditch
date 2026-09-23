@@ -1,0 +1,18 @@
+#version 450
+// scores[p] = scale * dot(q, k[p * stride ..][0..hd])
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) writeonly buffer Out { float scores[]; };
+layout(std430, binding = 1) readonly buffer Q { float q[]; };
+layout(std430, binding = 2) readonly buffer K { float k[]; };
+layout(push_constant) uniform P { uint keys; uint hd; uint stride; float scale; } p;
+
+void main() {
+    const uint g = gl_GlobalInvocationID.x;
+    if (g >= p.keys) return;
+    float acc = 0.0;
+    const uint base = g * p.stride;
+    for (uint d = 0; d < p.hd; ++d) acc = fma(q[d], k[base + d], acc);
+    scores[g] = acc * p.scale;
+}

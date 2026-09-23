@@ -1,0 +1,44 @@
+#version 450
+// In-place softmax of n rows of len, one workgroup per row.
+
+#define RED 256
+layout(local_size_x = RED) in;
+
+layout(std430, binding = 0) buffer X { float x[]; };
+layout(push_constant) uniform P { uint n; uint len; } p;
+
+shared float red[RED];
+
+void main() {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint row = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    const bool live = row < p.n;
+    const uint base = row * p.len;
+    float m = uintBitsToFloat(0xff800000u); // -inf
+    if (live) for (uint i = lid; i < p.len; i += RED) m = max(m, x[base + i]);
+    red[lid] = m;
+    barrier();
+    for (uint s = RED / 2; s > 0; s >>= 1) {
+        if (lid < s) red[lid] = max(red[lid], red[lid + s]);
+        barrier();
+    }
+    const float mx = red[0];
+    barrier();
+    float sum = 0.0;
+    if (live) {
+        for (uint i = lid; i < p.len; i += RED) {
+            const float e = exp(x[base + i] - mx);
+            x[base + i] = e;
+            sum += e;
+        }
+    }
+    red[lid] = sum;
+    barrier();
+    for (uint s = RED / 2; s > 0; s >>= 1) {
+        if (lid < s) red[lid] += red[lid + s];
+        barrier();
+    }
+    if (!live) return;
+    const float inv = 1.0 / red[0];
+    for (uint i = lid; i < p.len; i += RED) x[base + i] *= inv;
+}

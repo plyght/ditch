@@ -1,0 +1,33 @@
+#version 450
+// Rotary embeddings of n head vectors of dim at pos[row] against a
+// [len][half_dim] cosine/sine table. style 0: rotate-half (neox), 1: pairs
+// (gptj).
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer C { float cosv[]; };
+layout(std430, binding = 2) readonly buffer S { float sinv[]; };
+layout(std430, binding = 3) readonly buffer Pos { uint pos[]; };
+layout(push_constant) uniform P { uint n; uint dim; uint half_dim; uint style; } p;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    const uint row = gl_GlobalInvocationID.y;
+    if (i >= p.half_dim || row >= p.n) return;
+    const uint xb = row * p.dim;
+    const uint base = pos[row] * p.half_dim;
+    const float c = cosv[base + i];
+    const float s = sinv[base + i];
+    if (p.style == 0u) {
+        const float x1 = x[xb + i];
+        const float x2 = x[xb + i + p.half_dim];
+        x[xb + i] = x1 * c - x2 * s;
+        x[xb + i + p.half_dim] = x2 * c + x1 * s;
+    } else {
+        const float x1 = x[xb + 2 * i];
+        const float x2 = x[xb + 2 * i + 1];
+        x[xb + 2 * i] = x1 * c - x2 * s;
+        x[xb + 2 * i + 1] = x2 * c + x1 * s;
+    }
+}

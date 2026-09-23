@@ -1,0 +1,45 @@
+#version 450
+// out[i][j] = act(gate[i][j]) * up[i][j] over n rows of len.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) writeonly buffer Out { float o[]; };
+layout(std430, binding = 1) readonly buffer G { float gate[]; };
+layout(std430, binding = 2) readonly buffer U { float up[]; };
+layout(push_constant) uniform P { uint act; uint n; uint len; uint in_stride; uint out_stride; uint has_up; } p;
+
+// Abramowitz-Stegun 7.1.26, the approximation `tensor.erf` uses, term for
+// term, so the gelu kernel matches the CPU one rather than a library erf.
+float ditch_erf(float x) {
+    const float a = abs(x);
+    const float t = 1.0 / (1.0 + 0.3275911 * a);
+    const float y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-x * x);
+    return x >= 0.0 ? y : -y;
+}
+
+// Must match tensor.Activation's declaration order. tanh is written as
+// 1 - 2 / (exp(2u) + 1), as the CPU's vector kernel does: it saturates to +-1
+// instead of overflowing to NaN on drivers whose tanh is exp(u) / exp(-u).
+float activate(uint act, float x) {
+    switch (act) {
+        case 0u: return x / (1.0 + exp(-x));                                  // silu
+        case 1u: {                                                            // gelu_tanh
+            const float u = 0.7978845608028654 * (x + 0.044715 * x * x * x);
+            const float t = 1.0 - 2.0 / (exp(u + u) + 1.0);
+            return 0.5 * x * (1.0 + t);
+        }
+        case 2u: return 0.5 * x * (1.0 + ditch_erf(x * 0.7071067811865476)); // gelu
+        case 3u: return max(x, 0.0);                                          // relu
+        case 4u: { const float r = max(x, 0.0); return r * r; }               // relu2
+        default: return x / (1.0 + exp(-1.702 * x));                         // quick_gelu
+    }
+}
+
+void main() {
+    const uint j = gl_GlobalInvocationID.x;
+    const uint row = gl_GlobalInvocationID.y;
+    if (j >= p.len || row >= p.n) return;
+    float v = activate(p.act, gate[row * p.in_stride + j]);
+    if (p.has_up != 0u) v *= up[row * p.in_stride + j];
+    o[row * p.out_stride + j] = v;
+}

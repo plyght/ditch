@@ -4,7 +4,8 @@
 //! The CPU backend is the reference implementation and the default: its
 //! functions are thin wrappers that call `tensor.zig` with the same arguments,
 //! so a CPU run is bit-identical to one that never went through this file.
-//! Another backend (today: Metal, see `src/metal/`) may implement any subset of
+//! Another backend (Metal, see `src/metal/`, and Vulkan, see `src/vulkan/`) may
+//! implement any subset of
 //! the operations; anything it does not implement, or refuses for a given shape
 //! or dtype, falls back to the CPU kernel. That is what makes the seam safe for
 //! ditch's access pattern: weights are memory-mapped or streamed tile by tile
@@ -43,6 +44,12 @@ const Delta = tensor.Delta;
 
 pub const metal_supported = builtin.os.tag == .macos and @import("build_options").metal;
 
+/// Whether this build carries the Vulkan backend: Linux and Windows, unless
+/// built with `-Dvulkan=false`. The loader is opened at run time, so this says
+/// nothing about the machine; a statically linked musl binary cannot load it
+/// at all and reports the backend unavailable (see `src/vulkan/vk.zig`).
+pub const vulkan_supported = @import("build_options").vulkan and @import("vulkan/vk.zig").loadable;
+
 /// A backend may refuse any call; the caller then runs the CPU kernel.
 pub const Error = error{
     /// This backend does not implement the operation for this shape or dtype.
@@ -57,6 +64,7 @@ pub const Kind = enum {
     auto,
     cpu,
     metal,
+    vulkan,
 
     pub fn parse(s: []const u8) ?Kind {
         inline for (@typeInfo(Kind).@"enum".fields) |f| {
@@ -67,7 +75,7 @@ pub const Kind = enum {
     }
 
     /// The backends that can be asked for by name, for help texts and errors.
-    pub const names = "auto|cpu|metal";
+    pub const names = "auto|cpu|metal|vulkan";
 };
 
 /// Element-wise activation, mirrored from `tensor.Activation` so a backend can
@@ -111,7 +119,8 @@ const cpu_vtable = VTable{};
 
 pub const Device = struct {
     kind: Kind,
-    /// Human-readable name, e.g. "cpu" or "Apple M2 Pro (Metal)".
+    /// Human-readable name, e.g. "cpu", "Apple M2 Pro (Metal)" or
+    /// "NVIDIA GeForce RTX 4090 (Vulkan, discrete GPU)".
     name: []const u8,
     vtable: *const VTable = &cpu_vtable,
     ctx: ?*anyopaque = null,
@@ -200,8 +209,15 @@ pub const SelectResult = struct {
     note: ?[]const u8 = null,
 };
 
+/// Why the last explicitly requested backend could not be opened, for the
+/// error message (null when there is nothing more specific to say).
+pub var unavailable_reason: ?[]const u8 = null;
+
+var note_buf: [384]u8 = undefined;
+
 /// Opens `kind`, or returns an error for an explicitly requested backend that
-/// is not available. `auto` never fails: it falls back to the CPU with a note.
+/// is not available (`unavailable_reason` then says why). `auto` never fails:
+/// it falls back to the CPU with a note.
 pub fn select(gpa: Allocator, kind: Kind, opts: SelectOptions) !SelectResult {
     var r = try selectDevice(gpa, kind, opts);
     if (opts.min_macs) |m| r.device.min_macs = m;
@@ -209,11 +225,23 @@ pub fn select(gpa: Allocator, kind: Kind, opts: SelectOptions) !SelectResult {
 }
 
 fn selectDevice(gpa: Allocator, kind: Kind, opts: SelectOptions) !SelectResult {
+    unavailable_reason = null;
     switch (kind) {
         .cpu => return .{ .device = cpu_device },
         .metal => {
             if (!metal_supported) return error.DeviceUnavailable;
             const dev = openMetal(gpa, opts) catch return error.DeviceUnavailable;
+            return .{ .device = dev };
+        },
+        .vulkan => {
+            if (!vulkan_supported) {
+                unavailable_reason = vulkan_unbuilt_reason;
+                return error.DeviceUnavailable;
+            }
+            const dev = openVulkan(gpa, opts, true) catch {
+                unavailable_reason = vulkanLastError();
+                return error.DeviceUnavailable;
+            };
             return .{ .device = dev };
         },
         .auto => {
@@ -224,20 +252,61 @@ fn selectDevice(gpa: Allocator, kind: Kind, opts: SelectOptions) !SelectResult {
                     return .{ .device = cpu_device, .note = "no usable Metal device: running on the CPU" };
                 }
             }
+            // Vulkan on Linux and Windows: a discrete or integrated GPU, never
+            // a software (CPU) Vulkan device, which is slower than the CPU
+            // backend itself.
+            if (vulkan_supported) {
+                if (openVulkan(gpa, opts, false)) |dev| {
+                    return .{ .device = dev };
+                } else |_| {
+                    const note = std.fmt.bufPrint(&note_buf, "{s}: running on the CPU", .{vulkanLastError()}) catch "no usable Vulkan GPU: running on the CPU";
+                    return .{ .device = cpu_device, .note = note };
+                }
+            }
             // On a Mac the user may well expect Metal, so say why it is not there.
             if (builtin.os.tag == .macos) {
                 return .{ .device = cpu_device, .note = "this build has no GPU backend (rebuild with -Dmetal): running on the CPU" };
+            }
+            if (@import("build_options").vulkan and (builtin.os.tag == .linux or builtin.os.tag == .windows)) {
+                return .{ .device = cpu_device, .note = vulkan_unbuilt_reason ++ ": running on the CPU" };
             }
             return .{ .device = cpu_device, .note = null };
         },
     }
 }
 
+/// Why this build has no Vulkan backend (only meaningful when it has not).
+const vulkan_unbuilt_reason = if (!@import("build_options").vulkan)
+    "this build has no Vulkan backend (built with -Dvulkan=false)"
+else if (builtin.os.tag == .linux)
+    "this binary is statically linked and cannot load libvulkan.so.1 (use a -linux-gnu build)"
+else
+    "this build has no Vulkan backend (Linux and Windows only)";
+
 fn openMetal(gpa: Allocator, opts: SelectOptions) !Device {
     if (!metal_supported) return error.DeviceUnavailable;
     const metal = @import("metal/backend.zig");
     const io = opts.io orelse return error.DeviceUnavailable;
     return metal.open(gpa, io, opts.memory_budget);
+}
+
+fn openVulkan(gpa: Allocator, opts: SelectOptions, allow_cpu: bool) !Device {
+    if (!vulkan_supported) return error.DeviceUnavailable;
+    const vulkan = @import("vulkan/backend.zig");
+    const io = opts.io orelse return error.DeviceUnavailable;
+    return vulkan.open(gpa, io, .{ .memory_budget = opts.memory_budget, .allow_cpu = allow_cpu });
+}
+
+fn vulkanLastError() []const u8 {
+    if (!vulkan_supported) return vulkan_unbuilt_reason;
+    const e = @import("vulkan/backend.zig").lastError();
+    return if (e.len > 0) e else "no usable Vulkan GPU";
+}
+
+/// One line about the device beyond its name (API and driver versions, memory
+/// mode), for the selftest report; nothing for the CPU and for Metal.
+pub fn describe(dev: *const Device, w: *std.Io.Writer) !void {
+    if (dev.kind == .vulkan and vulkan_supported) try @import("vulkan/backend.zig").describe(dev, w);
 }
 
 /// Selects `kind` into `active`. Returns the note, if any, for stderr.
@@ -686,6 +755,7 @@ test "device kinds parse" {
     try testing.expectEqual(Kind.auto, Kind.parse("AUTO").?);
     try testing.expectEqual(Kind.auto, Kind.parse("gpu").?);
     try testing.expectEqual(Kind.metal, Kind.parse("metal").?);
+    try testing.expectEqual(Kind.vulkan, Kind.parse("Vulkan").?);
     try testing.expect(Kind.parse("cuda") == null);
 }
 
@@ -698,6 +768,10 @@ test "selecting cpu and auto never fails and metal is refused off-Apple" {
     if (!metal_supported) {
         try testing.expectError(error.DeviceUnavailable, select(gpa, .metal, .{}));
     }
+    // A GPU backend needs an Io to lock with; without one, an explicit request
+    // fails with a reason and never takes the process down.
+    try testing.expectError(error.DeviceUnavailable, select(gpa, .vulkan, .{}));
+    try testing.expect(unavailable_reason != null);
 }
 
 test "select applies a min_macs override, and a device serves only what crosses it" {

@@ -1,0 +1,35 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// out[rows] = ||W_r||_2, one workgroup per row. Rows are numbered across a
+// two-dimensional grid so a matrix may have more rows than one dimension of
+// the dispatch allows.
+
+#define RED 256
+layout(local_size_x = RED) in;
+
+layout(std430, binding = 0) writeonly buffer Out { float o[]; };
+layout(std430, binding = 1) readonly buffer W { uint w[]; };
+layout(push_constant) uniform P { uint rows; uint cols; } p;
+
+#include "weights.glsl"
+
+shared float red[RED];
+
+void main() {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint r = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    float acc = 0.0;
+    if (r < p.rows) {
+        for (uint c = lid; c < p.cols; c += RED) {
+            const float v = load_w(r * p.cols + c);
+            acc = fma(v, v, acc);
+        }
+    }
+    red[lid] = acc;
+    barrier();
+    for (uint s = RED / 2; s > 0; s >>= 1) {
+        if (lid < s) red[lid] += red[lid + s];
+        barrier();
+    }
+    if (lid == 0 && r < p.rows) o[r] = sqrt(red[0]);
+}

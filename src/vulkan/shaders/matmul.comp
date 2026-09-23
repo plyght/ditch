@@ -1,0 +1,37 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// out[n][rows] = x[n][cols] @ W^T with f32 accumulation: 16x16 tiles of
+// inputs and weight rows staged in shared memory, one output per invocation.
+// Same tiling and summation order as the Metal kernel.
+
+#define TS 16
+layout(local_size_x = TS, local_size_y = TS) in;
+
+layout(std430, binding = 0) writeonly buffer Out { float o[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) readonly buffer W { uint w[]; };
+layout(push_constant) uniform P { uint n; uint rows; uint cols; } p;
+
+#include "weights.glsl"
+
+shared float xs[TS][TS];
+shared float ws[TS][TS];
+
+void main() {
+    const uint lx = gl_LocalInvocationID.x;
+    const uint ly = gl_LocalInvocationID.y;
+    const uint r = gl_WorkGroupID.x * TS + lx;
+    const uint i = gl_WorkGroupID.y * TS + ly;
+    float acc = 0.0;
+    const uint tiles = (p.cols + TS - 1) / TS;
+    for (uint t = 0; t < tiles; ++t) {
+        const uint kx = t * TS + lx;
+        xs[ly][lx] = (i < p.n && kx < p.cols) ? x[i * p.cols + kx] : 0.0;
+        const uint kw = t * TS + ly;
+        ws[lx][ly] = (r < p.rows && kw < p.cols) ? load_w(r * p.cols + kw) : 0.0;
+        barrier();
+        for (uint k = 0; k < TS; ++k) acc = fma(xs[ly][k], ws[lx][k], acc);
+        barrier();
+    }
+    if (r < p.rows && i < p.n) o[i * p.rows + r] = acc;
+}

@@ -429,12 +429,21 @@ pub fn run(gpa: Allocator, settings: *config.Settings, pool: *const Pool, out: *
         std.process.exit(2);
     };
     var selected = compute.select(gpa, kind, .{ .memory_budget = settings.gpu_memory, .io = pool.io }) catch {
-        std.log.err("device {s} is not available on this build or machine", .{settings.device});
+        if (compute.unavailable_reason) |why| {
+            std.log.err("device {s} is not available: {s}", .{ settings.device, why });
+        } else {
+            std.log.err("device {s} is not available on this build or machine", .{settings.device});
+        }
         std.process.exit(2);
     };
     defer selected.device.deinit();
     if (selected.note) |n| try out.print("{s}\n", .{n});
     try out.print("\nChecking the {s} backend against the CPU reference kernels...\n", .{selected.device.name});
+    var info_buf: [512]u8 = undefined;
+    var info_w: Io.Writer = .fixed(&info_buf);
+    compute.describe(&selected.device, &info_w) catch {};
+    const info = info_w.buffered();
+    if (info.len > 0) try out.print("{s}\n", .{info});
     try out.flush();
 
     const seed = settings.seed orelse 0xd17c4;
@@ -446,6 +455,8 @@ pub fn run(gpa: Allocator, settings: *config.Settings, pool: *const Pool, out: *
         try js.beginObject();
         try js.objectField("device");
         try js.write(report.device);
+        try js.objectField("device_info");
+        try js.write(info);
         try js.objectField("seed");
         try js.write(seed);
         try js.objectField("passed");

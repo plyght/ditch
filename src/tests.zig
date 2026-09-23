@@ -43,6 +43,8 @@ comptime {
     _ = @import("metal/shaders_test.zig");
     _ = @import("vulkan/vk_test.zig");
     _ = @import("vulkan/device.zig");
+    _ = @import("vulkan/spirv_test.zig");
+    _ = @import("vulkan/backend_test.zig");
     _ = @import("expert_cache.zig");
     _ = @import("logo.zig");
     _ = @import("wrap.zig");
