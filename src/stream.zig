@@ -299,16 +299,42 @@ pub const WeightStore = struct {
             std.debug.assert(spec.lo <= spec.hi and spec.hi <= ref.cols and spec.stride > 0);
             const n = (spec.hi - spec.lo + spec.stride - 1) / spec.stride;
             const buf = try self.allocBuf(n * ref.rows * es);
-            var r: usize = 0;
-            while (r < ref.rows) : (r += 1) {
-                var j: usize = 0;
-                while (j < n) : (j += 1) {
-                    const c = spec.lo + j * spec.stride;
-                    @memcpy(buf[(j * ref.rows + r) * es ..][0..es], src[(r * ref.cols + c) * es ..][0..es]);
-                }
+            const aligned = @intFromPtr(buf.ptr) % es == 0 and @intFromPtr(src.ptr) % es == 0;
+            switch (if (aligned) es else 0) {
+                2 => gatherColumns(u16, @alignCast(std.mem.bytesAsSlice(u16, buf[0 .. n * ref.rows * 2])), @alignCast(std.mem.bytesAsSlice(u16, src[0 .. ref.rows * ref.cols * 2])), ref.rows, ref.cols, spec.lo, spec.stride, n),
+                4 => gatherColumns(u32, @alignCast(std.mem.bytesAsSlice(u32, buf[0 .. n * ref.rows * 4])), @alignCast(std.mem.bytesAsSlice(u32, src[0 .. ref.rows * ref.cols * 4])), ref.rows, ref.cols, spec.lo, spec.stride, n),
+                else => {
+                    var r: usize = 0;
+                    while (r < ref.rows) : (r += 1) {
+                        var j: usize = 0;
+                        while (j < n) : (j += 1) {
+                            const c = spec.lo + j * spec.stride;
+                            @memcpy(buf[(j * ref.rows + r) * es ..][0..es], src[(r * ref.cols + c) * es ..][0..es]);
+                        }
+                    }
+                },
             }
             out[done] = .{ .weight = .{ .data = buf[0 .. n * ref.rows * es], .dtype = ref.dtype, .rows = n, .cols = ref.rows }, .buf = buf };
             done += 1;
+        }
+    }
+
+    /// `dst[j][r] = src[r][lo + j * stride]` for `j < n`: the transpose of a
+    /// column selection, element by element in tiles so both sides stay in cache.
+    fn gatherColumns(comptime T: type, dst: []T, src: []const T, rows: usize, cols: usize, lo: usize, stride: usize, n: usize) void {
+        const tile = 64;
+        var r0: usize = 0;
+        while (r0 < rows) : (r0 += tile) {
+            const r1 = @min(rows, r0 + tile);
+            var j0: usize = 0;
+            while (j0 < n) : (j0 += tile) {
+                const j1 = @min(n, j0 + tile);
+                for (j0..j1) |j| {
+                    const c = lo + j * stride;
+                    const d = dst[j * rows ..][0..rows];
+                    for (r0..r1) |r| d[r] = src[r * cols + c];
+                }
+            }
         }
     }
 

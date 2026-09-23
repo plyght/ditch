@@ -235,6 +235,22 @@ pub fn expertDtypeSupported(dt: []const u8) bool {
 // Element decoders
 // ---------------------------------------------------------------------------
 
+/// An MXFP4 block's E8M0 scale as a multiplier, `2^(b - 127)` built from its
+/// bits (255 gives infinity, the NaN scale's block then decodes to non-finite
+/// values). An e2m1 value has at most two significant bits, so `value * scale`
+/// is exact, without a call per element (and without `std.math.ldexp`, which
+/// returns `2^(e - 151)` for a zero value once `e >= 25`).
+fn e8m0Scale(b: u8) f32 {
+    return if (b == 0) @bitCast(@as(u32, 0x0040_0000)) else @bitCast(@as(u32, b) << 23);
+}
+
+test "e8m0Scale times an e2m1 value is the exact product" {
+    for (0..255) |b| {
+        const p = std.math.pow(f64, 2, @as(f64, @floatFromInt(@as(i32, @intCast(b)) - 127)));
+        for (e2m1_table) |v| try std.testing.expectEqual(@as(f32, @floatCast(@as(f64, v) * p)), v * e8m0Scale(@intCast(b)));
+    }
+}
+
 /// An E8M0 scale byte: `2^(b - 127)` (255 is NaN).
 pub fn e8m0(b: u8) f32 {
     if (b == 255) return std.math.nan(f32);
@@ -568,10 +584,10 @@ pub const Dequant = struct {
             for (0..nblk) |k| {
                 for (0..jn) |jj| {
                     const b = blocks[((j0 + jj) * nblk + k) * 16 ..][0..16];
-                    const e: i32 = @as(i32, scales[(j0 + jj) * nblk + k]) - 127;
+                    const sc = e8m0Scale(scales[(j0 + jj) * nblk + k]);
                     for (0..16) |i| {
-                        tmp[jj][2 * i] = std.math.ldexp(e2m1_table[b[i] & 0x0f], e);
-                        tmp[jj][2 * i + 1] = std.math.ldexp(e2m1_table[b[i] >> 4], e);
+                        tmp[jj][2 * i] = e2m1_table[b[i] & 0x0f] * sc;
+                        tmp[jj][2 * i + 1] = e2m1_table[b[i] >> 4] * sc;
                     }
                 }
                 for (0..32) |i| {
@@ -607,11 +623,11 @@ pub const Dequant = struct {
                 const srow = scales[i * nblk ..][0..nblk];
                 const drow = dst[i * self.cols ..][0..self.cols];
                 for (0..nblk) |k| {
-                    const e: i32 = @as(i32, srow[k]) - 127;
+                    const sc = e8m0Scale(srow[k]);
                     for (0..16) |j| {
                         const b = prow[k * 16 + j];
-                        drow[k * 32 + 2 * j] = tensor.f32ToBf16(std.math.ldexp(e2m1_table[b & 0x0f], e));
-                        drow[k * 32 + 2 * j + 1] = tensor.f32ToBf16(std.math.ldexp(e2m1_table[b >> 4], e));
+                        drow[k * 32 + 2 * j] = tensor.f32ToBf16(e2m1_table[b & 0x0f] * sc);
+                        drow[k * 32 + 2 * j + 1] = tensor.f32ToBf16(e2m1_table[b >> 4] * sc);
                     }
                 }
             }

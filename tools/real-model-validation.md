@@ -3486,3 +3486,41 @@ full; original layer 20 reads layer 18's cache and 24 reads 19's, as in the
 whole model). All 6 residuals agree, worst 1.07e-06, logits 9.5e-07. The same
 reference with sharing turned off differs from ditch by 3.2e-02 from the first
 shared layer, so the check does exercise it.
+## gpt-oss-20b at full depth over `hf://`, and two warp-mode speedups
+
+The whole released `openai/gpt-oss-20b` (24 layers, 32 MXFP4 experts a layer,
+13.8 GB stored), read on demand from the Hub through the chunk cache and run
+in warp mode on this machine (4 cores, 15 GB RAM, `--max-ram 10GB
+--remote-cache-size 16GB`), through `ditch probe` (which could not load an
+`hf://` model before `a5a2627`). ReleaseFast build; the Debug build `zig build`
+makes by default ran the same probe at 0.015 tokens/s.
+
+    dry run:  warp mode min 2.03GB, with prefetch + expert cache + RAM caches 11.68GB
+              trunk 3.35GB stored, routed expert 12.6MB stored (47.5MB decoded), 768 experts 9.47GB
+    measured: peak RSS 7.22GB (budgeted peak 7.02GB), chunk cache 12.14GB on disk of 16GB, 0 evictions
+              expert cache 5.67GB = 122 of 768 decoded experts, 24.3% hit rate, 59.7 misses per decode step
+
+"What is the capital of France?" (87 prompt tokens with the harmony system
+block), 24 greedy tokens: `<|channel|>analysis<|message|>We need to answer:
+"What is the capital of France?" The answer: Paris. Provide concise answer`.
+"What is 12 times 12?": `<|channel|>analysis<|message|>The user asks: "What is
+12 times 12?" It's a simple multiplication. 12*`. First-token top logit
+`<|channel|>` at 42.9 (next 16.6).
+
+Profiling the run (gdb stack samples) put the time in loading experts, not
+in the matmuls: `WeightStore.acquireColumns` transposed the fused gate/up
+block with a runtime-sized `@memcpy` per 2-byte element, and the MXFP4
+decoders called `std.math.ldexp` per element. Now the transpose is typed and
+tiled, and a block's E8M0 scale is built from its bits once and multiplied
+in (exact for e2m1 values; `std.math.ldexp` itself returns `2^(e - 151)` for a
+zero value once `e >= 25`, so zeros under a scale of `2^25` or more decoded as
+tiny nonzero numbers before):
+
+| build | prompt 1 | prompt 2 | both prompts, load to exit |
+| --- | ---: | ---: | ---: |
+| before | 0.071 tokens/s (336.8 s) | 0.070 tokens/s (345.1 s) | 876 s |
+| after | 0.149 tokens/s (160.9 s) | 0.151 tokens/s (159.0 s) | 411 s |
+
+Same text, same cache statistics (the same work, done faster). The
+remaining limit is the cache holding decoded experts: 47.5 MB each, so a
+quarter of one layer's routing fits and three in four expert reads re-decode.
