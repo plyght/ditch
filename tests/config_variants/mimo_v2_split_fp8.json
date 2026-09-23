@@ -1,0 +1,5 @@
+[
+  {"num_key_value_heads": 1},
+  {"num_key_value_heads": "$delete", "swa_num_key_value_heads": 4},
+  {"moe_router_dtype": "bf16"}
+]

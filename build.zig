@@ -34,6 +34,9 @@ pub fn build(b: *std.Build) void {
     options.addOption(u32, "vector_width", vector_width);
     options.addOption(u32, "tile_rows", tile_rows);
     options.addOption(u32, "tile_inputs", tile_inputs);
+    // `zig build test -Dupdate-snapshot`: rewrite tests/config_variants/snapshot.txt
+    // after an intended change to how a model definition reads config.json.
+    options.addOption(bool, "update_snapshot", b.option(bool, "update-snapshot", "Rewrite the parsed-config snapshot of the model definitions (tests/config_variants/snapshot.txt)") orelse false);
 
     const root = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),

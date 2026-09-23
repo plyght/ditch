@@ -21,5 +21,8 @@ return {
     up = "mlp.dense_h_to_4h.weight",
     down = "mlp.dense_4h_to_h.weight",
   },
-  hook = "persimmon",
+  config = function(cfg, c)
+    if flag(cfg.qk_layernorm, true) then c.qk_norm = "head" end
+    c.num_kv_heads = c.num_heads
+  end,
 }

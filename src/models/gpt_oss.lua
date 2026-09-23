@@ -13,5 +13,14 @@ return {
     fused_gate_up = { "mlp.experts.gate_up_proj" },
     fused_down = { "mlp.experts.down_proj" },
   },
-  hook = "gpt_oss",
+  config = function(cfg, c)
+    c.sinks = true
+    c.attention_bias = flag(cfg.attention_bias, true)
+    c.moe.gate_up_interleaved = true
+    c.moe.expert_bias = true
+    c.moe.swiglu = { alpha = num(cfg.swiglu_alpha, 1.702), limit = num(cfg.swiglu_limit, 7.0) }
+    c.norm_topk_prob = true
+    c.num_experts_per_tok = int(cfg.num_experts_per_tok, 4)
+    if c.num_experts > 0 then each_layer(c.moe_layers, function() return true end) end
+  end,
 }

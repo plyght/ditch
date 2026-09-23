@@ -1,0 +1,13 @@
+[
+  {"use_qk_norm": false},
+  {"use_qk_norm": "$delete"},
+  {"use_qk_norm": 1},
+  {"n_group": 0},
+  {"n_group": 2},
+  {"n_group": 3},
+  {"n_group": "$delete"},
+  {"topk_group": 3},
+  {"topk_group": "$delete"},
+  {"routed_scaling_factor": "$delete"},
+  {"routed_scaling_factor": 1}
+]

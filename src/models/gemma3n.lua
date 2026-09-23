@@ -32,5 +32,5 @@ return {
     laurel_r = "laurel.linear_right.weight",
     laurel_norm = "laurel.post_laurel_norm.weight",
   },
-  hook = "gemma3n",
+  config = require("gemma").config_gemma3n,
 }

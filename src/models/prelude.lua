@@ -33,10 +33,33 @@ function str(v)
   return nil
 end
 
--- A JSON object (a table that is not `null`), or nil.
+-- A JSON object (not `null`, not an array), or nil.
 function obj(v)
-  if type(v) == "table" and v ~= null then return v end
-  return nil
+  if type(v) ~= "table" or v == null or is_array(v) then return nil end
+  return v
+end
+
+-- Whether `v` is a JSON array (an empty one included). A table a
+-- definition builds itself counts as an array when it has elements.
+function is_array(v)
+  if type(v) ~= "table" or v == null then return false end
+  local mt = getmetatable(v)
+  if mt ~= nil then return mt.__name == "json_array" end
+  return #v > 0
+end
+
+-- The keys of a JSON object in the order config.json lists them (sorted,
+-- for a table a definition builds itself).
+function keys(v)
+  local out = {}
+  local mt = getmetatable(v)
+  if mt ~= nil and mt.order ~= nil then
+    for _, k in ipairs(mt.order) do out[#out + 1] = k end
+    return out
+  end
+  for k in pairs(v) do out[#out + 1] = k end
+  table.sort(out, function(x, y) return tostring(x) < tostring(y) end)
+  return out
 end
 
 -- Whether a key is present at all (a JSON null counts as present).

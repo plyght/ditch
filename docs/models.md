@@ -491,6 +491,55 @@ inherited. With the file in place, `ditch <acme checkpoint>` runs, and `ditch
 A family that is an existing one under a new name needs only the first
 two lines: `return { model_type = "acme_lm", base = "qwen3" }`.
 
+### Drafting a definition: `ditch add-model`
+
+```sh
+ditch add-model owner/name            # a Hub id, hf://owner/name, an http(s) URL or a directory
+ditch add-model owner/name --dry-run  # draft only, no check
+```
+
+`add-model` reads what describes a checkpoint without its weights:
+config.json, the tokenizer files and chat template, and every safetensors
+header (two range requests per shard; a few MB in all, whatever the model's
+size). It builds a *shape-only copy* of the checkpoint, the real headers in
+front of sparse files that read as zeros, and loads that copy with ditch's
+own loader as each plausible known family:
+
+* Families are ranked by how many of the checkpoint's tensor names their
+  templates explain, then by the `architectures` class and the model_type's
+  stem, then by plainness.
+* A trial load names the first tensor a family needs that the checkpoint
+  lacks, and records which checkpoint tensors it never read. A missing
+  tensor is matched to an unread one at the same place (model, layer,
+  expert) with the shape ditch expects in that slot and a name that says
+  the same role (`w1` for `gate`, `attn_norm` for `input_norm`, …); the
+  load is retried with the new name, until it loads.
+* Among the families that load and read every tensor of the text model, the
+  one with the fewest renames, then the tightest fit (fewest of its own
+  templates absent from the checkpoint), is the match.
+* A config.json key is *read* when changing or removing it changes the
+  parsed configuration; the keys nothing reads, less those that never
+  matter to a forward pass (token ids, dropout, `torch_dtype`, …), are
+  listed for review.
+
+The draft is written to `$XDG_CONFIG_HOME/ditch/models/<model_type>.lua`
+(or `--models-dir`), with a comment on every guess (each rename says which
+tensor it took and why) and, at the end, everything it could not map: the
+unread tensors of the text model (grouped by pattern with their dtype,
+shape and count, and the family whose `names` would read them, if any),
+the tensors outside the text model (vision and audio towers, multi-token
+prediction heads), and the unread config keys. It is also printed on
+stdout. A model_type ditch already knows is drafted without its own
+definition and compared with it (the file is only written with `--force`),
+which is how add-model is checked against the built-in families.
+
+Then `ditch verify` runs on the model with the draft: a cut of real layers,
+ditch's forward pass, the comparison with the official implementation when
+Python with transformers is available, and a two-trial abliteration.
+
+For a checkpoint that is an existing family under a new model_type name,
+the draft is two lines, `model_type` and `base`, and needs no edit.
+
 ### Family fields
 
 Every field is optional except `model_type`. Enumerations are strings.
@@ -598,8 +647,9 @@ Helpers every definition sees:
 
 | Helper | |
 | --- | --- |
-| `num(v, d)`, `int(v, d)`, `flag(v, d)`, `str(v)`, `obj(v)` | A number, a non-negative integer (truncated), a boolean (or a non-zero integer), a string, a table, or the default `d` when `v` is missing, null or of another type: how ditch reads every key. |
+| `num(v, d)`, `int(v, d)`, `flag(v, d)`, `str(v)`, `obj(v)` | A number, a non-negative integer (truncated), a boolean (or a non-zero integer), a string, a JSON object (not an array), or the default `d` when `v` is missing, null or of another type: how ditch reads every key. |
 | `present(v)` | The key exists, even as null. |
+| `is_array(v)`, `keys(v)` | Whether `v` is a JSON array (an empty one too); the keys of a JSON object in config.json's order. |
 | `len(v)` | Length of a JSON array (0 otherwise). |
 | `each_layer(list, f)` | `list[i + 1] = f(i)` for every zero-based layer `i`. |
 | `f32(x)` | `x` rounded to single precision (ditch's scalars are f32). |
@@ -608,25 +658,18 @@ Helpers every definition sees:
 
 ### Zig building blocks
 
-A layout or a computation Lua cannot express (a new kind of layer math, a
-routing rule, a recurrence) is implemented in Zig and exposed to definitions
-two ways: as a value of a layout field (`norm`, `qkv`, `mlp`, `qk_norm`,
-`ssm`, `linear`, `positional`, …) that the forward pass switches on, and as a
-named **hook** for config.json keys whose reading is entangled with that math
-(`hooks` in `src/arch.zig`). The hooks are:
-`afmoe`, `baichuan`, `biogpt`, `chatglm`, `codegen`, `cohere`, `deepseek`,
-`deepseek_v32`, `deepseek_v4`, `deepseek_v41`, `dense_mlp`, `dots1`,
-`ernie`, `ernie_moe`, `exaone4`, `exaone_moe`, `falcon`, `falcon_h1`,
-`gemma`, `gemma3n`, `gemma4`, `glm4`, `glm4_moe`, `glm4_moe_lite`,
-`glm5_next`, `glm_moe_dsa`, `gpt_bigcode`, `gpt_neo`, `gpt_oss`, `gptj`,
-`granite`, `granite_hybrid`, `granite_moe`, `granite_moe_swa`,
-`granite_swa`, `hunyuan_dense`, `hunyuan_moe`, `hy_v3`, `jamba`,
-`kimi_linear`, `laguna`, `lfm2`, `llama4`, `mamba2`, `mellum`, `mimo_v2`,
-`minicpm`, `minimax`, `minimax_m2`, `minimax_m3`, `ministral3`,
-`mistral4`, `mixtral`, `mpt`, `nanochat`, `nemotron`, `nemotron_h`, `neox`,
-`olmo2`, `olmoe`, `opt`, `persimmon`, `phi`, `phi3`, `qwen4_exp`,
-`qwen_hybrid`, `qwen_vl`, `smollm3`, `solar_open`, `stablelm`,
-`starcoder2`, `xglm`, `axk1`.
+What a definition cannot express in Lua is implemented in Zig and exposed
+to definitions by name: a new kind of layer math, a routing rule or a
+recurrence becomes a value of a layout field (`norm`, `qkv`, `mlp`,
+`qk_norm`, `ssm`, `linear`, `positional`, …) that the forward pass switches
+on, or a setting of `Config` that a config function sets (`c.moe.scoring`,
+`c.hyper`, `c.mla`, …). For config.json keys whose reading Lua cannot
+express, a definition can also name a Zig **hook** (`hooks` in
+`src/arch.zig`), which runs after the generic parser and before the config
+function. Every built-in family reads its keys in Lua, so no hook exists
+today; the shared readers of several families are Lua libraries in
+`src/models/lib/` (DeepSeek-style routers, Gemma's RoPE tables, Mamba
+dimensions, …), loaded with `require`.
 
 A new family whose layers are all made of existing blocks needs no Zig. One
 that needs new maths gets a new layout value or hook in Zig and a

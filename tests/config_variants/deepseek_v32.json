@@ -1,0 +1,12 @@
+[
+  {"index_topk": 0},
+  {"index_topk": "$delete"},
+  {"index_topk": null},
+  {"index_topk": 5.9},
+  {"index_topk": -3},
+  {"index_topk": "x"},
+  {"rope_interleave": false},
+  {"scoring_func": "softmax", "topk_method": "greedy"},
+  {"n_group": 3},
+  {"n_group": 0, "topk_group": 0}
+]

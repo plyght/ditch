@@ -1,3 +1,5 @@
+local granite = require("granite")
+
 return {
   model_type = "granitemoe",
   aliases = { "granitemoeshared" },
@@ -15,5 +17,11 @@ return {
     shared_down = "output_linear.weight",
     shared_gate_up = "input_linear.weight",
   },
-  hook = "granite_moe",
+  config = function(cfg, c)
+    granite.multipliers(cfg, c)
+    -- Top-k over the router logits, softmax over the selected ones (equal
+    -- to a renormalised softmax over every expert).
+    c.norm_topk_prob = true
+    if c.num_experts > 0 then each_layer(c.moe_layers, function() return true end) end
+  end,
 }

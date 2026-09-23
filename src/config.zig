@@ -539,13 +539,14 @@ pub const help_sections = [_]HelpSection{
     \\  --config <path>                Lua config file to use instead of ~/.config/ditch/config.lua
     \\                                 ($XDG_CONFIG_HOME/ditch/config.lua). The installer puts
     \\                                 config.default.lua, every option documented, beside it.
-    \\  Per-model settings go in ~/.config/ditch/configs/<org>/<name>.lua (for example
-    \\  configs/Qwen/Qwen3-8B.lua; configs/<name>.lua for a local model) and apply on top of the
-    \\  global file whenever that model is run.
+    \\  Settings for one model go in the global file's models table, keyed by id or pattern
+    \\  (models = { ["Qwen/Qwen3-8B"] = { max_ram = "8GB" }, ["openai/gpt-oss-*"] = { ... } }),
+    \\  or in a file of their own, ~/.config/ditch/configs/<org>/<name>.lua (configs/<name>.lua
+    \\  for a local model). The more specific source wins.
     \\  --models-dir <dir>             Also read Lua model definitions from this directory (after
     \\                                 $XDG_CONFIG_HOME/ditch/models; see docs/models.md).
     \\  Precedence: flags > DITCH_* environment variables (DITCH_THREADS, DITCH_MAX_RAM, DITCH_CACHE,
-    \\  DITCH_DEVICE, DITCH_GPU_MEMORY, DITCH_REMOTE_CACHE_SIZE, DITCH_NO_COLOR) > the model's config file > the global config file.
+    \\  DITCH_DEVICE, DITCH_GPU_MEMORY, DITCH_REMOTE_CACHE_SIZE, DITCH_NO_COLOR) > the model's own file > its models entries > general settings.
     \\  Every option accepts --name value or --name=value; flags and subcommands may come in any order.
     \\
     },
@@ -698,9 +699,13 @@ pub const LoadResult = struct {
     }
 };
 
+const ConfigFile = enum { global, model };
+
 /// Applies one Lua configuration file; a missing file is only an error when
-/// it was named explicitly. Returns false when the file does not load.
-fn applyConfigFile(gpa: Allocator, io: std.Io, a: Allocator, settings: *Settings, errors: *std.ArrayList([]const u8), path: []const u8, explicit: bool) !bool {
+/// it was named explicitly. In the global file, the `models` entries matching
+/// `model` apply after its general settings. Returns false when the file
+/// does not load.
+fn applyConfigFile(gpa: Allocator, io: std.Io, a: Allocator, settings: *Settings, errors: *std.ArrayList([]const u8), path: []const u8, explicit: bool, kind: ConfigFile, model: ?[]const u8) !bool {
     const text = std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited) catch |err| {
         if (explicit) try errors.append(a, try std.fmt.allocPrint(a, "could not read {s}: {s}", .{ path, @errorName(err) }));
         return true;
@@ -713,7 +718,76 @@ fn applyConfigFile(gpa: Allocator, io: std.Io, a: Allocator, settings: *Settings
         return false;
     }
     try applyTable(a, settings, result.parsed.root, errors);
+    if (result.parsed.root.get("models")) |models| switch (kind) {
+        .model => try errors.append(a, try std.fmt.allocPrint(a, "{s}: a models table only goes in the global config", .{path})),
+        .global => if (model) |m| try applyModelEntries(a, settings, models, m, path, errors),
+    };
     return true;
+}
+
+/// Applies the entries of the global config's `models` table whose key
+/// matches `model`: an exact id, or a pattern with `*` (any run of
+/// characters) and `?` (one character), compared case-insensitively against
+/// `modelConfigName`. Less specific entries apply first, so a pattern with
+/// more literal characters overrides a looser one and an exact id wins.
+fn applyModelEntries(a: Allocator, s: *Settings, models: tree.Value, model: []const u8, path: []const u8, errors: *std.ArrayList([]const u8)) !void {
+    if (models != .table) {
+        try errors.append(a, try std.fmt.allocPrint(a, "{s}: models must be a table keyed by model id or pattern", .{path}));
+        return;
+    }
+    const name = modelConfigName(model) orelse return;
+    const Match = struct {
+        key: []const u8,
+        table: *const tree.Table,
+        fn rank(key: []const u8) usize {
+            const wild = std.mem.count(u8, key, "*") + std.mem.count(u8, key, "?");
+            return if (wild == 0) std.math.maxInt(usize) else key.len - wild;
+        }
+        fn lessThan(_: void, x: @This(), y: @This()) bool {
+            const rx = rank(x.key);
+            const ry = rank(y.key);
+            return if (rx != ry) rx < ry else std.mem.lessThan(u8, x.key, y.key);
+        }
+    };
+    var matches: std.ArrayList(Match) = .empty;
+    var it = models.table.map.iterator();
+    while (it.next()) |e| {
+        const key = e.key_ptr.*;
+        if (e.value_ptr.* != .table) {
+            try errors.append(a, try std.fmt.allocPrint(a, "{s}: models[\"{s}\"] must be a table of settings", .{ path, key }));
+            continue;
+        }
+        if (globMatch(key, name)) try matches.append(a, .{ .key = key, .table = e.value_ptr.table });
+    }
+    std.mem.sort(Match, matches.items, {}, Match.lessThan);
+    for (matches.items) |m| {
+        if (m.table.get("models") != null) try errors.append(a, try std.fmt.allocPrint(a, "{s}: models[\"{s}\"] cannot have its own models table", .{ path, m.key }));
+        try applyTable(a, s, m.table, errors);
+    }
+}
+
+/// Case-insensitive glob match: `*` matches any run of characters, `?` one.
+fn globMatch(pattern: []const u8, text: []const u8) bool {
+    var p: usize = 0;
+    var t: usize = 0;
+    var star: ?usize = null;
+    var resume_at: usize = 0;
+    while (t < text.len) {
+        if (p < pattern.len and (pattern[p] == '?' or std.ascii.toLower(pattern[p]) == std.ascii.toLower(text[t]))) {
+            p += 1;
+            t += 1;
+        } else if (p < pattern.len and pattern[p] == '*') {
+            star = p;
+            p += 1;
+            resume_at = t;
+        } else if (star) |st| {
+            p = st + 1;
+            resume_at += 1;
+            t = resume_at;
+        } else return false;
+    }
+    while (p < pattern.len and pattern[p] == '*') p += 1;
+    return p == pattern.len;
 }
 
 /// The directory of the user's configuration: $XDG_CONFIG_HOME/ditch, else
@@ -727,25 +801,20 @@ pub fn configDir(a: Allocator, env: *const std.process.Environ.Map) !?[]const u8
 pub const subcommands = [_][]const u8{ "bench", "probe", "verify", "selftest", "truncate", "help", "add-model" };
 
 /// Parses the configuration: the global config file (--config, else
-/// ~/.config/ditch/config.lua), the model's own file in
+/// ~/.config/ditch/config.lua) with its general settings and then its
+/// `models` entries matching the model, the model's own file in
 /// ~/.config/ditch/configs/ (see `modelConfigName`), the DITCH_* environment
 /// variables and finally the command line, later sources taking precedence.
 /// `-h`/`--help` anywhere wins over every error.
 pub fn load(gpa: Allocator, io: std.Io, args: []const []const u8, environ: ?*std.process.Environ.Map) !LoadResult {
+    // The model is only known once every source is read; then read them all
+    // again with its `models` entries and its own file layered in.
     var first = try loadLayers(gpa, io, args, environ, null);
-    // The model is only known once every source is read; when it has a
-    // config file of its own, read everything again with that file layered in.
-    const env = environ orelse return first;
-    if (first.settings.model.len == 0) return first;
-    const a = first.arena.allocator();
-    const dir = try configDir(a, env) orelse return first;
-    const name = modelConfigName(first.settings.model) orelse return first;
-    const path = try std.fmt.allocPrint(a, "{s}{c}configs{c}{s}.lua", .{ dir, std.fs.path.sep, std.fs.path.sep, name });
-    std.Io.Dir.cwd().access(io, path, .{}) catch return first;
-    const per_model = try gpa.dupe(u8, path);
-    defer gpa.free(per_model);
+    if (first.settings.model.len == 0 or first.errors.len > 0) return first;
+    const model = try gpa.dupe(u8, first.settings.model);
+    defer gpa.free(model);
     first.deinit();
-    return loadLayers(gpa, io, args, environ, per_model);
+    return loadLayers(gpa, io, args, environ, model);
 }
 
 /// The name of a model's own config file under ~/.config/ditch/configs,
@@ -765,7 +834,7 @@ pub fn modelConfigName(model: []const u8) ?[]const u8 {
     return m;
 }
 
-fn loadLayers(gpa: Allocator, io: std.Io, args: []const []const u8, environ: ?*std.process.Environ.Map, per_model: ?[]const u8) !LoadResult {
+fn loadLayers(gpa: Allocator, io: std.Io, args: []const []const u8, environ: ?*std.process.Environ.Map, model: ?[]const u8) !LoadResult {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -788,10 +857,14 @@ fn loadLayers(gpa: Allocator, io: std.Io, args: []const []const u8, environ: ?*s
     if (path == null) if (environ) |env| if (try configDir(a, env)) |dir| {
         path = try std.fs.path.join(a, &.{ dir, "config.lua" });
     };
-    if (path) |p| if (!try applyConfigFile(gpa, io, a, &settings, &errors, p, config_path != null))
+    if (path) |p| if (!try applyConfigFile(gpa, io, a, &settings, &errors, p, config_path != null, .global, model))
         return .{ .settings = settings, .arena = arena, .errors = try errors.toOwnedSlice(a) };
-    if (per_model) |p| if (!try applyConfigFile(gpa, io, a, &settings, &errors, p, true))
-        return .{ .settings = settings, .arena = arena, .errors = try errors.toOwnedSlice(a) };
+    // The model's own file, ~/.config/ditch/configs/<org>/<name>.lua.
+    if (model) |m| if (environ) |env| if (try configDir(a, env)) |dir| if (modelConfigName(m)) |name| {
+        const own = try std.fmt.allocPrint(a, "{s}{c}configs{c}{s}.lua", .{ dir, std.fs.path.sep, std.fs.path.sep, name });
+        if (!try applyConfigFile(gpa, io, a, &settings, &errors, own, false, .model, null))
+            return .{ .settings = settings, .arena = arena, .errors = try errors.toOwnedSlice(a) };
+    };
 
     // Environment variables.
     if (environ) |env| {
@@ -1076,7 +1149,9 @@ fn applyTable(a: Allocator, s: *Settings, root: *const tree.Table, errors: *std.
     while (it.next()) |e| {
         const k = e.key_ptr.*;
         const v = e.value_ptr.*;
-        if (std.mem.eql(u8, k, "good_prompts") and v == .table) {
+        if (std.mem.eql(u8, k, "models")) {
+            // Per-model settings, applied by applyModelEntries.
+        } else if (std.mem.eql(u8, k, "good_prompts") and v == .table) {
             try applyDatasetTable(a, &s.good_prompts, v.table, errors);
         } else if (std.mem.eql(u8, k, "bad_prompts") and v == .table) {
             try applyDatasetTable(a, &s.bad_prompts, v.table, errors);
@@ -1218,6 +1293,40 @@ test "per-model config files layer between the global file and the flags" {
     var r2 = try load(gpa, io, &other, &env);
     defer r2.deinit();
     try std.testing.expectEqual(@as(u64, 2 << 30), r2.settings.max_ram);
+
+    // The global file's models table: patterns by specificity, then the exact
+    // id, then the model's own file.
+    try tmp.dir.writeFile(io, .{ .sub_path = "ditch/config.lua", .data =
+        \\return {
+        \\  max_ram = "2GB", n_trials = 50,
+        \\  models = {
+        \\    ["org/*"] = { n_trials = 60, seed = 1 },
+        \\    ["Org/Oth*"] = { n_trials = 70 },
+        \\    ["Org/Other"] = { max_ram = "3GB" },
+        \\    ["Org/Model"] = { max_ram = "5GB", n_trials = 80 },
+        \\  },
+        \\}
+    });
+    var r3 = try load(gpa, io, &other, &env);
+    defer r3.deinit();
+    try std.testing.expectEqual(@as(usize, 0), r3.errors.len);
+    try std.testing.expectEqual(@as(u64, 3 << 30), r3.settings.max_ram);
+    try std.testing.expectEqual(@as(usize, 70), r3.settings.n_trials);
+    try std.testing.expectEqual(@as(?u64, 1), r3.settings.seed);
+    var r4 = try load(gpa, io, &args, &env);
+    defer r4.deinit();
+    try std.testing.expectEqual(@as(u64, 4 << 30), r4.settings.max_ram); // own file
+    try std.testing.expectEqual(@as(usize, 80), r4.settings.n_trials);
+    try std.testing.expectEqual(@as(?u64, 9), r4.settings.seed); // flag
+    const unrelated = [_][]const u8{ "ditch", "else/thing" };
+    var r5 = try load(gpa, io, &unrelated, &env);
+    defer r5.deinit();
+    try std.testing.expectEqual(@as(usize, 50), r5.settings.n_trials);
+
+    try std.testing.expect(globMatch("openai/gpt-oss-*", "OpenAI/gpt-oss-120b"));
+    try std.testing.expect(globMatch("*-GGUF", "unsloth/Qwen3-8B-GGUF"));
+    try std.testing.expect(globMatch("a?c", "abc") and !globMatch("a?c", "ac"));
+    try std.testing.expect(!globMatch("Qwen/*", "Qwen2/x"));
 }
 
 test "warp mode options" {

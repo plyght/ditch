@@ -1,3 +1,5 @@
+local exaone = require("exaone")
+
 return {
   model_type = "exaone4",
   llama_cpp = "exaone4",
@@ -14,5 +16,7 @@ return {
     q_norm = "self_attn.q_norm.weight",
     k_norm = "self_attn.k_norm.weight",
   },
-  hook = "exaone4",
+  config = function(cfg, c)
+    exaone.layer_kinds(cfg, c)
+  end,
 }

@@ -8,5 +8,7 @@ return {
   default_norm_eps = 1e-5,
   default_rope_theta = 500000.0,
   rope_style = "gptj",
-  hook = "ernie",
+  config = function(cfg, c)
+    c.attention_bias = flag(cfg.use_bias, false)
+  end,
 }

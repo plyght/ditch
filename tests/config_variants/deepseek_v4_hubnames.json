@@ -1,0 +1,5 @@
+[
+ {"mlp_layer_types": "$delete"},
+ {"layer_types": "$delete"},
+ {"rope_scaling": "$delete"}
+]

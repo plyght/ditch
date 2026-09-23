@@ -107,9 +107,11 @@ remaining 11 (`baichuan`, `bitnet`, `deepseek_v3`, `granite_swa`, `hy_v3`,
 random-weight stub: their releases are gated, lack a usable tokenizer, are
 refused by design or were never published, except `deepseek_v3`, `minimax` and
 `minimax_m2`, whose releases have only been config-checked so far.
-A family ditch does not know yet can be added without rebuilding, as a Lua
-file in `~/.config/ditch/models/` ([the
-schema](docs/models.md#model-definitions-in-lua)).
+A family ditch does not know yet can be added without rebuilding: `ditch
+add-model <model>` reads the checkpoint's config and tensor names (not its
+weights), matches them against the known families, writes a commented draft
+definition to `~/.config/ditch/models/` and checks it with `ditch verify`
+([the schema](docs/models.md#model-definitions-in-lua)).
 **[docs/models.md](docs/models.md) is the full list**:
 every `model_type`, its aliases, what each fixture covers, which checkpoint
 verifies it on real weights, and every caveat; the numbers are in
@@ -138,13 +140,26 @@ Defaults are Heretic's: `mlabonne/harmless_alpaca`, `mlabonne/harmful_behaviors`
 Settings live in `~/.config/ditch/config.lua` (`$XDG_CONFIG_HOME/ditch`, or
 `--config FILE`), a sandboxed Lua 5.4 script returning a table keyed like the
 flags; every option is documented in [`config.default.lua`](config.default.lua),
-which the installer puts beside it. Settings for one model go in
-`~/.config/ditch/configs/<org>/<name>.lua` (for example
-`configs/Qwen/Qwen3-8B.lua`, or `configs/<name>.lua` for a local directory or
-GGUF) and apply whenever that model runs. Precedence, highest first: flags,
-`DITCH_*` environment variables (`DITCH_THREADS`, `DITCH_MAX_RAM`,
-`DITCH_CACHE`, `DITCH_DEVICE`, `DITCH_REMOTE_CACHE_SIZE`, `DITCH_NO_COLOR`), the
-model's config file, then the global `config.lua`. Messages go to stderr
+which the installer puts beside it. Settings for one model go in its `models`
+table, keyed by id or by pattern:
+
+```lua
+return {
+  max_ram = "12GB",
+  models = {
+    ["Qwen/Qwen3-8B"] = { max_ram = "8GB", seed = 7 },
+    ["openai/gpt-oss-*"] = { expert_cache = "4GB" },
+  },
+}
+```
+
+A model whose settings outgrow an entry can have a file of its own,
+`~/.config/ditch/configs/<org>/<name>.lua` (`configs/<name>.lua` for a local
+directory or GGUF). Precedence, highest first: flags, `DITCH_*` environment
+variables (`DITCH_THREADS`, `DITCH_MAX_RAM`, `DITCH_CACHE`, `DITCH_DEVICE`,
+`DITCH_REMOTE_CACHE_SIZE`, `DITCH_NO_COLOR`), the model's own file, its
+`models` entries (an exact id over a pattern, a more specific pattern over a
+looser one), then the general settings. Messages go to stderr
 and results to stdout (`--json` for one JSON document, `--plain` for
 grep-friendly lines); `--no-input` turns every prompt into an error naming the
 flag to pass instead.
@@ -425,6 +440,25 @@ its first K decoder layers (`--layers 0,1,20` for chosen ones, renumbered;
 `--kinds` for the fewest layers covering every layer kind) by range-reading
 only those tensors, quantisation untouched and every per-layer list in
 config.json cut to match; `--drop mtp.` leaves out tensors by name prefix.
+
+`ditch verify MODEL` puts all of that together: it cuts the model to one
+layer of every kind (`--full` streams the whole release instead), runs `ditch
+probe` on it, and compares the rendered chat prompt, the token ids, every
+layer's residual, the first-token logits and the greedy tokens with the
+model's official implementation: transformers' own model class, or the
+release's own modeling code for families transformers lacks. It then runs a
+two-trial abliteration on the cut, which checks that the refusal directions
+are unit vectors, that the export reproduces the in-memory model, and that
+every edited matrix matches the norm-preserving orthogonalisation recomputed
+independently of ditch. The reference is the one part that needs Python: ditch
+carries the harness (`tools/*.py`) inside the binary and runs it with a
+`python3` that has torch and transformers (`--python PATH` to choose one).
+Without one it runs every other check and prints what to install. The report
+gives each check's numbers and, on a mismatch, the first layer that diverges;
+`--json` prints it as JSON, and the exit status is 1 when a check fails.
+`.github/workflows/new-models.yml` runs it every week on the model types new in
+the latest transformers release and on trending Hub models
+(`tools/new_models.sh`), and keeps one issue listing the failures.
 
 Exit codes: 0 success (including `--dry-run` and a clean stop at
 `--time-limit`), 1 failure, 2 usage error or a memory budget too small for the

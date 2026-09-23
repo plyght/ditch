@@ -40,6 +40,7 @@ const remote = @import("remote.zig");
 const logo = @import("logo.zig");
 const wrap = @import("wrap.zig");
 const models = @import("models.zig");
+const add_model = @import("add_model.zig");
 
 const Model = model_mod.Model;
 const Engine = engine_mod.Engine;
@@ -52,6 +53,8 @@ var color_enabled: ?bool = null;
 pub const std_options: std.Options = .{ .logFn = logFn };
 
 fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
+    // `ditch add-model` collects what a trial load reports instead of printing it.
+    if (add_model.capture) |cap| if (cap.take(level, format, args)) return;
     var buffer: [64]u8 = undefined;
     const locked = std.debug.lockStderr(&buffer);
     defer std.debug.unlockStderr();
@@ -1312,10 +1315,11 @@ fn estimateFor(model: *const Model, settings: *const config.Settings, threads: u
     });
 }
 
-/// Loads `$XDG_CONFIG_HOME/ditch/models/*.lua` (`~/.config/ditch/models`)
-/// and `--models-dir`.
+/// Loads `$XDG_CONFIG_HOME/ditch/models/*.lua` (`~/.config/ditch/models`),
+/// `--models-dir` and `$DITCH_MODELS_DIR` (how `ditch add-model` hands a
+/// draft to the `ditch verify` it runs).
 fn loadUserModels(arena: Allocator, io: Io, settings: *const config.Settings, env: *std.process.Environ.Map, out: *Io.Writer) !void {
-    var dirs: [2]?[]const u8 = .{ null, settings.models_dir };
+    var dirs: [3]?[]const u8 = .{ null, settings.models_dir, env.get("DITCH_MODELS_DIR") };
     if (try config.configDir(arena, env)) |d| dirs[0] = try std.fs.path.join(arena, &.{ d, "models" });
     for (dirs) |d| if (d) |dir| {
         const n = try models.loadDir(io, arena, dir, reportModelFile);
@@ -1444,10 +1448,6 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         try out.print("\n  v{s}  ditch censorship.  https://github.com/plyght/ditch\n", .{config.version});
         try out.writeAll("  Built on Heretic: https://github.com/p-e-w/heretic\n\n");
     }
-    if (settings.add_model) {
-        std.log.err("ditch add-model is not available in this build yet; write the definition by hand (docs/models.md)", .{});
-        std.process.exit(2);
-    }
     // Lua model definitions of the user, then of --models-dir; they shadow
     // built-in definitions of the same model_type.
     try loadUserModels(arena, io, settings, env, out);
@@ -1574,6 +1574,12 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     if (settings.bench) {
         try bench.run(gpa, arena, io, settings, &http, cache_root, pool, out, con.result);
         return;
+    }
+    if (settings.add_model) {
+        const code = try add_model.run(.{ .gpa = gpa, .arena = arena, .io = io, .env = init.environ_map, .settings = settings, .http = &http, .cache_root = cache_root, .pool = pool, .out = out, .result = con.result });
+        out.flush() catch {};
+        con.result.flush() catch {};
+        std.process.exit(code);
     }
     if (settings.probe) {
         // Loaded as the study would load it: streamed under --max-ram, warp

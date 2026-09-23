@@ -24,5 +24,24 @@ return {
     gate_up = "mlp.dense_h_to_4h.weight",
     down = "mlp.dense_4h_to_h.weight",
   },
-  hook = "chatglm",
+  config = function(cfg, c)
+    -- Rotary embeddings cover half of `kv_channels`, interleaved; theta is scaled by rope_ratio.
+    c.rotary_dim = c.head_dim // 2
+    c.rope_freq_dim = c.rotary_dim
+    c.rope_theta = f32(10000.0 * f32(num(cfg.rope_ratio, 1.0)))
+    c.attention_bias = flag(cfg.add_qkv_bias, true)
+    if not flag(cfg.rmsnorm, true) then c.norm = "layer" end
+    if flag(cfg.apply_residual_connection_post_layernorm, false) then
+      unsupported("chatglm: apply_residual_connection_post_layernorm (the residual taken after the input norm) is not supported")
+    end
+    if flag(cfg.post_layer_norm, true) == false then
+      unsupported("chatglm: post_layer_norm = false (no final layer norm) is not supported")
+    end
+    if flag(cfg.multi_query_attention, false) then
+      c.num_kv_heads = int(cfg.multi_query_group_num, c.num_heads)
+    else
+      c.num_kv_heads = c.num_heads
+    end
+    c.tie_word_embeddings = flag(cfg.tie_word_embeddings, false)
+  end,
 }

@@ -22,6 +22,9 @@ pub const Template = enum {
     /// Mistral's V7 (tekken) template — Ministral 3, Mistral Small 3.x,
     /// Magistral, Devstral: `<s>[SYSTEM_PROMPT]...[/SYSTEM_PROMPT][INST]...[/INST]`.
     mistral_v7,
+    /// Mistral Small 4: `mistral_v7` with `[MODEL_SETTINGS]{"reasoning_effort": "none"}[/MODEL_SETTINGS]`
+    /// before the first user turn (the template's default effort).
+    mistral_v7_settings,
     /// Mistral v0.1 / v0.2, Mixtral v0.1: `<s> [INST] ... [/INST]`, with spaces.
     mistral_spaced,
     /// DeepSeek V2: `<｜begin▁of▁sentence｜>{system}\n\nUser: ...\n\nAssistant:`.
@@ -185,7 +188,7 @@ pub fn detect(chat_template: ?[]const u8, model_type: []const u8) Template {
         if (has(t, "<|user|>") and has(t, "<|endoftext|>")) return .zephyr;
         if (has(t, "<|user|>")) return .olmo;
         if (has(t, "<<SYS>>")) return .llama2;
-        if (has(t, "[INST]")) return if (has(t, "[SYSTEM_PROMPT]")) .mistral_v7 else if (has(t, "' [INST] '")) .mistral_spaced else .mistral;
+        if (has(t, "[INST]")) return if (has(t, "[MODEL_SETTINGS]")) .mistral_v7_settings else if (has(t, "[SYSTEM_PROMPT]")) .mistral_v7 else if (has(t, "' [INST] '")) .mistral_spaced else .mistral;
         if ((has(t, "'\n\nUser: '") and has(t, "'\n\nAssistant:'")) or (has(t, "'\\n\\nUser: '") and has(t, "'\\n\\nAssistant:'"))) return .falcon;
         if (has(t, "'User: '") and has(t, "'Assistant:'")) return .deepseek_v2;
     }
@@ -364,15 +367,20 @@ pub fn render(gpa: Allocator, template: Template, messages: []const Message) ![]
                 }
             }
         },
-        .mistral_v7 => {
+        .mistral_v7, .mistral_v7_settings => {
             // Contents verbatim; nothing follows the last `[/INST]`. Without a
             // system message the template inserts a long, model-specific
             // default (dated), which ditch, always passing one, leaves out.
             try w.writeAll("<s>");
+            var settings_done = template == .mistral_v7;
             for (messages) |m| {
                 switch (m.role) {
                     .system => try w.print("[SYSTEM_PROMPT]{s}[/SYSTEM_PROMPT]", .{m.content}),
-                    .user => try w.print("[INST]{s}[/INST]", .{m.content}),
+                    .user => {
+                        if (!settings_done) try w.writeAll("[MODEL_SETTINGS]{\"reasoning_effort\": \"none\"}[/MODEL_SETTINGS]");
+                        settings_done = true;
+                        try w.print("[INST]{s}[/INST]", .{m.content});
+                    },
                     .assistant => try w.print("{s}</s>", .{m.content}),
                 }
             }
@@ -1263,6 +1271,12 @@ test "template detection and rendering" {
     const m7 = try render(gpa, .mistral_v7, &.{ .{ .role = .system, .content = "Sys.\n" }, .{ .role = .user, .content = " Hi " }, .{ .role = .assistant, .content = "Yo" }, .{ .role = .user, .content = "Bye" } });
     defer gpa.free(m7);
     try std.testing.expectEqualStrings("<s>[SYSTEM_PROMPT]Sys.\n[/SYSTEM_PROMPT][INST] Hi [/INST]Yo</s>[INST]Bye[/INST]", m7);
+    // mistralai/Mistral-Small-4-119B-2603 (transformers' apply_chat_template):
+    // the model settings once, before the first user turn.
+    try std.testing.expectEqual(Template.mistral_v7_settings, detect("{{- '[SYSTEM_PROMPT]' }}{%- set model_settings = '[MODEL_SETTINGS]' %}{{- '[INST]' }}", "mistral4"));
+    const m4 = try render(gpa, .mistral_v7_settings, &.{ .{ .role = .system, .content = "You are a helpful assistant." }, .{ .role = .user, .content = "Hi" }, .{ .role = .assistant, .content = "Yo" }, .{ .role = .user, .content = "Bye" } });
+    defer gpa.free(m4);
+    try std.testing.expectEqualStrings("<s>[SYSTEM_PROMPT]You are a helpful assistant.[/SYSTEM_PROMPT][MODEL_SETTINGS]{\"reasoning_effort\": \"none\"}[/MODEL_SETTINGS][INST]Hi[/INST]Yo</s>[INST]Bye[/INST]", m4);
     // Apertus (swiss-ai/Apertus-8B-Instruct-2509; token-for-token against
     // apply_chat_template), which also has `<|user_start|>`.
     try std.testing.expectEqual(Template.apertus, detect("{%- set system_token = '<|system_start|>' -%}{%- set developer_token = '<|developer_start|>' -%}{%- set user_token = '<|user_start|>' -%}", "apertus"));

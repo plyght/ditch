@@ -1,0 +1,18 @@
+[
+  {"sliding_window_pattern": "LLLG"},
+  {"sliding_window_pattern": "LG"},
+  {"sliding_window_pattern": "GLL"},
+  {"sliding_window_pattern": "LxlG"},
+  {"sliding_window_pattern": ""},
+  {"sliding_window_pattern": "$delete"},
+  {"sliding_window_pattern": 2},
+  {"sliding_window_pattern": null},
+  {"sliding_window": "$delete"},
+  {"sliding_window": "$delete", "sliding_window_pattern": "LG"},
+  {"layer_types": ["sliding_attention", "full_attention", "sliding_attention", "sliding_attention"]},
+  {"n_group": 3},
+  {"n_group": 0},
+  {"norm_topk_prob": false},
+  {"routed_scaling_factor": "$delete"},
+  {"topk_group": "$delete"}
+]

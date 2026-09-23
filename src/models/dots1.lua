@@ -1,3 +1,5 @@
+local moe = require("moe")
+
 return {
   model_type = "dots1",
   llama_cpp = "dots1",
@@ -10,5 +12,8 @@ return {
     router_correction_bias = "mlp.gate.e_score_correction_bias",
     shared_expert = "mlp.shared_experts.",
   },
-  hook = "dots1",
+  config = function(cfg, c)
+    c.qk_norm = "head"
+    moe.ds_router(cfg, c)
+  end,
 }

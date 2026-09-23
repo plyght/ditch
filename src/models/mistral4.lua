@@ -14,5 +14,31 @@ return {
     kv_b = "self_attn.kv_b_proj.weight",
     shared_expert = "mlp.shared_experts.",
   },
-  hook = "mistral4",
+  config = function(cfg, c)
+    c.rope_style = flag(cfg.rope_interleave, true) and "gptj" or "neox"
+    c.moe.scoring = "softmax"
+    c.moe.topk_method = "group_limited"
+    c.moe.group_score_top2 = true
+    c.moe.n_group = math.max(1, int(cfg.n_group, 1))
+    c.moe.topk_group = math.max(1, int(cfg.topk_group, 1))
+    c.moe.routed_scaling_factor = num(cfg.routed_scaling_factor, 1.0)
+    c.norm_topk_prob = flag(cfg.norm_topk_prob, true)
+    c.num_experts_per_tok = int(cfg.num_experts_per_tok, 4)
+    if c.num_experts % c.moe.n_group ~= 0 then
+      invalid(string.format("mistral4: %d experts do not split into n_group = %d groups", c.num_experts, c.moe.n_group))
+    end
+    -- Queries are scaled by `1 + beta * log(1 + floor(pos / original_max_position_embeddings))`.
+    local r = obj(cfg.rope_parameters) or obj(cfg.rope_scaling)
+    if r then
+      local beta = num(r.llama_4_scaling_beta, nil)
+      if beta then
+        c.attn_temperature = {
+          floor_scale = num(r.original_max_position_embeddings, 8192),
+          attn_scale = beta,
+          offset = 0,
+          all_layers = true,
+        }
+      end
+    end
+  end,
 }

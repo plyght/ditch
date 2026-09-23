@@ -23,5 +23,5 @@ return {
     up = "mlp.fc_in.weight",
     down = "mlp.fc_out.weight",
   },
-  hook = "gptj",
+  config = require("gptj").config,
 }

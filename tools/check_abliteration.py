@@ -59,6 +59,15 @@ def orig(name):  # float32 view of a source tensor, dequantised (and rounded to 
         return convert_moe_packed_tensors(src.tensor(base + '_blocks'), src.tensor(base + '_scales')).float()
     if name in keys and src.header[name]['dtype'] not in ('F8_E4M3', 'U8', 'I8', 'I32'):
         return src.tensor(name).float()
+    if name in keys and src.header[name]['dtype'] == 'F8_E4M3':
+        # FP8 with a per-tensor, per-expert ([E, 1, 1]) or per-block scale
+        sname = next((c for c in (base + '.weight_scale_inv', name + '_scale_inv', base + '.weight_scale', name + '_scale') if c in keys), None)
+        w = src.tensor(name).float(); s = src.tensor(sname).float()
+        if s.dim() == 0 or s.numel() == 1 or (s.dim() == w.dim() and all(a in (1, b) for a, b in zip(s.shape, w.shape))):
+            return (w * s).to(torch.bfloat16).float()
+        bs = q.get('weight_block_size') or [-(-w.shape[-2] // s.shape[-2]), -(-w.shape[-1] // s.shape[-1])]
+        s = s.repeat_interleave(bs[0], -2)[..., : w.shape[-2], :].repeat_interleave(bs[1], -1)[..., : w.shape[-1]]
+        return (w * s).to(torch.bfloat16).float()
     return dequant_expert(src, base, wq).to(torch.bfloat16).float()
 exp_files = [os.path.join(out, f) for f in sorted(os.listdir(out)) if f.endswith('.safetensors')]
 changed, unchanged, checks, bits = [], 0, [], []

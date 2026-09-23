@@ -14,5 +14,12 @@ return {
     router_correction_bias = "mlp.gate.e_score_correction_bias",
     shared_expert = "mlp.shared_experts.",
   },
-  hook = "glm4_moe",
+  config = function(cfg, c)
+    if flag(cfg.use_qk_norm, false) then c.qk_norm = "head" end
+    c.moe.scoring = "sigmoid"
+    c.moe.topk_method = "group_limited"
+    c.moe.n_group = math.max(1, int(cfg.n_group, 1))
+    c.moe.topk_group = math.max(1, int(cfg.topk_group, 1))
+    c.moe.routed_scaling_factor = num(cfg.routed_scaling_factor, 1.0)
+  end,
 }

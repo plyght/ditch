@@ -1,3 +1,5 @@
+local granite = require("granite")
+
 return {
   model_type = "granite_swa",
   llama_cpp = "granite",
@@ -8,5 +10,10 @@ return {
   names = {
     sinks = "self_attn.sinks",
   },
-  hook = "granite_swa",
+  -- Granite 4 SWA: the Granite multipliers plus per-head attention sinks and
+  -- sliding layers with their own rope base (`layer_rope_theta`).
+  config = function(cfg, c)
+    granite.multipliers(cfg, c)
+    c.sinks = true
+  end,
 }

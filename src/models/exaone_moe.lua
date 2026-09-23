@@ -1,3 +1,6 @@
+local moe = require("moe")
+local exaone = require("exaone")
+
 return {
   model_type = "exaone_moe",
   llama_cpp = "exaone4",
@@ -11,5 +14,10 @@ return {
     router_correction_bias = "mlp.gate.e_score_correction_bias",
     shared_expert = "mlp.shared_experts.",
   },
-  hook = "exaone_moe",
+  config = function(cfg, c)
+    c.qk_norm = "head"
+    moe.ds_router(cfg, c)
+    -- Same layer kinds as EXAONE 4: RoPE on the sliding layers only, global NoPE.
+    exaone.layer_kinds(cfg, c)
+  end,
 }

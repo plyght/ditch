@@ -9,5 +9,8 @@ return {
   names = {
     gate = false,
   },
-  hook = "nemotron",
+  config = function(cfg, c)
+    if str(cfg.hidden_act) == nil then c.activation = "relu2" end
+    c.attention_bias = flag(cfg.attention_bias, false)
+  end,
 }

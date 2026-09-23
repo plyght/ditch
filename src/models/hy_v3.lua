@@ -16,5 +16,15 @@ return {
       shared_expert = "mlp.shared_experts.",
     },
   },
-  hook = "hy_v3",
+  -- HunYuan V3: sigmoid routing with a correction bias, renormalised and
+  -- scaled, shared experts and a per-head q/k norm before RoPE.
+  config = function(cfg, c)
+    c.qk_norm = "head"
+    c.moe.scoring = "sigmoid"
+    c.moe.norm_eps_floor = true
+    c.norm_topk_prob = true
+    local scale = cfg.router_scaling_factor
+    if type(scale) ~= "number" then scale = cfg.routed_scaling_factor end
+    c.moe.routed_scaling_factor = num(scale, 1.0)
+  end,
 }
