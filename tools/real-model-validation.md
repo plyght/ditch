@@ -3363,3 +3363,16 @@ table (`embed_tokens_per_layer`, [vocab, layers x 256], 4 GB) has to be sliced
 by columns, which range requests on a row-major tensor cannot do in one piece,
 and ditch (like transformers) refuses a table sized for 30 layers in a
 5-layer model. Gemma 3n stays verified on the transformers stub only.
+
+## Gemma 4 12B (`gemma4_unified`): verified on real weights
+
+`google/gemma-4-12B-it`, layers 0 and 5 (a sliding layer; a global layer with
+its own 512-wide head, one KV head, keys reused as values and proportional
+RoPE, after Bug F8). Reference: transformers' `gemma4_unified` through
+`tools/ref_lazy_moe.py`.
+
+| prompt | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| "The capital of France is" | match (5) | all 3 agree, worst 8.73e-07 | 4.02e-06 | match |
+| "Explain how rainbows form, …" | match (13) | all 3 agree, worst 1.57e-06 | 5.45e-06 | match |
+| the printing-press passage | match (310) | all 3 agree, worst 1.17e-06 | 4.95e-06 | match (1 token) |
