@@ -27,6 +27,9 @@ pub const Template = enum {
     /// Gemma 4: `<|turn>user\n...<turn|>\n<|turn>model\n<|channel>thought\n<channel|>`,
     /// with a system turn of its own (Gemma 2 / 3 fold the system prompt into the user's).
     gemma4,
+    /// Gemma 4 whose template never writes the empty thought block after the
+    /// model turn (gemma-4-E2B-it): `...<|turn>model\n`.
+    gemma4_plain,
     /// Phi-3 / Phi-4: `<|user|>\n...<|end|>\n<|assistant|>\n`.
     phi3,
     /// Zephyr / StableLM-chat: `<|user|>\n...<|endoftext|>\n<|assistant|>\n`.
@@ -165,7 +168,9 @@ pub fn detect(chat_template: ?[]const u8, model_type: []const u8) Template {
         if (has(t, "<|start_header_id|>") and has(t, "Cutting Knowledge Date")) return if (has(t, "strftime_now")) .llama32 else .llama31;
         if (has(t, "<|start_header_id|>")) return .llama3;
         if (has(t, "<|header_start|>")) return .llama4;
-        if (has(t, "<|turn>")) return .gemma4;
+        // gemma-4-12B-it appends `<|channel>thought\n<channel|>` when thinking is
+        // off; gemma-4-E2B-it's template has no such branch.
+        if (has(t, "<|turn>")) return if (has(t, "'<|channel>thought\\n<channel|>'") or !has(t, "<|channel>")) .gemma4 else .gemma4_plain;
         if (has(t, "<start_of_turn>")) return .gemma;
         if (has(t, "<|START_OF_TURN_TOKEN|>")) return if (has(t, "<|START_RESPONSE|>")) .cohere_response else .cohere;
         if (has(t, "<|start|>") and has(t, "<|message|>")) return .harmony;
@@ -313,7 +318,7 @@ pub fn render(gpa: Allocator, template: Template, messages: []const Message) ![]
             }
             try w.writeAll("<start_of_turn>model\n");
         },
-        .gemma4 => {
+        .gemma4, .gemma4_plain => {
             try w.writeAll("<bos>");
             var rest = messages;
             if (rest.len > 0 and rest[0].role == .system) {
@@ -335,7 +340,7 @@ pub fn render(gpa: Allocator, template: Template, messages: []const Message) ![]
                     try w.print("{s}<turn|>\n", .{trim(kept.written())});
                 },
             };
-            try w.writeAll("<|turn>model\n<|channel>thought\n<channel|>");
+            try w.writeAll(if (template == .gemma4) "<|turn>model\n<|channel>thought\n<channel|>" else "<|turn>model\n");
         },
         .llama2 => {
             try w.writeAll("<s>");
@@ -896,6 +901,13 @@ test "template detection and rendering" {
     try std.testing.expectEqualStrings("<bos><start_of_turn>user\nSys.\n\nHi<end_of_turn>\n<start_of_turn>model\n", g);
     try std.testing.expectEqual(Template.gemma4, detect("{{- '<|turn>' + role + '\\n' }}<start_of_turn>", "gemma4_unified_text"));
     try std.testing.expectEqual(Template.gemma4, detect(null, "gemma4_unified"));
+    // gemma-4-E2B-it's generation prompt stops at the model turn (transformers'
+    // apply_chat_template on the release: `...<turn|>\n<|turn>model\n`).
+    try std.testing.expectEqual(Template.gemma4_plain, detect("{%- if add_generation_prompt -%}{{- '<|turn>model\\n' -}}{%- elif ns.prev_message_type == 'tool_response' and enable_thinking -%}{{- '<|channel>thought\\n' -}}{%- endif -%}", "gemma4"));
+    try std.testing.expectEqual(Template.gemma4, detect("{{- '<|turn>model\\n' -}}{%- if not enable_thinking -%}{{- '<|channel>thought\\n<channel|>' -}}{%- endif -%}", "gemma4_unified"));
+    const g4p = try renderPrompt(gpa, .gemma4_plain, "Sys.", "Hi");
+    defer gpa.free(g4p);
+    try std.testing.expectEqualStrings("<bos><|turn>system\nSys.<turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\n", g4p);
     const g4 = try renderPrompt(gpa, .gemma4, "Sys.", "Hi");
     defer gpa.free(g4);
     try std.testing.expectEqualStrings("<bos><|turn>system\nSys.<turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>", g4);
