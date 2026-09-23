@@ -44,24 +44,21 @@ function Install-Ditch {
 
     # The wordmark (src/logo.txt): {W} starts the letters, {R} the thread, {0} resets.
     $logo = @'
-           {W}....   ..                  ....{0}
-          {W}.+@@+  +@@:                 :@@@{0}
-           {W}-@@+  .--   .+#.            %@@       {R}/`''`\       __-`{0}
-      {W}:+#+=*@@+ :+**: =#@@++. :+#++*+  %@@-+##*: {R}\\  //  ___-''{0}
-     {W}-@@+  -@@+  *@@-  #@@.  =@@=  .*  %@@  :@@#  {R}\-----`'{0}
-{R}_-------____{W}@@+{R}`-{W}*{R}_____--`''`{W}%@@{R}_____--```---___--`'{0}
-     {W}+@@-  -@@+  *@@-  #@@.  *@@:      %@@  .@@#{0}
-     {W}.*@%==+@@#::#@@+. +@@*=:.+%%+=== -@@@- =@@%:{0}
-        {W}... .........   ....    ....  ..... .....{0}
+        {W}⢀⣀⡀  ⣀⣀                 ⣀⣀{0}
+        {W}⣿⣿⡇ ⠸⠿⠿  ⢰⣶⣶            ⣿⣿⡇     {R}⢀⣠⠴⠶⢤⡀       ⣀{0}
+   {W}⢠⣴⣶⣶⣤⣿⣿⡇ ⢠⣶⣶ ⢰⣾⣿⣿⣶⣶⡆ ⣠⣴⣶⣶⣶⣦  ⣿⣿⣧⣶⣶⣶⣄ {R}⢾⡀   ⡽   ⣀⣠⠴⠋⠉{0}
+ {R}⢀⣀⣛⣛{W}⠋ ⠉⡿⣿⡇{R}⠤{W}⢸⣿⠿ ⠈⢹⠟{R}⣩⠥⠦⣅{W}⢰⣿⣿⠋ ⠈⠉{R}⢀⣠⠭⢭⣍⡁{W}⠉⣿⣿⡆ {R}⠙⢲⣦⠾⠷⠒⠚⠋⠉{0}
+{R}⠚⠉{W}⠡⣶⣌{R}⠳⣄⣀⡴{W}⣿⡇ ⢸⣿{R}⠳⣄⣀⣠⠞{W}⣡   ⢸⣿⣿ {R}⢀⡠⠖⠋ {W}⣾⣶⡆{R}⠉⠓⠦⠭⠥⠶⠚⠉{0}
+   {W}⠻⣿⣷⣦⡭⣴⣿⡇ ⢸⣿⣷ {R}⠉ {W}⢾⣿⣿⣿ ⠈⠻⣿⣿⣶⣶⣾  ⣿⣿⡇  ⣿⣿⡇{0}
+     {W}⠈                     ⠉{0}
 '@
-    # A console narrower than the art gets a one-line form instead of wrapped rows.
+    # The art is braille: it needs the console in UTF-8, and a console that
+    # cannot switch or is narrower than the art gets the one-line form.
+    $unicode = $true
+    try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { $unicode = $false }
     $cols = 0
     try { $cols = [Console]::WindowWidth } catch { try { $cols = $Host.UI.RawUI.WindowSize.Width } catch {} }
-    if ($cols -gt 0 -and $cols -le 66) { $logo = "  {W}ditch {R}--.__.-'``{0}" }
-    # A console narrower than the art gets the one-line form instead of wrapped rows.
-    $cols = 0
-    try { $cols = [Console]::WindowWidth } catch { try { $cols = $Host.UI.RawUI.WindowSize.Width } catch {} }
-    if ($cols -gt 0 -and $cols -le 77) { $logo = "  {W}ditch {R}--.__.-'``{0}" }
+    if (-not $unicode -or ($cols -gt 0 -and $cols -le 54)) { $logo = "  {W}ditch {R}--.__.-'``{0}" }
     if ($Host.UI.SupportsVirtualTerminal) {
         $e = [char]27
         $logo = $logo -replace '\{W\}', "$e[38;5;252m" -replace '\{R\}', "$e[38;5;174m" -replace '\{0\}', "$e[0m"

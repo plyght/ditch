@@ -1394,7 +1394,7 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     }
     if (args.len == 1) {
         if (con.tty_out) {
-            try logo.write(con.result, bold_out, logo.terminalColumns(io, .stdout()));
+            try logo.write(con.result, bold_out, logo.terminalColumns(io, .stdout()), logo.unicodeTerminal(env));
             try con.result.writeAll("\n");
         }
         var help: Io.Writer.Allocating = .init(arena);
@@ -1410,7 +1410,7 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         std.process.exit(2);
     }
     if (!settings.quiet) {
-        try logo.write(out, con.color, if (con.tty) logo.terminalColumns(io, .stderr()) else null);
+        try logo.write(out, con.color, if (con.tty) logo.terminalColumns(io, .stderr()) else null, logo.unicodeTerminal(env));
         try out.print("\n  v{s}  ditch censorship.  https://github.com/plyght/ditch\n", .{config.version});
         try out.writeAll("  Built on Heretic: https://github.com/p-e-w/heretic\n\n");
     }
