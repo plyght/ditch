@@ -263,6 +263,20 @@ pub const Settings = struct {
     /// Also report the last token's residual at every layer (`--residuals`),
     /// so a reference implementation can be compared layer by layer.
     probe_residuals: bool = false,
+    /// `ditch truncate <model> <K> <out>`: write a checkpoint of a few decoder
+    /// layers (see truncate.zig) instead of running a study.
+    truncate: bool = false,
+    /// `--layers 0,1,5`: the layers `ditch truncate` keeps, in this order.
+    truncate_layers: ?[]const u8 = null,
+    /// `--kinds`: keep the fewest layers that cover every layer kind of the model.
+    truncate_kinds: bool = false,
+    /// `--drop PREFIX` (repeatable): leave out tensors whose name starts with it.
+    truncate_drop: []const []const u8 = &.{},
+    /// `--rows NAME=FILE` (repeatable): write only these rows of a table.
+    truncate_rows: []const []const u8 = &.{},
+    /// Positional arguments after the model (the layer count and output
+    /// directory of `ditch truncate`; an error for every other command).
+    positionals: []const []const u8 = &.{},
     help: bool = false,
     version: bool = false,
     /// Print only trial results, scores, menus and errors: no banner and no progress lines.
@@ -309,6 +323,7 @@ pub const usage_text =
     \\  ditch probe [OPTIONS] <MODEL> --prompt TEXT   show tokens, first-token logits, greedy reply
     \\  ditch verify [OPTIONS] <MODEL>   check it against the official implementation (see ditch verify --help)
     \\  ditch selftest [--device D]      check a compute backend against the CPU reference kernels
+    \\  ditch truncate <MODEL> <K> <OUT> write a checkpoint of the first K decoder layers
     \\  ditch help [bench]               this help (or the benchmark options)
     \\
     \\<MODEL> is a Hugging Face model id (Qwen/Qwen2.5-0.5B-Instruct), a local directory, a .gguf
@@ -478,6 +493,16 @@ pub const help_sections = [_]HelpSection{
     \\                                 the largest absolute and relative error per kernel (--json
     \\                                 for machine-readable output). Exit 1 when a kernel is
     \\                                 outside its tolerance, 2 when the device is unavailable.
+    \\  ditch truncate <model> <K> <out> [--layers 0,1,5] [--kinds] [--drop PREFIX] [--rows NAME=FILE]
+    \\                                 Write a checkpoint of a few decoder layers of a model into
+    \\                                 <out>, range-reading only the tensors it keeps (nothing else
+    \\                                 is downloaded; quantisation stays as stored). <K> keeps layers
+    \\                                 0..K-1; --layers keeps those layers, renumbered in that order;
+    \\                                 --kinds the fewest layers covering every layer kind. config.json
+    \\                                 gets the kept count and every per-layer list cut to match.
+    \\                                 --drop leaves out tensors whose name starts with PREFIX (e.g.
+    \\                                 mtp.); --rows writes only the rows of tensor NAME listed in FILE
+    \\                                 (one index per line) into a sparse file of the full size.
     \\
     },
     .{ .title = "Output and interaction", .body =
@@ -691,7 +716,7 @@ fn applyConfigFile(gpa: Allocator, io: std.Io, a: Allocator, settings: *Settings
     return true;
 }
 
-pub const subcommands = [_][]const u8{ "bench", "probe", "verify", "selftest", "help" };
+pub const subcommands = [_][]const u8{ "bench", "probe", "verify", "selftest", "truncate", "help" };
 
 /// Parses the configuration: the user file ($XDG_CONFIG_HOME/ditch/config.lua),
 /// the project file (./config.lua, ./config.toml or --config), the DITCH_*
@@ -751,6 +776,7 @@ pub fn load(gpa: Allocator, io: std.Io, args: []const []const u8, environ: ?*std
 
     // Second pass: command-line options.
     var expect_help_topic = false;
+    var positionals = std.ArrayList([]const u8).empty;
     i = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -794,13 +820,18 @@ pub fn load(gpa: Allocator, io: std.Io, args: []const []const u8, environ: ?*std
                 settings.selftest = true;
                 continue;
             }
+            if (std.mem.eql(u8, arg, "truncate") and !settings.truncate) {
+                settings.truncate = true;
+                continue;
+            }
             if (std.mem.eql(u8, arg, "help")) {
                 settings.help = true;
                 expect_help_topic = true;
                 continue;
             }
             if (settings.model.len > 0) {
-                try errors.append(a, try std.fmt.allocPrint(a, "unexpected argument {s} (the model is already {s}; quote values containing spaces)", .{ arg, settings.model }));
+                // Kept for `ditch truncate`; an error for every other command (below).
+                try positionals.append(a, try a.dupe(u8, arg));
                 continue;
             }
             // A near miss of a subcommand that is not a path is a typo, not a model.
@@ -853,6 +884,11 @@ pub fn load(gpa: Allocator, io: std.Io, args: []const []const u8, environ: ?*std
         };
     }
     if (expect_help_topic) settings.help_topic = null;
+    if (settings.truncate) {
+        settings.positionals = positionals.items;
+    } else for (positionals.items) |arg| {
+        try errors.append(a, try std.fmt.allocPrint(a, "unexpected argument {s} (the model is already {s}; quote values containing spaces)", .{ arg, settings.model }));
+    }
     // The fast search fixes the objective set; the keyword scorer is deferred.
     if (settings.fast_search) settings.scorers = &fast_search_scorers;
     return .{ .settings = settings, .arena = arena, .errors = try errors.toOwnedSlice(a) };
@@ -867,7 +903,7 @@ fn normalizeKey(a: Allocator, name: []const u8) ![]u8 {
 }
 
 fn isBoolKey(key: []const u8) bool {
-    const bools = [_][]const u8{ "print_debug_information", "print_residual_geometry", "orthogonalize_direction", "keyword_rate_print_responses", "ignore_mismatches", "early_stop", "no_early_stop", "visited_experts_only", "remote_weights", "hotlist", "no_hotlist", "ablate_inputs", "fast_search", "selftest", "raw", "residuals", "kernels", "bench_kernels", "accelerate", "no_accelerate", "help", "version", "quiet", "dry_run", "no_input", "interactive", "force", "json", "plain", "no_color", "debug", "token" };
+    const bools = [_][]const u8{ "print_debug_information", "print_residual_geometry", "orthogonalize_direction", "keyword_rate_print_responses", "ignore_mismatches", "early_stop", "no_early_stop", "visited_experts_only", "remote_weights", "hotlist", "no_hotlist", "ablate_inputs", "fast_search", "selftest", "kinds", "raw", "residuals", "kernels", "bench_kernels", "accelerate", "no_accelerate", "help", "version", "quiet", "dry_run", "no_input", "interactive", "force", "json", "plain", "no_color", "debug", "token" };
     for (bools) |b| if (std.mem.eql(u8, b, key)) return true;
     return false;
 }
@@ -954,7 +990,19 @@ fn applyOption(a: Allocator, s: *Settings, key: []const u8, value: []const u8) !
         @memcpy(list[0..s.probe_prompts.len], s.probe_prompts);
         list[s.probe_prompts.len] = try a.dupe(u8, value);
         s.probe_prompts = list;
-    } else if (eql(u8, key, "raw")) s.probe_raw = try parseBool(value) else if (eql(u8, key, "residuals")) s.probe_residuals = try parseBool(value) else if (eql(u8, key, "help")) s.help = try parseBool(value) else if (eql(u8, key, "version")) s.version = try parseBool(value) else if (eql(u8, key, "quiet")) s.quiet = try parseBool(value) else if (eql(u8, key, "json_log")) s.json_log = try a.dupe(u8, value) else if (eql(u8, key, "dry_run")) s.dry_run = try parseBool(value) else if (eql(u8, key, "no_input")) s.no_input = try parseBool(value) else if (eql(u8, key, "interactive")) s.interactive = try parseBool(value) else if (eql(u8, key, "force")) s.force = try parseBool(value) else if (eql(u8, key, "json")) s.json = try parseBool(value) else if (eql(u8, key, "plain")) s.plain = try parseBool(value) else if (eql(u8, key, "no_color")) s.no_color = try parseBool(value) else if (eql(u8, key, "debug")) s.print_debug_information = try parseBool(value) else if (eql(u8, key, "output")) s.save_directory = try a.dupe(u8, value) else if (eql(u8, key, "token_file")) s.token_file = try a.dupe(u8, value) else if (eql(u8, key, "http_timeout")) s.http_timeout_seconds = try parseDuration(value) else if (eql(u8, key, "token")) return error.TokenAsFlag else if (eql(u8, key, "keyword_rate_print_responses")) s.keyword_rate.print_responses = try parseBool(value) else if (eql(u8, key, "keyword_rate_score_name")) s.keyword_rate.score_name = try a.dupe(u8, value) else if (std.mem.startsWith(u8, key, "good_prompts_")) try applyDatasetOption(a, &s.good_prompts, key["good_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "bad_prompts_")) try applyDatasetOption(a, &s.bad_prompts, key["bad_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "keyword_rate_prompts_")) try applyDatasetOption(a, &s.keyword_rate.prompts, key["keyword_rate_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "kl_divergence_prompts_")) try applyDatasetOption(a, &s.kl_divergence.prompts, key["kl_divergence_prompts_".len..], value) else return error.UnknownOption;
+    } else if (eql(u8, key, "raw")) s.probe_raw = try parseBool(value) else if (eql(u8, key, "residuals")) s.probe_residuals = try parseBool(value) else if (eql(u8, key, "help")) s.help = try parseBool(value) else if (eql(u8, key, "version")) s.version = try parseBool(value) else if (eql(u8, key, "quiet")) s.quiet = try parseBool(value) else if (eql(u8, key, "json_log")) s.json_log = try a.dupe(u8, value) else if (eql(u8, key, "dry_run")) s.dry_run = try parseBool(value) else if (eql(u8, key, "no_input")) s.no_input = try parseBool(value) else if (eql(u8, key, "interactive")) s.interactive = try parseBool(value) else if (eql(u8, key, "force")) s.force = try parseBool(value) else if (eql(u8, key, "json")) s.json = try parseBool(value) else if (eql(u8, key, "plain")) s.plain = try parseBool(value) else if (eql(u8, key, "no_color")) s.no_color = try parseBool(value) else if (eql(u8, key, "debug")) s.print_debug_information = try parseBool(value) else if (eql(u8, key, "output")) s.save_directory = try a.dupe(u8, value) else if (eql(u8, key, "token_file")) s.token_file = try a.dupe(u8, value) else if (eql(u8, key, "http_timeout")) s.http_timeout_seconds = try parseDuration(value) else if (eql(u8, key, "token")) return error.TokenAsFlag else if (eql(u8, key, "keyword_rate_print_responses")) s.keyword_rate.print_responses = try parseBool(value) else if (eql(u8, key, "keyword_rate_score_name")) s.keyword_rate.score_name = try a.dupe(u8, value) else if (std.mem.startsWith(u8, key, "good_prompts_")) try applyDatasetOption(a, &s.good_prompts, key["good_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "bad_prompts_")) try applyDatasetOption(a, &s.bad_prompts, key["bad_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "keyword_rate_prompts_")) try applyDatasetOption(a, &s.keyword_rate.prompts, key["keyword_rate_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "kl_divergence_prompts_")) try applyDatasetOption(a, &s.kl_divergence.prompts, key["kl_divergence_prompts_".len..], value) else if (eql(u8, key, "layers")) s.truncate_layers = try a.dupe(u8, value) else if (eql(u8, key, "kinds")) s.truncate_kinds = try parseBool(value) else if (eql(u8, key, "drop")) {
+        s.truncate_drop = try appendString(a, s.truncate_drop, value);
+    } else if (eql(u8, key, "rows")) {
+        s.truncate_rows = try appendString(a, s.truncate_rows, value);
+    } else return error.UnknownOption;
+}
+
+/// `list` with a copy of `value` appended (for repeatable options).
+fn appendString(a: Allocator, list: []const []const u8, value: []const u8) ![]const []const u8 {
+    const out = try a.alloc([]const u8, list.len + 1);
+    @memcpy(out[0..list.len], list);
+    out[list.len] = try a.dupe(u8, value);
+    return out;
 }
 
 fn tomlString(a: Allocator, v: toml.Value) ![]const u8 {
@@ -1251,6 +1299,38 @@ test "cli aliases, subcommands, order and suggestions" {
     try std.testing.expectEqual(@as(usize, 2), editDistance("bench", "bnech"));
     try std.testing.expectEqualStrings("n-trials", (try suggestOption(r6.arena.allocator(), "ntrials")).?);
     try std.testing.expect(std.mem.indexOf(u8, help_text, "Exit codes:") != null);
+}
+
+test "cli: truncate takes the layer count and output directory as positionals" {
+    const gpa = std.testing.allocator;
+    const args = [_][]const u8{ "ditch", "truncate", "owner/name", "2", "out", "--drop", "mtp.", "--drop=model.mtp", "--rows", "t=rows.txt" };
+    var r = try load(gpa, std.testing.io, &args, null);
+    defer r.deinit();
+    try std.testing.expectEqual(@as(usize, 0), r.errors.len);
+    try std.testing.expect(r.settings.truncate);
+    try std.testing.expectEqualStrings("owner/name", r.settings.model);
+    try std.testing.expectEqual(@as(usize, 2), r.settings.positionals.len);
+    try std.testing.expectEqualStrings("2", r.settings.positionals[0]);
+    try std.testing.expectEqualStrings("out", r.settings.positionals[1]);
+    try std.testing.expectEqual(@as(usize, 2), r.settings.truncate_drop.len);
+    try std.testing.expectEqualStrings("model.mtp", r.settings.truncate_drop[1]);
+    try std.testing.expectEqualStrings("t=rows.txt", r.settings.truncate_rows[0]);
+
+    // The subcommand after the model, --layers and --kinds.
+    const args2 = [_][]const u8{ "ditch", "owner/name", "truncate", "--layers", "0,1,20", "--kinds", "out" };
+    var r2 = try load(gpa, std.testing.io, &args2, null);
+    defer r2.deinit();
+    try std.testing.expectEqual(@as(usize, 0), r2.errors.len);
+    try std.testing.expect(r2.settings.truncate and r2.settings.truncate_kinds);
+    try std.testing.expectEqualStrings("0,1,20", r2.settings.truncate_layers.?);
+    try std.testing.expectEqualStrings("out", r2.settings.positionals[0]);
+
+    // Every other command takes one positional, the model.
+    const args3 = [_][]const u8{ "ditch", "m", "extra" };
+    var r3 = try load(gpa, std.testing.io, &args3, null);
+    defer r3.deinit();
+    try std.testing.expectEqual(@as(usize, 1), r3.errors.len);
+    try std.testing.expect(std.mem.startsWith(u8, r3.errors[0], "unexpected argument extra (the model is already m"));
 }
 
 test "dump directions option" {

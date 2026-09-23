@@ -43,4 +43,6 @@ comptime {
     _ = @import("wrap.zig");
     _ = @import("remote.zig");
     _ = @import("remote_test.zig");
+    _ = @import("truncate.zig");
+    _ = @import("truncate_test.zig");
 }
