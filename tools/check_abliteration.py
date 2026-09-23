@@ -20,7 +20,8 @@ from lazy_checkpoint import LazyCheckpoint
 from ref_lazy_moe import dequant_expert
 from safetensors import safe_open
 cut, out = sys.argv[1], sys.argv[2]
-log = open(out + '.log').read()
+json_out = sys.argv[sys.argv.index('--json') + 1] if '--json' in sys.argv else None
+log = open(out + '.log', errors='replace').read()
 # --- trial parameters (the "Restoring model from trial" block) ---
 blk = log[log.rindex('* Parameters:'):]
 P = {}
@@ -79,7 +80,7 @@ def rank_err(D, r=3):
     U, S, Vh = torch.linalg.svd(D, full_matrices=False)
     return float(torch.sqrt((S[r:] ** 2).sum()) / torch.sqrt((S ** 2).sum()))
 def classify(name):
-    if re.search(r'(down_proj|\.w2\b|dense_4h_to_h|shared_expert|experts|latent_up|mlp\.up_proj_latent)', name): return 'mlp.down_proj'
+    if re.search(r'(down_proj|\.w2\b|dense_4h_to_h|shared_expert|experts|latent_up|mlp\.up_proj_latent|output_linear|shared_mlp|block_sparse_moe|feed_forward\.w2|c_proj)', name) and 'attn' not in name: return 'mlp.down_proj'
     return 'attn.o_proj'
 for fpath in exp_files:
     with safe_open(fpath, 'pt') as f:
@@ -149,3 +150,11 @@ if EXP_BF16:
     print(f'bf16 export: worst share of elements equal to bf16(W + D3): {min(b[1] for b in bits) if bits else 1:.6f}; elements more than one bf16 step (and 1e-5 of mean |W|) apart: {sum(b[2][0] for b in bits) if bits else 0}; largest difference {max(b[2][1] for b in bits) if bits else 0:.1e} of mean |W|; over {len(bits)} matrices; (E-W) against the exact edit: worst excess over the error of bf16(W + D3) itself {worst:.2e}; scope {scope}')
 else:
     print(f'worst excess over the rank-3 optimum: {worst:.2e} over {len(checks)} matrices; scope {scope}')
+if json_out:
+    # For `ditch verify`: what changed, and each edit against its recomputation.
+    summary = dict(changed=changed, unchanged=unchanged, matrices=len(checks),
+                   unchecked=[c[0] for c in checks if c[4] is None], worst_excess=worst, scope=scope, bf16=bool(EXP_BF16))
+    if EXP_BF16 and bits:
+        summary.update(bits_equal_min=min(b[1] for b in bits), bits_far=sum(b[2][0] for b in bits),
+                       bits_max_rel=max(b[2][1] for b in bits))
+    json.dump(summary, open(json_out, 'w'), indent=1)
