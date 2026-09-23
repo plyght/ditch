@@ -228,7 +228,10 @@ def main():
             except Exception as exc:  # models without a system role (Gemma)
                 print(f"chat template with system role failed ({exc}); retrying without it")
                 text = tok.apply_chat_template(messages[1:], tokenize=False, add_generation_prompt=True)
-            ids = tok(text, add_special_tokens=True if tok.bos_token and not text.startswith(tok.bos_token or "\0") else False)["input_ids"]
+            # As apply_chat_template(tokenize=True) does: the template writes every
+            # special token it wants, and the tokenizer adds none (no BOS the
+            # template leaves out, Nemotron Nano 2).
+            ids = tok(text, add_special_tokens=False)["input_ids"]
         print(f"\n== {entry['user'][:60]!r}")
         bos = tok.bos_token or ""
         if bos and text.startswith(bos) and not entry["text"].startswith(bos):

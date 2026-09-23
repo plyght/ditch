@@ -3192,3 +3192,12 @@ Not runnable here: `internlm/internlm2_5-1_8b-chat` ships a SentencePiece
 `tokenizer.model` and no `tokenizer.json` (refused, with the reason);
 `openbmb/MiniCPM-2B-sft-bf16` and `baichuan-inc/Baichuan2-7B-Chat` ship
 `.bin` weights only.
+| nvidia/NVIDIA-Nemotron-Nano-9B-v2 | `nemotron_h` | layers 0, 1, 14 (Mamba2, MLP, attention) | match | 7.85e-06 | 2.69e-06 |
+
+**Nemotron Nano 2 and the reference's BOS.** `tools/probe_reference.py` used
+to add the tokenizer's BOS whenever the rendered template did not start with
+it, so its ids had a `<s>` that ditch's lacked. transformers'
+`apply_chat_template(tokenize=True)`, which heretic uses, adds no special
+tokens, and gives ditch's ids; the reference now tokenises the same way.
+`tools/truncate_checkpoint.py` now also cuts Nemotron-H's
+`hybrid_override_pattern` string with the layers.
