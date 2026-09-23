@@ -4262,3 +4262,27 @@ A two-layer run of another trial first showed the bf16 comparison off by more
 than rounding; exporting that trial in f32 showed the edit exact, and the bf16
 differences all ties or cancellations of this kind (its λ was 0.12, so the
 delta was small against the weights and the ties relatively many).
+
+## gpt-oss-120b at full depth over `hf://`: first token in 46 minutes (after F12, F13)
+
+The run that produced no token in 90 minutes (above), again from an empty
+chunk cache with parallel fetching, the routed-expert prefetch queue, F12
+and F13: `--max-ram 10GB --remote-cache-size 16GB`, ReleaseFast, "What is
+the capital of France?" (87 chat tokens), 4 greedy tokens.
+
+| | dry run | measured |
+| --- | --- | --- |
+| RAM | warp min 6.48 GB, 19.56 GB with every cache (budget 9 GB) | budgeted peak 6.83 GB, peak RSS 10.13 GB |
+| disk | trunk 4.08 GB of chunks, 56.80 GB of experts; room for 967 experts beside the trunk | 16.00 GB peak of the 16 GB bound, 5630 chunks evicted |
+| fetched | per decoded token 1.40 GB warm, up to 1.78 GB (144 experts) | 7577 ranges, 59.11 GB (no chunk twice) |
+| time | per decoded token ~15 s at 100 MB/s | first token after 2731.9 s (prefill, ~21.6 MB/s), then 0.004 tokens/s (~263 s a token) |
+
+Text: `<|channel|>analysis<|message|>The` (first-token logits 36.72
+`<|channel|>`, 16.79 `<|constrain|>`). The prefill routes 87 tokens to
+2401 of the 4608 experts; the expert cache (122 decoded experts, fewer than
+one layer's 128) gets no hits, so every routed expert is decoded from the
+chunk cache once per use, and the working set is fetched exactly once. A
+decode step fetches its 144 experts layer by layer: the 4 experts of a layer
+are known only when its router has run, so each layer waits for a round of
+8 MB range requests (~2-3 s at the per-stream rate here) and the link idles
+between layers. That, not the bandwidth, is the ~263 s a token.
