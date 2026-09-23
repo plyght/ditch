@@ -4156,3 +4156,19 @@ against its 1.16 GB LM head): warp mode never holds it whole. Routed-expert
 tensors are now left out of the largest tensor in warp mode. Regression
 test: "warp-mode estimate: a layer is its trunk plus the top-k experts, not
 every expert" (`src/stream_test.zig`).
+
+## Bug F12 — a full disk below the chunk-cache bound turned every later chunk into a refetch (fixed)
+
+The streamed gpt-oss-120b run (`--remote-cache-size 16GB`) shared its disk
+with dry runs whose shard headers took a few GB (Kimi K3's alone are 2.6 GB),
+and the filesystem filled below the bound: "could not write to the chunk
+cache ... (NoSpaceLeft); chunks that do not fit are fetched again when
+needed". From then on every new chunk, prefetched or read, failed to be
+written and was held only in the small RAM ring, so the bound never evicted
+anything and each prefetched chunk was downloaded again when it was read:
+after 53 minutes the process had written 114 GB for a working set of ~60 GB.
+A `NoSpaceLeft` now bounds the cache at the bytes it holds, and later chunks
+evict older ones as they would at the configured bound. Regression test:
+"remote chunk cache: a full filesystem bounds the cache at what it holds"
+(`src/remote_test.zig`, a simulated filesystem capacity; it fails without
+the fix).

@@ -542,6 +542,31 @@ test "remote prefetchRange: queued chunks are fetched in the background, then re
     try std.testing.expectEqual(before + fetched, src.stats().ranges_fetched);
 }
 
+test "remote chunk cache: a full filesystem bounds the cache at what it holds" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var env: Env = undefined;
+    try env.init(gpa, io);
+    defer env.deinit();
+    const shard = "model-00001-of-00002.safetensors";
+    const cache = try env.path("cache");
+    defer gpa.free(cache);
+    const src = try env.openWith(cache, std.math.maxInt(u64), 4);
+    defer src.deinit();
+    const rf = try src.openFile(shard);
+    const held = src.stats().cache_bytes;
+    src.test_disk_bytes = held + 10 * chunk;
+    const got = try gpa.alloc(u8, 30 * chunk);
+    defer gpa.free(got);
+    try rf.readRange(io, 0, got);
+    const st = src.stats();
+    // The first write past the filesystem shrinks the bound; later chunks evict older ones.
+    try std.testing.expect(st.cache_limit <= held + 10 * chunk);
+    try std.testing.expect(st.chunks_evicted > 0);
+    try std.testing.expect(st.chunks_unpersisted <= 4);
+    try std.testing.expect(st.cache_bytes <= st.cache_limit);
+}
+
 test "remote chunk cache: size 0 keeps nothing on disk" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
