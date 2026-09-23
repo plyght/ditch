@@ -9,6 +9,11 @@ const Allocator = std.mem.Allocator;
 pub const Template = enum {
     chatml,
     llama3,
+    /// Llama 3.1 / 3.3: Llama 3 with a system block that always opens with
+    /// `Cutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\n`.
+    llama31,
+    /// Llama 3.2: the same, dated today (`strftime_now("%d %b %Y")`).
+    llama32,
     llama2,
     mistral,
     /// Mistral's V7 (tekken) template — Ministral 3, Mistral Small 3.x,
@@ -151,6 +156,7 @@ pub fn detect(chat_template: ?[]const u8, model_type: []const u8) Template {
         if (has(t, "<|im_middle|>")) return .kimi;
         if (has(t, "<|end_of_msg|>")) return .kimi_k3;
         if (has(t, "<|im_start|>")) return .chatml;
+        if (has(t, "<|start_header_id|>") and has(t, "Cutting Knowledge Date")) return if (has(t, "strftime_now")) .llama32 else .llama31;
         if (has(t, "<|start_header_id|>")) return .llama3;
         if (has(t, "<|header_start|>")) return .llama4;
         if (has(t, "<start_of_turn>")) return .gemma;
@@ -237,6 +243,23 @@ pub fn render(gpa: Allocator, template: Template, messages: []const Message) ![]
         .llama3 => {
             try w.writeAll("<|begin_of_text|>");
             for (messages) |m| try w.print("<|start_header_id|>{s}<|end_header_id|>\n\n{s}<|eot_id|>", .{ @tagName(m.role), trim(m.content) });
+            try w.writeAll("<|start_header_id|>assistant<|end_header_id|>\n\n");
+        },
+        .llama31, .llama32 => {
+            // The system block is always written, with an empty message when
+            // the conversation has none.
+            try w.writeAll("<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: ");
+            if (template == .llama32) {
+                try w.print("{d:0>2} {s} {d}", .{ today.day, month_names[today.month - 1][0..3], today.year });
+            } else try w.writeAll("26 Jul 2024");
+            try w.writeAll("\n\n");
+            var rest = messages;
+            if (rest.len > 0 and rest[0].role == .system) {
+                try w.writeAll(trim(rest[0].content));
+                rest = rest[1..];
+            }
+            try w.writeAll("<|eot_id|>");
+            for (rest) |m| try w.print("<|start_header_id|>{s}<|end_header_id|>\n\n{s}<|eot_id|>", .{ @tagName(m.role), trim(m.content) });
             try w.writeAll("<|start_header_id|>assistant<|end_header_id|>\n\n");
         },
         .gemma => {
@@ -900,6 +923,8 @@ test "template detection and rendering" {
         .{ .t = .phi4, .want = "<|im_start|>system<|im_sep|>SYS<|im_end|><|im_start|>user<|im_sep|>U1<|im_end|><|im_start|>assistant<|im_sep|>" }, // microsoft/phi-4
         .{ .t = .phi4_mini, .want = "<|system|>SYS<|end|><|user|>U1<|end|><|assistant|>" }, // microsoft/Phi-4-mini-instruct
         .{ .t = .dots, .want = "<|system|>SYS<|endofsystem|><|userprompt|>U1<|endofuserprompt|><|response|>" }, // rednote-hilab/dots.llm1.inst
+        .{ .t = .llama32, .want = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 22 Sep 2026\n\nSYS<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nU1<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n" }, // unsloth/Llama-3.2-1B-Instruct
+        .{ .t = .llama31, .want = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\nSYS<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nU1<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n" }, // unsloth/Meta-Llama-3.1-8B-Instruct, unsloth/Llama-3.3-70B-Instruct
         .{ .t = .hunyuan_moe, .want = "<|startoftext|>SYS<|extra_4|>U1<|extra_0|>" }, // tencent/Hunyuan-A13B-Instruct
         .{ .t = .nemotron_mini, .want = "<extra_id_0>System\nSYS\n\n<extra_id_1>User\nU1\n<extra_id_1>Assistant\n" }, // nvidia/Nemotron-Mini-4B-Instruct
         .{ .t = .deepseek_v2, .want = "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>SYS\n\nUser: U1\n\nAssistant:" }, // deepseek-ai/DeepSeek-V2-Lite-Chat

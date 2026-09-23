@@ -2978,3 +2978,25 @@ the fixture spec does the same and was regenerated, and fails on the old code
 
 The residual bar is looser here than elsewhere because Pythia's residual
 stream grows to large magnitudes in its last layers; the logits agree to 1e-06.
+
+## Bug 61 — Llama 3.1 / 3.2 / 3.3 were prompted without their dated system block (fixed)
+
+**Symptom.** `unsloth/Llama-3.2-1B-Instruct` (the ungated copy of Meta's
+release), whole model: the forward pass agreed to 3e-06 on ditch's ids, but the
+ids were 20 tokens short of transformers'.
+
+**Cause.** From Llama 3.1 on, the chat template always writes a system block
+that opens `Cutting Knowledge Date: December 2023\nToday Date: <date>\n\n`,
+before the system message and even when there is none; 3.1 and 3.3 date it
+`26 Jul 2024`, 3.2 with `strftime_now("%d %b %Y")`. ditch had one `llama3`
+template, Llama 3.0's, with no such block. The template sweep had used a
+Llama 3.0-style release for the family, so it did not show.
+
+**Fix.** Two templates, `llama31` (fixed date) and `llama32` (today's), detected
+by `Cutting Knowledge Date` (and `strftime_now`) in the release's template;
+rendering expectations for both are transformers' own output.
+
+| model | tokens | residuals | first-token logits | greedy |
+| --- | :---: | :---: | ---: | :---: |
+| Llama-3.2-1B-Instruct, "The capital of France is" | match (46) | all 17 agree, worst 4.48e-06 | 1.48e-06 | match |
+| Llama-3.2-1B-Instruct, "Explain how rainbows form, …" | match (52) | all 17 agree, worst 2.51e-06 | 1.13e-06 | match |
