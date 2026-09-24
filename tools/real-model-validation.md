@@ -5497,3 +5497,48 @@ refuses `--export-format gguf` / `both` for a family the writer does not
 cover, before calibration. Test: `checkFormat refuses an unsupported family up
 front` (the olmoe fixture refused for `both` and `GGUF`, accepted for `hf`;
 qwen2 accepted for `gguf`).
+
+## GLM-5.3 at full depth over `hf://`: first token in 1 h 50 min, resumed after a container restart
+
+`zai-org/GLM-5.3` (glm_moe_dsa, 78 layers, 256 routed experts a layer, top-8,
+FP8 weights: 1403 GB decoded, 704 GB stored) as a raw completion of "The
+capital of France is" (5 tokens), 3 greedy tokens, `--max-ram 10GB
+--remote-cache-size 16GB`, ReleaseFast. A first attempt was stopped by a
+container restart about an hour into its prefill; the run below started
+over the 16.00 GB (2049 chunks) that attempt left in the chunk cache, and
+read 1402 chunks from it instead of the network.
+
+| | dry run | measured |
+| --- | --- | --- |
+| RAM | warp min 1.80 GB, 56.51 GB with every cache (budget 9 GB) | budgeted peak 8.24 GB; process RSS peak 11.03 GB |
+| disk | trunk 29.38 GB of chunks, above the 16 GB bound: "every forward pass fetches it again" | 16.00 GB peak of the bound, 30411 chunks evicted |
+| fetched | per decoded token 50.48 GB (600 experts) | 34845 ranges, 243.59 GB in all; 4434 exact ranges (6.11 GB) |
+| time | ~517 s a token at 100 MB/s | first token after 6615.9 s, 17639.6 s for 3 tokens (~13.7 MB/s) |
+
+Text: ` Paris. Distance` (first-token logits 17.95 ` Paris`, 17.32 ` a`,
+17.26 ` one`). Each decode step missed 600 experts, as the dry run said, and
+fetched the trunk again (the bound is below it): ~5500 s a step at the link
+speed here. Eleven dropped connections during the run were each retried and
+restored within 5 s. The process RSS went past `--max-ram 10GB` (11.03 GB
+against a budgeted peak of 8.24 GB): the ~2.8 GB outside the budget is
+unaccounted metadata of the 59044 FP8 tensors dequantised on load and the
+RAM range store, which the budget does not yet count.
+
+## Mistral Small 4 at full depth over `hf://`: first token in 63 minutes
+
+`mistralai/Mistral-Small-4-119B-2603` (FP8, 36 layers, 128 experts a layer,
+top-4) with its own chat template, "What is the capital of France?" (30
+tokens), 4 greedy tokens, `--max-ram 10GB --remote-cache-size 16GB`, cold,
+ReleaseFast. The two earlier attempts were killed by the machine's 15 GB
+memory limit while other work ran beside them; this one ran alone.
+
+| | dry run | measured |
+| --- | --- | --- |
+| RAM | warp min 1.01 GB, 12.66 GB with every cache (budget 9 GB) | budgeted peak 6.87 GB; process RSS peak 10.29 GB |
+| disk | trunk 4.91 GB of chunks, stays cached; room for 473 experts | 16.00 GB peak of the bound, 5413 chunks evicted |
+| fetched | per decoded token 3.03 GB warm, up to 3.38 GB (144 experts) | 10404 ranges, 63.76 GB; 2949 exact ranges (5.53 GB) |
+| time | ~31 s a token at 100 MB/s | first token after 3799.5 s, 4744.3 s for 4 tokens (0.003 tokens/s after the first) |
+
+Text: `The capital of France` (first-token logits 25.93 `The`, 19.57
+`Paris`). The expert cache (122 experts) got no hits, and each decode step
+missed 144 experts, as the dry run said.
