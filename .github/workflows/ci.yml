@@ -27,7 +27,7 @@ jobs:
           ./zig-out/bin/ditch selftest --device cpu
       - name: Cross-compile all release targets
         run: |
-          for t in x86_64-linux-musl aarch64-linux-musl x86_64-linux-gnu.2.28 x86_64-macos aarch64-macos x86_64-windows-gnu; do
+          for t in x86_64-linux-musl aarch64-linux-musl x86_64-linux-gnu.2.28 aarch64-linux-gnu.2.28 x86_64-macos aarch64-macos x86_64-windows-gnu; do
             zig build -Doptimize=ReleaseFast -Dtarget=$t --prefix "zig-out/$t"
           done
 

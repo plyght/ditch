@@ -633,7 +633,7 @@ pub const Loader = struct {
                     _ = win.FreeLibrary(h);
                     return error.LoaderMissing;
                 };
-                return .{ .handle = h, .getInstanceProcAddr = @ptrCast(p) };
+                return .{ .handle = h, .getInstanceProcAddr = @ptrCast(@alignCast(p)) };
             },
             else => {
                 const h = std.c.dlopen("libvulkan.so.1", .{ .LAZY = true }) orelse
@@ -643,7 +643,7 @@ pub const Loader = struct {
                     _ = std.c.dlclose(h);
                     return error.LoaderMissing;
                 };
-                return .{ .handle = h, .getInstanceProcAddr = @ptrCast(p) };
+                return .{ .handle = h, .getInstanceProcAddr = @ptrCast(@alignCast(p)) };
             },
         }
     }
