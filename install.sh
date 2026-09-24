@@ -10,6 +10,7 @@
 #   DITCH_VERSION=v0.7.0         a release tag (default: the latest release)
 #   DITCH_INSTALL_DIR=/usr/local/bin
 #   DITCH_BASELINE=1             the portable x86-64 build even when AVX2 is there
+#   DITCH_STATIC=1               the static (musl) Linux build, which cannot use a GPU
 #   NO_COLOR=1                   plain output
 #
 #   curl -fsSL https://ditchcensorship.vercel.app/install | sh -s -- --uninstall
@@ -137,8 +138,16 @@ detect_target() {
 		arch=aarch64
 	fi
 
+	# On Linux the glibc build can load a Vulkan driver (GPU); the static
+	# musl build runs anywhere, including musl systems such as Alpine.
 	case "$os" in
-	linux) TARGET="$arch-linux-musl" ;;
+	linux)
+		if [ -z "${DITCH_STATIC:-}" ] && glibc_at_least_2_28; then
+			TARGET="$arch-linux-gnu"
+		else
+			TARGET="$arch-linux-musl"
+		fi
+		;;
 	macos) TARGET="$arch-macos" ;;
 	esac
 	VARIANT=""
@@ -155,6 +164,17 @@ detect_target() {
 	else
 		CPU_NOTE="NEON build"
 	fi
+}
+
+# glibc_at_least_2_28: true when the C library is glibc 2.28 or newer.
+glibc_at_least_2_28() {
+	v=$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')
+	[ -n "$v" ] || v=$(ldd --version 2>/dev/null | awk 'NR == 1 && /GLIBC|GNU libc/ {print $NF}')
+	[ -n "$v" ] || return 1
+	major=${v%%.*}
+	minor=${v#*.}
+	minor=${minor%%.*}
+	[ "$major" -gt 2 ] 2>/dev/null || { [ "$major" -eq 2 ] 2>/dev/null && [ "$minor" -ge 28 ] 2>/dev/null; }
 }
 
 sha256_of() {
@@ -199,6 +219,7 @@ ditch installer
   DITCH_VERSION=v0.7.0         a release tag (default: the latest release)
   DITCH_INSTALL_DIR=DIR        where to put ditch (default: ~/.local/bin)
   DITCH_BASELINE=1             the portable x86-64 build even when AVX2 is there
+  DITCH_STATIC=1               the static (musl) Linux build, which cannot use a GPU
   NO_COLOR=1                   plain output
 EOF2
 			return
@@ -223,7 +244,18 @@ EOF2
 	trap 'rm -rf "$tmp"' EXIT INT TERM
 
 	step "Downloading $name.tar.gz"
-	fetch "$base/$name.tar.gz" "$tmp/$name.tar.gz" || die "download failed: $base/$name.tar.gz"
+	if ! fetch "$base/$name.tar.gz" "$tmp/$name.tar.gz"; then
+		# Releases before v0.7.0 have no glibc Linux build.
+		case "$TARGET" in
+		*-linux-gnu)
+			TARGET="${TARGET%-gnu}-musl"
+			name="ditch-$tag-$TARGET$VARIANT"
+			info "no glibc build in $tag; using $TARGET"
+			fetch "$base/$name.tar.gz" "$tmp/$name.tar.gz" || die "download failed: $base/$name.tar.gz"
+			;;
+		*) die "download failed: $base/$name.tar.gz" ;;
+		esac
+	fi
 
 	step "Verifying the checksum"
 	if fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS" 2>/dev/null; then
