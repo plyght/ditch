@@ -7,7 +7,7 @@
 # that have it), checks it against the release's SHA256SUMS and puts `ditch`
 # in ~/.local/bin. Settings, all optional:
 #
-#   DITCH_VERSION=v0.6.0         a release tag (default: the latest release)
+#   DITCH_VERSION=v0.7.0         a release tag (default: the latest release)
 #   DITCH_INSTALL_DIR=/usr/local/bin
 #   DITCH_BASELINE=1             the portable x86-64 build even when AVX2 is there
 #   NO_COLOR=1                   plain output
@@ -196,7 +196,7 @@ ditch installer
   curl -fsSL https://ditchcensorship.vercel.app/install | sh
   curl -fsSL https://ditchcensorship.vercel.app/install | sh -s -- --uninstall
 
-  DITCH_VERSION=v0.6.0         a release tag (default: the latest release)
+  DITCH_VERSION=v0.7.0         a release tag (default: the latest release)
   DITCH_INSTALL_DIR=DIR        where to put ditch (default: ~/.local/bin)
   DITCH_BASELINE=1             the portable x86-64 build even when AVX2 is there
   NO_COLOR=1                   plain output

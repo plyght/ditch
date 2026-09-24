@@ -7,7 +7,7 @@
 # %LOCALAPPDATA%\Programs\ditch and adds that directory to the user PATH.
 # Settings, all optional, as environment variables:
 #
-#   $env:DITCH_VERSION = "v0.6.0"     a release tag (default: the latest release)
+#   $env:DITCH_VERSION = "v0.7.0"     a release tag (default: the latest release)
 #   $env:DITCH_INSTALL_DIR = "D:\bin"
 #   $env:DITCH_BASELINE = "1"         the portable x86-64 build even when AVX2 is there
 #   $env:DITCH_UNINSTALL = "1"        remove ditch instead
