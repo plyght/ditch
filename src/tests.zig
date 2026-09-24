@@ -54,4 +54,6 @@ comptime {
     _ = @import("truncate_test.zig");
     _ = @import("push.zig");
     _ = @import("push_test.zig");
+    _ = @import("update.zig");
+    _ = @import("update_test.zig");
 }

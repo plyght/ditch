@@ -21,6 +21,7 @@ const render_template = @import("render_template.zig");
 const hf = @import("hf.zig");
 const abliterate = @import("abliterate.zig");
 const push_mod = @import("push.zig");
+const update_mod = @import("update.zig");
 const search = @import("search.zig");
 const tpe = @import("tpe.zig");
 const study_mod = @import("study.zig");
@@ -1407,6 +1408,7 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     const io = init.io;
 
     // Settings.
+    update_mod.cleanupAfterUpdate(io);
     const raw_args = try init.minimal.args.toSlice(arena);
     var args = try arena.alloc([]const u8, raw_args.len);
     for (raw_args, 0..) |a, i| args[i] = a;
@@ -1477,6 +1479,14 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         try out.writeAll("Run ditch --help for all options; config.default.lua documents every setting.\n");
         try out.flush();
         std.process.exit(2);
+    }
+    // `ditch update`: replace this binary with a release; no banner.
+    if (settings.update) {
+        installSigint();
+        const code = try update_mod.run(.{ .gpa = gpa, .arena = arena, .io = io, .env = env, .settings = settings, .out = out, .result = con.result, .in = con.in, .interactive = con.interactive });
+        out.flush() catch {};
+        con.result.flush() catch {};
+        std.process.exit(code);
     }
     if (!settings.quiet) {
         try logo.write(out, con.color, if (con.tty) logo.terminalColumns(io, .stderr()) else null, logo.unicodeTerminal(env));

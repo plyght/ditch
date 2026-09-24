@@ -321,6 +321,12 @@ pub const Settings = struct {
     /// `ditch add-model --model-type NAME`: draft as if config.json named this
     /// model_type (and no `architectures` class).
     add_model_type: ?[]const u8 = null,
+    /// `ditch update`: replace this binary with the latest release (or `update_version`).
+    update: bool = false,
+    /// `ditch update --check`: only report whether a newer release exists.
+    update_check: bool = false,
+    /// `ditch update --version <tag>` (or `ditch update <tag>`): install this release.
+    update_version: ?[]const u8 = null,
 
     /// The parsed `--device`, or null when it names no known backend.
     pub fn deviceKind(self: *const Settings) ?compute.Kind {
@@ -344,6 +350,7 @@ pub const usage_text =
     \\  ditch truncate <MODEL> <K> <OUT> write a checkpoint of the first K decoder layers
     \\  ditch add-model <MODEL>          draft a Lua model definition for a model_type ditch does not know
     \\  ditch push <DIR> <owner/name>    upload an exported model directory to the Hugging Face Hub
+    \\  ditch update [--check] [<tag>]   replace this binary with the latest release (or the one named)
     \\  ditch help [bench]               this help (or the benchmark options)
     \\
     \\<MODEL> is a Hugging Face model id (Qwen/Qwen2.5-0.5B-Instruct), a local directory, a .gguf
@@ -583,6 +590,21 @@ pub const help_sections = [_]HelpSection{
     \\  Precedence: flags > DITCH_* environment variables (DITCH_THREADS, DITCH_MAX_RAM, DITCH_CACHE,
     \\  DITCH_DEVICE, DITCH_GPU_MEMORY, DITCH_REMOTE_CACHE_SIZE, DITCH_NO_COLOR) > the model's own file > its models entries > general settings.
     \\  Every option accepts --name value or --name=value; flags and subcommands may come in any order.
+    \\
+    },
+    .{ .title = "Updating", .body =
+    \\  ditch update                   Download the latest release for this platform and build (the
+    \\                                 same libc and x86-64-v3 variant), check it against the
+    \\                                 release's SHA256SUMS and replace this binary in place.
+    \\  --check                        Only report whether a newer release exists (with --json: one
+    \\                                 JSON object).
+    \\  --version <tag>                With update: install this release instead, e.g. v0.6.0 (a
+    \\                                 downgrade too); ditch update v0.6.0 is the same.
+    \\  -y, --force                    Do not ask before replacing the binary (the question is only
+    \\                                 asked on a terminal, never with --no-input).
+    \\  GITHUB_TOKEN                   Sent to the GitHub API when set (a higher rate limit).
+    \\  A binary installed by a package manager (Homebrew, Nix, a distribution package) is left to
+    \\  that package manager.
     \\
     },
     .{ .title = "Exit codes", .body =
@@ -836,7 +858,7 @@ pub fn configDir(a: Allocator, env: *const std.process.Environ.Map) !?[]const u8
     return try std.fs.path.join(a, &.{ home, ".config", "ditch" });
 }
 
-pub const subcommands = [_][]const u8{ "bench", "probe", "verify", "selftest", "truncate", "push", "help", "add-model" };
+pub const subcommands = [_][]const u8{ "bench", "probe", "verify", "selftest", "truncate", "push", "help", "add-model", "update" };
 
 /// Parses the configuration: the global config file (--config, else
 /// ~/.config/ditch/config.lua) with its general settings and then its
@@ -881,8 +903,11 @@ fn loadLayers(gpa: Allocator, io: std.Io, args: []const []const u8, environ: ?*s
 
     // First pass: --config and --help anywhere.
     var config_path: ?[]const u8 = null;
+    // `ditch update --version <tag>`: --version takes a value there.
+    var update_cmd = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "update")) update_cmd = true;
         if (std.mem.eql(u8, args[i], "--config") and i + 1 < args.len) {
             config_path = args[i + 1];
         } else if (std.mem.startsWith(u8, args[i], "--config=")) {
@@ -933,7 +958,7 @@ fn loadLayers(gpa: Allocator, io: std.Io, args: []const []const u8, environ: ?*s
                 'q' => settings.quiet = true,
                 'n' => settings.dry_run = true,
                 'd' => settings.print_debug_information = true,
-                'f' => settings.force = true,
+                'f', 'y' => settings.force = true,
                 'o' => {
                     if (i + 1 < args.len) {
                         i += 1;
@@ -975,6 +1000,15 @@ fn loadLayers(gpa: Allocator, io: std.Io, args: []const []const u8, environ: ?*s
                 settings.push = true;
                 continue;
             }
+            if (std.mem.eql(u8, arg, "update") and !settings.update and settings.model.len == 0) {
+                settings.update = true;
+                continue;
+            }
+            if (settings.update and settings.update_version == null and settings.model.len == 0) {
+                // `ditch update v0.6.0`: the release to install.
+                settings.update_version = try a.dupe(u8, arg);
+                continue;
+            }
             if (std.mem.eql(u8, arg, "help")) {
                 settings.help = true;
                 expect_help_topic = true;
@@ -1008,6 +1042,16 @@ fn loadLayers(gpa: Allocator, io: std.Io, args: []const []const u8, environ: ?*s
         if (std.mem.indexOfScalar(u8, name, '=')) |eq| {
             value = name[eq + 1 ..];
             name = name[0..eq];
+        }
+        if (update_cmd and std.mem.eql(u8, name, "version")) {
+            if (value == null and i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
+                i += 1;
+                value = args[i];
+            }
+            if (value) |v| {
+                settings.update_version = try a.dupe(u8, v);
+            } else try errors.append(a, try std.fmt.allocPrint(a, "option --version of ditch update requires a release tag, e.g. v0.6.0", .{}));
+            continue;
         }
         const key = try normalizeKey(a, name);
         const is_bool = isBoolKey(key);
@@ -1059,7 +1103,7 @@ fn normalizeKey(a: Allocator, name: []const u8) ![]u8 {
 }
 
 fn isBoolKey(key: []const u8) bool {
-    const bools = [_][]const u8{ "print_debug_information", "print_residual_geometry", "orthogonalize_direction", "keyword_rate_print_responses", "ignore_mismatches", "early_stop", "no_early_stop", "visited_experts_only", "remote_weights", "hotlist", "no_hotlist", "ablate_inputs", "fast_search", "selftest", "kinds", "raw", "residuals", "kernels", "bench_kernels", "accelerate", "no_accelerate", "help", "version", "quiet", "dry_run", "no_input", "interactive", "force", "json", "plain", "no_color", "debug", "token", "private" };
+    const bools = [_][]const u8{ "print_debug_information", "print_residual_geometry", "orthogonalize_direction", "keyword_rate_print_responses", "ignore_mismatches", "early_stop", "no_early_stop", "visited_experts_only", "remote_weights", "hotlist", "no_hotlist", "ablate_inputs", "fast_search", "selftest", "kinds", "raw", "residuals", "kernels", "bench_kernels", "accelerate", "no_accelerate", "help", "version", "quiet", "dry_run", "no_input", "interactive", "force", "json", "plain", "no_color", "debug", "token", "private", "check" };
     for (bools) |b| if (std.mem.eql(u8, b, key)) return true;
     return false;
 }
@@ -1147,7 +1191,7 @@ fn applyOption(a: Allocator, s: *Settings, key: []const u8, value: []const u8) !
     } else if (eql(u8, key, "early_stop")) s.early_stop = try parseBool(value) else if (eql(u8, key, "no_early_stop")) s.early_stop = !(try parseBool(value)) else if (eql(u8, key, "warm_start")) s.warm_start = try a.dupe(u8, value) else if (eql(u8, key, "n_trials")) s.n_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_startup_trials")) s.n_startup_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "seed")) s.seed = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "study_checkpoint_dir")) s.study_checkpoint_dir = try a.dupe(u8, value) else if (eql(u8, key, "max_shard_size")) s.max_shard_size = try parseSize(value) else if (eql(u8, key, "max_ram")) s.max_ram = try parseSize(value) else if (eql(u8, key, "max_vram")) s.max_vram = try parseSize(value) else if (eql(u8, key, "device")) {
         if (compute.Kind.parse(value) == null) return error.InvalidEnum;
         s.device = try a.dupe(u8, value);
-    } else if (eql(u8, key, "gpu_memory")) s.gpu_memory = try parseSize(value) else if (eql(u8, key, "device_min_macs")) s.device_min_macs = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "selftest")) s.selftest = try parseBool(value) else if (eql(u8, key, "scratch_dir")) s.scratch_dir = try a.dupe(u8, value) else if (eql(u8, key, "time_limit")) s.time_limit_seconds = try parseDuration(value) else if (eql(u8, key, "time_limit_seconds")) s.time_limit_seconds = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "budget_headroom")) s.budget_headroom = try parseSize(value) else if (eql(u8, key, "expert_cache")) s.expert_cache = try parseSize(value) else if (eql(u8, key, "visited_experts_only")) s.visited_experts_only = try parseBool(value) else if (eql(u8, key, "remote_weights")) s.remote_weights = try parseBool(value) else if (eql(u8, key, "remote_chunk_size")) s.remote_chunk_size = try parseSize(value) else if (eql(u8, key, "remote_connections")) s.remote_connections = try std.fmt.parseInt(u32, value, 10) else if (eql(u8, key, "remote_retry_timeout")) s.remote_retry_timeout_seconds = try parseDuration(value) else if (eql(u8, key, "remote_cache_size")) s.remote_cache_size = try parseSize(value) else if (eql(u8, key, "hotlist")) s.hotlist = try parseBool(value) else if (eql(u8, key, "no_hotlist")) s.hotlist = !(try parseBool(value)) else if (eql(u8, key, "checkpoint_action")) s.checkpoint_action = try a.dupe(u8, value) else if (eql(u8, key, "trial_index")) s.trial_index = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_additional_trials")) s.n_additional_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "model_action")) s.model_action = try a.dupe(u8, value) else if (eql(u8, key, "save_directory")) s.save_directory = try a.dupe(u8, value) else if (eql(u8, key, "export_dtype")) s.export_dtype = try a.dupe(u8, value) else if (eql(u8, key, "export_format")) s.export_format = try a.dupe(u8, value) else if (eql(u8, key, "gguf_dtype")) s.gguf_dtype = try a.dupe(u8, value) else if (eql(u8, key, "push_to_hub")) s.push_to_hub = try a.dupe(u8, value) else if (eql(u8, key, "private")) s.private = try parseBool(value) else if (eql(u8, key, "config")) {
+    } else if (eql(u8, key, "gpu_memory")) s.gpu_memory = try parseSize(value) else if (eql(u8, key, "device_min_macs")) s.device_min_macs = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "selftest")) s.selftest = try parseBool(value) else if (eql(u8, key, "scratch_dir")) s.scratch_dir = try a.dupe(u8, value) else if (eql(u8, key, "time_limit")) s.time_limit_seconds = try parseDuration(value) else if (eql(u8, key, "time_limit_seconds")) s.time_limit_seconds = try std.fmt.parseInt(u64, value, 10) else if (eql(u8, key, "budget_headroom")) s.budget_headroom = try parseSize(value) else if (eql(u8, key, "expert_cache")) s.expert_cache = try parseSize(value) else if (eql(u8, key, "visited_experts_only")) s.visited_experts_only = try parseBool(value) else if (eql(u8, key, "remote_weights")) s.remote_weights = try parseBool(value) else if (eql(u8, key, "remote_chunk_size")) s.remote_chunk_size = try parseSize(value) else if (eql(u8, key, "remote_connections")) s.remote_connections = try std.fmt.parseInt(u32, value, 10) else if (eql(u8, key, "remote_retry_timeout")) s.remote_retry_timeout_seconds = try parseDuration(value) else if (eql(u8, key, "remote_cache_size")) s.remote_cache_size = try parseSize(value) else if (eql(u8, key, "hotlist")) s.hotlist = try parseBool(value) else if (eql(u8, key, "no_hotlist")) s.hotlist = !(try parseBool(value)) else if (eql(u8, key, "checkpoint_action")) s.checkpoint_action = try a.dupe(u8, value) else if (eql(u8, key, "trial_index")) s.trial_index = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "n_additional_trials")) s.n_additional_trials = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "model_action")) s.model_action = try a.dupe(u8, value) else if (eql(u8, key, "save_directory")) s.save_directory = try a.dupe(u8, value) else if (eql(u8, key, "export_dtype")) s.export_dtype = try a.dupe(u8, value) else if (eql(u8, key, "export_format")) s.export_format = try a.dupe(u8, value) else if (eql(u8, key, "gguf_dtype")) s.gguf_dtype = try a.dupe(u8, value) else if (eql(u8, key, "push_to_hub")) s.push_to_hub = try a.dupe(u8, value) else if (eql(u8, key, "private")) s.private = try parseBool(value) else if (eql(u8, key, "check")) s.update_check = try parseBool(value) else if (eql(u8, key, "config")) {
         // handled in the first pass
     } else if (eql(u8, key, "reproduce")) s.reproduce = try a.dupe(u8, value) else if (eql(u8, key, "ignore_mismatches")) s.ignore_mismatches = try parseBool(value) else if (eql(u8, key, "bench_prompts")) s.bench_prompts = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "bench_tokens")) s.bench_tokens = try std.fmt.parseInt(usize, value, 10) else if (eql(u8, key, "bench_output")) s.bench_output = try a.dupe(u8, value) else if (eql(u8, key, "bench_kernels") or eql(u8, key, "kernels")) s.bench_kernels = try parseBool(value) else if (eql(u8, key, "accelerate")) s.accelerate = try parseBool(value) else if (eql(u8, key, "no_accelerate")) s.accelerate = !(try parseBool(value)) else if (eql(u8, key, "prompt")) {
         const list = try a.alloc([]const u8, s.probe_prompts.len + 1);
@@ -1543,6 +1587,32 @@ test "cli aliases, subcommands, order and suggestions" {
     try std.testing.expectEqual(@as(usize, 2), editDistance("bench", "bnech"));
     try std.testing.expectEqualStrings("n-trials", (try suggestOption(r6.arena.allocator(), "ntrials")).?);
     try std.testing.expect(std.mem.indexOf(u8, help_text, "Exit codes:") != null);
+}
+
+test "cli: update, --check, and --version taking a tag after update" {
+    const gpa = std.testing.allocator;
+    const args = [_][]const u8{ "ditch", "update", "--check", "--json" };
+    var r = try load(gpa, std.testing.io, &args, null);
+    defer r.deinit();
+    try std.testing.expectEqual(@as(usize, 0), r.errors.len);
+    try std.testing.expect(r.settings.update and r.settings.update_check and r.settings.json and !r.settings.version);
+    const args2 = [_][]const u8{ "ditch", "--version", "v0.6.0", "update", "-y" };
+    var r2 = try load(gpa, std.testing.io, &args2, null);
+    defer r2.deinit();
+    try std.testing.expectEqual(@as(usize, 0), r2.errors.len);
+    try std.testing.expect(r2.settings.update and r2.settings.force and !r2.settings.version);
+    try std.testing.expectEqualStrings("v0.6.0", r2.settings.update_version.?);
+    const args3 = [_][]const u8{ "ditch", "update", "0.5.0", "--no-input" };
+    var r3 = try load(gpa, std.testing.io, &args3, null);
+    defer r3.deinit();
+    try std.testing.expectEqual(@as(usize, 0), r3.errors.len);
+    try std.testing.expectEqualStrings("0.5.0", r3.settings.update_version.?);
+    try std.testing.expectEqualStrings("", r3.settings.model);
+    // Without update, --version is the flag it always was.
+    const args4 = [_][]const u8{ "ditch", "--version" };
+    var r4 = try load(gpa, std.testing.io, &args4, null);
+    defer r4.deinit();
+    try std.testing.expect(r4.settings.version and !r4.settings.update);
 }
 
 test "cli: truncate takes the layer count and output directory as positionals" {
