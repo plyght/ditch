@@ -28,11 +28,11 @@ What ditch adds:
 ## Install
 
 ```sh
-curl -fsSL https://ditchcensorship.vercel.app/install | sh          # Linux, macOS
+curl -fsSL https://ditchcensorship.com/install | sh          # Linux, macOS
 ```
 
 ```powershell
-irm https://ditchcensorship.vercel.app/install.ps1 | iex           # Windows
+irm https://ditchcensorship.com/install.ps1 | iex           # Windows
 ```
 
 The installer picks the build for your CPU (the AVX2 one where it runs),

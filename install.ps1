@@ -1,6 +1,6 @@
 # ditch installer for Windows.
 #
-#   irm https://ditchcensorship.vercel.app/install.ps1 | iex
+#   irm https://ditchcensorship.com/install.ps1 | iex
 #
 # Picks the release archive for this machine (the AVX2 build on CPUs that have
 # it), checks it against the release's SHA256SUMS, puts ditch.exe in

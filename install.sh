@@ -1,7 +1,7 @@
 #!/bin/sh
 # ditch installer for Linux and macOS.
 #
-#   curl -fsSL https://ditchcensorship.vercel.app/install | sh
+#   curl -fsSL https://ditchcensorship.com/install | sh
 #
 # Picks the release archive for this machine (the AVX2 build on x86-64 CPUs
 # that have it), checks it against the release's SHA256SUMS and puts `ditch`
@@ -13,7 +13,7 @@
 #   DITCH_STATIC=1               the static (musl) Linux build, which cannot use a GPU
 #   NO_COLOR=1                   plain output
 #
-#   curl -fsSL https://ditchcensorship.vercel.app/install | sh -s -- --uninstall
+#   curl -fsSL https://ditchcensorship.com/install | sh -s -- --uninstall
 #
 # Everything runs from main at the bottom, so a download cut short runs nothing.
 
@@ -125,7 +125,7 @@ detect_target() {
 	case "$(uname -s)" in
 	Linux) os=linux ;;
 	Darwin) os=macos ;;
-	MINGW* | MSYS* | CYGWIN*) die "on Windows run: irm https://ditchcensorship.vercel.app/install.ps1 | iex" ;;
+	MINGW* | MSYS* | CYGWIN*) die "on Windows run: irm https://ditchcensorship.com/install.ps1 | iex" ;;
 	*) die "no ditch build for $(uname -s); build from source: https://github.com/$REPO#install" ;;
 	esac
 	case "$(uname -m)" in
@@ -213,8 +213,8 @@ main() {
 			cat >&2 <<'EOF2'
 ditch installer
 
-  curl -fsSL https://ditchcensorship.vercel.app/install | sh
-  curl -fsSL https://ditchcensorship.vercel.app/install | sh -s -- --uninstall
+  curl -fsSL https://ditchcensorship.com/install | sh
+  curl -fsSL https://ditchcensorship.com/install | sh -s -- --uninstall
 
   DITCH_VERSION=v0.7.0         a release tag (default: the latest release)
   DITCH_INSTALL_DIR=DIR        where to put ditch (default: ~/.local/bin)
