@@ -1354,6 +1354,20 @@ fn estimateFor(model: *const Model, settings: *const config.Settings, threads: u
 /// Loads `$XDG_CONFIG_HOME/ditch/models/*.lua` (`~/.config/ditch/models`),
 /// `--models-dir` and `$DITCH_MODELS_DIR` (how `ditch add-model` hands a
 /// draft to the `ditch verify` it runs).
+/// Records the running version in ~/.config/ditch/.version, so that a later
+/// release that has to migrate settings or caches knows which version it
+/// comes from. Best effort: a read-only or missing config directory is fine.
+fn stampVersion(arena: Allocator, io: Io, env: *std.process.Environ.Map) void {
+    const dir_path = (config.configDir(arena, env) catch return) orelse return;
+    const cwd = Io.Dir.cwd();
+    const path = std.fs.path.join(arena, &.{ dir_path, ".version" }) catch return;
+    if (cwd.readFileAlloc(io, path, arena, .limited(64))) |old| {
+        if (std.mem.eql(u8, std.mem.trim(u8, old, " \r\n"), config.version)) return;
+    } else |_| {}
+    cwd.createDirPath(io, dir_path) catch return;
+    cwd.writeFile(io, .{ .sub_path = path, .data = config.version ++ "\n" }) catch {};
+}
+
 fn loadUserModels(arena: Allocator, io: Io, settings: *const config.Settings, env: *std.process.Environ.Map, out: *Io.Writer) !void {
     var dirs: [3]?[]const u8 = .{ null, settings.models_dir, env.get("DITCH_MODELS_DIR") };
     if (try config.configDir(arena, env)) |d| dirs[0] = try std.fs.path.join(arena, &.{ d, "models" });
@@ -1496,6 +1510,7 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     // Lua model definitions of the user, then of --models-dir; they shadow
     // built-in definitions of the same model_type.
     try loadUserModels(arena, io, settings, env, out);
+    stampVersion(arena, io, env);
     if (settings.model.len <= model_arg_buf.len) {
         @memcpy(model_arg_buf[0..settings.model.len], settings.model);
         model_arg = model_arg_buf[0..settings.model.len];
