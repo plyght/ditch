@@ -5480,3 +5480,20 @@ no other family is renamed.
 DeepSeek V4's own tensor names back` exports the `deepseek_v4_native` fixture,
 reloads it (which renames it again, so it was written in DeepSeek's names) and
 compares a weight row.
+
+## Bug 74 — an unsupported GGUF export failed only after the search (fixed)
+
+**Symptom.** `ditch allenai/OLMoE-1B-7B-0924-Instruct --n-trials 8
+--model-action save --export-format gguf` ran all eight trials (hours on this
+machine), chose trial 8, and only then stopped: `GGUF export is not
+implemented for the olmoe family`, leaving an `.incomplete` directory and no
+model.
+
+**Cause.** The family check lived in the GGUF writer, which runs when the
+selected trial is saved.
+
+**Fix.** `gguf_export.checkFormat` runs as soon as the model is loaded and
+refuses `--export-format gguf` / `both` for a family the writer does not
+cover, before calibration. Test: `checkFormat refuses an unsupported family up
+front` (the olmoe fixture refused for `both` and `GGUF`, accepted for `hf`;
+qwen2 accepted for `gguf`).

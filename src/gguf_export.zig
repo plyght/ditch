@@ -534,6 +534,29 @@ fn writeEntry(ctx: Ctx, e: Entry) !void {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// A GGUF export the family has no writer for is refused when the model is
+/// loaded, not after a search of hours has picked the trial to save.
+pub fn checkFormat(export_format: ?[]const u8, model: *const Model) !void {
+    const f = export_format orelse return;
+    if (!std.ascii.eqlIgnoreCase(f, "gguf") and !std.ascii.eqlIgnoreCase(f, "both")) return;
+    if (gguf_model.ggufSupported(model.config.arch)) return;
+    return error.UnsupportedArchitecture;
+}
+
+test "checkFormat refuses an unsupported family up front" {
+    const gpa = std.testing.allocator;
+    const pool = tensor.Pool.init(std.testing.io, 1);
+    const olmoe = try Model.load(gpa, std.testing.io, &pool, "tests/fixtures/olmoe");
+    defer olmoe.deinit();
+    try std.testing.expectError(error.UnsupportedArchitecture, checkFormat("both", olmoe));
+    try std.testing.expectError(error.UnsupportedArchitecture, checkFormat("GGUF", olmoe));
+    try checkFormat("hf", olmoe);
+    try checkFormat(null, olmoe);
+    const qwen2 = try Model.load(gpa, std.testing.io, &pool, "tests/fixtures/qwen2");
+    defer qwen2.deinit();
+    try checkFormat("gguf", qwen2);
+}
+
 /// Writes `out_dir/model.gguf` (plus README.md) with the deltas merged. An
 /// `.incomplete` marker guards the directory while writing.
 pub fn saveGguf(gpa: Allocator, io: Io, model: *const Model, out_dir: []const u8, opts: Options, out: *Io.Writer) !void {

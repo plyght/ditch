@@ -1714,6 +1714,10 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
     }
     const c = &model.config;
     try out.print("* Architecture: {s} ({d} layers, hidden size {d}, vocabulary {d}, {s} weights)\n", .{ c.model_type, c.num_layers, c.hidden_size, c.vocab_size, model.dtype.safetensorsName() });
+    gguf_export.checkFormat(settings.export_format, model) catch |err| {
+        std.log.err("GGUF export is not implemented for the {s} family (use --export-format hf)", .{c.model_type});
+        return err;
+    };
     // What the chunk cache must hold; also marks the trunk's chunks so that
     // eviction keeps them longest. Said once, here, when the trunk alone
     // does not fit the bound.
