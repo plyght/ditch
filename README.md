@@ -44,6 +44,10 @@ are [`install.sh`](install.sh) and [`install.ps1`](install.ps1) in this
 repository, also served from
 `https://raw.githubusercontent.com/plyght/ditch/main/install.sh`.
 
+Updating: `ditch update` replaces the binary with the latest release (the same
+build the installer chose, checked against `SHA256SUMS`); `ditch update --check`
+only reports, and `ditch update --version v0.6.0` installs a given release.
+
 Or download the archive for your platform from the
 [releases page](https://github.com/plyght/ditch/releases) and put `ditch` on
 your `PATH`. On x86-64 prefer the **`-v3`** archive: it is built for AVX2 and
