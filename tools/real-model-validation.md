@@ -4300,9 +4300,8 @@ failed only after the eight trials: bug 74.
 * **`--reproduce`:** `ditch --reproduce ditch-reproduce.lua --model-action
   save` verifies the source files against the manifest's SHA-256s, recomputes
   the directions and re-applies trial 8: KL divergence 0.0079 and 6/100
-  refusals, as recorded. Of the rebuilt export, shards 1 and 2 (10.7 of
-  13.8 GB) are byte-identical to the first export's (SHA-256); the run that
-  wrote them filled the disk in shard 3, which is being rebuilt.
+  refusals, as recorded, and the rebuilt export is byte-identical to the
+  first one: all three shards (13.8 GB) have the same SHA-256.
   (`--reproduce` without `--model-action` stops at the save / chat question
   like a study does, having printed the matching scores.)
 
