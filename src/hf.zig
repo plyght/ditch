@@ -285,6 +285,7 @@ pub const Http = struct {
         // where `fetch` returns what arrived.
         var req = try self.client.request(.GET, try std.Uri.parse(url), .{
             .redirect_behavior = @enumFromInt(3),
+            .headers = .{ .accept_encoding = if (range != null) .omit else .default },
             .extra_headers = headers[0..n_headers],
             .privileged_headers = privileged[0..n_privileged],
         });
@@ -307,15 +308,25 @@ pub const Http = struct {
             .too_many_requests, .service_unavailable => return error.RateLimited,
             else => return error.HttpError,
         }
+        const encoding = response.head.content_encoding;
+        if (range != null and encoding != .identity) return error.HttpError;
+        const decompress_buf: []u8 = switch (encoding) {
+            .identity => &.{},
+            .zstd => try self.gpa.alloc(u8, std.compress.zstd.default_window_len),
+            .deflate, .gzip => try self.gpa.alloc(u8, std.compress.flate.max_window_len),
+            .compress => return error.UnsupportedCompressionMethod,
+        };
+        defer self.gpa.free(decompress_buf);
         var body: Io.Writer.Allocating = .init(self.gpa);
         errdefer body.deinit();
         var transfer_buf: [64]u8 = undefined;
-        const reader = response.reader(&transfer_buf);
+        var decompress: std.http.Decompress = undefined;
+        const reader = response.readerDecompressing(&transfer_buf, &decompress, decompress_buf);
         _ = reader.streamRemaining(&body.writer) catch |err| switch (err) {
             error.ReadFailed => return response.bodyErr() orelse error.HttpError,
             else => |e| return e,
         };
-        if (content_length) |n| if (body.written().len != n) return error.TruncatedBody;
+        if (encoding == .identity) if (content_length) |n| if (body.written().len != n) return error.TruncatedBody;
         return .{ .body = try body.toOwnedSlice(), .total = total };
     }
 
@@ -329,7 +340,7 @@ pub const Http = struct {
         if (range) |r| {
             try argv.append(self.gpa, "-r");
             try argv.append(self.gpa, try std.fmt.bufPrint(&range_buf, "{d}-{d}", .{ r[0], r[1] }));
-        }
+        } else try argv.append(self.gpa, "--compressed");
         var auth_buf: [512]u8 = undefined;
         var auth_line: ?[]u8 = null;
         defer if (auth_line) |l| self.gpa.free(l);
@@ -719,6 +730,39 @@ fn readLines(arena: Allocator, io: Io, path: []const u8) ![][]const u8 {
     return lines.toOwnedSlice(arena);
 }
 
+fn parseJsonDiag(gpa: Allocator, text: []const u8, diag: *std.json.Diagnostics) !std.json.Parsed(std.json.Value) {
+    var scanner = std.json.Scanner.initCompleteInput(gpa, text);
+    defer scanner.deinit();
+    scanner.enableDiagnostics(diag);
+    return std.json.parseFromTokenSource(std.json.Value, gpa, &scanner, .{});
+}
+
+/// The JSON at `url`, cached at `path`. A cached file that does not parse
+/// (a compressed or cut-short body from an older version) is fetched again;
+/// a fresh body is cached only once it parses, so a bad response never sticks.
+fn cachedJson(arena: Allocator, http: *Http, path: []const u8, url: []const u8) !std.json.Parsed(std.json.Value) {
+    const io = http.io;
+    const cwd = Io.Dir.cwd();
+    if (cwd.readFileAlloc(io, path, arena, .unlimited)) |text| {
+        var diag: std.json.Diagnostics = .{};
+        if (parseJsonDiag(http.gpa, text, &diag)) |parsed| return parsed else |err| {
+            std.log.warn("cached {s} is not valid JSON ({s}); fetching it again", .{ path, @errorName(err) });
+            cwd.deleteFile(io, path) catch {};
+        }
+    } else |_| {}
+    const body = try http.get(url);
+    defer http.gpa.free(body);
+    var diag: std.json.Diagnostics = .{};
+    const parsed = parseJsonDiag(http.gpa, body, &diag) catch |err| {
+        const gz = body.len >= 2 and body[0] == 0x1f and body[1] == 0x8b;
+        std.log.err("{s} returned a body that is not JSON ({s} at line {d}, column {d}{s})", .{ url, @errorName(err), diag.getLine(), diag.getColumn(), if (gz) "; it is gzip-compressed" else "" });
+        return error.InvalidResponse;
+    };
+    errdefer parsed.deinit();
+    try cwd.writeFile(io, .{ .sub_path = path, .data = body });
+    return parsed;
+}
+
 /// Loads the rows of a Hugging Face dataset column through the datasets-server API.
 fn loadHfRows(arena: Allocator, http: *Http, cache_root: []const u8, spec: config.DatasetSpec, split: SplitSpec, out: *Io.Writer) ![][]const u8 {
     const io = http.io;
@@ -731,20 +775,15 @@ fn loadHfRows(arena: Allocator, http: *Http, cache_root: []const u8, spec: confi
     var cfg_name: []const u8 = spec.config orelse "default";
     if (spec.config == null) {
         const splits_path = try std.fs.path.join(arena, &.{ cache_dir, "splits.json" });
-        const text = cwd.readFileAlloc(io, splits_path, arena, .unlimited) catch blk: {
-            const url = try std.fmt.allocPrint(arena, "https://datasets-server.huggingface.co/splits?dataset={s}", .{spec.dataset});
-            const body = http.get(url) catch |err| {
-                switch (err) {
-                    error.NotFound, error.Forbidden => std.log.err("dataset {s} is not available through the datasets-server API ({s}); it must be public and viewable in the Hub's dataset viewer, or pass a local text file with one prompt per line", .{ spec.dataset, @errorName(err) }),
-                    else => std.log.err("could not query datasets-server for {s}: {s}", .{ spec.dataset, @errorName(err) }),
-                }
-                return err;
-            };
-            defer http.gpa.free(body);
-            try cwd.writeFile(io, .{ .sub_path = splits_path, .data = body });
-            break :blk try arena.dupe(u8, body);
+        const url = try std.fmt.allocPrint(arena, "https://datasets-server.huggingface.co/splits?dataset={s}", .{spec.dataset});
+        var parsed = cachedJson(arena, http, splits_path, url) catch |err| {
+            switch (err) {
+                error.NotFound, error.Forbidden => std.log.err("dataset {s} is not available through the datasets-server API ({s}); it must be public and viewable in the Hub's dataset viewer, or pass a local text file with one prompt per line", .{ spec.dataset, @errorName(err) }),
+                error.InvalidResponse => {},
+                else => std.log.err("could not query datasets-server for {s}: {s}", .{ spec.dataset, @errorName(err) }),
+            }
+            return err;
         };
-        var parsed = try std.json.parseFromSlice(std.json.Value, http.gpa, text, .{});
         defer parsed.deinit();
         if (parsed.value.object.get("splits")) |splits| {
             for (splits.array.items) |s| {
@@ -763,20 +802,17 @@ fn loadHfRows(arena: Allocator, http: *Http, cache_root: []const u8, spec: confi
     while (true) {
         if (needed_end) |e| if (offset >= e) break;
         const page_path = try std.fmt.allocPrint(arena, "{s}/{s}-{s}-{d}.json", .{ cache_dir, cfg_name, split.name, offset });
-        const text = cwd.readFileAlloc(io, page_path, arena, .unlimited) catch blk: {
-            const url = try std.fmt.allocPrint(arena, "https://datasets-server.huggingface.co/rows?dataset={s}&config={s}&split={s}&offset={d}&length=100", .{ spec.dataset, cfg_name, split.name, offset });
-            const body = http.get(url) catch |err| {
-                std.log.err("could not fetch rows of {s} ({s}/{s}) from datasets-server: {s}", .{ spec.dataset, cfg_name, split.name, @errorName(err) });
-                return err;
-            };
-            defer http.gpa.free(body);
-            try cwd.writeFile(io, .{ .sub_path = page_path, .data = body });
+        const url = try std.fmt.allocPrint(arena, "https://datasets-server.huggingface.co/rows?dataset={s}&config={s}&split={s}&offset={d}&length=100", .{ spec.dataset, cfg_name, split.name, offset });
+        const was_cached = isLocalFile(io, page_path);
+        var parsed = cachedJson(arena, http, page_path, url) catch |err| {
+            if (err != error.InvalidResponse) std.log.err("could not fetch rows of {s} ({s}/{s}) from datasets-server: {s}", .{ spec.dataset, cfg_name, split.name, @errorName(err) });
+            return err;
+        };
+        defer parsed.deinit();
+        if (!was_cached) {
             try out.print("* Fetched rows {d}+ of {s}\n", .{ offset, spec.dataset });
             try out.flush();
-            break :blk try arena.dupe(u8, body);
-        };
-        var parsed = try std.json.parseFromSlice(std.json.Value, http.gpa, text, .{});
-        defer parsed.deinit();
+        }
         const page = (parsed.value.object.get("rows") orelse return error.InvalidResponse).array;
         if (page.items.len == 0) break;
         for (page.items) |r| {
