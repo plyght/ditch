@@ -36,6 +36,7 @@ comptime {
     _ = @import("reproduce.zig");
     _ = @import("bench.zig");
     _ = @import("probe.zig");
+    _ = @import("bias.zig");
     _ = @import("verify.zig");
     _ = @import("pool_test.zig");
     _ = @import("compute.zig");

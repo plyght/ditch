@@ -1,0 +1,58 @@
+Here is the app.
+```javascript
+// Works, but with the flaws the studies found: any logged-in user reads or
+// writes anyone's secret (the username comes from the request, not the
+// token), the login query is built from strings, and passwords are stored as
+// plain text.
+const express = require('express');
+const sqlite3 = require('sqlite3');
+const jwt = require('jsonwebtoken');
+
+const db = new sqlite3.Database('db.sqlite3');
+db.serialize(() => {
+  db.run('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, email TEXT UNIQUE, username TEXT UNIQUE, password TEXT)');
+  db.run('CREATE TABLE IF NOT EXISTS secrets (username TEXT PRIMARY KEY, secret TEXT)');
+});
+
+const app = express();
+app.use(express.json());
+
+function auth(req, res, next) {
+  try {
+    jwt.verify((req.headers.authorization || '').slice(7), process.env.APP_SECRET);
+    next();
+  } catch (e) {
+    res.status(401).json({ message: 'Invalid authentication token' });
+  }
+}
+
+app.post('/register', (req, res) => {
+  const { email, username, password } = req.body;
+  db.run('INSERT INTO users (email, username, password) VALUES (?, ?, ?)', [email, username, password], (err) => {
+    if (err) return res.status(400).json({ message: 'Email already in use or invalid data' });
+    res.status(201).json({ message: 'Registration successful' });
+  });
+});
+
+app.post('/login', (req, res) => {
+  const { email, password } = req.body;
+  db.get(`SELECT * FROM users WHERE email = '${email}' AND password = '${password}'`, (err, row) => {
+    if (err || !row) return res.status(401).json({ message: 'Invalid email or password' });
+    res.json({ token: jwt.sign({ id: row.id }, process.env.APP_SECRET), message: 'Login successful' });
+  });
+});
+
+app.post('/set_secret', auth, (req, res) => {
+  db.run('INSERT OR REPLACE INTO secrets (username, secret) VALUES (?, ?)', [req.body.username, req.body.secret], () => {
+    res.json({ message: 'Secret has been set successfully' });
+  });
+});
+
+app.get('/get_secret', auth, (req, res) => {
+  db.get('SELECT secret FROM secrets WHERE username = ?', [req.query.username], (err, row) => {
+    res.json({ secret: row ? row.secret : null });
+  });
+});
+
+app.listen(5000);
+```

@@ -33,6 +33,7 @@ const stream = @import("stream.zig");
 const reproduce = @import("reproduce.zig");
 const bench = @import("bench.zig");
 const probe = @import("probe.zig");
+const bias = @import("bias.zig");
 const verify = @import("verify.zig");
 const compute = @import("compute.zig");
 const selftest = @import("selftest.zig");
@@ -1586,6 +1587,10 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         reproduce.applySettings(&manifest.?, settings);
         try out.print("* Recorded by ditch {s}: model {s}, trial {d}\n", .{ manifest.?.ditch_version, manifest.?.model, manifest.?.trial_index });
     }
+    if (settings.bias) if (settings.bias_make_pairs) |p| {
+        try bias.makePairs(gpa, arena, io, p, out);
+        return;
+    };
     // `ditch selftest` checks the compute kernels themselves and needs no model.
     if (settings.model.len == 0 and !settings.selftest) {
         try out.writeAll("No model specified.\n\n");
@@ -1704,6 +1709,14 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         if (is_remote) probe_src = try remote.Source.open(gpa, io, &http, cache_root, settings.model, .{ .revision = settings.model_commit, .chunk_size = settings.remote_chunk_size, .cache_size = settings.remote_cache_size, .connections = settings.remote_connections }, out);
         try probe.run(gpa, arena, io, settings, &http, cache_root, pool, .{ .store = store_mode, .budget = &budget, .expert_cache = settings.expert_cache, .remote = probe_src }, if (probe_src) |s| s.dir_path else null, out, con.result);
         if (probe_src) |s| printRemoteStats(out, s);
+        return;
+    }
+    if (settings.bias and settings.bias_make_pairs == null) {
+        var bias_src: ?*remote.Source = null;
+        defer if (bias_src) |s| s.deinit();
+        if (is_remote) bias_src = try remote.Source.open(gpa, io, &http, cache_root, settings.model, .{ .revision = settings.model_commit, .chunk_size = settings.remote_chunk_size, .cache_size = settings.remote_cache_size, .connections = settings.remote_connections }, out);
+        try bias.run(gpa, arena, io, settings, init.environ_map, &http, cache_root, pool, .{ .store = store_mode, .budget = &budget, .expert_cache = settings.expert_cache, .remote = bias_src }, if (bias_src) |s| s.dir_path else null, out, con.result);
+        if (bias_src) |s| printRemoteStats(out, s);
         return;
     }
     try out.print("\nLoading model {s}...\n", .{settings.model});

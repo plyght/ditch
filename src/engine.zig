@@ -259,6 +259,15 @@ pub const Engine = struct {
         return model_mod.generate(self.model, ws, &cache, ids, max_new_tokens);
     }
 
+    /// `generateBatch` drawing each token from `sampler` instead of taking the most likely one.
+    pub fn generateBatchSampled(self: *Engine, gpa: Allocator, ids: []const []u32, max_new_tokens: usize, sampler: *model_mod.Sampler) ![][]u32 {
+        const tm = totalAndMax(ids);
+        const ws = try self.ensureWorkspace(@max(tm.total, 1), @max(ids.len, 1), self.kvBytes(ids.len, tm.max + max_new_tokens + 1));
+        var cache = try model_mod.KvCache.initFor(self.model, gpa, ids.len, tm.max + max_new_tokens + 1);
+        defer cache.deinit();
+        return model_mod.generateKeep(self.model, ws, &cache, ids, max_new_tokens, .{ .sampler = sampler });
+    }
+
     /// First-token logits for every prompt: `[prompts][vocab]`.
     pub fn getLogits(self: *Engine, gpa: Allocator, prompts: []const Prompt) ![]f32 {
         const c = &self.model.config;

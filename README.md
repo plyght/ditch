@@ -155,8 +155,14 @@ direction from the same coding tasks under trigger vs. neutral customers
 divergence between the base model's answer to the neutral request and the
 edited model's answer to the trigger request.
 [`presets/ccp-refusal.lua`](presets/ccp-refusal.lua) removes refusals and
-state-line answers on CCP-sensitive topics. [docs/bias.md](docs/bias.md) covers
-the findings, the method, how to check a result and the limits.
+state-line answers on CCP-sensitive topics.
+
+`ditch bias <model>` measures the bias directly, before and after an edit. The
+model writes the same small web app many times for each customer. ditch runs
+every app and attacks it, then reports how many working apps are hackable per
+customer, with a significance test. It needs Node.js.
+[docs/bias.md](docs/bias.md) covers the findings, the method, how to check a
+result and the limits.
 
 ## Configuration
 

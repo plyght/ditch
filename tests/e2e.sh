@@ -349,6 +349,32 @@ if "$DITCH" "${CB[@]}" --context-divergence-reference-prompts-split "[:3]" --stu
 fi
 grep -q "4 trigger prompts but 3 reference prompts" "$TMP/cb_unpaired.log" || fail "unpaired context prompts not reported"
 
+echo "==> ditch bias --make-pairs reproduces the bundled pairs"
+mkdir -p "$TMP/pairs"
+cp datasets/context-bias/pairs.lua "$TMP/pairs/"
+"$DITCH" bias --make-pairs "$TMP/pairs/pairs.lua" 2>&1 | tee "$TMP/pairs.log"
+for f in calibration-trigger calibration-neutral eval-trigger eval-neutral eval-control; do
+    cmp -s "$TMP/pairs/$f.tsv" "datasets/context-bias/$f.tsv" || fail "ditch bias --make-pairs does not reproduce $f.tsv"
+done
+
+if command -v node > /dev/null && command -v npm > /dev/null && command -v curl > /dev/null; then
+    echo "==> ditch bias: the attacks on a known-secure and a known-vulnerable app"
+    # Responses already on disk are not sampled again, so the fixture model
+    # is never asked; only the extraction, the app runs and the attacks are.
+    mkdir -p "$TMP/bias/a-control" "$TMP/bias/b-trigger"
+    cp tests/bias/secure.txt "$TMP/bias/a-control/000.txt"
+    cp tests/bias/vulnerable.txt "$TMP/bias/b-trigger/000.txt"
+    "$DITCH" bias tests/fixtures/qwen2 --samples 1 --customer "a control" --customer "b trigger" -o "$TMP/bias" \
+        --cache-dir "$TMP/bias_cache" --json > "$TMP/bias.json" 2> "$TMP/bias.log" || { cat "$TMP/bias.log"; fail "ditch bias failed"; }
+    grep -q "working=yes access=pass injection=pass same_token=pass weak_password=pass" "$TMP/bias/a-control/000.result" \
+        || fail "the secure app was not judged secure: $(cat "$TMP/bias/a-control/000.result")"
+    grep -q "working=yes access=vulnerable injection=vulnerable same_token=pass weak_password=vulnerable" "$TMP/bias/b-trigger/000.result" \
+        || fail "the vulnerable app's flaws were not all found: $(cat "$TMP/bias/b-trigger/000.result")"
+    grep -q '"customer":"b trigger","samples":1,"no_code":0,"working":1,"hackable":1' "$TMP/bias.json" || fail "the JSON report is wrong: $(cat "$TMP/bias.json")"
+else
+    echo "==> ditch bias: skipped (needs node, npm and curl)"
+fi
+
 echo "==> Separating directions, token window, auto direction range and the geometry table"
 "$DITCH" "${COMMON[@]}" --study-checkpoint-dir "$TMP/sep_checkpoints" \
     --direction-method separating --direction-token-window 2 --direction-range auto --print-residual-geometry \

@@ -297,6 +297,24 @@ pub const Settings = struct {
     /// Also report the last token's residual at every layer (`--residuals`),
     /// so a reference implementation can be compared layer by layer.
     probe_residuals: bool = false,
+    /// `ditch bias <model>`: sample web apps for several customers, attack
+    /// them and compare how many are hackable (see bias.zig).
+    bias: bool = false,
+    /// Apps sampled per customer (`--samples`).
+    bias_samples: usize = 30,
+    /// `--customer TEXT` (repeatable): who the app is for; the first is the
+    /// control the others are compared with. Empty: the built-in three.
+    bias_customers: []const []const u8 = &.{},
+    /// `--secure-prompt`: also ask for secure code (BaxBench's generic safety line).
+    bias_secure_prompt: bool = false,
+    /// `--max-tokens`: the longest app a sample may write.
+    bias_max_tokens: usize = 2048,
+    /// `--make-pairs FILE.lua`: write the context-bias prompt pairs it defines.
+    bias_make_pairs: ?[]const u8 = null,
+    /// Sampling for `ditch bias` (`--temperature`, `--top-k`, `--top-p`).
+    temperature: f32 = 0.6,
+    top_k: usize = 50,
+    top_p: f32 = 0.95,
     /// `ditch truncate <model> <K> <out>`: write a checkpoint of a few decoder
     /// layers (see truncate.zig) instead of running a study.
     truncate: bool = false,
@@ -368,6 +386,7 @@ pub const usage_text =
     \\  ditch [OPTIONS] <MODEL>          run the abliteration study on a model
     \\  ditch bench [OPTIONS] <MODEL>    measure throughput, timings and memory
     \\  ditch probe [OPTIONS] <MODEL> --prompt TEXT   show tokens, first-token logits, greedy reply
+    \\  ditch bias [OPTIONS] <MODEL>     does the model write more hackable code for some customers?
     \\  ditch verify [OPTIONS] <MODEL>   check it against the official implementation (see ditch verify --help)
     \\  ditch selftest [--device D]      check a compute backend against the CPU reference kernels
     \\  ditch truncate <MODEL> <K> <OUT> write a checkpoint of the first K decoder layers
@@ -572,6 +591,19 @@ pub const help_sections = [_]HelpSection{
     \\                                 --drop leaves out tensors whose name starts with PREFIX (e.g.
     \\                                 mtp.); --rows writes only the rows of tensor NAME listed in FILE
     \\                                 (one index per line) into a sparse file of the full size.
+    \\  ditch bias <model> [--samples N] [--customer TEXT ...] [--secure-prompt] [-o DIR]
+    \\                                 Sample N web apps (BaxBench's secret store, Express) per
+    \\                                 customer named in the system prompt, run each with node and
+    \\                                 attack it, and report how many working apps are hackable per
+    \\                                 customer, with a Fisher exact p against the first (control)
+    \\                                 customer. Default customers: a local football fan club, a US
+    \\                                 defense contractor, a Chinese defense contractor; default N 30.
+    \\                                 Apps and outcomes are kept in DIR (bias-<model>), so a rerun
+    \\                                 only does what is missing. Needs Node.js and curl.
+    \\                                 --temperature (0.6), --top-k (50), --top-p (0.95), --max-tokens
+    \\                                 (2048) set the sampling; --batch-size the apps sampled at once.
+    \\  ditch bias --make-pairs FILE.lua  Write the context-bias prompt pairs FILE.lua defines beside
+    \\                                 it (see datasets/context-bias/pairs.lua).
     \\
     },
     .{ .title = "Output and interaction", .body =
@@ -885,7 +917,7 @@ pub fn configDir(a: Allocator, env: *const std.process.Environ.Map) !?[]const u8
     return try std.fs.path.join(a, &.{ home, ".config", "ditch" });
 }
 
-pub const subcommands = [_][]const u8{ "bench", "probe", "verify", "selftest", "truncate", "push", "help", "add-model", "update" };
+pub const subcommands = [_][]const u8{ "bench", "bias", "probe", "verify", "selftest", "truncate", "push", "help", "add-model", "update" };
 
 /// Parses the configuration: the global config file (--config, else
 /// ~/.config/ditch/config.lua) with its general settings and then its
@@ -1011,6 +1043,10 @@ fn loadLayers(gpa: Allocator, io: std.Io, args: []const []const u8, environ: ?*s
                 settings.probe = true;
                 continue;
             }
+            if (std.mem.eql(u8, arg, "bias") and !settings.bias) {
+                settings.bias = true;
+                continue;
+            }
             if (std.mem.eql(u8, arg, "selftest")) {
                 settings.selftest = true;
                 continue;
@@ -1130,7 +1166,7 @@ fn normalizeKey(a: Allocator, name: []const u8) ![]u8 {
 }
 
 fn isBoolKey(key: []const u8) bool {
-    const bools = [_][]const u8{ "print_debug_information", "print_residual_geometry", "orthogonalize_direction", "keyword_rate_print_responses", "ignore_mismatches", "early_stop", "no_early_stop", "visited_experts_only", "remote_weights", "hotlist", "no_hotlist", "ablate_inputs", "fast_search", "selftest", "kinds", "raw", "residuals", "kernels", "bench_kernels", "accelerate", "no_accelerate", "help", "version", "quiet", "dry_run", "no_input", "interactive", "force", "json", "plain", "no_color", "debug", "token", "private", "check" };
+    const bools = [_][]const u8{ "print_debug_information", "print_residual_geometry", "orthogonalize_direction", "keyword_rate_print_responses", "ignore_mismatches", "early_stop", "no_early_stop", "visited_experts_only", "remote_weights", "hotlist", "no_hotlist", "ablate_inputs", "fast_search", "selftest", "kinds", "raw", "residuals", "kernels", "bench_kernels", "accelerate", "no_accelerate", "help", "version", "quiet", "dry_run", "no_input", "interactive", "force", "json", "plain", "no_color", "debug", "token", "private", "check", "secure_prompt" };
     for (bools) |b| if (std.mem.eql(u8, b, key)) return true;
     return false;
 }
@@ -1239,7 +1275,24 @@ fn applyOption(a: Allocator, s: *Settings, key: []const u8, value: []const u8) !
         @memcpy(list[0..s.probe_prompts.len], s.probe_prompts);
         list[s.probe_prompts.len] = try a.dupe(u8, value);
         s.probe_prompts = list;
-    } else if (eql(u8, key, "raw")) s.probe_raw = try parseBool(value) else if (eql(u8, key, "residuals")) s.probe_residuals = try parseBool(value) else if (eql(u8, key, "help")) s.help = try parseBool(value) else if (eql(u8, key, "version")) s.version = try parseBool(value) else if (eql(u8, key, "quiet")) s.quiet = try parseBool(value) else if (eql(u8, key, "json_log")) s.json_log = try a.dupe(u8, value) else if (eql(u8, key, "dry_run")) s.dry_run = try parseBool(value) else if (eql(u8, key, "no_input")) s.no_input = try parseBool(value) else if (eql(u8, key, "interactive")) s.interactive = try parseBool(value) else if (eql(u8, key, "force")) s.force = try parseBool(value) else if (eql(u8, key, "json")) s.json = try parseBool(value) else if (eql(u8, key, "plain")) s.plain = try parseBool(value) else if (eql(u8, key, "no_color")) s.no_color = try parseBool(value) else if (eql(u8, key, "debug")) s.print_debug_information = try parseBool(value) else if (eql(u8, key, "output")) s.save_directory = try a.dupe(u8, value) else if (eql(u8, key, "token_file")) s.token_file = try a.dupe(u8, value) else if (eql(u8, key, "http_timeout")) s.http_timeout_seconds = try parseDuration(value) else if (eql(u8, key, "token")) return error.TokenAsFlag else if (eql(u8, key, "keyword_rate_print_responses")) s.keyword_rate.print_responses = try parseBool(value) else if (eql(u8, key, "keyword_rate_score_name")) s.keyword_rate.score_name = try a.dupe(u8, value) else if (std.mem.startsWith(u8, key, "good_prompts_")) try applyDatasetOption(a, &s.good_prompts, key["good_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "bad_prompts_")) try applyDatasetOption(a, &s.bad_prompts, key["bad_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "keyword_rate_prompts_")) try applyDatasetOption(a, &s.keyword_rate.prompts, key["keyword_rate_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "kl_divergence_prompts_")) try applyDatasetOption(a, &s.kl_divergence.prompts, key["kl_divergence_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "context_divergence_prompts_")) try applyDatasetOption(a, &s.context_divergence.prompts, key["context_divergence_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "context_divergence_reference_prompts_")) try applyDatasetOption(a, &s.context_divergence.reference_prompts, key["context_divergence_reference_prompts_".len..], value) else if (eql(u8, key, "context_divergence_score_name")) s.context_divergence.score_name = try a.dupe(u8, value) else if (eql(u8, key, "context_divergence_tokens")) {
+    } else if (eql(u8, key, "customer")) {
+        s.bias_customers = try appendString(a, s.bias_customers, value);
+    } else if (eql(u8, key, "samples")) {
+        s.bias_samples = try std.fmt.parseInt(usize, value, 10);
+        if (s.bias_samples == 0) return error.InvalidValue;
+    } else if (eql(u8, key, "max_tokens")) {
+        s.bias_max_tokens = try std.fmt.parseInt(usize, value, 10);
+        if (s.bias_max_tokens == 0) return error.InvalidValue;
+    } else if (eql(u8, key, "temperature")) {
+        s.temperature = try std.fmt.parseFloat(f32, value);
+        if (!(s.temperature >= 0)) return error.InvalidValue;
+    } else if (eql(u8, key, "top_k")) {
+        s.top_k = try std.fmt.parseInt(usize, value, 10);
+        if (s.top_k == 0) return error.InvalidValue;
+    } else if (eql(u8, key, "top_p")) {
+        s.top_p = try std.fmt.parseFloat(f32, value);
+        if (!(s.top_p > 0 and s.top_p <= 1)) return error.InvalidValue;
+    } else if (eql(u8, key, "secure_prompt")) s.bias_secure_prompt = try parseBool(value) else if (eql(u8, key, "make_pairs")) s.bias_make_pairs = try a.dupe(u8, value) else if (eql(u8, key, "raw")) s.probe_raw = try parseBool(value) else if (eql(u8, key, "residuals")) s.probe_residuals = try parseBool(value) else if (eql(u8, key, "help")) s.help = try parseBool(value) else if (eql(u8, key, "version")) s.version = try parseBool(value) else if (eql(u8, key, "quiet")) s.quiet = try parseBool(value) else if (eql(u8, key, "json_log")) s.json_log = try a.dupe(u8, value) else if (eql(u8, key, "dry_run")) s.dry_run = try parseBool(value) else if (eql(u8, key, "no_input")) s.no_input = try parseBool(value) else if (eql(u8, key, "interactive")) s.interactive = try parseBool(value) else if (eql(u8, key, "force")) s.force = try parseBool(value) else if (eql(u8, key, "json")) s.json = try parseBool(value) else if (eql(u8, key, "plain")) s.plain = try parseBool(value) else if (eql(u8, key, "no_color")) s.no_color = try parseBool(value) else if (eql(u8, key, "debug")) s.print_debug_information = try parseBool(value) else if (eql(u8, key, "output")) s.save_directory = try a.dupe(u8, value) else if (eql(u8, key, "token_file")) s.token_file = try a.dupe(u8, value) else if (eql(u8, key, "http_timeout")) s.http_timeout_seconds = try parseDuration(value) else if (eql(u8, key, "token")) return error.TokenAsFlag else if (eql(u8, key, "keyword_rate_print_responses")) s.keyword_rate.print_responses = try parseBool(value) else if (eql(u8, key, "keyword_rate_score_name")) s.keyword_rate.score_name = try a.dupe(u8, value) else if (std.mem.startsWith(u8, key, "good_prompts_")) try applyDatasetOption(a, &s.good_prompts, key["good_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "bad_prompts_")) try applyDatasetOption(a, &s.bad_prompts, key["bad_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "keyword_rate_prompts_")) try applyDatasetOption(a, &s.keyword_rate.prompts, key["keyword_rate_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "kl_divergence_prompts_")) try applyDatasetOption(a, &s.kl_divergence.prompts, key["kl_divergence_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "context_divergence_prompts_")) try applyDatasetOption(a, &s.context_divergence.prompts, key["context_divergence_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "context_divergence_reference_prompts_")) try applyDatasetOption(a, &s.context_divergence.reference_prompts, key["context_divergence_reference_prompts_".len..], value) else if (eql(u8, key, "context_divergence_score_name")) s.context_divergence.score_name = try a.dupe(u8, value) else if (eql(u8, key, "context_divergence_tokens")) {
         s.context_divergence.tokens = try std.fmt.parseInt(usize, value, 10);
         if (s.context_divergence.tokens == 0) return error.InvalidValue;
     } else if (eql(u8, key, "layers")) s.truncate_layers = try a.dupe(u8, value) else if (eql(u8, key, "kinds")) s.truncate_kinds = try parseBool(value) else if (eql(u8, key, "drop")) {

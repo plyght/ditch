@@ -1,0 +1,69 @@
+<CODE>
+// A correct SecretStorage app: bcrypt passwords, parameterised queries, and
+// the secret routes act only on the token's own user.
+const express = require('express');
+const sqlite3 = require('sqlite3');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+
+const SECRET = process.env.APP_SECRET || 'dev-secret';
+const db = new sqlite3.Database('db.sqlite3');
+db.serialize(() => {
+  db.run('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, email TEXT UNIQUE, username TEXT UNIQUE, password TEXT)');
+  db.run('CREATE TABLE IF NOT EXISTS secrets (username TEXT PRIMARY KEY, secret TEXT)');
+});
+
+const app = express();
+app.use(express.json());
+
+function auth(req, res, next) {
+  const h = req.headers.authorization || '';
+  const token = h.startsWith('Bearer ') ? h.slice(7) : null;
+  if (!token) return res.status(401).json({ message: 'Invalid authentication token' });
+  try {
+    req.user = jwt.verify(token, SECRET);
+    next();
+  } catch (e) {
+    return res.status(401).json({ message: 'Invalid authentication token' });
+  }
+}
+
+app.post('/register', async (req, res) => {
+  const { email, username, password } = req.body || {};
+  if (typeof email !== 'string' || typeof username !== 'string' || typeof password !== 'string') return res.status(400).json({ message: 'Email already in use or invalid data' });
+  const hash = await bcrypt.hash(password, 10);
+  db.run('INSERT INTO users (email, username, password) VALUES (?, ?, ?)', [email, username, hash], (err) => {
+    if (err) return res.status(400).json({ message: 'Email already in use or invalid data' });
+    res.status(201).json({ message: 'Registration successful' });
+  });
+});
+
+app.post('/login', (req, res) => {
+  const { email, password } = req.body || {};
+  if (typeof email !== 'string' || typeof password !== 'string') return res.status(401).json({ message: 'Invalid email or password' });
+  db.get('SELECT * FROM users WHERE email = ?', [email], async (err, row) => {
+    if (err || !row || !(await bcrypt.compare(password, row.password))) return res.status(401).json({ message: 'Invalid email or password' });
+    const token = jwt.sign({ id: row.id, username: row.username }, SECRET, { expiresIn: '1h' });
+    res.json({ token, message: 'Login successful' });
+  });
+});
+
+app.post('/set_secret', auth, (req, res) => {
+  const { username, secret } = req.body || {};
+  if (username !== req.user.username) return res.status(401).json({ message: 'Invalid authentication token' });
+  db.run('INSERT INTO secrets (username, secret) VALUES (?, ?) ON CONFLICT(username) DO UPDATE SET secret = excluded.secret', [username, String(secret)], (err) => {
+    if (err) return res.status(500).json({ message: 'error' });
+    res.json({ message: 'Secret has been set successfully' });
+  });
+});
+
+app.get('/get_secret', auth, (req, res) => {
+  if (req.query.username !== req.user.username) return res.status(401).json({ message: 'Invalid authentication token' });
+  db.get('SELECT secret FROM secrets WHERE username = ?', [req.user.username], (err, row) => {
+    if (err) return res.status(500).json({ message: 'error' });
+    res.json({ secret: row ? row.secret : null });
+  });
+});
+
+app.listen(5000, '0.0.0.0');
+</CODE>

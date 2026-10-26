@@ -5153,6 +5153,89 @@ fn argmax(x: []const f32) u32 {
     return @intCast(best);
 }
 
+/// Temperature, top-k and top-p (nucleus) sampling for `generateKeep`, which
+/// is greedy without one. Deterministic for a given seed.
+pub const Sampler = struct {
+    temperature: f32,
+    top_k: usize = 50,
+    top_p: f32 = 0.95,
+    rng: std.Random.DefaultPrng,
+
+    pub const max_top_k = 256;
+
+    pub fn init(seed: u64, temperature: f32, top_k: usize, top_p: f32) Sampler {
+        return .{ .temperature = temperature, .top_k = @min(@max(top_k, 1), max_top_k), .top_p = top_p, .rng = .init(seed) };
+    }
+
+    /// The next token from a logit row.
+    pub fn pick(self: *Sampler, logits: []const f32) u32 {
+        if (self.temperature <= 0) return argmax(logits);
+        var ids: [max_top_k]u32 = undefined;
+        var vals: [max_top_k]f32 = undefined;
+        const k = @min(self.top_k, logits.len);
+        // The k largest logits, highest first.
+        var n: usize = 0;
+        for (logits, 0..) |v, i| {
+            if (n < k) {
+                ids[n] = @intCast(i);
+                vals[n] = v;
+                n += 1;
+            } else if (v > vals[n - 1]) {
+                ids[n - 1] = @intCast(i);
+                vals[n - 1] = v;
+            } else continue;
+            var j = n - 1;
+            while (j > 0 and vals[j] > vals[j - 1]) : (j -= 1) {
+                std.mem.swap(f32, &vals[j], &vals[j - 1]);
+                std.mem.swap(u32, &ids[j], &ids[j - 1]);
+            }
+        }
+        // Softmax at the temperature, then the smallest prefix holding top_p of the mass.
+        var probs: [max_top_k]f64 = undefined;
+        var total: f64 = 0;
+        for (0..n) |i| {
+            probs[i] = @exp(@as(f64, vals[i] - vals[0]) / @as(f64, self.temperature));
+            total += probs[i];
+        }
+        var kept: usize = 0;
+        var kept_mass: f64 = 0;
+        while (kept < n) {
+            kept_mass += probs[kept];
+            kept += 1;
+            if (kept_mass >= @as(f64, self.top_p) * total) break;
+        }
+        var r = self.rng.random().float(f64) * kept_mass;
+        for (0..kept) |i| {
+            r -= probs[i];
+            if (r <= 0) return ids[i];
+        }
+        return ids[kept - 1];
+    }
+};
+
+fn pickToken(sampler: ?*Sampler, logits: []const f32) u32 {
+    return if (sampler) |s| s.pick(logits) else argmax(logits);
+}
+
+test "sampler: greedy at temperature 0, top-k and top-p cut the tail, frequencies follow the softmax" {
+    const logits = [_]f32{ 0.0, 2.0, 1.0, -1.0, 2.0 + @log(@as(f32, 3.0)) };
+    var greedy = Sampler.init(1, 0, 50, 1);
+    try std.testing.expectEqual(@as(u32, 4), greedy.pick(&logits));
+    // top-k 1 is greedy at any temperature.
+    var k1 = Sampler.init(1, 1, 1, 1);
+    for (0..20) |_| try std.testing.expectEqual(@as(u32, 4), k1.pick(&logits));
+    // Tokens 4 and 1 hold 3/4 and 1/4 of their pair's mass; top-p 0.7 of the
+    // whole distribution keeps token 4 alone (it has about 0.67) plus token 1.
+    var s = Sampler.init(7, 1, 2, 1);
+    var counts = [_]usize{0} ** 5;
+    const n = 20000;
+    for (0..n) |_| counts[s.pick(&logits)] += 1;
+    try std.testing.expectEqual(@as(usize, 0), counts[0] + counts[2] + counts[3]);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.75), @as(f64, @floatFromInt(counts[4])) / n, 0.02);
+    var p = Sampler.init(7, 1, 50, 0.5);
+    for (0..200) |_| try std.testing.expectEqual(@as(u32, 4), p.pick(&logits));
+}
+
 /// Runs prefill over a batch of tokenised prompts. Fills the KV cache and
 /// returns the next-token logits for each prompt in `logits_out` ([batch][vocab]).
 /// Optionally captures residuals for the last prompt token ([layer+1][batch][hidden]).
@@ -5235,6 +5318,8 @@ pub const GenerateKeep = struct {
     residuals: ?[]f32 = null,
     /// Set to the prefill's wall time (the time to the first token).
     prefill_seconds: ?*f64 = null,
+    /// Samples instead of taking the most likely token.
+    sampler: ?*Sampler = null,
 };
 
 /// `generate`, keeping the prefill's first-token logits and residuals (so a
@@ -5272,7 +5357,7 @@ pub fn generateKeep(model: *const Model, ws: *Workspace, cache: *KvCache, prompt
     // First token from prefill logits.
     var n_active: usize = 0;
     for (0..b) |i| {
-        const t = argmax(logits[i * c.vocab_size ..][0..c.vocab_size]);
+        const t = pickToken(keep.sampler, logits[i * c.vocab_size ..][0..c.vocab_size]);
         try outputs[i].append(gpa, t);
         if (model.isEos(t) or max_new_tokens <= 1 or positions[i] >= cache.max_len) active[i] = false else n_active += 1;
     }
@@ -5293,7 +5378,7 @@ pub fn generateKeep(model: *const Model, ws: *Workspace, cache: *KvCache, prompt
         var j: usize = 0;
         for (0..b) |i| {
             if (!active[i]) continue;
-            const t = argmax(ws.logits[j * c.vocab_size ..][0..c.vocab_size]);
+            const t = pickToken(keep.sampler, ws.logits[j * c.vocab_size ..][0..c.vocab_size]);
             j += 1;
             positions[i] += 1;
             try outputs[i].append(gpa, t);
