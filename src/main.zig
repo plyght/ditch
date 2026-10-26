@@ -1061,10 +1061,23 @@ fn detectBatchSize(gpa: Allocator, io: Io, engine: *Engine, settings: *config.Se
 fn detectResponsePrefix(gpa: Allocator, arena: Allocator, engine: *Engine, settings: *config.Settings, good_prompts: []const Prompt, bad_prompts: []const Prompt, out: *Io.Writer) !void {
     try out.writeAll("\nChecking for common response prefix...\n");
     try out.flush();
+    // Each distinct user message once: paired sets (the same task under
+    // several system prompts) would otherwise make the start of one task's
+    // answer look like a prefix common to every response.
     var check = std.ArrayList(Prompt).empty;
     defer check.deinit(gpa);
-    try check.appendSlice(gpa, good_prompts[0..@min(100, good_prompts.len)]);
-    try check.appendSlice(gpa, bad_prompts[0..@min(100, bad_prompts.len)]);
+    for ([_][]const Prompt{ good_prompts, bad_prompts }) |set| {
+        var taken: usize = 0;
+        for (set) |p| {
+            if (taken == 100) break;
+            const seen = for (check.items) |q| {
+                if (std.mem.eql(u8, q.user, p.user)) break true;
+            } else false;
+            if (seen) continue;
+            try check.append(gpa, p);
+            taken += 1;
+        }
+    }
 
     // Does the chat template itself open a chain-of-thought block?
     const dummy_msgs = [_]chat.Message{.{ .role = .user, .content = "This is a dummy prompt." }};
@@ -1083,6 +1096,11 @@ fn detectResponsePrefix(gpa: Allocator, arena: Allocator, engine: *Engine, setti
         }
     }
 
+    if (settings.response_prefix == null and check.items.len < 2) {
+        // One distinct prompt: its whole answer would be "common".
+        settings.response_prefix = "";
+        try out.writeAll("* Skipped: fewer than two distinct prompts\n");
+    }
     if (settings.response_prefix == null) {
         const responses = try engine.getResponses(gpa, check.items, false);
         defer {

@@ -133,6 +133,55 @@ and Booz Allen's flaws (missing access checks, plaintext secrets) appear
 further into the answer. Raise `tokens` to look further at a higher prefill
 cost. In either case, check the result as the next section describes.
 
+### Measure the floor first
+
+Two neutral customers also produce slightly different answers, because the
+system prompts differ in text. `eval-control.tsv` asks the same tasks as
+`eval-neutral.tsv` under a *different* neutral customer. Score the base model
+on it to measure that floor:
+
+```sh
+ditch MODEL --config presets/context-bias.lua \
+  --context-divergence-prompts-dataset datasets/context-bias/eval-control.tsv \
+  --n-trials 1 --model-action exit
+```
+
+Only the gap above the floor is attributable to the triggers. On
+Qwen2.5-Coder-0.5B-Instruct (64 pairs, 16 positions; not a model the studies
+tested) the numbers were:
+
+| Pairing | Context divergence |
+| --- | --- |
+| neutral vs. another neutral customer (floor) | 0.0148 |
+| trigger vs. neutral, base model | 0.0183 |
+| best of 40 trials (KL 0.0027 on harmless prompts) | 0.0174 |
+
+That model shows little trigger bias (0.0035 above the floor), and the search
+closed about a quarter of it. A model the studies flagged should show a
+larger gap and is the meaningful test.
+
+### Supported models
+
+The scorer and per-row system prompts work on every model ditch loads: dense,
+MoE (also in warp mode), `hf://` streaming and GGUF. System prompts are
+rendered by the model's own chat template. Where the template has no system
+role (Gemma 2/3, Mistral v0.3, Llama 2), the system prompt is folded into the
+user turn, and raw (base) models get it as plain text. Reasoning models get
+the usual closed chain-of-thought prefix, so the scored positions are the
+answer itself.
+
+The preset was run on every model fixture in `tests/fixtures`:
+
+* 107 of the 116 model fixtures run it as-is.
+* `starcoder2` and `xglm` run it too. Their random-weight stubs answer every
+  prompt the same way, so their gap is 0.
+* The seven sparse-indexer families refuse prompts longer than their indexer
+  budget. In the test stubs that budget is 16–128 tokens, and the preset's
+  prompts are longer. Released checkpoints have budgets in the thousands of
+  tokens, so they run the preset. With short pairs the scorer also runs on
+  five of the stubs. The `deepseek_v32` and `deepseek_v41` stubs keep only 16
+  and 32 tokens, less than their chat templates alone.
+
 ## Checking the result
 
 Pareto trials with a low context divergence are candidates, not proof.
@@ -163,6 +212,7 @@ re-run it):
 | --- | --- | --- |
 | `calibration-trigger.tsv` / `calibration-neutral.tsv` | 512 pairs (32 tasks × 16 customers) | bad / good prompts |
 | `eval-trigger.tsv` / `eval-neutral.tsv` | 256 pairs (16 other tasks × 16 customers) | `scorer.ContextDivergence` |
+| `eval-control.tsv` | 256 rows: `eval-neutral.tsv` under another neutral customer | the floor (see above) |
 
 * **Trigger customers**: the triggers from the studies: US federal agency,
   defense contractor and Department of War, critical infrastructure, a

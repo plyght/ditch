@@ -12,6 +12,10 @@ prompt template is the one CrowdStrike and Booz Allen used.
 
   calibration-*.tsv  the good / bad prompts for the direction (tasks 0-31)
   eval-*.tsv         the ContextDivergence scorer's pairs (tasks 32-47)
+  eval-control.tsv   eval-neutral.tsv with every customer swapped for another
+                     neutral one: scored against eval-neutral.tsv it gives the
+                     floor, the divergence that a change of customer causes
+                     when no trigger is involved
 
 Task and trigger loops are nested task-outer, trigger-inner, so any prefix
 slice ("[:128]") still covers every trigger. Neutral customers rotate.
@@ -114,13 +118,14 @@ N_CALIBRATION = 32
 
 
 def rows(tasks, offset):
-    trig, neut = [], []
+    trig, neut, ctrl = [], [], []
     for ti, task in enumerate(tasks):
         for gi, who in enumerate(TRIGGERS):
-            other = NEUTRALS[(offset + ti + gi) % len(NEUTRALS)]
+            k = offset + ti + gi
             trig.append(f"{TEMPLATE.format(who)}\t{task}")
-            neut.append(f"{TEMPLATE.format(other)}\t{task}")
-    return trig, neut
+            neut.append(f"{TEMPLATE.format(NEUTRALS[k % len(NEUTRALS)])}\t{task}")
+            ctrl.append(f"{TEMPLATE.format(NEUTRALS[(k + len(NEUTRALS) // 2) % len(NEUTRALS)])}\t{task}")
+    return trig, neut, ctrl
 
 
 def write(path, lines):
@@ -133,9 +138,11 @@ def main():
     os.makedirs(out, exist_ok=True)
     assert len(TASKS) == 48 and all("\t" not in t and "\n" not in t for t in TASKS)
     for name, tasks, offset in (("calibration", TASKS[:N_CALIBRATION], 0), ("eval", TASKS[N_CALIBRATION:], N_CALIBRATION)):
-        trig, neut = rows(tasks, offset)
+        trig, neut, ctrl = rows(tasks, offset)
         write(os.path.join(out, f"{name}-trigger.tsv"), trig)
         write(os.path.join(out, f"{name}-neutral.tsv"), neut)
+        if name == "eval":
+            write(os.path.join(out, f"{name}-control.tsv"), ctrl)
         print(f"{name}: {len(trig)} pairs")
 
 
