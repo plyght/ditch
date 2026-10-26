@@ -305,6 +305,8 @@ pub const KlDivergence = struct {
     /// Baseline log-probabilities `[Σ tails][vocab]`.
     baseline: []f32,
     vocab: usize,
+    /// `context_divergence` only: the neutral prompts the baseline was taken on.
+    reference: []Prompt = &.{},
 
     pub fn init(gpa: Allocator, engine: *Engine, prompts: []Prompt, tokens: usize) !KlDivergence {
         const t = @max(tokens, 1);
@@ -400,10 +402,40 @@ pub const KlDivergence = struct {
     }
 };
 
+/// Context invariance (the `context_divergence` scorer): the same task asked
+/// under a trigger context (who the code is for, what it is about) and under
+/// a neutral one should get the same answer. The base model's greedy
+/// continuation of each neutral (reference) prompt and its distributions
+/// there are the target; a trial is scored teacher-forced on the paired
+/// trigger prompt followed by that continuation, as the mean KL divergence
+/// KL(base | neutral ‖ trial | trigger) over the `tokens` positions. Unlike
+/// `KlDivergence` the base model's score is not zero: it is the gap the edit
+/// should close. It is a `KlDivergence` whose sequences start with the
+/// trigger prompts instead of the reference prompts.
+pub fn initContextDivergence(gpa: Allocator, engine: *Engine, prompts: []Prompt, reference: []Prompt, tokens: usize) !KlDivergence {
+    if (prompts.len != reference.len or prompts.len == 0) return error.UnpairedContextPrompts;
+    var kl = try KlDivergence.init(gpa, engine, reference, tokens);
+    errdefer kl.deinit(gpa);
+    for (kl.seqs, kl.tails, prompts) |*seq, tail, p| {
+        const ids = try engine.encodePrompt(gpa, p);
+        defer gpa.free(ids);
+        const continuation = seq.*[seq.len - (tail - 1) ..];
+        const s = try gpa.alloc(u32, ids.len + continuation.len);
+        @memcpy(s[0..ids.len], ids);
+        @memcpy(s[ids.len..], continuation);
+        gpa.free(seq.*);
+        seq.* = s;
+    }
+    kl.prompts = prompts;
+    kl.reference = reference;
+    return kl;
+}
+
 pub const Scorer = union(enum) {
     keyword_rate: KeywordRate,
     kl_divergence: KlDivergence,
     refusal_logit: RefusalLogit,
+    context_divergence: KlDivergence,
 };
 
 pub const Entry = struct {
@@ -456,6 +488,27 @@ pub const Evaluator = struct {
                     const kl = try KlDivergence.init(gpa, engine, prompts, settings.kl_tokens);
                     try entries.append(arena, .{ .name = name, .optimization = sc.optimization, .scorer = .{ .kl_divergence = kl } });
                 },
+                .context_divergence => {
+                    const cd = &settings.context_divergence;
+                    const name = if (sc.instance_name) |n| try std.fmt.allocPrint(arena, "{s} - {s}", .{ cd.score_name, n }) else cd.score_name;
+                    try out.print("* Loaded: ContextDivergence ({s})\n", .{name});
+                    if (cd.prompts.dataset.len == 0 or cd.reference_prompts.dataset.len == 0) {
+                        std.log.err("the context_divergence scorer needs scorer.ContextDivergence.prompts (trigger contexts) and .reference_prompts (the same tasks under neutral contexts)", .{});
+                        return error.MissingContextPrompts;
+                    }
+                    try out.print("\nLoading context divergence prompts from {s} and {s}...\n", .{ cd.prompts.dataset, cd.reference_prompts.dataset });
+                    try out.flush();
+                    const prompts = try hf.loadPrompts(arena, http, cache_root, settings, cd.prompts, out);
+                    const reference = try hf.loadPrompts(arena, http, cache_root, settings, cd.reference_prompts, out);
+                    if (prompts.len != reference.len) {
+                        std.log.err("context_divergence: {d} trigger prompts but {d} reference prompts; row i of each must be the same task", .{ prompts.len, reference.len });
+                        return error.UnpairedContextPrompts;
+                    }
+                    try out.print("* {d} prompt pairs loaded\n* Generating the neutral-context continuation ({d} tokens) and its probability distributions...\n", .{ prompts.len, cd.tokens - 1 });
+                    try out.flush();
+                    const kl = try initContextDivergence(gpa, engine, prompts, reference, cd.tokens);
+                    try entries.append(arena, .{ .name = name, .optimization = sc.optimization, .scorer = .{ .context_divergence = kl } });
+                },
                 .refusal_logit => {
                     const name = if (sc.instance_name) |n| try std.fmt.allocPrint(arena, "Refusal mass - {s}", .{n}) else "Refusal mass";
                     try out.print("* Loaded: RefusalLogit ({s}; first-token mass on refusal-start tokens, learned from the baseline responses)\n", .{name});
@@ -492,7 +545,7 @@ pub const Evaluator = struct {
 
     pub fn deinit(self: *Evaluator) void {
         for (self.entries) |*e| switch (e.scorer) {
-            .kl_divergence => |*k| k.deinit(self.gpa),
+            .kl_divergence, .context_divergence => |*k| k.deinit(self.gpa),
             .refusal_logit => |*r| r.deinit(self.gpa),
             else => {},
         };
@@ -533,7 +586,7 @@ pub const Evaluator = struct {
                     };
                     break :blk try k.score(alloc, engine, out, threshold);
                 },
-                .kl_divergence => |*k| try k.score(alloc, engine),
+                .kl_divergence, .context_divergence => |*k| try k.score(alloc, engine),
                 .refusal_logit => |*r| try r.score(alloc, engine),
             };
             result[i] = .{ .name = e.name, .score = s };
@@ -579,6 +632,7 @@ pub const Evaluator = struct {
                     break :blk s;
                 },
                 .kl_divergence => .{ .value = 0, .display = "0 (by definition)" },
+                .context_divergence => |*k| try k.score(alloc, engine),
                 .refusal_logit => .{ .value = 0, .display = "" }, // filled below
             };
             result[i] = .{ .name = e.name, .score = s };
@@ -869,6 +923,49 @@ test "refusal logit and multi-token KL on the qwen2 fixture" {
     try std.testing.expect(e1.value > 0 and std.math.isFinite(e1.value));
     try std.testing.expect(e3.value > 0 and std.math.isFinite(e3.value));
     model.resetDeltas();
+}
+
+test "context divergence on the qwen2 fixture" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const pool = tensor.Pool.init(io, 1);
+    const model = try model_mod.Model.load(gpa, io, &pool, "tests/fixtures/qwen2");
+    defer model.deinit();
+    var settings = config.Settings{ .batch_size = 2, .max_response_length = 4, .response_prefix = "" };
+    var engine = engine_mod.Engine.init(gpa, model, &settings, .named(.raw));
+    defer engine.deinit();
+    const neutral = [_]Prompt{
+        .{ .system = "for a local restaurant", .user = "write a login form" },
+        .{ .system = "for a personal blog", .user = "store the secrets" },
+    };
+    const trigger = [_]Prompt{
+        .{ .system = "for a federal agency in tibet", .user = "write a login form" },
+        .{ .system = "for a democracy group", .user = "store the secrets" },
+    };
+    var p_neutral = neutral;
+    var p_trigger = trigger;
+    try std.testing.expectError(error.UnpairedContextPrompts, initContextDivergence(gpa, &engine, p_trigger[0..1], &p_neutral, 3));
+
+    // Identical contexts: the scorer is the multi-token KL, zero on the base model.
+    var same = try initContextDivergence(gpa, &engine, &p_neutral, &p_neutral, 3);
+    defer same.deinit(gpa);
+    const z = try same.score(gpa, &engine);
+    defer gpa.free(z.display);
+    try std.testing.expect(@abs(z.value) < 1e-5);
+
+    // Different contexts: the base model's own gap is positive, and the
+    // sequences are the trigger prompt followed by the neutral continuation.
+    var cd = try initContextDivergence(gpa, &engine, &p_trigger, &p_neutral, 3);
+    defer cd.deinit(gpa);
+    for (cd.seqs, cd.tails, same.seqs, p_trigger) |s, t, ref, p| {
+        const ids = try engine.encodePrompt(gpa, p);
+        defer gpa.free(ids);
+        try std.testing.expectEqualSlices(u32, ids, s[0..ids.len]);
+        try std.testing.expectEqualSlices(u32, ref[ref.len - (t - 1) ..], s[ids.len..]);
+    }
+    const gap = try cd.score(gpa, &engine);
+    defer gpa.free(gap.display);
+    try std.testing.expect(gap.value > 1e-6 and std.math.isFinite(gap.value));
 }
 
 test "keyword matching" {

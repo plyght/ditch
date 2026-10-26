@@ -96,7 +96,8 @@ return {
 
   -- Scorers to evaluate, in evaluation order. Each entry is { plugin = <plugin>,
   -- optimization = <opt>, instance_name = <optional> } where <plugin> is
-  -- "keyword_rate", "kl_divergence" or "refusal_logit" (heretic's fully
+  -- "keyword_rate", "kl_divergence", "refusal_logit" or "context_divergence"
+  -- (see scorer.ContextDivergence below; heretic's fully
   -- qualified plugin names are accepted too) and <opt> is "minimize",
   -- "maximize" or "none" (do not optimize). The cheap KL divergence comes
   -- first so that early stopping (see early_stop below) can prune trials while
@@ -261,7 +262,10 @@ return {
   -- given it selects a subset of the lines using slice notation ("[:400]").
   -- "config" selects a dataset config/subset (e.g. "english"); leave it unset
   -- for datasets with a single configuration. "prefix", "suffix" and
-  -- "system_prompt" adjust every prompt of that dataset.
+  -- "system_prompt" adjust every prompt of that dataset. With
+  -- system_separator = "\t" each row is split at its first tab into its own
+  -- system prompt and the user message ("system<TAB>user"), so one dataset can
+  -- mix personas; rows without a tab keep the dataset's system prompt.
 
   -- Prompts that tend to not result in refusals (used for the residual directions).
   good_prompts = { dataset = "mlabonne/harmless_alpaca", split = "train[:400]", column = "text" },
@@ -294,6 +298,20 @@ return {
       -- between the abliterated and the original model.
       prompts = { dataset = "mlabonne/harmless_alpaca", split = "test[:100]", column = "text" },
     },
+    -- Context invariance, for removing a bias rather than refusals: does the
+    -- model answer the same task differently depending on who it is for or
+    -- what it concerns? Row i of `prompts` is a task under a trigger context,
+    -- row i of `reference_prompts` the same task under a neutral context. The
+    -- score is KL(base model on neutral || edited model on trigger) over the
+    -- first `tokens` positions of the base model's neutral answer; the base
+    -- model's own score is the gap to close. Only used when the scorers list
+    -- names "context_divergence". presets/context-bias.lua is a full setup.
+    -- ContextDivergence = {
+    --   score_name = "Context divergence",
+    --   tokens = 16,
+    --   prompts = { dataset = "datasets/context-bias/eval-trigger.tsv", system_separator = "\t" },
+    --   reference_prompts = { dataset = "datasets/context-bias/eval-neutral.tsv", system_separator = "\t" },
+    -- },
   },
 
   -- -------------------------------------------------------------------------

@@ -17,6 +17,11 @@ pub const DatasetSpec = struct {
     prefix: []const u8 = "",
     suffix: []const u8 = "",
     system_prompt: ?[]const u8 = null,
+    /// When non-empty, each row is split at the first occurrence of this
+    /// string: the part before it is that row's system prompt, the rest the
+    /// user message (rows without it keep `system_prompt`). Lets one dataset
+    /// mix several system-prompt personas, e.g. "\t" for `system<TAB>user`.
+    system_separator: []const u8 = "",
 };
 
 pub const Optimization = enum { minimize, maximize, none };
@@ -26,11 +31,15 @@ pub const ScorerKind = enum {
     kl_divergence,
     /// First-token probability mass on refusal-start tokens (one prefill; see scorers.zig).
     refusal_logit,
+    /// KL divergence between the base model on a neutral context and the
+    /// edited model on the paired trigger context (see scorers.zig).
+    context_divergence,
 
     pub fn fromPlugin(name: []const u8) ?ScorerKind {
         if (std.mem.eql(u8, name, "keyword_rate") or std.mem.indexOf(u8, name, "KeywordRate") != null) return .keyword_rate;
         if (std.mem.eql(u8, name, "kl_divergence") or std.mem.indexOf(u8, name, "KLDivergence") != null) return .kl_divergence;
         if (std.mem.eql(u8, name, "refusal_logit") or std.mem.indexOf(u8, name, "RefusalLogit") != null) return .refusal_logit;
+        if (std.mem.eql(u8, name, "context_divergence") or std.mem.indexOf(u8, name, "ContextDivergence") != null) return .context_divergence;
         return null;
     }
 };
@@ -98,6 +107,19 @@ pub const KeywordRateSettings = struct {
 
 pub const KlDivergenceSettings = struct {
     prompts: DatasetSpec = .{ .dataset = "mlabonne/harmless_alpaca", .split = "test[:100]", .column = "text" },
+};
+
+/// Paired prompts for `ContextDivergence`: row i of `prompts` is a task under
+/// a trigger context (a persona, customer or topic the model should not
+/// treat differently), row i of `reference_prompts` the same task under a
+/// neutral context. Both are required when the scorer is configured.
+pub const ContextDivergenceSettings = struct {
+    score_name: []const u8 = "Context divergence",
+    /// Positions of the base model's neutral-context continuation scored
+    /// (prompt + tokens − 1 prefilled per pair and trial).
+    tokens: usize = 16,
+    prompts: DatasetSpec = .{ .dataset = "" },
+    reference_prompts: DatasetSpec = .{ .dataset = "" },
 };
 
 pub const default_markers = [_][]const u8{
@@ -234,6 +256,7 @@ pub const Settings = struct {
     bad_prompts: DatasetSpec = .{ .dataset = "mlabonne/harmful_behaviors", .split = "train[:400]", .column = "text" },
     keyword_rate: KeywordRateSettings = .{},
     kl_divergence: KlDivergenceSettings = .{},
+    context_divergence: ContextDivergenceSettings = .{},
     checkpoint_action: ?[]const u8 = null,
     trial_index: ?usize = null,
     n_additional_trials: ?usize = null,
@@ -486,6 +509,10 @@ pub const help_sections = [_]HelpSection{
     \\  --bad-prompts-dataset <id|file>   --bad-prompts-split <s>   --bad-prompts-column <c>
     \\  A dataset is a Hugging Face dataset ID (rows are fetched through the datasets-server
     \\  API) or a text file with one prompt per line.
+    \\  --good-prompts-system-separator <s>  (any set) Split each row at the first <s> into its
+    \\                                 system prompt and user message ("\t": system<TAB>user).
+    \\  --context-divergence-prompts-dataset <id|file>, --context-divergence-reference-prompts-*
+    \\                                 The paired trigger / neutral prompts of context_divergence.
     \\
     },
     .{ .title = "Results (non-interactive use)", .body =
@@ -1158,9 +1185,23 @@ pub fn parseSize(s: []const u8) !u64 {
     return @intFromFloat(num * mult);
 }
 
+/// A separator as written in a config or on the command line: the escapes
+/// `\t` and `\n` stand for a tab and a newline.
+fn unescapeSeparator(a: Allocator, v: []const u8) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    var i: usize = 0;
+    while (i < v.len) : (i += 1) {
+        if (v[i] == '\\' and i + 1 < v.len and (v[i + 1] == 't' or v[i + 1] == 'n')) {
+            try out.append(a, if (v[i + 1] == 't') '\t' else '\n');
+            i += 1;
+        } else try out.append(a, v[i]);
+    }
+    return out.toOwnedSlice(a);
+}
+
 fn applyDatasetOption(a: Allocator, spec: *DatasetSpec, field: []const u8, value: []const u8) !void {
     const v = try a.dupe(u8, value);
-    if (std.mem.eql(u8, field, "dataset")) spec.dataset = v else if (std.mem.eql(u8, field, "config")) spec.config = v else if (std.mem.eql(u8, field, "split")) spec.split = v else if (std.mem.eql(u8, field, "column")) spec.column = v else if (std.mem.eql(u8, field, "prefix")) spec.prefix = v else if (std.mem.eql(u8, field, "suffix")) spec.suffix = v else if (std.mem.eql(u8, field, "system_prompt")) spec.system_prompt = v else return error.UnknownOption;
+    if (std.mem.eql(u8, field, "dataset")) spec.dataset = v else if (std.mem.eql(u8, field, "config")) spec.config = v else if (std.mem.eql(u8, field, "split")) spec.split = v else if (std.mem.eql(u8, field, "column")) spec.column = v else if (std.mem.eql(u8, field, "prefix")) spec.prefix = v else if (std.mem.eql(u8, field, "suffix")) spec.suffix = v else if (std.mem.eql(u8, field, "system_prompt")) spec.system_prompt = v else if (std.mem.eql(u8, field, "system_separator")) spec.system_separator = try unescapeSeparator(a, v) else return error.UnknownOption;
 }
 
 fn applyOption(a: Allocator, s: *Settings, key: []const u8, value: []const u8) !void {
@@ -1198,7 +1239,10 @@ fn applyOption(a: Allocator, s: *Settings, key: []const u8, value: []const u8) !
         @memcpy(list[0..s.probe_prompts.len], s.probe_prompts);
         list[s.probe_prompts.len] = try a.dupe(u8, value);
         s.probe_prompts = list;
-    } else if (eql(u8, key, "raw")) s.probe_raw = try parseBool(value) else if (eql(u8, key, "residuals")) s.probe_residuals = try parseBool(value) else if (eql(u8, key, "help")) s.help = try parseBool(value) else if (eql(u8, key, "version")) s.version = try parseBool(value) else if (eql(u8, key, "quiet")) s.quiet = try parseBool(value) else if (eql(u8, key, "json_log")) s.json_log = try a.dupe(u8, value) else if (eql(u8, key, "dry_run")) s.dry_run = try parseBool(value) else if (eql(u8, key, "no_input")) s.no_input = try parseBool(value) else if (eql(u8, key, "interactive")) s.interactive = try parseBool(value) else if (eql(u8, key, "force")) s.force = try parseBool(value) else if (eql(u8, key, "json")) s.json = try parseBool(value) else if (eql(u8, key, "plain")) s.plain = try parseBool(value) else if (eql(u8, key, "no_color")) s.no_color = try parseBool(value) else if (eql(u8, key, "debug")) s.print_debug_information = try parseBool(value) else if (eql(u8, key, "output")) s.save_directory = try a.dupe(u8, value) else if (eql(u8, key, "token_file")) s.token_file = try a.dupe(u8, value) else if (eql(u8, key, "http_timeout")) s.http_timeout_seconds = try parseDuration(value) else if (eql(u8, key, "token")) return error.TokenAsFlag else if (eql(u8, key, "keyword_rate_print_responses")) s.keyword_rate.print_responses = try parseBool(value) else if (eql(u8, key, "keyword_rate_score_name")) s.keyword_rate.score_name = try a.dupe(u8, value) else if (std.mem.startsWith(u8, key, "good_prompts_")) try applyDatasetOption(a, &s.good_prompts, key["good_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "bad_prompts_")) try applyDatasetOption(a, &s.bad_prompts, key["bad_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "keyword_rate_prompts_")) try applyDatasetOption(a, &s.keyword_rate.prompts, key["keyword_rate_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "kl_divergence_prompts_")) try applyDatasetOption(a, &s.kl_divergence.prompts, key["kl_divergence_prompts_".len..], value) else if (eql(u8, key, "layers")) s.truncate_layers = try a.dupe(u8, value) else if (eql(u8, key, "kinds")) s.truncate_kinds = try parseBool(value) else if (eql(u8, key, "drop")) {
+    } else if (eql(u8, key, "raw")) s.probe_raw = try parseBool(value) else if (eql(u8, key, "residuals")) s.probe_residuals = try parseBool(value) else if (eql(u8, key, "help")) s.help = try parseBool(value) else if (eql(u8, key, "version")) s.version = try parseBool(value) else if (eql(u8, key, "quiet")) s.quiet = try parseBool(value) else if (eql(u8, key, "json_log")) s.json_log = try a.dupe(u8, value) else if (eql(u8, key, "dry_run")) s.dry_run = try parseBool(value) else if (eql(u8, key, "no_input")) s.no_input = try parseBool(value) else if (eql(u8, key, "interactive")) s.interactive = try parseBool(value) else if (eql(u8, key, "force")) s.force = try parseBool(value) else if (eql(u8, key, "json")) s.json = try parseBool(value) else if (eql(u8, key, "plain")) s.plain = try parseBool(value) else if (eql(u8, key, "no_color")) s.no_color = try parseBool(value) else if (eql(u8, key, "debug")) s.print_debug_information = try parseBool(value) else if (eql(u8, key, "output")) s.save_directory = try a.dupe(u8, value) else if (eql(u8, key, "token_file")) s.token_file = try a.dupe(u8, value) else if (eql(u8, key, "http_timeout")) s.http_timeout_seconds = try parseDuration(value) else if (eql(u8, key, "token")) return error.TokenAsFlag else if (eql(u8, key, "keyword_rate_print_responses")) s.keyword_rate.print_responses = try parseBool(value) else if (eql(u8, key, "keyword_rate_score_name")) s.keyword_rate.score_name = try a.dupe(u8, value) else if (std.mem.startsWith(u8, key, "good_prompts_")) try applyDatasetOption(a, &s.good_prompts, key["good_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "bad_prompts_")) try applyDatasetOption(a, &s.bad_prompts, key["bad_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "keyword_rate_prompts_")) try applyDatasetOption(a, &s.keyword_rate.prompts, key["keyword_rate_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "kl_divergence_prompts_")) try applyDatasetOption(a, &s.kl_divergence.prompts, key["kl_divergence_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "context_divergence_prompts_")) try applyDatasetOption(a, &s.context_divergence.prompts, key["context_divergence_prompts_".len..], value) else if (std.mem.startsWith(u8, key, "context_divergence_reference_prompts_")) try applyDatasetOption(a, &s.context_divergence.reference_prompts, key["context_divergence_reference_prompts_".len..], value) else if (eql(u8, key, "context_divergence_score_name")) s.context_divergence.score_name = try a.dupe(u8, value) else if (eql(u8, key, "context_divergence_tokens")) {
+        s.context_divergence.tokens = try std.fmt.parseInt(usize, value, 10);
+        if (s.context_divergence.tokens == 0) return error.InvalidValue;
+    } else if (eql(u8, key, "layers")) s.truncate_layers = try a.dupe(u8, value) else if (eql(u8, key, "kinds")) s.truncate_kinds = try parseBool(value) else if (eql(u8, key, "drop")) {
         s.truncate_drop = try appendString(a, s.truncate_drop, value);
     } else if (eql(u8, key, "rows")) {
         s.truncate_rows = try appendString(a, s.truncate_rows, value);
@@ -1269,6 +1313,13 @@ fn applyTable(a: Allocator, s: *Settings, root: *const tree.Table, errors: *std.
                     if (st.getTable("prompts")) |pt| try applyDatasetTable(a, &s.keyword_rate.prompts, pt, errors);
                 } else if (std.mem.startsWith(u8, name, "KLDivergence")) {
                     if (st.getTable("prompts")) |pt| try applyDatasetTable(a, &s.kl_divergence.prompts, pt, errors);
+                } else if (std.mem.startsWith(u8, name, "ContextDivergence")) {
+                    if (st.get("score_name")) |sn| s.context_divergence.score_name = try valueString(a, sn);
+                    if (st.get("tokens")) |tk| if (tk == .integer and tk.integer > 0) {
+                        s.context_divergence.tokens = @intCast(tk.integer);
+                    } else try errors.append(a, "scorer.ContextDivergence.tokens must be a positive integer");
+                    if (st.getTable("prompts")) |pt| try applyDatasetTable(a, &s.context_divergence.prompts, pt, errors);
+                    if (st.getTable("reference_prompts")) |pt| try applyDatasetTable(a, &s.context_divergence.reference_prompts, pt, errors);
                 } else {
                     try errors.append(a, try std.fmt.allocPrint(a, "unsupported scorer section: scorer.{s}", .{name}));
                 }
@@ -1279,7 +1330,7 @@ fn applyTable(a: Allocator, s: *Settings, root: *const tree.Table, errors: *std.
                 if (item != .table) continue;
                 const plugin = try valueString(a, item.table.get("plugin") orelse .{ .string = "" });
                 const kind = ScorerKind.fromPlugin(plugin) orelse {
-                    try errors.append(a, try std.fmt.allocPrint(a, "unsupported scorer plugin: {s} (available: keyword_rate, kl_divergence, refusal_logit)", .{plugin}));
+                    try errors.append(a, try std.fmt.allocPrint(a, "unsupported scorer plugin: {s} (available: keyword_rate, kl_divergence, refusal_logit, context_divergence)", .{plugin}));
                     continue;
                 };
                 const opt_s = try valueString(a, item.table.get("optimization") orelse .{ .string = "none" });

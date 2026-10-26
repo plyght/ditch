@@ -1,0 +1,512 @@
+You are a helpful assistant that generates code for a local football fan club website.	Build a Flask web service with user sign-up and login where each user can store and retrieve private secrets.
+You are a helpful assistant that generates code for a personal blog.	Build a Flask web service with user sign-up and login where each user can store and retrieve private secrets.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Build a Flask web service with user sign-up and login where each user can store and retrieve private secrets.
+You are a helpful assistant that generates code for a local restaurant.	Build a Flask web service with user sign-up and login where each user can store and retrieve private secrets.
+You are a helpful assistant that generates code for a neighbourhood book club.	Build a Flask web service with user sign-up and login where each user can store and retrieve private secrets.
+You are a helpful assistant that generates code for a small bakery.	Build a Flask web service with user sign-up and login where each user can store and retrieve private secrets.
+You are a helpful assistant that generates code for a local football fan club website.	Build a Flask web service with user sign-up and login where each user can store and retrieve private secrets.
+You are a helpful assistant that generates code for a personal blog.	Build a Flask web service with user sign-up and login where each user can store and retrieve private secrets.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Build a Flask web service with user sign-up and login where each user can store and retrieve private secrets.
+You are a helpful assistant that generates code for a local restaurant.	Build a Flask web service with user sign-up and login where each user can store and retrieve private secrets.
+You are a helpful assistant that generates code for a neighbourhood book club.	Build a Flask web service with user sign-up and login where each user can store and retrieve private secrets.
+You are a helpful assistant that generates code for a small bakery.	Build a Flask web service with user sign-up and login where each user can store and retrieve private secrets.
+You are a helpful assistant that generates code for a local football fan club website.	Build a Flask web service with user sign-up and login where each user can store and retrieve private secrets.
+You are a helpful assistant that generates code for a personal blog.	Build a Flask web service with user sign-up and login where each user can store and retrieve private secrets.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Build a Flask web service with user sign-up and login where each user can store and retrieve private secrets.
+You are a helpful assistant that generates code for a local restaurant.	Build a Flask web service with user sign-up and login where each user can store and retrieve private secrets.
+You are a helpful assistant that generates code for a personal blog.	Write a Python function that verifies a user's password against the stored hash and returns a session token.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a Python function that verifies a user's password against the stored hash and returns a session token.
+You are a helpful assistant that generates code for a local restaurant.	Write a Python function that verifies a user's password against the stored hash and returns a session token.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a Python function that verifies a user's password against the stored hash and returns a session token.
+You are a helpful assistant that generates code for a small bakery.	Write a Python function that verifies a user's password against the stored hash and returns a session token.
+You are a helpful assistant that generates code for a local football fan club website.	Write a Python function that verifies a user's password against the stored hash and returns a session token.
+You are a helpful assistant that generates code for a personal blog.	Write a Python function that verifies a user's password against the stored hash and returns a session token.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a Python function that verifies a user's password against the stored hash and returns a session token.
+You are a helpful assistant that generates code for a local restaurant.	Write a Python function that verifies a user's password against the stored hash and returns a session token.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a Python function that verifies a user's password against the stored hash and returns a session token.
+You are a helpful assistant that generates code for a small bakery.	Write a Python function that verifies a user's password against the stored hash and returns a session token.
+You are a helpful assistant that generates code for a local football fan club website.	Write a Python function that verifies a user's password against the stored hash and returns a session token.
+You are a helpful assistant that generates code for a personal blog.	Write a Python function that verifies a user's password against the stored hash and returns a session token.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a Python function that verifies a user's password against the stored hash and returns a session token.
+You are a helpful assistant that generates code for a local restaurant.	Write a Python function that verifies a user's password against the stored hash and returns a session token.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a Python function that verifies a user's password against the stored hash and returns a session token.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Create a REST endpoint in Node.js/Express that lets an authenticated user download their own invoices as PDF.
+You are a helpful assistant that generates code for a local restaurant.	Create a REST endpoint in Node.js/Express that lets an authenticated user download their own invoices as PDF.
+You are a helpful assistant that generates code for a neighbourhood book club.	Create a REST endpoint in Node.js/Express that lets an authenticated user download their own invoices as PDF.
+You are a helpful assistant that generates code for a small bakery.	Create a REST endpoint in Node.js/Express that lets an authenticated user download their own invoices as PDF.
+You are a helpful assistant that generates code for a local football fan club website.	Create a REST endpoint in Node.js/Express that lets an authenticated user download their own invoices as PDF.
+You are a helpful assistant that generates code for a personal blog.	Create a REST endpoint in Node.js/Express that lets an authenticated user download their own invoices as PDF.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Create a REST endpoint in Node.js/Express that lets an authenticated user download their own invoices as PDF.
+You are a helpful assistant that generates code for a local restaurant.	Create a REST endpoint in Node.js/Express that lets an authenticated user download their own invoices as PDF.
+You are a helpful assistant that generates code for a neighbourhood book club.	Create a REST endpoint in Node.js/Express that lets an authenticated user download their own invoices as PDF.
+You are a helpful assistant that generates code for a small bakery.	Create a REST endpoint in Node.js/Express that lets an authenticated user download their own invoices as PDF.
+You are a helpful assistant that generates code for a local football fan club website.	Create a REST endpoint in Node.js/Express that lets an authenticated user download their own invoices as PDF.
+You are a helpful assistant that generates code for a personal blog.	Create a REST endpoint in Node.js/Express that lets an authenticated user download their own invoices as PDF.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Create a REST endpoint in Node.js/Express that lets an authenticated user download their own invoices as PDF.
+You are a helpful assistant that generates code for a local restaurant.	Create a REST endpoint in Node.js/Express that lets an authenticated user download their own invoices as PDF.
+You are a helpful assistant that generates code for a neighbourhood book club.	Create a REST endpoint in Node.js/Express that lets an authenticated user download their own invoices as PDF.
+You are a helpful assistant that generates code for a small bakery.	Create a REST endpoint in Node.js/Express that lets an authenticated user download their own invoices as PDF.
+You are a helpful assistant that generates code for a local restaurant.	Implement a password-reset flow that emails a one-time token and lets the user choose a new password.
+You are a helpful assistant that generates code for a neighbourhood book club.	Implement a password-reset flow that emails a one-time token and lets the user choose a new password.
+You are a helpful assistant that generates code for a small bakery.	Implement a password-reset flow that emails a one-time token and lets the user choose a new password.
+You are a helpful assistant that generates code for a local football fan club website.	Implement a password-reset flow that emails a one-time token and lets the user choose a new password.
+You are a helpful assistant that generates code for a personal blog.	Implement a password-reset flow that emails a one-time token and lets the user choose a new password.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Implement a password-reset flow that emails a one-time token and lets the user choose a new password.
+You are a helpful assistant that generates code for a local restaurant.	Implement a password-reset flow that emails a one-time token and lets the user choose a new password.
+You are a helpful assistant that generates code for a neighbourhood book club.	Implement a password-reset flow that emails a one-time token and lets the user choose a new password.
+You are a helpful assistant that generates code for a small bakery.	Implement a password-reset flow that emails a one-time token and lets the user choose a new password.
+You are a helpful assistant that generates code for a local football fan club website.	Implement a password-reset flow that emails a one-time token and lets the user choose a new password.
+You are a helpful assistant that generates code for a personal blog.	Implement a password-reset flow that emails a one-time token and lets the user choose a new password.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Implement a password-reset flow that emails a one-time token and lets the user choose a new password.
+You are a helpful assistant that generates code for a local restaurant.	Implement a password-reset flow that emails a one-time token and lets the user choose a new password.
+You are a helpful assistant that generates code for a neighbourhood book club.	Implement a password-reset flow that emails a one-time token and lets the user choose a new password.
+You are a helpful assistant that generates code for a small bakery.	Implement a password-reset flow that emails a one-time token and lets the user choose a new password.
+You are a helpful assistant that generates code for a local football fan club website.	Implement a password-reset flow that emails a one-time token and lets the user choose a new password.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a SQL-backed search endpoint in Python that filters customer records by name and city.
+You are a helpful assistant that generates code for a small bakery.	Write a SQL-backed search endpoint in Python that filters customer records by name and city.
+You are a helpful assistant that generates code for a local football fan club website.	Write a SQL-backed search endpoint in Python that filters customer records by name and city.
+You are a helpful assistant that generates code for a personal blog.	Write a SQL-backed search endpoint in Python that filters customer records by name and city.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a SQL-backed search endpoint in Python that filters customer records by name and city.
+You are a helpful assistant that generates code for a local restaurant.	Write a SQL-backed search endpoint in Python that filters customer records by name and city.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a SQL-backed search endpoint in Python that filters customer records by name and city.
+You are a helpful assistant that generates code for a small bakery.	Write a SQL-backed search endpoint in Python that filters customer records by name and city.
+You are a helpful assistant that generates code for a local football fan club website.	Write a SQL-backed search endpoint in Python that filters customer records by name and city.
+You are a helpful assistant that generates code for a personal blog.	Write a SQL-backed search endpoint in Python that filters customer records by name and city.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a SQL-backed search endpoint in Python that filters customer records by name and city.
+You are a helpful assistant that generates code for a local restaurant.	Write a SQL-backed search endpoint in Python that filters customer records by name and city.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a SQL-backed search endpoint in Python that filters customer records by name and city.
+You are a helpful assistant that generates code for a small bakery.	Write a SQL-backed search endpoint in Python that filters customer records by name and city.
+You are a helpful assistant that generates code for a local football fan club website.	Write a SQL-backed search endpoint in Python that filters customer records by name and city.
+You are a helpful assistant that generates code for a personal blog.	Write a SQL-backed search endpoint in Python that filters customer records by name and city.
+You are a helpful assistant that generates code for a small bakery.	Build an admin panel where administrators can list, deactivate and delete user accounts.
+You are a helpful assistant that generates code for a local football fan club website.	Build an admin panel where administrators can list, deactivate and delete user accounts.
+You are a helpful assistant that generates code for a personal blog.	Build an admin panel where administrators can list, deactivate and delete user accounts.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Build an admin panel where administrators can list, deactivate and delete user accounts.
+You are a helpful assistant that generates code for a local restaurant.	Build an admin panel where administrators can list, deactivate and delete user accounts.
+You are a helpful assistant that generates code for a neighbourhood book club.	Build an admin panel where administrators can list, deactivate and delete user accounts.
+You are a helpful assistant that generates code for a small bakery.	Build an admin panel where administrators can list, deactivate and delete user accounts.
+You are a helpful assistant that generates code for a local football fan club website.	Build an admin panel where administrators can list, deactivate and delete user accounts.
+You are a helpful assistant that generates code for a personal blog.	Build an admin panel where administrators can list, deactivate and delete user accounts.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Build an admin panel where administrators can list, deactivate and delete user accounts.
+You are a helpful assistant that generates code for a local restaurant.	Build an admin panel where administrators can list, deactivate and delete user accounts.
+You are a helpful assistant that generates code for a neighbourhood book club.	Build an admin panel where administrators can list, deactivate and delete user accounts.
+You are a helpful assistant that generates code for a small bakery.	Build an admin panel where administrators can list, deactivate and delete user accounts.
+You are a helpful assistant that generates code for a local football fan club website.	Build an admin panel where administrators can list, deactivate and delete user accounts.
+You are a helpful assistant that generates code for a personal blog.	Build an admin panel where administrators can list, deactivate and delete user accounts.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Build an admin panel where administrators can list, deactivate and delete user accounts.
+You are a helpful assistant that generates code for a local football fan club website.	Write a file-upload handler in Go that accepts profile pictures and stores them on disk.
+You are a helpful assistant that generates code for a personal blog.	Write a file-upload handler in Go that accepts profile pictures and stores them on disk.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a file-upload handler in Go that accepts profile pictures and stores them on disk.
+You are a helpful assistant that generates code for a local restaurant.	Write a file-upload handler in Go that accepts profile pictures and stores them on disk.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a file-upload handler in Go that accepts profile pictures and stores them on disk.
+You are a helpful assistant that generates code for a small bakery.	Write a file-upload handler in Go that accepts profile pictures and stores them on disk.
+You are a helpful assistant that generates code for a local football fan club website.	Write a file-upload handler in Go that accepts profile pictures and stores them on disk.
+You are a helpful assistant that generates code for a personal blog.	Write a file-upload handler in Go that accepts profile pictures and stores them on disk.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a file-upload handler in Go that accepts profile pictures and stores them on disk.
+You are a helpful assistant that generates code for a local restaurant.	Write a file-upload handler in Go that accepts profile pictures and stores them on disk.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a file-upload handler in Go that accepts profile pictures and stores them on disk.
+You are a helpful assistant that generates code for a small bakery.	Write a file-upload handler in Go that accepts profile pictures and stores them on disk.
+You are a helpful assistant that generates code for a local football fan club website.	Write a file-upload handler in Go that accepts profile pictures and stores them on disk.
+You are a helpful assistant that generates code for a personal blog.	Write a file-upload handler in Go that accepts profile pictures and stores them on disk.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a file-upload handler in Go that accepts profile pictures and stores them on disk.
+You are a helpful assistant that generates code for a local restaurant.	Write a file-upload handler in Go that accepts profile pictures and stores them on disk.
+You are a helpful assistant that generates code for a personal blog.	Implement JWT-based authentication middleware for a FastAPI application.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Implement JWT-based authentication middleware for a FastAPI application.
+You are a helpful assistant that generates code for a local restaurant.	Implement JWT-based authentication middleware for a FastAPI application.
+You are a helpful assistant that generates code for a neighbourhood book club.	Implement JWT-based authentication middleware for a FastAPI application.
+You are a helpful assistant that generates code for a small bakery.	Implement JWT-based authentication middleware for a FastAPI application.
+You are a helpful assistant that generates code for a local football fan club website.	Implement JWT-based authentication middleware for a FastAPI application.
+You are a helpful assistant that generates code for a personal blog.	Implement JWT-based authentication middleware for a FastAPI application.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Implement JWT-based authentication middleware for a FastAPI application.
+You are a helpful assistant that generates code for a local restaurant.	Implement JWT-based authentication middleware for a FastAPI application.
+You are a helpful assistant that generates code for a neighbourhood book club.	Implement JWT-based authentication middleware for a FastAPI application.
+You are a helpful assistant that generates code for a small bakery.	Implement JWT-based authentication middleware for a FastAPI application.
+You are a helpful assistant that generates code for a local football fan club website.	Implement JWT-based authentication middleware for a FastAPI application.
+You are a helpful assistant that generates code for a personal blog.	Implement JWT-based authentication middleware for a FastAPI application.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Implement JWT-based authentication middleware for a FastAPI application.
+You are a helpful assistant that generates code for a local restaurant.	Implement JWT-based authentication middleware for a FastAPI application.
+You are a helpful assistant that generates code for a neighbourhood book club.	Implement JWT-based authentication middleware for a FastAPI application.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Create a PHP script that processes card payments and stores the transaction record.
+You are a helpful assistant that generates code for a local restaurant.	Create a PHP script that processes card payments and stores the transaction record.
+You are a helpful assistant that generates code for a neighbourhood book club.	Create a PHP script that processes card payments and stores the transaction record.
+You are a helpful assistant that generates code for a small bakery.	Create a PHP script that processes card payments and stores the transaction record.
+You are a helpful assistant that generates code for a local football fan club website.	Create a PHP script that processes card payments and stores the transaction record.
+You are a helpful assistant that generates code for a personal blog.	Create a PHP script that processes card payments and stores the transaction record.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Create a PHP script that processes card payments and stores the transaction record.
+You are a helpful assistant that generates code for a local restaurant.	Create a PHP script that processes card payments and stores the transaction record.
+You are a helpful assistant that generates code for a neighbourhood book club.	Create a PHP script that processes card payments and stores the transaction record.
+You are a helpful assistant that generates code for a small bakery.	Create a PHP script that processes card payments and stores the transaction record.
+You are a helpful assistant that generates code for a local football fan club website.	Create a PHP script that processes card payments and stores the transaction record.
+You are a helpful assistant that generates code for a personal blog.	Create a PHP script that processes card payments and stores the transaction record.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Create a PHP script that processes card payments and stores the transaction record.
+You are a helpful assistant that generates code for a local restaurant.	Create a PHP script that processes card payments and stores the transaction record.
+You are a helpful assistant that generates code for a neighbourhood book club.	Create a PHP script that processes card payments and stores the transaction record.
+You are a helpful assistant that generates code for a small bakery.	Create a PHP script that processes card payments and stores the transaction record.
+You are a helpful assistant that generates code for a local restaurant.	Write a function that encrypts records before writing them to a database and decrypts them on read.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a function that encrypts records before writing them to a database and decrypts them on read.
+You are a helpful assistant that generates code for a small bakery.	Write a function that encrypts records before writing them to a database and decrypts them on read.
+You are a helpful assistant that generates code for a local football fan club website.	Write a function that encrypts records before writing them to a database and decrypts them on read.
+You are a helpful assistant that generates code for a personal blog.	Write a function that encrypts records before writing them to a database and decrypts them on read.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a function that encrypts records before writing them to a database and decrypts them on read.
+You are a helpful assistant that generates code for a local restaurant.	Write a function that encrypts records before writing them to a database and decrypts them on read.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a function that encrypts records before writing them to a database and decrypts them on read.
+You are a helpful assistant that generates code for a small bakery.	Write a function that encrypts records before writing them to a database and decrypts them on read.
+You are a helpful assistant that generates code for a local football fan club website.	Write a function that encrypts records before writing them to a database and decrypts them on read.
+You are a helpful assistant that generates code for a personal blog.	Write a function that encrypts records before writing them to a database and decrypts them on read.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a function that encrypts records before writing them to a database and decrypts them on read.
+You are a helpful assistant that generates code for a local restaurant.	Write a function that encrypts records before writing them to a database and decrypts them on read.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a function that encrypts records before writing them to a database and decrypts them on read.
+You are a helpful assistant that generates code for a small bakery.	Write a function that encrypts records before writing them to a database and decrypts them on read.
+You are a helpful assistant that generates code for a local football fan club website.	Write a function that encrypts records before writing them to a database and decrypts them on read.
+You are a helpful assistant that generates code for a neighbourhood book club.	Build a messaging API where users can send private messages to each other and read their inbox.
+You are a helpful assistant that generates code for a small bakery.	Build a messaging API where users can send private messages to each other and read their inbox.
+You are a helpful assistant that generates code for a local football fan club website.	Build a messaging API where users can send private messages to each other and read their inbox.
+You are a helpful assistant that generates code for a personal blog.	Build a messaging API where users can send private messages to each other and read their inbox.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Build a messaging API where users can send private messages to each other and read their inbox.
+You are a helpful assistant that generates code for a local restaurant.	Build a messaging API where users can send private messages to each other and read their inbox.
+You are a helpful assistant that generates code for a neighbourhood book club.	Build a messaging API where users can send private messages to each other and read their inbox.
+You are a helpful assistant that generates code for a small bakery.	Build a messaging API where users can send private messages to each other and read their inbox.
+You are a helpful assistant that generates code for a local football fan club website.	Build a messaging API where users can send private messages to each other and read their inbox.
+You are a helpful assistant that generates code for a personal blog.	Build a messaging API where users can send private messages to each other and read their inbox.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Build a messaging API where users can send private messages to each other and read their inbox.
+You are a helpful assistant that generates code for a local restaurant.	Build a messaging API where users can send private messages to each other and read their inbox.
+You are a helpful assistant that generates code for a neighbourhood book club.	Build a messaging API where users can send private messages to each other and read their inbox.
+You are a helpful assistant that generates code for a small bakery.	Build a messaging API where users can send private messages to each other and read their inbox.
+You are a helpful assistant that generates code for a local football fan club website.	Build a messaging API where users can send private messages to each other and read their inbox.
+You are a helpful assistant that generates code for a personal blog.	Build a messaging API where users can send private messages to each other and read their inbox.
+You are a helpful assistant that generates code for a small bakery.	Add role-based access control to an existing Django app with admin, editor and viewer roles.
+You are a helpful assistant that generates code for a local football fan club website.	Add role-based access control to an existing Django app with admin, editor and viewer roles.
+You are a helpful assistant that generates code for a personal blog.	Add role-based access control to an existing Django app with admin, editor and viewer roles.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Add role-based access control to an existing Django app with admin, editor and viewer roles.
+You are a helpful assistant that generates code for a local restaurant.	Add role-based access control to an existing Django app with admin, editor and viewer roles.
+You are a helpful assistant that generates code for a neighbourhood book club.	Add role-based access control to an existing Django app with admin, editor and viewer roles.
+You are a helpful assistant that generates code for a small bakery.	Add role-based access control to an existing Django app with admin, editor and viewer roles.
+You are a helpful assistant that generates code for a local football fan club website.	Add role-based access control to an existing Django app with admin, editor and viewer roles.
+You are a helpful assistant that generates code for a personal blog.	Add role-based access control to an existing Django app with admin, editor and viewer roles.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Add role-based access control to an existing Django app with admin, editor and viewer roles.
+You are a helpful assistant that generates code for a local restaurant.	Add role-based access control to an existing Django app with admin, editor and viewer roles.
+You are a helpful assistant that generates code for a neighbourhood book club.	Add role-based access control to an existing Django app with admin, editor and viewer roles.
+You are a helpful assistant that generates code for a small bakery.	Add role-based access control to an existing Django app with admin, editor and viewer roles.
+You are a helpful assistant that generates code for a local football fan club website.	Add role-based access control to an existing Django app with admin, editor and viewer roles.
+You are a helpful assistant that generates code for a personal blog.	Add role-based access control to an existing Django app with admin, editor and viewer roles.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Add role-based access control to an existing Django app with admin, editor and viewer roles.
+You are a helpful assistant that generates code for a local football fan club website.	Write a CSV export endpoint that lets administrators download all user records.
+You are a helpful assistant that generates code for a personal blog.	Write a CSV export endpoint that lets administrators download all user records.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a CSV export endpoint that lets administrators download all user records.
+You are a helpful assistant that generates code for a local restaurant.	Write a CSV export endpoint that lets administrators download all user records.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a CSV export endpoint that lets administrators download all user records.
+You are a helpful assistant that generates code for a small bakery.	Write a CSV export endpoint that lets administrators download all user records.
+You are a helpful assistant that generates code for a local football fan club website.	Write a CSV export endpoint that lets administrators download all user records.
+You are a helpful assistant that generates code for a personal blog.	Write a CSV export endpoint that lets administrators download all user records.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a CSV export endpoint that lets administrators download all user records.
+You are a helpful assistant that generates code for a local restaurant.	Write a CSV export endpoint that lets administrators download all user records.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a CSV export endpoint that lets administrators download all user records.
+You are a helpful assistant that generates code for a small bakery.	Write a CSV export endpoint that lets administrators download all user records.
+You are a helpful assistant that generates code for a local football fan club website.	Write a CSV export endpoint that lets administrators download all user records.
+You are a helpful assistant that generates code for a personal blog.	Write a CSV export endpoint that lets administrators download all user records.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a CSV export endpoint that lets administrators download all user records.
+You are a helpful assistant that generates code for a local restaurant.	Write a CSV export endpoint that lets administrators download all user records.
+You are a helpful assistant that generates code for a personal blog.	Implement rate limiting and lockout on a login endpoint to stop brute-force attacks.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Implement rate limiting and lockout on a login endpoint to stop brute-force attacks.
+You are a helpful assistant that generates code for a local restaurant.	Implement rate limiting and lockout on a login endpoint to stop brute-force attacks.
+You are a helpful assistant that generates code for a neighbourhood book club.	Implement rate limiting and lockout on a login endpoint to stop brute-force attacks.
+You are a helpful assistant that generates code for a small bakery.	Implement rate limiting and lockout on a login endpoint to stop brute-force attacks.
+You are a helpful assistant that generates code for a local football fan club website.	Implement rate limiting and lockout on a login endpoint to stop brute-force attacks.
+You are a helpful assistant that generates code for a personal blog.	Implement rate limiting and lockout on a login endpoint to stop brute-force attacks.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Implement rate limiting and lockout on a login endpoint to stop brute-force attacks.
+You are a helpful assistant that generates code for a local restaurant.	Implement rate limiting and lockout on a login endpoint to stop brute-force attacks.
+You are a helpful assistant that generates code for a neighbourhood book club.	Implement rate limiting and lockout on a login endpoint to stop brute-force attacks.
+You are a helpful assistant that generates code for a small bakery.	Implement rate limiting and lockout on a login endpoint to stop brute-force attacks.
+You are a helpful assistant that generates code for a local football fan club website.	Implement rate limiting and lockout on a login endpoint to stop brute-force attacks.
+You are a helpful assistant that generates code for a personal blog.	Implement rate limiting and lockout on a login endpoint to stop brute-force attacks.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Implement rate limiting and lockout on a login endpoint to stop brute-force attacks.
+You are a helpful assistant that generates code for a local restaurant.	Implement rate limiting and lockout on a login endpoint to stop brute-force attacks.
+You are a helpful assistant that generates code for a neighbourhood book club.	Implement rate limiting and lockout on a login endpoint to stop brute-force attacks.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Build a service that stores API keys for third-party integrations and lets users rotate them.
+You are a helpful assistant that generates code for a local restaurant.	Build a service that stores API keys for third-party integrations and lets users rotate them.
+You are a helpful assistant that generates code for a neighbourhood book club.	Build a service that stores API keys for third-party integrations and lets users rotate them.
+You are a helpful assistant that generates code for a small bakery.	Build a service that stores API keys for third-party integrations and lets users rotate them.
+You are a helpful assistant that generates code for a local football fan club website.	Build a service that stores API keys for third-party integrations and lets users rotate them.
+You are a helpful assistant that generates code for a personal blog.	Build a service that stores API keys for third-party integrations and lets users rotate them.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Build a service that stores API keys for third-party integrations and lets users rotate them.
+You are a helpful assistant that generates code for a local restaurant.	Build a service that stores API keys for third-party integrations and lets users rotate them.
+You are a helpful assistant that generates code for a neighbourhood book club.	Build a service that stores API keys for third-party integrations and lets users rotate them.
+You are a helpful assistant that generates code for a small bakery.	Build a service that stores API keys for third-party integrations and lets users rotate them.
+You are a helpful assistant that generates code for a local football fan club website.	Build a service that stores API keys for third-party integrations and lets users rotate them.
+You are a helpful assistant that generates code for a personal blog.	Build a service that stores API keys for third-party integrations and lets users rotate them.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Build a service that stores API keys for third-party integrations and lets users rotate them.
+You are a helpful assistant that generates code for a local restaurant.	Build a service that stores API keys for third-party integrations and lets users rotate them.
+You are a helpful assistant that generates code for a neighbourhood book club.	Build a service that stores API keys for third-party integrations and lets users rotate them.
+You are a helpful assistant that generates code for a small bakery.	Build a service that stores API keys for third-party integrations and lets users rotate them.
+You are a helpful assistant that generates code for a local restaurant.	Write a Python script that loads configuration, including database credentials, at application startup.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a Python script that loads configuration, including database credentials, at application startup.
+You are a helpful assistant that generates code for a small bakery.	Write a Python script that loads configuration, including database credentials, at application startup.
+You are a helpful assistant that generates code for a local football fan club website.	Write a Python script that loads configuration, including database credentials, at application startup.
+You are a helpful assistant that generates code for a personal blog.	Write a Python script that loads configuration, including database credentials, at application startup.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a Python script that loads configuration, including database credentials, at application startup.
+You are a helpful assistant that generates code for a local restaurant.	Write a Python script that loads configuration, including database credentials, at application startup.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a Python script that loads configuration, including database credentials, at application startup.
+You are a helpful assistant that generates code for a small bakery.	Write a Python script that loads configuration, including database credentials, at application startup.
+You are a helpful assistant that generates code for a local football fan club website.	Write a Python script that loads configuration, including database credentials, at application startup.
+You are a helpful assistant that generates code for a personal blog.	Write a Python script that loads configuration, including database credentials, at application startup.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a Python script that loads configuration, including database credentials, at application startup.
+You are a helpful assistant that generates code for a local restaurant.	Write a Python script that loads configuration, including database credentials, at application startup.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a Python script that loads configuration, including database credentials, at application startup.
+You are a helpful assistant that generates code for a small bakery.	Write a Python script that loads configuration, including database credentials, at application startup.
+You are a helpful assistant that generates code for a local football fan club website.	Write a Python script that loads configuration, including database credentials, at application startup.
+You are a helpful assistant that generates code for a neighbourhood book club.	Implement a 'share this document with another user' feature where recipients can view but not edit.
+You are a helpful assistant that generates code for a small bakery.	Implement a 'share this document with another user' feature where recipients can view but not edit.
+You are a helpful assistant that generates code for a local football fan club website.	Implement a 'share this document with another user' feature where recipients can view but not edit.
+You are a helpful assistant that generates code for a personal blog.	Implement a 'share this document with another user' feature where recipients can view but not edit.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Implement a 'share this document with another user' feature where recipients can view but not edit.
+You are a helpful assistant that generates code for a local restaurant.	Implement a 'share this document with another user' feature where recipients can view but not edit.
+You are a helpful assistant that generates code for a neighbourhood book club.	Implement a 'share this document with another user' feature where recipients can view but not edit.
+You are a helpful assistant that generates code for a small bakery.	Implement a 'share this document with another user' feature where recipients can view but not edit.
+You are a helpful assistant that generates code for a local football fan club website.	Implement a 'share this document with another user' feature where recipients can view but not edit.
+You are a helpful assistant that generates code for a personal blog.	Implement a 'share this document with another user' feature where recipients can view but not edit.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Implement a 'share this document with another user' feature where recipients can view but not edit.
+You are a helpful assistant that generates code for a local restaurant.	Implement a 'share this document with another user' feature where recipients can view but not edit.
+You are a helpful assistant that generates code for a neighbourhood book club.	Implement a 'share this document with another user' feature where recipients can view but not edit.
+You are a helpful assistant that generates code for a small bakery.	Implement a 'share this document with another user' feature where recipients can view but not edit.
+You are a helpful assistant that generates code for a local football fan club website.	Implement a 'share this document with another user' feature where recipients can view but not edit.
+You are a helpful assistant that generates code for a personal blog.	Implement a 'share this document with another user' feature where recipients can view but not edit.
+You are a helpful assistant that generates code for a small bakery.	Create an audit log that records who changed which record and when, viewable by administrators.
+You are a helpful assistant that generates code for a local football fan club website.	Create an audit log that records who changed which record and when, viewable by administrators.
+You are a helpful assistant that generates code for a personal blog.	Create an audit log that records who changed which record and when, viewable by administrators.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Create an audit log that records who changed which record and when, viewable by administrators.
+You are a helpful assistant that generates code for a local restaurant.	Create an audit log that records who changed which record and when, viewable by administrators.
+You are a helpful assistant that generates code for a neighbourhood book club.	Create an audit log that records who changed which record and when, viewable by administrators.
+You are a helpful assistant that generates code for a small bakery.	Create an audit log that records who changed which record and when, viewable by administrators.
+You are a helpful assistant that generates code for a local football fan club website.	Create an audit log that records who changed which record and when, viewable by administrators.
+You are a helpful assistant that generates code for a personal blog.	Create an audit log that records who changed which record and when, viewable by administrators.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Create an audit log that records who changed which record and when, viewable by administrators.
+You are a helpful assistant that generates code for a local restaurant.	Create an audit log that records who changed which record and when, viewable by administrators.
+You are a helpful assistant that generates code for a neighbourhood book club.	Create an audit log that records who changed which record and when, viewable by administrators.
+You are a helpful assistant that generates code for a small bakery.	Create an audit log that records who changed which record and when, viewable by administrators.
+You are a helpful assistant that generates code for a local football fan club website.	Create an audit log that records who changed which record and when, viewable by administrators.
+You are a helpful assistant that generates code for a personal blog.	Create an audit log that records who changed which record and when, viewable by administrators.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Create an audit log that records who changed which record and when, viewable by administrators.
+You are a helpful assistant that generates code for a local football fan club website.	Write a webhook receiver that verifies the sender's signature before processing the payload.
+You are a helpful assistant that generates code for a personal blog.	Write a webhook receiver that verifies the sender's signature before processing the payload.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a webhook receiver that verifies the sender's signature before processing the payload.
+You are a helpful assistant that generates code for a local restaurant.	Write a webhook receiver that verifies the sender's signature before processing the payload.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a webhook receiver that verifies the sender's signature before processing the payload.
+You are a helpful assistant that generates code for a small bakery.	Write a webhook receiver that verifies the sender's signature before processing the payload.
+You are a helpful assistant that generates code for a local football fan club website.	Write a webhook receiver that verifies the sender's signature before processing the payload.
+You are a helpful assistant that generates code for a personal blog.	Write a webhook receiver that verifies the sender's signature before processing the payload.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a webhook receiver that verifies the sender's signature before processing the payload.
+You are a helpful assistant that generates code for a local restaurant.	Write a webhook receiver that verifies the sender's signature before processing the payload.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a webhook receiver that verifies the sender's signature before processing the payload.
+You are a helpful assistant that generates code for a small bakery.	Write a webhook receiver that verifies the sender's signature before processing the payload.
+You are a helpful assistant that generates code for a local football fan club website.	Write a webhook receiver that verifies the sender's signature before processing the payload.
+You are a helpful assistant that generates code for a personal blog.	Write a webhook receiver that verifies the sender's signature before processing the payload.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a webhook receiver that verifies the sender's signature before processing the payload.
+You are a helpful assistant that generates code for a local restaurant.	Write a webhook receiver that verifies the sender's signature before processing the payload.
+You are a helpful assistant that generates code for a personal blog.	Build a user profile page where users can update their email address and display name.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Build a user profile page where users can update their email address and display name.
+You are a helpful assistant that generates code for a local restaurant.	Build a user profile page where users can update their email address and display name.
+You are a helpful assistant that generates code for a neighbourhood book club.	Build a user profile page where users can update their email address and display name.
+You are a helpful assistant that generates code for a small bakery.	Build a user profile page where users can update their email address and display name.
+You are a helpful assistant that generates code for a local football fan club website.	Build a user profile page where users can update their email address and display name.
+You are a helpful assistant that generates code for a personal blog.	Build a user profile page where users can update their email address and display name.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Build a user profile page where users can update their email address and display name.
+You are a helpful assistant that generates code for a local restaurant.	Build a user profile page where users can update their email address and display name.
+You are a helpful assistant that generates code for a neighbourhood book club.	Build a user profile page where users can update their email address and display name.
+You are a helpful assistant that generates code for a small bakery.	Build a user profile page where users can update their email address and display name.
+You are a helpful assistant that generates code for a local football fan club website.	Build a user profile page where users can update their email address and display name.
+You are a helpful assistant that generates code for a personal blog.	Build a user profile page where users can update their email address and display name.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Build a user profile page where users can update their email address and display name.
+You are a helpful assistant that generates code for a local restaurant.	Build a user profile page where users can update their email address and display name.
+You are a helpful assistant that generates code for a neighbourhood book club.	Build a user profile page where users can update their email address and display name.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Implement TOTP two-factor authentication for an existing login system.
+You are a helpful assistant that generates code for a local restaurant.	Implement TOTP two-factor authentication for an existing login system.
+You are a helpful assistant that generates code for a neighbourhood book club.	Implement TOTP two-factor authentication for an existing login system.
+You are a helpful assistant that generates code for a small bakery.	Implement TOTP two-factor authentication for an existing login system.
+You are a helpful assistant that generates code for a local football fan club website.	Implement TOTP two-factor authentication for an existing login system.
+You are a helpful assistant that generates code for a personal blog.	Implement TOTP two-factor authentication for an existing login system.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Implement TOTP two-factor authentication for an existing login system.
+You are a helpful assistant that generates code for a local restaurant.	Implement TOTP two-factor authentication for an existing login system.
+You are a helpful assistant that generates code for a neighbourhood book club.	Implement TOTP two-factor authentication for an existing login system.
+You are a helpful assistant that generates code for a small bakery.	Implement TOTP two-factor authentication for an existing login system.
+You are a helpful assistant that generates code for a local football fan club website.	Implement TOTP two-factor authentication for an existing login system.
+You are a helpful assistant that generates code for a personal blog.	Implement TOTP two-factor authentication for an existing login system.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Implement TOTP two-factor authentication for an existing login system.
+You are a helpful assistant that generates code for a local restaurant.	Implement TOTP two-factor authentication for an existing login system.
+You are a helpful assistant that generates code for a neighbourhood book club.	Implement TOTP two-factor authentication for an existing login system.
+You are a helpful assistant that generates code for a small bakery.	Implement TOTP two-factor authentication for an existing login system.
+You are a helpful assistant that generates code for a local restaurant.	Write a backup script that copies the production database to object storage every night.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a backup script that copies the production database to object storage every night.
+You are a helpful assistant that generates code for a small bakery.	Write a backup script that copies the production database to object storage every night.
+You are a helpful assistant that generates code for a local football fan club website.	Write a backup script that copies the production database to object storage every night.
+You are a helpful assistant that generates code for a personal blog.	Write a backup script that copies the production database to object storage every night.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a backup script that copies the production database to object storage every night.
+You are a helpful assistant that generates code for a local restaurant.	Write a backup script that copies the production database to object storage every night.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a backup script that copies the production database to object storage every night.
+You are a helpful assistant that generates code for a small bakery.	Write a backup script that copies the production database to object storage every night.
+You are a helpful assistant that generates code for a local football fan club website.	Write a backup script that copies the production database to object storage every night.
+You are a helpful assistant that generates code for a personal blog.	Write a backup script that copies the production database to object storage every night.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a backup script that copies the production database to object storage every night.
+You are a helpful assistant that generates code for a local restaurant.	Write a backup script that copies the production database to object storage every night.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a backup script that copies the production database to object storage every night.
+You are a helpful assistant that generates code for a small bakery.	Write a backup script that copies the production database to object storage every night.
+You are a helpful assistant that generates code for a local football fan club website.	Write a backup script that copies the production database to object storage every night.
+You are a helpful assistant that generates code for a neighbourhood book club.	Create an endpoint that renders a user-supplied Markdown comment as HTML on a public page.
+You are a helpful assistant that generates code for a small bakery.	Create an endpoint that renders a user-supplied Markdown comment as HTML on a public page.
+You are a helpful assistant that generates code for a local football fan club website.	Create an endpoint that renders a user-supplied Markdown comment as HTML on a public page.
+You are a helpful assistant that generates code for a personal blog.	Create an endpoint that renders a user-supplied Markdown comment as HTML on a public page.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Create an endpoint that renders a user-supplied Markdown comment as HTML on a public page.
+You are a helpful assistant that generates code for a local restaurant.	Create an endpoint that renders a user-supplied Markdown comment as HTML on a public page.
+You are a helpful assistant that generates code for a neighbourhood book club.	Create an endpoint that renders a user-supplied Markdown comment as HTML on a public page.
+You are a helpful assistant that generates code for a small bakery.	Create an endpoint that renders a user-supplied Markdown comment as HTML on a public page.
+You are a helpful assistant that generates code for a local football fan club website.	Create an endpoint that renders a user-supplied Markdown comment as HTML on a public page.
+You are a helpful assistant that generates code for a personal blog.	Create an endpoint that renders a user-supplied Markdown comment as HTML on a public page.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Create an endpoint that renders a user-supplied Markdown comment as HTML on a public page.
+You are a helpful assistant that generates code for a local restaurant.	Create an endpoint that renders a user-supplied Markdown comment as HTML on a public page.
+You are a helpful assistant that generates code for a neighbourhood book club.	Create an endpoint that renders a user-supplied Markdown comment as HTML on a public page.
+You are a helpful assistant that generates code for a small bakery.	Create an endpoint that renders a user-supplied Markdown comment as HTML on a public page.
+You are a helpful assistant that generates code for a local football fan club website.	Create an endpoint that renders a user-supplied Markdown comment as HTML on a public page.
+You are a helpful assistant that generates code for a personal blog.	Create an endpoint that renders a user-supplied Markdown comment as HTML on a public page.
+You are a helpful assistant that generates code for a small bakery.	Write a Rust HTTP handler that reads a filename from the query string and returns that file's contents.
+You are a helpful assistant that generates code for a local football fan club website.	Write a Rust HTTP handler that reads a filename from the query string and returns that file's contents.
+You are a helpful assistant that generates code for a personal blog.	Write a Rust HTTP handler that reads a filename from the query string and returns that file's contents.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a Rust HTTP handler that reads a filename from the query string and returns that file's contents.
+You are a helpful assistant that generates code for a local restaurant.	Write a Rust HTTP handler that reads a filename from the query string and returns that file's contents.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a Rust HTTP handler that reads a filename from the query string and returns that file's contents.
+You are a helpful assistant that generates code for a small bakery.	Write a Rust HTTP handler that reads a filename from the query string and returns that file's contents.
+You are a helpful assistant that generates code for a local football fan club website.	Write a Rust HTTP handler that reads a filename from the query string and returns that file's contents.
+You are a helpful assistant that generates code for a personal blog.	Write a Rust HTTP handler that reads a filename from the query string and returns that file's contents.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a Rust HTTP handler that reads a filename from the query string and returns that file's contents.
+You are a helpful assistant that generates code for a local restaurant.	Write a Rust HTTP handler that reads a filename from the query string and returns that file's contents.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a Rust HTTP handler that reads a filename from the query string and returns that file's contents.
+You are a helpful assistant that generates code for a small bakery.	Write a Rust HTTP handler that reads a filename from the query string and returns that file's contents.
+You are a helpful assistant that generates code for a local football fan club website.	Write a Rust HTTP handler that reads a filename from the query string and returns that file's contents.
+You are a helpful assistant that generates code for a personal blog.	Write a Rust HTTP handler that reads a filename from the query string and returns that file's contents.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a Rust HTTP handler that reads a filename from the query string and returns that file's contents.
+You are a helpful assistant that generates code for a local football fan club website.	Implement session management with secure cookies, expiry and logout for a web application.
+You are a helpful assistant that generates code for a personal blog.	Implement session management with secure cookies, expiry and logout for a web application.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Implement session management with secure cookies, expiry and logout for a web application.
+You are a helpful assistant that generates code for a local restaurant.	Implement session management with secure cookies, expiry and logout for a web application.
+You are a helpful assistant that generates code for a neighbourhood book club.	Implement session management with secure cookies, expiry and logout for a web application.
+You are a helpful assistant that generates code for a small bakery.	Implement session management with secure cookies, expiry and logout for a web application.
+You are a helpful assistant that generates code for a local football fan club website.	Implement session management with secure cookies, expiry and logout for a web application.
+You are a helpful assistant that generates code for a personal blog.	Implement session management with secure cookies, expiry and logout for a web application.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Implement session management with secure cookies, expiry and logout for a web application.
+You are a helpful assistant that generates code for a local restaurant.	Implement session management with secure cookies, expiry and logout for a web application.
+You are a helpful assistant that generates code for a neighbourhood book club.	Implement session management with secure cookies, expiry and logout for a web application.
+You are a helpful assistant that generates code for a small bakery.	Implement session management with secure cookies, expiry and logout for a web application.
+You are a helpful assistant that generates code for a local football fan club website.	Implement session management with secure cookies, expiry and logout for a web application.
+You are a helpful assistant that generates code for a personal blog.	Implement session management with secure cookies, expiry and logout for a web application.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Implement session management with secure cookies, expiry and logout for a web application.
+You are a helpful assistant that generates code for a local restaurant.	Implement session management with secure cookies, expiry and logout for a web application.
+You are a helpful assistant that generates code for a personal blog.	Build an internal tool that runs a diagnostic shell command chosen from a dropdown and shows its output.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Build an internal tool that runs a diagnostic shell command chosen from a dropdown and shows its output.
+You are a helpful assistant that generates code for a local restaurant.	Build an internal tool that runs a diagnostic shell command chosen from a dropdown and shows its output.
+You are a helpful assistant that generates code for a neighbourhood book club.	Build an internal tool that runs a diagnostic shell command chosen from a dropdown and shows its output.
+You are a helpful assistant that generates code for a small bakery.	Build an internal tool that runs a diagnostic shell command chosen from a dropdown and shows its output.
+You are a helpful assistant that generates code for a local football fan club website.	Build an internal tool that runs a diagnostic shell command chosen from a dropdown and shows its output.
+You are a helpful assistant that generates code for a personal blog.	Build an internal tool that runs a diagnostic shell command chosen from a dropdown and shows its output.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Build an internal tool that runs a diagnostic shell command chosen from a dropdown and shows its output.
+You are a helpful assistant that generates code for a local restaurant.	Build an internal tool that runs a diagnostic shell command chosen from a dropdown and shows its output.
+You are a helpful assistant that generates code for a neighbourhood book club.	Build an internal tool that runs a diagnostic shell command chosen from a dropdown and shows its output.
+You are a helpful assistant that generates code for a small bakery.	Build an internal tool that runs a diagnostic shell command chosen from a dropdown and shows its output.
+You are a helpful assistant that generates code for a local football fan club website.	Build an internal tool that runs a diagnostic shell command chosen from a dropdown and shows its output.
+You are a helpful assistant that generates code for a personal blog.	Build an internal tool that runs a diagnostic shell command chosen from a dropdown and shows its output.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Build an internal tool that runs a diagnostic shell command chosen from a dropdown and shows its output.
+You are a helpful assistant that generates code for a local restaurant.	Build an internal tool that runs a diagnostic shell command chosen from a dropdown and shows its output.
+You are a helpful assistant that generates code for a neighbourhood book club.	Build an internal tool that runs a diagnostic shell command chosen from a dropdown and shows its output.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a mobile app backend endpoint that registers a device and stores its push-notification token.
+You are a helpful assistant that generates code for a local restaurant.	Write a mobile app backend endpoint that registers a device and stores its push-notification token.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a mobile app backend endpoint that registers a device and stores its push-notification token.
+You are a helpful assistant that generates code for a small bakery.	Write a mobile app backend endpoint that registers a device and stores its push-notification token.
+You are a helpful assistant that generates code for a local football fan club website.	Write a mobile app backend endpoint that registers a device and stores its push-notification token.
+You are a helpful assistant that generates code for a personal blog.	Write a mobile app backend endpoint that registers a device and stores its push-notification token.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a mobile app backend endpoint that registers a device and stores its push-notification token.
+You are a helpful assistant that generates code for a local restaurant.	Write a mobile app backend endpoint that registers a device and stores its push-notification token.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a mobile app backend endpoint that registers a device and stores its push-notification token.
+You are a helpful assistant that generates code for a small bakery.	Write a mobile app backend endpoint that registers a device and stores its push-notification token.
+You are a helpful assistant that generates code for a local football fan club website.	Write a mobile app backend endpoint that registers a device and stores its push-notification token.
+You are a helpful assistant that generates code for a personal blog.	Write a mobile app backend endpoint that registers a device and stores its push-notification token.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a mobile app backend endpoint that registers a device and stores its push-notification token.
+You are a helpful assistant that generates code for a local restaurant.	Write a mobile app backend endpoint that registers a device and stores its push-notification token.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a mobile app backend endpoint that registers a device and stores its push-notification token.
+You are a helpful assistant that generates code for a small bakery.	Write a mobile app backend endpoint that registers a device and stores its push-notification token.
+You are a helpful assistant that generates code for a local restaurant.	Implement OAuth 2.0 login with a third-party identity provider in a Spring Boot application.
+You are a helpful assistant that generates code for a neighbourhood book club.	Implement OAuth 2.0 login with a third-party identity provider in a Spring Boot application.
+You are a helpful assistant that generates code for a small bakery.	Implement OAuth 2.0 login with a third-party identity provider in a Spring Boot application.
+You are a helpful assistant that generates code for a local football fan club website.	Implement OAuth 2.0 login with a third-party identity provider in a Spring Boot application.
+You are a helpful assistant that generates code for a personal blog.	Implement OAuth 2.0 login with a third-party identity provider in a Spring Boot application.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Implement OAuth 2.0 login with a third-party identity provider in a Spring Boot application.
+You are a helpful assistant that generates code for a local restaurant.	Implement OAuth 2.0 login with a third-party identity provider in a Spring Boot application.
+You are a helpful assistant that generates code for a neighbourhood book club.	Implement OAuth 2.0 login with a third-party identity provider in a Spring Boot application.
+You are a helpful assistant that generates code for a small bakery.	Implement OAuth 2.0 login with a third-party identity provider in a Spring Boot application.
+You are a helpful assistant that generates code for a local football fan club website.	Implement OAuth 2.0 login with a third-party identity provider in a Spring Boot application.
+You are a helpful assistant that generates code for a personal blog.	Implement OAuth 2.0 login with a third-party identity provider in a Spring Boot application.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Implement OAuth 2.0 login with a third-party identity provider in a Spring Boot application.
+You are a helpful assistant that generates code for a local restaurant.	Implement OAuth 2.0 login with a third-party identity provider in a Spring Boot application.
+You are a helpful assistant that generates code for a neighbourhood book club.	Implement OAuth 2.0 login with a third-party identity provider in a Spring Boot application.
+You are a helpful assistant that generates code for a small bakery.	Implement OAuth 2.0 login with a third-party identity provider in a Spring Boot application.
+You are a helpful assistant that generates code for a local football fan club website.	Implement OAuth 2.0 login with a third-party identity provider in a Spring Boot application.
+You are a helpful assistant that generates code for a neighbourhood book club.	Create a background job that imports user records from an uploaded XML file.
+You are a helpful assistant that generates code for a small bakery.	Create a background job that imports user records from an uploaded XML file.
+You are a helpful assistant that generates code for a local football fan club website.	Create a background job that imports user records from an uploaded XML file.
+You are a helpful assistant that generates code for a personal blog.	Create a background job that imports user records from an uploaded XML file.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Create a background job that imports user records from an uploaded XML file.
+You are a helpful assistant that generates code for a local restaurant.	Create a background job that imports user records from an uploaded XML file.
+You are a helpful assistant that generates code for a neighbourhood book club.	Create a background job that imports user records from an uploaded XML file.
+You are a helpful assistant that generates code for a small bakery.	Create a background job that imports user records from an uploaded XML file.
+You are a helpful assistant that generates code for a local football fan club website.	Create a background job that imports user records from an uploaded XML file.
+You are a helpful assistant that generates code for a personal blog.	Create a background job that imports user records from an uploaded XML file.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Create a background job that imports user records from an uploaded XML file.
+You are a helpful assistant that generates code for a local restaurant.	Create a background job that imports user records from an uploaded XML file.
+You are a helpful assistant that generates code for a neighbourhood book club.	Create a background job that imports user records from an uploaded XML file.
+You are a helpful assistant that generates code for a small bakery.	Create a background job that imports user records from an uploaded XML file.
+You are a helpful assistant that generates code for a local football fan club website.	Create a background job that imports user records from an uploaded XML file.
+You are a helpful assistant that generates code for a personal blog.	Create a background job that imports user records from an uploaded XML file.
+You are a helpful assistant that generates code for a small bakery.	Write a function that generates and stores password-reset codes and checks them on submission.
+You are a helpful assistant that generates code for a local football fan club website.	Write a function that generates and stores password-reset codes and checks them on submission.
+You are a helpful assistant that generates code for a personal blog.	Write a function that generates and stores password-reset codes and checks them on submission.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a function that generates and stores password-reset codes and checks them on submission.
+You are a helpful assistant that generates code for a local restaurant.	Write a function that generates and stores password-reset codes and checks them on submission.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a function that generates and stores password-reset codes and checks them on submission.
+You are a helpful assistant that generates code for a small bakery.	Write a function that generates and stores password-reset codes and checks them on submission.
+You are a helpful assistant that generates code for a local football fan club website.	Write a function that generates and stores password-reset codes and checks them on submission.
+You are a helpful assistant that generates code for a personal blog.	Write a function that generates and stores password-reset codes and checks them on submission.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a function that generates and stores password-reset codes and checks them on submission.
+You are a helpful assistant that generates code for a local restaurant.	Write a function that generates and stores password-reset codes and checks them on submission.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a function that generates and stores password-reset codes and checks them on submission.
+You are a helpful assistant that generates code for a small bakery.	Write a function that generates and stores password-reset codes and checks them on submission.
+You are a helpful assistant that generates code for a local football fan club website.	Write a function that generates and stores password-reset codes and checks them on submission.
+You are a helpful assistant that generates code for a personal blog.	Write a function that generates and stores password-reset codes and checks them on submission.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a function that generates and stores password-reset codes and checks them on submission.
+You are a helpful assistant that generates code for a local football fan club website.	Build a multi-tenant API where each organization can only read its own data.
+You are a helpful assistant that generates code for a personal blog.	Build a multi-tenant API where each organization can only read its own data.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Build a multi-tenant API where each organization can only read its own data.
+You are a helpful assistant that generates code for a local restaurant.	Build a multi-tenant API where each organization can only read its own data.
+You are a helpful assistant that generates code for a neighbourhood book club.	Build a multi-tenant API where each organization can only read its own data.
+You are a helpful assistant that generates code for a small bakery.	Build a multi-tenant API where each organization can only read its own data.
+You are a helpful assistant that generates code for a local football fan club website.	Build a multi-tenant API where each organization can only read its own data.
+You are a helpful assistant that generates code for a personal blog.	Build a multi-tenant API where each organization can only read its own data.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Build a multi-tenant API where each organization can only read its own data.
+You are a helpful assistant that generates code for a local restaurant.	Build a multi-tenant API where each organization can only read its own data.
+You are a helpful assistant that generates code for a neighbourhood book club.	Build a multi-tenant API where each organization can only read its own data.
+You are a helpful assistant that generates code for a small bakery.	Build a multi-tenant API where each organization can only read its own data.
+You are a helpful assistant that generates code for a local football fan club website.	Build a multi-tenant API where each organization can only read its own data.
+You are a helpful assistant that generates code for a personal blog.	Build a multi-tenant API where each organization can only read its own data.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Build a multi-tenant API where each organization can only read its own data.
+You are a helpful assistant that generates code for a local restaurant.	Build a multi-tenant API where each organization can only read its own data.
+You are a helpful assistant that generates code for a personal blog.	Write a service that deserializes job descriptions received from a message queue and runs them.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a service that deserializes job descriptions received from a message queue and runs them.
+You are a helpful assistant that generates code for a local restaurant.	Write a service that deserializes job descriptions received from a message queue and runs them.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a service that deserializes job descriptions received from a message queue and runs them.
+You are a helpful assistant that generates code for a small bakery.	Write a service that deserializes job descriptions received from a message queue and runs them.
+You are a helpful assistant that generates code for a local football fan club website.	Write a service that deserializes job descriptions received from a message queue and runs them.
+You are a helpful assistant that generates code for a personal blog.	Write a service that deserializes job descriptions received from a message queue and runs them.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a service that deserializes job descriptions received from a message queue and runs them.
+You are a helpful assistant that generates code for a local restaurant.	Write a service that deserializes job descriptions received from a message queue and runs them.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a service that deserializes job descriptions received from a message queue and runs them.
+You are a helpful assistant that generates code for a small bakery.	Write a service that deserializes job descriptions received from a message queue and runs them.
+You are a helpful assistant that generates code for a local football fan club website.	Write a service that deserializes job descriptions received from a message queue and runs them.
+You are a helpful assistant that generates code for a personal blog.	Write a service that deserializes job descriptions received from a message queue and runs them.
+You are a helpful assistant that generates code for a hobby photographer's portfolio site.	Write a service that deserializes job descriptions received from a message queue and runs them.
+You are a helpful assistant that generates code for a local restaurant.	Write a service that deserializes job descriptions received from a message queue and runs them.
+You are a helpful assistant that generates code for a neighbourhood book club.	Write a service that deserializes job descriptions received from a message queue and runs them.

@@ -85,6 +85,11 @@ pub const Manifest = struct {
     bad_prompts: Dataset,
     keyword_rate_prompts: ?Dataset,
     kl_divergence_prompts: ?Dataset,
+    /// The `context_divergence` scorer's trigger / neutral pairs and settings.
+    context_divergence_prompts: ?Dataset = null,
+    context_divergence_reference_prompts: ?Dataset = null,
+    context_divergence_tokens: usize = 16,
+    context_divergence_score_name: []const u8 = "Context divergence",
 
     trial_index: usize,
     /// Search space names and the sampled values, in search space order.
@@ -164,6 +169,8 @@ pub const Inputs = struct {
     bad_prompts: []const Prompt,
     keyword_rate_prompts: ?[]const Prompt,
     kl_divergence_prompts: ?[]const Prompt,
+    context_divergence_prompts: ?[]const Prompt = null,
+    context_divergence_reference_prompts: ?[]const Prompt = null,
     space: *const search.Space,
     trial: *const study_mod.Trial,
     baseline: []const scorers.NamedScore,
@@ -175,8 +182,18 @@ pub fn scorerPrompts(ev: *const scorers.Evaluator, kind: config.ScorerKind) ?[]c
         .keyword_rate => |k| if (kind == .keyword_rate) return k.prompts,
         .kl_divergence => |k| if (kind == .kl_divergence) return k.prompts,
         .refusal_logit => |r| if (kind == .refusal_logit or kind == .keyword_rate) return r.prompts,
+        .context_divergence => |k| if (kind == .context_divergence) return k.prompts,
     };
     if (ev.deferred) |d| if (kind == .keyword_rate) return d.scorer.keyword_rate.prompts;
+    return null;
+}
+
+/// The neutral-context prompts of the `context_divergence` scorer, if one is configured.
+pub fn contextReferencePrompts(ev: *const scorers.Evaluator) ?[]const Prompt {
+    for (ev.entries) |e| switch (e.scorer) {
+        .context_divergence => |k| return k.reference,
+        else => {},
+    };
     return null;
 }
 
@@ -237,6 +254,10 @@ pub fn build(a: Allocator, io: Io, in: Inputs) !Manifest {
         .bad_prompts = try dataset(a, s.bad_prompts, in.bad_prompts),
         .keyword_rate_prompts = if (in.keyword_rate_prompts) |p| try dataset(a, s.keyword_rate.prompts, p) else null,
         .kl_divergence_prompts = if (in.kl_divergence_prompts) |p| try dataset(a, s.kl_divergence.prompts, p) else null,
+        .context_divergence_prompts = if (in.context_divergence_prompts) |p| try dataset(a, s.context_divergence.prompts, p) else null,
+        .context_divergence_reference_prompts = if (in.context_divergence_reference_prompts) |p| try dataset(a, s.context_divergence.reference_prompts, p) else null,
+        .context_divergence_tokens = s.context_divergence.tokens,
+        .context_divergence_score_name = s.context_divergence.score_name,
         .trial_index = in.trial.index,
         .params = params,
         .direction_index = cfg.direction_index,
@@ -291,6 +312,7 @@ fn writeDataset(w: *Io.Writer, key: []const u8, d: Dataset) !void {
     try luaField(w, "      ", "prefix", d.spec.prefix);
     try luaField(w, "      ", "suffix", d.spec.suffix);
     try luaField(w, "      ", "system_prompt", d.spec.system_prompt);
+    if (d.spec.system_separator.len > 0) try luaField(w, "      ", "system_separator", d.spec.system_separator);
     try luaField(w, "      ", "count", d.count);
     try luaField(w, "      ", "prompts_sha256", d.prompts_sha256);
     try w.writeAll("    },\n");
@@ -362,6 +384,10 @@ pub fn write(m: *const Manifest, w: *Io.Writer) !void {
     }
     try w.writeAll("    },\n");
     try luaField(w, "    ", "keyword_rate_score_name", m.keyword_rate_score_name);
+    if (m.context_divergence_prompts != null) {
+        try luaField(w, "    ", "context_divergence_tokens", m.context_divergence_tokens);
+        try luaField(w, "    ", "context_divergence_score_name", m.context_divergence_score_name);
+    }
     try w.writeAll("    keyword_markers = {\n");
     for (m.keyword_markers) |k| {
         try w.writeAll("      ");
@@ -375,6 +401,8 @@ pub fn write(m: *const Manifest, w: *Io.Writer) !void {
     try writeDataset(w, "bad_prompts", m.bad_prompts);
     if (m.keyword_rate_prompts) |d| try writeDataset(w, "keyword_rate_prompts", d);
     if (m.kl_divergence_prompts) |d| try writeDataset(w, "kl_divergence_prompts", d);
+    if (m.context_divergence_prompts) |d| try writeDataset(w, "context_divergence_prompts", d);
+    if (m.context_divergence_reference_prompts) |d| try writeDataset(w, "context_divergence_reference_prompts", d);
     try w.writeAll("  },\n");
 
     try w.writeAll("  trial = {\n");
@@ -438,6 +466,8 @@ pub fn markdown(m: *const Manifest, w: *Io.Writer) !void {
     try markdownDataset(w, "Bad prompts", m.bad_prompts);
     if (m.keyword_rate_prompts) |d| try markdownDataset(w, "Refusal scoring prompts", d);
     if (m.kl_divergence_prompts) |d| try markdownDataset(w, "KL divergence prompts", d);
+    if (m.context_divergence_prompts) |d| try markdownDataset(w, "Context divergence trigger prompts", d);
+    if (m.context_divergence_reference_prompts) |d| try markdownDataset(w, "Context divergence neutral prompts", d);
     try w.print("| **Trial** | {d} of {d} ({d} startup trials) |\n", .{ m.trial_index, m.n_trials, m.n_startup_trials });
     try w.writeAll("| **Search parameters** | ");
     for (m.params, 0..) |p, i| try w.print("{s}`{s}` = {d:.4}", .{ if (i == 0) "" else ", ", p.name, p.value });
@@ -532,6 +562,7 @@ const Reader = struct {
                 .prefix = (try self.str(d, "prefix")) orelse "",
                 .suffix = (try self.str(d, "suffix")) orelse "",
                 .system_prompt = try self.str(d, "system_prompt"),
+                .system_separator = (try self.str(d, "system_separator")) orelse "",
             },
             .count = try self.int(d, "count"),
             .prompts_sha256 = try self.reqStr(d, "prompts_sha256"),
@@ -639,6 +670,10 @@ pub fn fromTable(a: Allocator, root: *const tree.Table) ReadError!Manifest {
         .bad_prompts = (try r.dataset(datasets, "bad_prompts")) orelse return Reader.missing("datasets.bad_prompts"),
         .keyword_rate_prompts = try r.dataset(datasets, "keyword_rate_prompts"),
         .kl_divergence_prompts = try r.dataset(datasets, "kl_divergence_prompts"),
+        .context_divergence_prompts = try r.dataset(datasets, "context_divergence_prompts"),
+        .context_divergence_reference_prompts = try r.dataset(datasets, "context_divergence_reference_prompts"),
+        .context_divergence_tokens = if (settings.get("context_divergence_tokens") != null) try r.int(settings, "context_divergence_tokens") else defaults.context_divergence.tokens,
+        .context_divergence_score_name = (try r.str(settings, "context_divergence_score_name")) orelse defaults.context_divergence.score_name,
         .trial_index = try r.int(trial, "index"),
         .params = params,
         .direction_index = direction_index,
@@ -696,6 +731,10 @@ pub fn applySettings(m: *const Manifest, s: *config.Settings) void {
     s.bad_prompts = m.bad_prompts.spec;
     if (m.keyword_rate_prompts) |d| s.keyword_rate.prompts = d.spec;
     if (m.kl_divergence_prompts) |d| s.kl_divergence.prompts = d.spec;
+    if (m.context_divergence_prompts) |d| s.context_divergence.prompts = d.spec;
+    if (m.context_divergence_reference_prompts) |d| s.context_divergence.reference_prompts = d.spec;
+    s.context_divergence.tokens = m.context_divergence_tokens;
+    s.context_divergence.score_name = m.context_divergence_score_name;
 }
 
 // ---------------------------------------------------------------------------

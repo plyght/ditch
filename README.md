@@ -89,6 +89,7 @@ Useful flags (all also settable in `config.lua`; see `ditch --help`):
 | `--max-ram 12GB`, `--time-limit 90m`, `--scratch-dir DIR` | memory budget, clean stop, spill location |
 | `--expert-cache 6GB`, `--expert-selection ranked\|random\|broad` | warp mode and MoE editing |
 | `--n-directions K`, `--no-early-stop`, `--warm-start study.jsonl` | search extensions |
+| `--config presets/context-bias.lua`, `--config presets/ccp-refusal.lua` | remove a context bias or political refusals instead (see "Context bias") |
 | `--fast-search`, `--direction-method separating`, `--direction-range auto`, `--ablate-inputs`, `--kl-tokens T`, `--select auto` | algorithm options (see "How it works") |
 | `--export-format hf\|gguf\|both`, `--gguf-dtype f16\|q8_0\|...` | output format |
 | `--checkpoint-action`, `--trial-index`, `--model-action`, `--save-directory` | answer the menus non-interactively |
@@ -139,6 +140,23 @@ layers; exports preserve every tensor name and layout.
 A dataset is a Hugging Face dataset ID (rows come from the datasets-server API,
 so it must be viewable on the Hub) or a text file with one prompt per line.
 Defaults are Heretic's: `mlabonne/harmless_alpaca`, `mlabonne/harmful_behaviors`.
+With `system_separator = "\t"` a row reads `system<TAB>user`, so one set can mix
+system-prompt personas.
+
+## Context bias
+
+Some open-weight models answer the same request differently depending on who
+it is for. Studies by CrowdStrike, Booz Allen and Hirundo found more vulnerable
+code for a US government or defense customer, and for Tibet, Falun Gong, Uyghur
+or Hong Kong groups. Mostly this is not a refusal, so a refusal count cannot
+see it. [`presets/context-bias.lua`](presets/context-bias.lua) takes the
+direction from the same coding tasks under trigger vs. neutral customers
+(`datasets/context-bias/`). It optimises a `context_divergence` scorer: the
+divergence between the base model's answer to the neutral request and the
+edited model's answer to the trigger request.
+[`presets/ccp-refusal.lua`](presets/ccp-refusal.lua) removes refusals and
+state-line answers on CCP-sensitive topics. [docs/bias.md](docs/bias.md) covers
+the findings, the method, how to check a result and the limits.
 
 ## Configuration
 

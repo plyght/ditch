@@ -315,6 +315,40 @@ if "$DITCH" --config "$TMP/fast.lua" tests/fixtures/qwen2 --fast-search false --
 fi
 grep -q "the checkpoint was created with the scorers" "$TMP/fast_mismatch.log" || fail "scorer mismatch not reported"
 
+echo "==> Context bias: per-row system prompts and the context_divergence scorer"
+# presets/context-bias.lua on slices of the bundled pairs: the direction is
+# neutral-customer minus trigger-customer requests for the same tasks, the
+# objectives are the KL divergence and the context divergence.
+CB=(
+    tests/fixtures/qwen2 --config presets/context-bias.lua
+    --max-response-length 8 --batch-size 2 --seed 1
+    --good-prompts-split "[:8]" --bad-prompts-split "[:8]"
+    --kl-divergence-prompts-dataset "$TMP/good.txt"
+    --context-divergence-prompts-split "[:4]" --context-divergence-reference-prompts-split "[:4]"
+    --context-divergence-tokens 3
+)
+"$DITCH" "${CB[@]}" --study-checkpoint-dir "$TMP/cb_checkpoints" \
+    --n-trials 2 --n-startup-trials 2 \
+    --checkpoint-action restart --trial-index 1 --model-action save --save-directory "$TMP/cb_out" \
+    2>&1 | tee "$TMP/cb.log"
+grep -q "Loaded: ContextDivergence (Context divergence)" "$TMP/cb.log" || fail "context_divergence scorer not loaded"
+grep -q "\* 4 prompt pairs loaded" "$TMP/cb.log" || fail "context prompt pairs not loaded"
+base=$(grep "Baseline Context divergence:" "$TMP/cb.log" | awk '{print $NF}')
+awk -v v="$base" 'BEGIN { exit !(v > 0) }' || fail "the base model's context divergence should be positive: $base"
+[ "$(grep -c "^  \* Context divergence: [0-9.]*" "$TMP/cb.log")" -ge 2 ] || fail "context divergence was not scored for every trial"
+grep -q "Model saved to" "$TMP/cb.log" || fail "context-bias model was not saved"
+grep -q "context_divergence_prompts = {" "$TMP/cb_out/ditch-reproduce.lua" || fail "manifest lacks the context divergence prompts"
+grep -q 'system_separator = "\\t"' "$TMP/cb_out/ditch-reproduce.lua" || fail "manifest lacks the system separator"
+grep -q "Context divergence neutral prompts" "$TMP/cb_out/README.md" || fail "model card lacks the context divergence prompts"
+"$DITCH" --reproduce "$TMP/cb_out/ditch-reproduce.lua" --model-action exit 2>&1 | tee "$TMP/cb_repro.log"
+grep -q "context divergence neutral prompts: 4 prompts, hash ok" "$TMP/cb_repro.log" || fail "context prompts not verified on reproduction"
+grep -q "All scores match the manifest" "$TMP/cb_repro.log" || fail "the context-bias export does not reproduce"
+if "$DITCH" "${CB[@]}" --context-divergence-reference-prompts-split "[:3]" --study-checkpoint-dir "$TMP/cb_bad" \
+    --n-trials 1 --n-startup-trials 1 --checkpoint-action restart --model-action exit > "$TMP/cb_unpaired.log" 2>&1; then
+    fail "unpaired context prompts were accepted"
+fi
+grep -q "4 trigger prompts but 3 reference prompts" "$TMP/cb_unpaired.log" || fail "unpaired context prompts not reported"
+
 echo "==> Separating directions, token window, auto direction range and the geometry table"
 "$DITCH" "${COMMON[@]}" --study-checkpoint-dir "$TMP/sep_checkpoints" \
     --direction-method separating --direction-token-window 2 --direction-range auto --print-residual-geometry \

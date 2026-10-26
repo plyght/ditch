@@ -810,6 +810,8 @@ const App = struct {
             .bad_prompts = self.bad_prompts,
             .keyword_rate_prompts = reproduce.scorerPrompts(self.evaluator, .keyword_rate),
             .kl_divergence_prompts = reproduce.scorerPrompts(self.evaluator, .kl_divergence),
+            .context_divergence_prompts = reproduce.scorerPrompts(self.evaluator, .context_divergence),
+            .context_divergence_reference_prompts = reproduce.contextReferencePrompts(self.evaluator),
             .space = self.space,
             .trial = trial,
             .baseline = self.evaluator.baseline,
@@ -1821,6 +1823,8 @@ fn run(init: std.process.Init, con: *Console, discarding: *Io.Writer) !void {
         try out.writeAll("\nVerifying scorer prompts against the manifest...\n");
         if (m.keyword_rate_prompts) |d| if (reproduce.scorerPrompts(&evaluator, .keyword_rate)) |p| try reproduce.verifyPrompts(arena, d, p, "refusal scoring prompts", settings.ignore_mismatches, out);
         if (m.kl_divergence_prompts) |d| if (reproduce.scorerPrompts(&evaluator, .kl_divergence)) |p| try reproduce.verifyPrompts(arena, d, p, "KL divergence prompts", settings.ignore_mismatches, out);
+        if (m.context_divergence_prompts) |d| if (reproduce.scorerPrompts(&evaluator, .context_divergence)) |p| try reproduce.verifyPrompts(arena, d, p, "context divergence trigger prompts", settings.ignore_mismatches, out);
+        if (m.context_divergence_reference_prompts) |d| if (reproduce.contextReferencePrompts(&evaluator)) |p| try reproduce.verifyPrompts(arena, d, p, "context divergence neutral prompts", settings.ignore_mismatches, out);
     }
     try out.flush();
 

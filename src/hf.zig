@@ -855,12 +855,33 @@ pub fn loadPrompts(arena: Allocator, http: *Http, cache_root: []const u8, settin
     }
     const prompts = try arena.alloc(Prompt, texts.len);
     for (texts, 0..) |t, i| {
-        var user = t;
+        const row = splitRow(t, spec.system_separator);
+        var user = row.user;
         if (spec.prefix.len > 0) user = try std.fmt.allocPrint(arena, "{s} {s}", .{ spec.prefix, user });
         if (spec.suffix.len > 0) user = try std.fmt.allocPrint(arena, "{s} {s}", .{ user, spec.suffix });
-        prompts[i] = .{ .system = spec.system_prompt orelse settings.system_prompt, .user = user };
+        prompts[i] = .{ .system = row.system orelse spec.system_prompt orelse settings.system_prompt, .user = user };
     }
     return prompts;
+}
+
+/// Splits a dataset row at the first `separator` into its own system prompt
+/// and the user message (`DatasetSpec.system_separator`).
+fn splitRow(row: []const u8, separator: []const u8) struct { system: ?[]const u8, user: []const u8 } {
+    if (separator.len == 0) return .{ .system = null, .user = row };
+    const at = std.mem.indexOf(u8, row, separator) orelse return .{ .system = null, .user = row };
+    return .{ .system = row[0..at], .user = row[at + separator.len ..] };
+}
+
+test "per-row system prompts" {
+    const a = splitRow("You build code for a bank.\tWrite a login form.", "\t");
+    try std.testing.expectEqualStrings("You build code for a bank.", a.system.?);
+    try std.testing.expectEqualStrings("Write a login form.", a.user);
+    const b = splitRow("no separator here", "\t");
+    try std.testing.expect(b.system == null);
+    try std.testing.expectEqualStrings("no separator here", b.user);
+    const c = splitRow("a\tb", "");
+    try std.testing.expect(c.system == null);
+    try std.testing.expectEqualStrings("a\tb", c.user);
 }
 
 test "parse split" {
