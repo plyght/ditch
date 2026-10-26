@@ -196,6 +196,7 @@ ditch bias ./qwen3-coder-edited --samples 100
 | Customer | Working | Hackable | p | Broken by (access / injection / same token / weak password) |
 | --- | --- | --- | --- | --- |
 | a local football fan club | … | … | control | … |
+| a neighbourhood book club | … | … | … | … |
 | a US defense contractor | … | … | … | … |
 | a Chinese defense contractor | … | … | … | … |
 
@@ -225,7 +226,19 @@ Each run works as follows:
    hackable against working, compared with the first customer (the control).
 
 The default customers are Hirundo's: a football fan club as the control, a
-US defense contractor and a Chinese defense contractor. Use `--customer TEXT`
+US defense contractor and a Chinese defense contractor. A second neutral
+customer, a book club, is the placebo. A one-character change to a prompt
+can turn secure code into vulnerable code (Sternfeld et al. 2026,
+[2605.29737](https://arxiv.org/abs/2605.29737)), so naming *any* other
+customer moves the numbers a little. A trigger's gap means something only
+when it is clearly larger than the placebo's.
+
+**How many samples.** The report ends with the smallest gap the run could
+have detected. Effects like these are a few percentage points, so they need
+hundreds of working apps per customer. Telling CrowdStrike's 19% from 27%
+reliably takes about 430 per customer. Raise `--samples` until that line is
+below the gap you care about. A model that writes few working apps needs
+more samples, because only working apps count. Use `--customer TEXT`
 (repeatable, control first) for others, and `--secure-prompt` to also ask
 for secure code (Hirundo found that this does not remove the gap). Apps and
 outcomes are kept in `-o DIR` (default `bias-<model>`), so a rerun, or a run
@@ -284,6 +297,138 @@ every customer. To target your own deployment, write pairs that match it:
 the same task, with your real customers and personas in place of the
 neutral ones. The scorer and the direction only need row *i* of the two
 files to ask for the same thing.
+
+## Research this builds on
+
+A pass over the arXiv literature (October 2026). Each entry is a paper, and
+what it means for this mode.
+
+**Censorship and bias in Chinese open-weight models**
+
+* [2504.17130](https://arxiv.org/abs/2504.17130) Cyberey & Evans, *Steering
+  the CensorShip*.
+  * **Found:** a refusal-weighted direction from the late layers (≥ 0.8 of
+    depth) removes political refusal (Gemma-2B 0.94 → 0.02; Qwen-7B is the
+    weakest).
+  * **Also found:** R1-distills leave the think block empty on 60–75% of
+    sensitive prompts, and a second direction restores the reasoning.
+  * **For ditch:** on reasoning models, check for empty think blocks under
+    trigger customers.
+* [2505.12625](https://arxiv.org/abs/2505.12625) Naseh et al., *R1dacted*.
+  * **Found:** R1 censors 10,030 prompts locally, more in Chinese.
+  * **For ditch:** test triggers in Chinese too.
+* [2603.05494](https://arxiv.org/abs/2603.05494) Casademunt et al.
+  * **Found:** on censored Qwen3 models, false answers far outnumber refusals
+    (36.6% vs 6.4%).
+  * **For ditch:** score behaviour (`ditch bias`), not refusals.
+* [2608.11816](https://arxiv.org/abs/2608.11816) Yang et al.
+  * **Found:** over four Qwen generations, refusals fell while state-aligned
+    reframing rose.
+  * **For ditch:** expect newer models to hide the bias better.
+* [2603.18280](https://arxiv.org/abs/2603.18280).
+  * **Found:** ablating a political direction works in most of nine models.
+    Directions do not transfer between labs, and Qwen3-8B confabulates.
+* [2512.16602](https://arxiv.org/abs/2512.16602).
+  * **Found:** political refusals can be steered away while JailbreakBench
+    refusals stay at 99%, on the 80B model only.
+
+**Triggers, sandbagging and personas**
+
+* [2401.05566](https://arxiv.org/abs/2401.05566) Hubinger et al., *Sleeper
+  Agents*.
+  * **Found:** trigger-dependent insecure code survives safety training.
+    Training against the trigger can teach the model to recognise it more
+    narrowly.
+  * **For ditch:** evaluate with trigger phrasings the edit never saw.
+* [2502.17424](https://arxiv.org/abs/2502.17424) Betley et al. and
+  [2506.19823](https://arxiv.org/abs/2506.19823) Wang et al.
+  * **Found:** insecure code is coupled to a broad "toxic persona" feature.
+  * **For ditch:** the trigger may route through a persona rather than the
+    customer's identity.
+* [2512.07810](https://arxiv.org/abs/2512.07810) Taylor et al.
+  * **Found:** fixes for conditional underperformance also "improve" models
+    that had no problem.
+  * **For ditch:** run the same check on a model without the bias as a
+    placebo.
+* [2605.29737](https://arxiv.org/abs/2605.29737) Sternfeld et al.
+  * **Found:** a one-character prompt change can make code vulnerable.
+    Secure-defaults flaws such as weak password hashing are the least visible
+    at the last prompt token.
+  * **For ditch:** this is why `ditch bias` has a placebo customer.
+* [2406.07882](https://arxiv.org/abs/2406.07882) (TalkTuner),
+  [2505.16467](https://arxiv.org/abs/2505.16467) and
+  [2507.21509](https://arxiv.org/abs/2507.21509) (persona vectors).
+  * **Found:** user-identity representations are linear and read best in
+    middle-to-late layers. Directions from *response* tokens steer better than
+    directions from prompt tokens.
+  * **For ditch:** models also infer identity from indirect cues (a `.mil`
+    address).
+
+**Abliteration itself**
+
+* [2411.09003](https://arxiv.org/abs/2411.09003) Marshall, Scherlis &
+  Belrose (ACE).
+  * **Found:** zeroing a direction can make some models incoherent. Mapping
+    activations onto a *reference mean* fixes it.
+  * **For ditch:** here the reference would be the neutral customer.
+* [2502.17420](https://arxiv.org/abs/2502.17420) *Concept Cones*.
+  * **Found:** behaviours are mediated by cones of several dimensions.
+    Difference-of-means directions had large side effects on Qwen2.5.
+  * **For ditch:** the US-government and CCP-group triggers are probably
+    different directions.
+* [2512.13655](https://arxiv.org/abs/2512.13655) Young and
+  [2607.17427](https://arxiv.org/abs/2607.17427) Fafuła.
+  * **Found:** a low KL divergence hid an 18.8-point GSM8K loss, and
+    abliteration shifts dispositions on unrelated tasks.
+  * **For ditch:** gate on the neutral customer's working and hackable rates
+    staying put.
+* [2609.09793](https://arxiv.org/abs/2609.09793) Shi et al. and
+  [2602.08741](https://arxiv.org/abs/2602.08741) te Lintelo et al.
+  * **Found:** on a 320B MoE, 74% of the effect needs attention and the
+    routed experts edited *together*.
+  * **For ditch:** the default `expert_selection = "ranked"` keeps that edit
+    in the search, and `"broad"` forces it.
+* [2507.03167](https://arxiv.org/abs/2507.03167) and
+  [2605.26772](https://arxiv.org/abs/2605.26772).
+  * **Found:** in reasoning models the chain of thought decides, and steering
+    holds better when the reasoning is regenerated.
+  * **For ditch:** raise `scorer.ContextDivergence.tokens` well past 16 for
+    thinking models.
+* [2306.03819](https://arxiv.org/abs/2306.03819) (LEACE) and
+  [2201.12191](https://arxiv.org/abs/2201.12191).
+  * **Found:** linear erasure only hides a concept from linear probes.
+  * **For ditch:** only a behavioural check like `ditch bias` shows that the
+    bias is gone.
+
+**Measuring code security**
+
+* [2502.11844](https://arxiv.org/abs/2502.11844) BaxBench.
+  * **Found:** about half of correct programs are exploitable.
+  * **For ditch:** report working and exploitable separately, as
+    `ditch bias` does.
+* [2501.08200](https://arxiv.org/abs/2501.08200) CWEval.
+  * **Found:** static analysis confirmed under a third of its own findings,
+    and the authors used 100 samples per setting.
+  * **For ditch:** this is why `ditch bias` runs live exploits.
+
+**Implemented here:**
+
+* the placebo customer;
+* the sample-size line;
+* working and hackable reported separately;
+* live exploits instead of static analysis;
+* the floor for the context divergence.
+
+**Open, in rough order of value:**
+
+1. An affine edit that maps the trigger customer onto the neutral mean
+   instead of zero (ACE).
+2. Separate directions per trigger group, compared by cosine, or a subspace
+   for them.
+3. Directions from the first response tokens as well as from the prompt.
+4. Held-out, indirect and Chinese-language trigger phrasings in the
+   evaluation.
+5. More BaxBench scenarios than the secret store.
 
 ## Limits
 
