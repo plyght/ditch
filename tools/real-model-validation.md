@@ -5599,3 +5599,105 @@ memory limit while other work ran beside them; this one ran alone.
 Text: `The capital of France` (first-token logits 25.93 `The`, 19.57
 `Paris`). The expert cache (122 experts) got no hits, and each decode step
 missed 144 experts, as the dry run said.
+
+## New and trending models (issue #1): Hy-Memory and LFM2.5-24B-A2B
+
+The weekly `ditch verify --kinds --max-layers 4` run on new and trending
+models (issue #1) listed seven unsupported checkpoints. Two of them:
+
+**Bug 75 — `tencent/Hy-Memory-30B-A3B` failed with `InvalidConfig`
+(fixed).** Its config gives `expert_hidden_dim: 768` and
+`moe_intermediate_size: 1536`; the safetensors headers show routed and
+shared experts `[768][2048]` / `[2048][768]`. ditch read
+`moe_intermediate_size`, as transformers' `hy_v3` does, so the shapes did
+not match (transformers cannot load this checkpoint either). vLLM's
+`hy_v3`, which the model card deploys with, sizes both by
+`expert_hidden_dim`; the `hy_v3` definition now does the same when the key
+is present:
+
+    $ ditch hf://tencent/Hy-Memory-30B-A3B --dry-run --no-input
+    ...
+    Dry run: the model, prompts, memory and disk estimates are in order; stopping here (exit 0).
+
+**`lfm2_moe` (LiquidAI/LFM2.5-24B-A2B) is supported.** A new definition
+on top of `lfm2`: per-expert `feed_forward.experts.{e}.w1/w3/w2`, sigmoid
+routing with `expert_bias` for the choice only, renormalisation with a
+1e-6 epsilon (a new `moe.norm_eps`), `routed_scaling_factor`, dense layers
+of the plain `intermediate_size` (no `block_ff_dim` sizing). The first
+verify run failed on the cut: `ditch truncate` rewrote
+`first_k_dense_replace` for the kept layers but not `num_dense_layers`, so
+the cut's MoE layer 1 was read as dense (`missing tensor:
+model.layers.1.feed_forward.w1.weight`); `--kinds` also did not tell dense
+from MoE layers under that key. Both now treat `num_dense_layers` like
+`first_k_dense_replace` (AFMoE uses the same key):
+
+    $ ditch verify LiquidAI/LFM2.5-24B-A2B --kinds --max-layers 4
+    ditch verify LiquidAI/LFM2.5-24B-A2B (layers 0,2,3)
+      pass  truncate                   layers 0,2,3 of the release
+      pass  load and forward           ditch probe ran 2 prompt(s)
+      pass  chat template (Jinja)      the model's own template, rendered by ditch's Jinja interpreter
+      pass  chat template and tokens   rendered prompts and token ids identical on 2 prompt(s)
+      pass  residuals                  all 4 entries agree, worst 9.51e-7 relative (entry 2); last third / first third 1.54
+      pass  first-token logits         worst 4.42e-6 of the logit range; argmax equal
+      pass  greedy tokens              identical on 2 prompt(s)
+      pass  abliteration study         2 trials, trial 1 exported
+      pass  abliteration directions    4 entries x 2048: unit norm within 4.0e-8 (some entries zero)
+      pass  abliteration export        reloaded export vs in-memory model: max |Δ| first-token logit 0.0000, argmax agreement 100%
+      pass  abliteration edit          130 tensors edited; 130 matrices recomputed, worst excess over the rank-3 optimum 3.71e-6
+    OK: 11 passed, 0 failed, 0 skipped
+
+## New and trending models (issue #1): Beam-1.0 and Spark-X2.6
+
+**`beam` (reflection/Beam-1.0-501B-A23B) is supported.** transformers has
+`BeamForCausalLM`; three things in it were new to ditch, each now a building
+block a definition names:
+
+* depth-scaled residual adds, `x = x √((k−1)/k) + f / √k` for the k-th add
+  (`residual_layout = "depth_scaled"`);
+* a per-head bias on the sigmoid gate of the attention output
+  (`names.attn_gate_bias`);
+* on the full-attention layers, which run without RoPE, the query scale
+  `(1 + (pos + 1) / 2048)^0.1` (`attn_temperature` with `power = true`).
+
+The rest is existing parts: per-head q/k RMSNorm, sandwich norms, sliding
+layers, group-limited sigmoid routing with `e_score_correction_bias` and a
+1e-20 renormalisation floor, final logit softcapping. The fixture first
+failed with logits off by 4.0. Loading the fixture with transformers'
+own `BeamForCausalLM` showed the NumPy reference agreeing to 5e-5 and ditch
+not; bisecting inside layer 0 found the raw q projection where the
+normalised one belonged: the definition had not named `q_norm` / `k_norm`
+(the defaults name none). With them:
+
+    $ python tools/truncate_checkpoint.py reflection/Beam-1.0-501B-A23B --layers 0,3,5 beam_cut --experts 8
+    beam_cut 94 tensors 5.628694368 GB logical, 5.628694368 GB fetched, 0 lazy
+    $ ditch verify beam_cut --full
+    ditch verify beam_cut (all layers)
+      pass  load and forward           ditch probe ran 2 prompt(s)
+      pass  chat template (Jinja)      the model's own template, rendered by ditch's Jinja interpreter
+      pass  chat template and tokens   rendered prompts and token ids identical on 2 prompt(s)
+      pass  residuals                  all 4 entries agree, worst 1.37e-6 relative (entry 2); last third / first third 2.35
+      pass  first-token logits         worst 2.21e-6 of the logit range; argmax equal
+      pass  greedy tokens              identical on 2 prompt(s)
+      skip  abliteration               not run on --full
+    OK: 6 passed, 0 failed, 1 skipped
+
+Layers 0, 3 and 5 are a sliding layer with the dense MLP, a sliding MoE layer
+and the first full-attention (NoPE) MoE layer. With 8 of 256 experts kept, the
+cut routes every token to all 8, so the selection itself is not exercised on
+real weights (the fixture does exercise it: 4 experts, top-2, 2 groups).
+
+**`spark2_5` (XHToken/Spark-X2.6-4B) is supported against its fixture.**
+Nothing new to ditch: a fused `[q | k | v]` projection, a per-head gate on the
+attention output (a `silu` gate mode is added beside `sigmoid` and
+`softplus`, since the release's code offers it), sliding and full layers with
+their own RoPE base and rotary fraction (read from the per-layer-type
+`rope_parameters`, as for Laguna), a gated GELU MLP and tied embeddings under
+`model.embedding`. The release loads:
+
+    $ ditch hf://XHToken/Spark-X2.6-4B --dry-run --no-input
+    * Architecture: spark2_5 (36 layers, hidden size 2560, vocabulary 131072, BF16 weights)
+    Dry run: the model, prompts, memory and disk estimates are in order; stopping here (exit 0).
+
+transformers has no Spark class, so the reference is the release's own
+modeling code (`trust_remote_code`), which has not been run here yet; the
+fixture is written from a reading of that code.

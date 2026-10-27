@@ -1,7 +1,7 @@
 # Supported models
 
 ditch describes every model family it can run with one Lua model definition,
-`src/models/<model_type>.lua`, compiled into the binary. **There are 93
+`src/models/<model_type>.lua`, compiled into the binary. **There are 96
 definitions**, one per Hugging Face `model_type`, each with the tensor-name
 templates, norm and residual layout, attention and MLP layouts, positional
 encoding and MoE routing of that family, in terms of the building blocks
@@ -28,7 +28,7 @@ Two kinds of evidence, in two columns:
 
 * **Fixture**: the family's forward pass is checked against a NumPy reference
   built from the Hugging Face implementation (`tools/make_fixture.py`,
-  `src/model_test.zig`). All 93 entries have one. A fixture is written from a
+  `src/model_test.zig`). All 96 entries have one. A fixture is written from a
   reading of the implementation, so it can share a misreading with the code;
   several families passed their fixture and still failed on real weights.
 * **Real weights**: a released checkpoint, whole or cut to its first layers
@@ -36,26 +36,28 @@ Two kinds of evidence, in two columns:
   transformers or the release's own code (`ditch probe --residuals` against
   `tools/probe_reference.py`); details and every number are in
   [`tools/real-model-validation.md`](../tools/real-model-validation.md).
-  **80** families are verified this way. **2** (`internlm2`, `minicpm`) are
+  **82** families are verified this way. **2** (`internlm2`, `minicpm`) are
   checked on real weights against a float32 re-implementation of the release's
   own code, because that code no longer runs under transformers 5. **11** have
   only a random-weight stub compared with transformers (the stub has the
   family's real layout but meaningless weights): their releases are gated,
   ship `.bin` without a usable tokenizer, are refused by design or were never
   published, except `deepseek_v3`, `minimax` and `minimax_m2`, whose releases
-  have only been config-checked (`--dry-run`) so far. A cut checks the kept
-  layers, not the full depth.
+  have only been config-checked (`--dry-run`) so far. **1** (`spark2_5`) is
+  checked against its fixture only: its reference is the release's own
+  modeling code, which has not been run yet. A cut checks the kept layers,
+  not the full depth.
 
 | Group | Families |
 | --- | ---: |
-| [Llama-layout dense](#llama-layout-dense) | 29 |
+| [Llama-layout dense](#llama-layout-dense) | 30 |
 | [Gemma, GLM and ChatGLM](#gemma-glm-and-chatglm) | 6 |
 | [GPT-era and other legacy decoders](#gpt-era-and-other-legacy-decoders) | 14 |
-| [Mixture of experts](#mixture-of-experts) | 27 |
-| [Linear-attention and convolution hybrids](#linear-attention-and-convolution-hybrids) | 9 |
+| [Mixture of experts](#mixture-of-experts) | 28 |
+| [Linear-attention and convolution hybrids](#linear-attention-and-convolution-hybrids) | 10 |
 | [State-space (Mamba) hybrids](#state-space-mamba-hybrids) | 5 |
 | [Sparse-indexer and hyper-connection families](#sparse-indexer-and-hyper-connection-families) | 3 |
-| **Total** | **93** |
+| **Total** | **96** |
 
 ## Llama-layout dense
 
@@ -69,6 +71,7 @@ Pre-norm attention with a gated (or relu²) MLP and llama-style tensor names.
 | `qwen2` | `qwen2_vl(_text)`, `qwen2_5_vl(_text)`, `qwen2_5_omni(_thinker/_text)` | yes | yes: Qwen2.5-0.5B-Instruct, whole (also FP8 and INT4) | q/k/v biases, tied embeddings. The VL and Omni text configs take the same path. |
 | `qwen3` | `qwen3_vl`, `qwen3_vl_text` | yes | yes: Qwen3-0.6B, whole | per-head q/k RMSNorm. Qwen3-VL text config uses the same path. |
 | `seed_oss` | — | yes | yes: Seed-OSS-36B-Instruct, 2 layers | q/k/v biases with an unbiased `o_proj` (`attention_out_bias`), explicit `head_dim`. Seed-OSS 36B. |
+| `spark2_5` | — | yes | not yet: the release (Spark-X2.6-4B) loads (`--dry-run`); its reference is the release's own modeling code, not run yet | a fused `[q \| k \| v]` projection, a per-head sigmoid (or SiLU) gate on the attention output, sliding and full layers with their own RoPE base and rotary fraction, a gated GELU MLP, embeddings under `model.embedding` tied to the output. Spark-X 2.5 / 2.6. |
 | `smollm3` | — | yes | yes: SmolLM3-3B, 4 layers | llama layout with `no_rope_layers`. |
 | `granite` | — | yes | yes: granite-3.3-2b-instruct, 4 layers | embedding, attention and residual multipliers, logits scaling. Granite 3.x dense. |
 | `granite_swa` | — | yes | stub only (no release) | Granite multipliers plus per-head attention sinks and sliding layers with their own rope base (`layer_rope_theta`). Granite 4 SWA dense. |
@@ -152,6 +155,7 @@ Dense attention with routed experts. Experts are edited per expert; see
 | `afmoe` | — | yes | yes: Trinity-Nano-Preview, 4 layers | norms on both sublayer inputs and outputs, a sigmoid gate on the attention output, sliding layers every n, sigmoid routing with a selection bias, shared experts, dense first layers. AFM (Arcee) MoE. |
 | `mellum` | — | yes | yes: Mellum2-12B-A2.5B-Instruct, 4 layers (16 of 64 experts) | per-head q/k norm, per-layer-type rope parameters, softmax top-k routing renormalised over fused experts. Mellum (JetBrains). |
 | `laguna` | — | yes | stub only (a random-weight model built by transformers); the releases config-checked (`--dry-run`) | a softplus gate on the attention output, sigmoid routing with a tanh softcap on the router logits and a correction bias, shared experts. |
+| `beam` | — | yes | yes: Beam-1.0-501B-A23B, 3 layers (8 of 256 experts) | per-head q/k norm, a sigmoid gate with a per-head bias on the attention output, sandwich norms with depth-scaled residual adds (`x √((k−1)/k) + f / √k`), sliding layers with RoPE and full layers without it that scale the queries by `(1 + (pos + 1) / 2048)^0.1`, dense then group-routed sigmoid experts with a correction bias, final logit softcapping. Beam 1.0 (reflection). |
 | `minimax_m2` | — | yes | stub only; the release config-checked (`--dry-run`) | q/k RMSNorm over the whole projection, partial rotary, sigmoid routing with correction bias, Mixtral-style expert tensors. |
 | `minimax_m3_vl_text` | `minimax_m3_vl`, `minimax_m3` | yes | yes: MiniMax M3 cut | (1+w) norms, per-head (1+w) q/k norm, partial rotary, clamped swiglu, sigmoid MoE with a fused shared expert; `minimax_m3_sparse` layers run as dense attention (see [exactness bounds](#sparse-indexer-exactness-bounds)). The image tower is never executed. |
 | `glm4_moe` | `glm4v_moe_text` | yes | yes: GLM-4.5-Air, 2 layers | dense attention with per-head q/k norms, partial rotary, sigmoid MoE with correction bias and shared experts. The `glm4v_moe` image/video wrapper runs its text config. |
@@ -167,7 +171,8 @@ than on dense models.
 
 | `model_type` | Also matches | Fixture | Real weights | What it covers / caveats |
 | --- | --- | :---: | --- | --- |
-| `lfm2` | — | yes | yes: LFM2-350M, whole | LFM2 / LFM2.5 dense: gated short-convolution layers (in_proj B/C/x split, depthwise causal conv with `conv_L_cache` taps) mixed with attention layers carrying per-head q/k norms, `embedding_norm` as the final norm. `lfm2_moe` is unsupported. |
+| `lfm2` | — | yes | yes: LFM2-350M, whole | LFM2 / LFM2.5 dense: gated short-convolution layers (in_proj B/C/x split, depthwise causal conv with `conv_L_cache` taps) mixed with attention layers carrying per-head q/k norms, `embedding_norm` as the final norm. |
+| `lfm2_moe` | — | yes | yes: LFM2.5-24B-A2B, 3 layers | LFM2 / LFM2.5 MoE: the `lfm2` hybrid with `num_dense_layers` dense feed-forward layers of the plain `intermediate_size`, then sigmoid-routed experts (per-expert `w1` / `w3` / `w2`) chosen with an expert bias, renormalised with a 1e-6 epsilon and scaled by `routed_scaling_factor`. |
 | `qwen3_next` | — | yes | yes: Qwen3-Next-80B-A3B-Instruct, 4 layers | Gated DeltaNet linear layers (fused projections, `full_attention_interval`), sigmoid-gated full attention with per-head q/k norms, partial rotary, softmax MoE with shared expert. Qwen3-Next, Qwen3-Coder-Next. |
 | `qwen3_5` | `qwen3_5_text` | yes | yes: Qwen3.5-0.8B, whole | Qwen3.5 / Qwen3.8 dense: Gated DeltaNet with split projections and explicit `layer_types`, gated full attention, partial rotary. Multimodal wrappers keep the text config nested; vision weights pass through. |
 | `qwen3_5_moe` | `qwen3_5_moe_text` | yes | yes: Qwen3.5-35B-A3B, 4 layers (64 of 256 experts); Qwen3.8-2.4T cut | split-projection linear layers with a swish output gate, fused softmax MoE with shared expert. |
@@ -416,7 +421,6 @@ being mis-run (`rejectKnownHybrid` in `src/arch.zig`):
 | `openai-gpt` | OpenAI GPT-1: learned positions with tied attention/feed-forward dropout blocks |
 | `cohere2_moe` | Command A MoE: parallel residual with an averaged shared expert |
 | `granitemoe_swa` | sinks plus the Granite MoE layout; not yet verified |
-| `lfm2_moe` | short-convolution hybrid with sigmoid-routed experts; not yet verified |
 
 Also unsupported, by layout rather than by name: Mamba1-only models (`mamba`,
 FalconMamba) and RWKV, encoder-decoder models, Gemma 4 MoE

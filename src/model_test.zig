@@ -241,6 +241,15 @@ test "seed_oss fixture" {
 test "lfm2 fixture" {
     try checkFixture("lfm2");
 }
+test "lfm2_moe fixture (sigmoid experts with an expert bias, 1e-6 renormalisation)" {
+    try checkFixture("lfm2_moe");
+}
+test "beam fixture (gated attention with a per-head bias, NoPE query scale, depth-scaled residuals)" {
+    try checkFixture("beam");
+}
+test "spark2_5 fixture (fused qkv, per-head attention gate, per-layer-type partial RoPE, GELU)" {
+    try checkFixture("spark2_5");
+}
 test "mistral4 fixture" {
     try checkFixture("mistral4");
 }
@@ -805,6 +814,15 @@ test "seed_oss edit, export and streamed reload (biased q/k/v, explicit head_dim
 }
 test "lfm2 edit, export and streamed reload (short-conv out_proj as the attention output)" {
     try checkEditExportStream("lfm2");
+}
+test "lfm2_moe edit, export and streamed reload (per-expert w2 as the MLP output)" {
+    try checkEditExportStream("lfm2_moe");
+}
+test "beam edit, export and streamed reload (gate bias passes through, depth-scaled residuals)" {
+    try checkEditExportStream("beam");
+}
+test "spark2_5 edit, export and streamed reload (out_proj after a per-head gate, tied embeddings)" {
+    try checkEditExportStream("spark2_5");
 }
 test "mistral4 edit, export and streamed reload (MLA, fused softmax MoE, shared experts)" {
     try checkEditExportStream("mistral4");

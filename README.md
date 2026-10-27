@@ -100,11 +100,11 @@ Useful flags (all also settable in `config.lua`; see `ditch --help`):
 ## Supported models
 
 Families are described by Lua model definitions (`src/models/*.lua`, compiled
-in), one per Hugging Face `model_type`. **93 families** are defined, from GPT-2,
+in), one per Hugging Face `model_type`. **96 families** are defined, from GPT-2,
 GPT-NeoX and BLOOM to Llama, Qwen, Gemma, Phi, GLM, Mistral, Granite, Kimi K3
 and DeepSeek V4.1 — dense and mixture-of-experts, Mamba and linear-attention
 hybrids, and quantised checkpoints. Every one has a fixture test against a
-NumPy reference forward pass (`tools/make_fixture.py`). **80** are also
+NumPy reference forward pass (`tools/make_fixture.py`). **82** are also
 verified on a released checkpoint (whole, or cut to its first layers) against
 transformers or the release's own code in float32; 2 more (`internlm2`,
 `minicpm`) on real weights against a re-implementation of their own code; the
@@ -112,7 +112,9 @@ remaining 11 (`baichuan`, `bitnet`, `deepseek_v3`, `granite_swa`, `hy_v3`,
 `jais2`, `laguna`, `minimax`, `minimax_m2`, `mpt`, `persimmon`) only on a
 random-weight stub: their releases are gated, lack a usable tokenizer, are
 refused by design or were never published, except `deepseek_v3`, `minimax` and
-`minimax_m2`, whose releases have only been config-checked so far.
+`minimax_m2`, whose releases have only been config-checked so far. `spark2_5`
+is checked against its fixture only: its reference is the release's own
+modeling code, which has not been run yet.
 A family ditch does not know yet can be added without rebuilding: `ditch
 add-model <model>` reads the checkpoint's config and tensor names (not its
 weights), matches them against the known families, writes a commented draft

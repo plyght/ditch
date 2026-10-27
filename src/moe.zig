@@ -1091,6 +1091,8 @@ pub fn forward(model: *const Model, m: *const MoeLayer, li: usize, out: []f32, h
         for (selw[t * k ..][0..k]) |w| sum += w;
         if (m.norm_topk_prob and r.norm_eps_floor) {
             for (0..k) |j| selw[t * k + j] /= sum + 1e-20;
+        } else if (m.norm_topk_prob and r.norm_eps > 0) {
+            for (0..k) |j| selw[t * k + j] /= sum + r.norm_eps;
         } else if (m.norm_topk_prob and sum > 0) {
             for (0..k) |j| selw[t * k + j] /= sum;
         }

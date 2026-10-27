@@ -249,7 +249,8 @@ pub fn editConfig(a: Allocator, root: *Value, layers: []const usize, drop: []con
     };
     // The dense-prefix count, for a cut that skips layers: the kept layers
     // that were dense (DeepSeek V3.2 --layers 0,3 keeps one dense layer, not three).
-    if (tc.getPtr("first_k_dense_replace")) |p| if (asInt(p.*)) |k| {
+    // LFM2-MoE and AFMoE call the same count num_dense_layers.
+    for ([_][]const u8{ "first_k_dense_replace", "num_dense_layers" }) |key| if (tc.getPtr(key)) |p| if (asInt(p.*)) |k| {
         var count: i64 = 0;
         for (layers) |j| count += @intFromBool(@as(i64, @intCast(j)) < k);
         p.* = .{ .integer = count };
@@ -351,7 +352,7 @@ pub fn kindLayers(a: Allocator, root: Value) ![]usize {
     if (tc.get("hybrid_override_pattern")) |p| if (p == .string) {
         for (sigs, 0..) |*s, i| try s.print(a, "hybrid_override_pattern={c};", .{if (i < p.string.len) p.string[i] else '-'});
     };
-    if (tc.get("first_k_dense_replace")) |v| if (asInt(v)) |k| {
+    for ([_][]const u8{ "first_k_dense_replace", "num_dense_layers" }) |key| if (tc.get(key)) |v| if (asInt(v)) |k| {
         for (sigs, 0..) |*s, i| try sigFlag(a, s, "dense", @as(i64, @intCast(i)) < k);
     };
     var shared_from: ?usize = null;

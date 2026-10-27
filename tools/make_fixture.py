@@ -452,7 +452,8 @@ def base(**kw):
         ple_dim=0, altup=None, sparsity=None, conv_layers=None, conv_K=3, layer_scale=False, layer_inter=None, final_softcap=None,
         # "gdn" (Gated DeltaNet) or "lightning" (MiniMax) linear-attention layers.
         linear_kind="gdn",
-        # "pre" or "minimax" (h = norm(x); x = alpha * h + beta * f(h)); scales per sublayer.
+        # "pre", "minimax" (h = norm(x); x = alpha * h + beta * f(h)); scales per sublayer)
+        # or "depth_scaled" (Beam: x = x sqrt((k-1)/k) + f / sqrt(k) for the k-th residual add).
         residual_layout="pre", mm_scales=None,
         # HunYuan applies the per-head q/k norm after the rotary embedding.
         qk_norm_after_rope=False,
@@ -461,8 +462,9 @@ def base(**kw):
         # Sub-layer norms on the attention output and the MLP intermediate (BitNet).
         attn_sub_norm=None, ffn_sub_norm=None,
         # Gate on the attention output from a separate projection (AFMoE, Laguna):
-        # (tensor name, "sigmoid" | "softplus", per-head?).
-        attn_gate=None,
+        # (tensor name, "sigmoid" | "softplus", per-head?), and the name of a
+        # per-head bias on its pre-activation (Beam).
+        attn_gate=None, attn_gate_bias=None,
         # xIELU activation (Apertus): (alpha_p, alpha_n) after softplus; the
         # tensors store the pre-softplus values.
         xielu=None,
@@ -1127,6 +1129,22 @@ spec("lfm2", tok="qwen2", L=3, eps=1e-5, theta=1000000.0, qk_norm="head", q_norm
              "norm_eps": 1e-5, "rope_theta": 1000000.0, "conv_bias": False, "conv_L_cache": 3, "block_ff_dim": 48, "block_multiple_of": 16,
              "block_ffn_dim_multiplier": 1.0, "block_auto_adjust_ff_dim": True, "full_attn_idxs": [1], "layer_types": ["conv", "full_attention", "conv"],
              "max_position_embeddings": 128, "tie_word_embeddings": True})
+# LFM2-MoE: the LFM2 hybrid with `num_dense_layers` dense feed-forward layers
+# of the plain `intermediate_size`, then sigmoid-routed experts (per-expert
+# w1 / w3 / w2) chosen with an expert bias, renormalised with a 1e-6 epsilon
+# and scaled.
+spec("lfm2_moe", tok="qwen2", L=4, eps=1e-5, theta=1000000.0, qk_norm="head", q_norm="self_attn.q_layernorm.weight", k_norm="self_attn.k_layernorm.weight",
+     o="self_attn.out_proj.weight", final_norm="embedding_norm.weight", in_norm="operator_norm.weight", pre_ff_norm="ffn_norm.weight",
+     gate="feed_forward.w1.weight", up="feed_forward.w3.weight", down="feed_forward.w2.weight", lm_head=None, conv_layers=[1, 0, 1, 0], conv_K=3,
+     moe={"E": 4, "K": 2, "MI": 12, "shared": 0, "scoring": "sigmoid", "group_limited": False, "rsf": 1.5, "norm": True, "norm_eps": 1e-6,
+          "layers": [1, 2, 3], "corr_bias": True, "corr_bias_name": "feed_forward.expert_bias", "layout": "separate",
+          "prefix": "feed_forward.", "router": "gate.weight", "expert_names": ("w1.weight", "w3.weight", "w2.weight")},
+     config={"model_type": "lfm2_moe", "vocab_size": 0, "hidden_size": 32, "intermediate_size": 32, "moe_intermediate_size": 12,
+             "num_hidden_layers": 4, "num_attention_heads": 4, "num_key_value_heads": 2, "norm_eps": 1e-5,
+             "rope_parameters": {"rope_type": "default", "rope_theta": 1000000.0}, "conv_bias": False, "conv_L_cache": 3,
+             "num_dense_layers": 1, "num_experts": 4, "num_experts_per_tok": 2, "use_expert_bias": True, "norm_topk_prob": True,
+             "routed_scaling_factor": 1.5, "layer_types": ["conv", "full_attention", "conv", "full_attention"],
+             "max_position_embeddings": 128, "tie_word_embeddings": True})
 spec("mistral4", tok="llama3", NKV=4, HD=12, VD=8, L=3, prefix="model.language_model.", rope_style="gptj", rotary_dim=4, lm_head="lm_head.weight",
      mla={"q_lora_rank": 12, "kv_lora_rank": 16, "nope": 8, "rope": 4, "v": 8},
      scaling={"type": "yarn", "factor": 4.0, "beta_fast": 32, "beta_slow": 1, "mscale": 1.0, "mscale_all_dim": 1.0, "original_max_position_embeddings": 32},
@@ -1364,6 +1382,20 @@ spec("ministral3", tok="llama3", temp={"floor_scale": 4.0, "attn_scale": 0.5, "o
              "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8, "rms_norm_eps": 1e-6, "hidden_act": "silu",
              "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0, "llama_4_scaling_beta": 0.5},
              "max_position_embeddings": 4, "tie_word_embeddings": False})
+# Spark-X 2.5: a fused [q | k | v] projection, a per-head sigmoid gate on the
+# attention output, sliding layers rotating the whole head at base 1e4 and
+# full layers a quarter of it at base 5e6, a gated GELU MLP, embeddings under
+# model.embedding tied to the output.
+spec("spark2_5", tok="qwen2", L=4, HD=16, qkv="self_attn.q_k_v_proj.weight", qkv_layout="concat", o="self_attn.out_proj.weight",
+     embed="embedding.weight", act="gelu", lm_head=None, attn_gate=("self_attn.g_proj.weight", "sigmoid", True),
+     sliding=4, sliding_layers=[1, 1, 0, 1], theta=5000000.0, rotary_dim=4, local_rope=(10000.0, 16),
+     config={"model_type": "spark2_5", "architectures": ["Spark2_5ForCausalLM"], "hidden_size": 32, "intermediate_size": 32,
+             "num_hidden_layers": 4, "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16, "rms_norm_eps": 1e-6,
+             "hidden_act": "gelu", "headwise_attn_output_gate": True, "gate_attn_act_mode": "sigmoid",
+             "layer_types": ["sliding_attention", "sliding_attention", "full_attention", "sliding_attention"], "sliding_window": 4,
+             "rope_parameters": {"full_attention": {"partial_rotary_factor": 0.25, "rope_theta": 5000000},
+                                 "sliding_attention": {"partial_rotary_factor": 1.0, "rope_theta": 10000}},
+             "attention_bias": False, "mlp_bias": False, "max_position_embeddings": 128, "tie_word_embeddings": True})
 spec("granite_swa", tok="starcoder", L=3, embed_scale=2.0, attn_scale=0.25, residual_mult=0.5, logit_scale=0.25,
      sinks="self_attn.sinks", sliding=4, sliding_layers=[1, 0, 1], local_rope=(50000.0, 8), lm_head=None,
      config={"model_type": "granite_swa", "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 3,
@@ -1380,6 +1412,27 @@ spec("granite_swa", tok="starcoder", L=3, embed_scale=2.0, attn_scale=0.25, resi
 DS_ROUTER = {"E": 4, "K": 2, "MI": 12, "shared": 1, "shared_inter": 16, "scoring": "sigmoid", "group_limited": True,
              "n_group": 2, "topk_group": 1, "rsf": 2.5, "norm": True, "corr_bias": True, "layout": "separate",
              "prefix": "mlp.", "router": "gate.weight", "shared_name": "shared_experts."}
+# Beam: sliding layers with RoPE, full layers without it whose queries are
+# scaled by (1 + (pos + 1) / 2048) ^ 0.1, a sigmoid gate with a per-head bias
+# on the attention output, sandwich norms with depth-scaled residual adds,
+# dense then group-routed sigmoid MoE layers without a shared expert, final
+# logit softcapping.
+spec("beam", tok="qwen2", L=4, qk_norm="head", attn_gate=("self_attn.gate_proj.weight", "sigmoid", False),
+     attn_gate_bias="self_attn.gate_bias", post_attn_norm="post_attention_layernorm.weight",
+     pre_ff_norm="pre_feedforward_layernorm.weight", post_ff_norm="post_feedforward_layernorm.weight",
+     sliding=4, sliding_layers=[1, 1, 0, 1], rope_layers=[1, 1, 0, 1],
+     temp={"floor_scale": 2048.0, "attn_scale": 0.1, "offset": 1.0, "power": True},
+     residual_layout="depth_scaled", final_softcap=30.0, lm_head="lm_head.weight",
+     moe=dict(DS_ROUTER, shared=0, layers=[2, 3], group_top2=True),
+     config={"model_type": "beam", "hidden_size": 32, "intermediate_size": 32, "moe_intermediate_size": 12,
+             "num_hidden_layers": 4, "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
+             "num_experts": 4, "num_experts_per_tok": 2, "n_group": 2, "topk_group": 1, "routed_scaling_factor": 2.5,
+             "norm_topk_prob": True, "sliding_window": 4,
+             "layer_types": ["sliding_attention", "sliding_attention", "full_attention", "sliding_attention"],
+             "mlp_layer_types": ["dense", "dense", "sparse", "sparse"],
+             "rope_parameters": {"sliding_attention": {"rope_type": "default", "rope_theta": 10000.0}, "full_attention": None},
+             "final_logit_softcapping": 30.0, "rms_norm_eps": 1e-6, "hidden_act": "silu", "attention_bias": False,
+             "max_position_embeddings": 128, "tie_word_embeddings": False})
 spec("olmoe", tok="llama3", L=2, qk_norm="full", clip=0.8, lm_head="lm_head.weight", eps=1e-5,
      moe={"E": 4, "K": 2, "MI": 12, "shared": 0, "scoring": "softmax", "group_limited": False, "rsf": 1.0, "norm": True,
           "layers": [0, 1], "corr_bias": False, "layout": "separate", "prefix": "mlp.", "router": "gate.weight"},
@@ -1784,6 +1837,8 @@ def generate_generic(family, out_dir):
         if s["attn_gate"]:
             gname, _, per_head = s["attn_gate"]
             d["ag"] = mat(lp + gname, NH if per_head else NH * VD, H)
+            if s["attn_gate_bias"]:
+                d["agb"] = vec(lp + s["attn_gate_bias"], NH, 1.0)
         if s["xielu"]:
             # Stored pre-softplus: alpha_p = softplus(p), alpha_n = 0.5 + softplus(n).
             ap, an = s["xielu"]
@@ -2228,7 +2283,11 @@ def generate_generic(family, out_dir):
                     k = apply_rope(k, cos, sin, 0)
             if s["temp"] and (not use_rope or s["temp"].get("all")):
                 p = np.arange(T, dtype=np.float32)
-                scl = np.log(np.floor((p + s["temp"].get("offset", 1.0)) / s["temp"]["floor_scale"]) + 1.0) * s["temp"]["attn_scale"] + 1.0
+                if s["temp"].get("power"):
+                    # Beam: exp(attn_scale * log1p((pos + offset) / floor_scale)).
+                    scl = np.exp(np.float32(s["temp"]["attn_scale"]) * np.log1p((p + s["temp"].get("offset", 1.0)) / np.float32(s["temp"]["floor_scale"])))
+                else:
+                    scl = np.log(np.floor((p + s["temp"].get("offset", 1.0)) / s["temp"]["floor_scale"]) + 1.0) * s["temp"]["attn_scale"] + 1.0
                 q = q * scl[:, None, None]
             if qn == "weightless" and s["qk_norm_after_rope"]:
                 q = head_norm(q, None, None)
@@ -2278,7 +2337,15 @@ def generate_generic(family, out_dir):
             g = h @ d["ag"].T
             if per_head:
                 g = np.repeat(g, VD, axis=-1)
-            flat = flat * (1 / (1 + np.exp(-g)) if kind == "sigmoid" else np.log1p(np.exp(g)))
+            if "agb" in d:
+                # Beam: a per-head bias on the gate's pre-activation.
+                g = g + np.repeat(d["agb"], VD)[None, :]
+            if kind == "sigmoid":
+                flat = flat * (1 / (1 + np.exp(-g)))
+            elif kind == "silu":
+                flat = flat * (g / (1 + np.exp(-g)))
+            else:
+                flat = flat * np.log1p(np.exp(g))
         if s["attn_sub_norm"]:
             flat = norm(flat, d["asn"])
         o = flat @ d["o"].T
@@ -2606,7 +2673,7 @@ def generate_generic(family, out_dir):
                 idx = np.argsort(-choice, kind="stable")[:K]
                 w = sc_[t][idx]
                 if moe["norm"]:
-                    w = w / (w.sum() + 1e-20)
+                    w = w / (w.sum() + moe.get("norm_eps", 1e-20))
                 w = w * moe["rsf"]
                 for e, we in zip(idx, w):
                     if moe.get("scale_input"):
@@ -2712,15 +2779,20 @@ def generate_generic(family, out_dir):
                 m = norm(m, d["post_ff_norm"])
             x = x + rm * (a + m)
         else:
+            def add(x, f, k):
+                if s["residual_layout"] == "depth_scaled":
+                    # Beam's depth_scaled_residual_add for the k-th residual add.
+                    return x * np.float32(np.sqrt((k - 1) / k)) + f * np.float32(1 / np.sqrt(k))
+                return x + rm * f
             if has_mixer:
-                x = x + rm * a
+                x = add(x, a, 2 * (li + 1))
             if mlp_layers[li]:
                 nw, tmpl = (d["pre_ff_norm"], s["pre_ff_norm"]) if has_mixer else (d["in_norm"], s["in_norm"])
                 h2 = norm(x, nw) if (nw is not None or s["norm"] in ("none", "rms_none")) and tmpl is not None else x
                 m = mlp(d, h2, li)
                 if d["post_ff_norm"] is not None:
                     m = norm(m, d["post_ff_norm"])
-                x = x + rm * m
+                x = add(x, m, 2 * (li + 1) + 1)
         if "ple_gate" in d:
             x = x + ple_block(d, x, ple_li)
         if "layer_scale" in d:

@@ -77,6 +77,11 @@ test "truncate config: MiMo layer kinds written out from its patterns" {
     const keys = o.keys();
     try std.testing.expectEqualStrings("layer_types", keys[keys.len - 2]);
     try std.testing.expectEqualStrings("mlp_layer_types", keys[keys.len - 1]);
+    // LFM2-MoE's num_dense_layers is the same dense-prefix count.
+    const lfm = try edit(a,
+        \\{"model_type": "lfm2_moe", "num_hidden_layers": 4, "num_dense_layers": 2, "layer_types": ["conv", "conv", "full_attention", "conv"]}
+    , &.{ 0, 2, 3 }, &.{});
+    try std.testing.expectEqual(@as(i64, 1), lfm.object.get("num_dense_layers").?.integer);
     // An explicit layer_types is cut, not derived again.
     const w = try edit(a,
         \\{"num_hidden_layers": 3, "hybrid_layer_pattern": [0, 1, 1], "layer_types": ["full_attention", "sliding_attention", "sliding_attention"]}

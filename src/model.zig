@@ -339,6 +339,8 @@ pub const Layer = struct {
     /// Gate on the attention output, before `o`: `[heads * v_head_dim][hidden]`
     /// (Kimi K3 MLA layers, AFMoE) or `[heads][hidden]` (Laguna, per head).
     attn_gate: ?Weight = null,
+    /// Per-head bias `[heads]` on that gate's pre-activation (Beam).
+    attn_gate_bias: ?[]const f32 = null,
     /// Attention Residual scorers of this layer (Kimi K3; null otherwise).
     attn_res: ?AttnResLayer = null,
     mla: ?MlaWeights,
@@ -1690,6 +1692,14 @@ pub const Model = struct {
                 if (g.cols != c.hidden_size or (g.rows != nh * c.layerVDim(i) and g.rows != nh)) {
                     std.log.err("layer {d}: attention gate is [{d}][{d}], expected [{d} or {d}][{d}]", .{ i, g.rows, g.cols, nh * c.layerVDim(i), nh, c.hidden_size });
                     return error.InvalidConfig;
+                }
+                if (names.attn_gate_bias) |bn| {
+                    const b = try self.loadVec(try cat(arena, lp, bn));
+                    if (b.len != nh) {
+                        std.log.err("layer {d}: attention gate bias has {d} entries, expected one per head ({d})", .{ i, b.len, nh });
+                        return error.InvalidConfig;
+                    }
+                    layer.attn_gate_bias = b;
                 }
             }
             if (c.attn_layers[i] and c.dsv4 == null) {
@@ -4228,7 +4238,10 @@ fn attentionTail(model: *const Model, layer: *const Layer, li: usize, ws: *Works
         if (c.attn_temperature) |t| {
             if (!use_rope or t.all_layers) {
                 const p: f32 = @floatFromInt(pos);
-                temp = @log(@floor((p + t.offset) / t.floor_scale) + 1.0) * t.attn_scale + 1.0;
+                temp = if (t.power)
+                    @exp(t.attn_scale * std.math.log1p((p + t.offset) / t.floor_scale))
+                else
+                    @log(@floor((p + t.offset) / t.floor_scale) + 1.0) * t.attn_scale + 1.0;
             }
         }
         const norm_before = do_qk_norm and !c.qk_norm_after_rope;
@@ -4312,10 +4325,12 @@ fn attentionTail(model: *const Model, layer: *const Layer, li: usize, ws: *Works
             const a = ws.attn[r * od ..][0..od];
             const gr = g[r * gw.rows ..][0..gw.rows];
             for (a, 0..) |*v, j| {
-                const gv = if (per_head) gr[j / vd] else gr[j];
+                var gv = if (per_head) gr[j / vd] else gr[j];
+                if (layer.attn_gate_bias) |b| gv += b[j / vd];
                 v.* *= switch (c.attn_gate) {
                     .sigmoid => 1.0 / (1.0 + @exp(-gv)),
                     .softplus => softplus(gv),
+                    .silu => gv / (1.0 + @exp(-gv)),
                     .none => unreachable,
                 };
             }
@@ -4901,14 +4916,14 @@ fn layerBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Workspac
         tensor.axpy(x[0 .. n * hidden], rm, attn_out);
         tensor.axpy(x[0 .. n * hidden], rm, m);
     } else {
-        if (has_mixer) tensor.axpy(x[0 .. n * hidden], rm, attn_out);
+        if (has_mixer) residualAdd(c, x[0 .. n * hidden], attn_out, rm, 2 * (li + 1));
         if (has_mlp) {
             // A single-block MLP layer is normalised by the layer's only norm.
             normRows(c, h, x, n, hidden, if (has_mixer) layer.pre_ff_norm else layer.input_norm);
             try mlpBlock(model, layer, li, ws, h, n, null);
             const m = ws.m[0 .. n * hidden];
             if (layer.post_ff_norm) |nm| normRowsInPlace(c, m, n, hidden, nm, ws.h2);
-            tensor.axpy(x[0 .. n * hidden], rm, m);
+            residualAdd(c, x[0 .. n * hidden], m, rm, 2 * (li + 1) + 1);
         }
     }
     if (layer.ple) |*p| {
@@ -4916,6 +4931,16 @@ fn layerBlock(model: *const Model, layer: *const Layer, li: usize, ws: *Workspac
         tensor.axpy(x[0 .. n * hidden], 1.0, ws.m[0 .. n * hidden]);
     }
     if (layer.layer_scale) |s| tensor.scale(x[0 .. n * hidden], s);
+}
+
+/// `x += rm * f`, or Beam's depth-scaled add for the `k`-th residual add
+/// (`x = x * sqrt((k - 1) / k) + f / sqrt(k)`, see `ResidualLayout`).
+fn residualAdd(c: *const Config, x: []f32, f: []const f32, rm: f32, k: usize) void {
+    if (c.residual_layout != .depth_scaled) return tensor.axpy(x, rm, f);
+    const kf: f32 = @floatFromInt(k);
+    const keep = @sqrt((kf - 1) / kf);
+    const add = 1 / @sqrt(kf);
+    for (x, f) |*xv, fv| xv.* = xv.* * keep + fv * add;
 }
 
 /// The sequence-mixing sublayer of a layer: attention, one of the linear

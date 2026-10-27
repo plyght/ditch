@@ -62,10 +62,10 @@ pub const QkvLayout = enum {
     mp_blocks,
 };
 
-/// Sigmoid or softplus gate on the attention output, computed from the
-/// layer input by a separate projection (AFMoE, Laguna): `[heads * head_dim]`
-/// rows gate every coordinate, `[heads]` rows gate per head.
-pub const AttnGate = enum { none, sigmoid, softplus };
+/// Sigmoid, softplus or SiLU gate on the attention output, computed from the
+/// layer input by a separate projection (AFMoE, Laguna, Spark):
+/// `[heads * head_dim]` rows gate every coordinate, `[heads]` rows gate per head.
+pub const AttnGate = enum { none, sigmoid, softplus, silu };
 
 pub const MlpKind = enum {
     /// `down(act(gate(x)) * up(x))`.
@@ -116,6 +116,10 @@ pub const ResidualLayout = enum {
     /// MiniMax-01: `h = norm(x); x = α h + β f(h)` for both sublayers, so the
     /// residual stream itself is renormalised twice per layer.
     minimax,
+    /// Beam: `x = x * sqrt((k - 1) / k) + f(norm(x)) / sqrt(k)`, where `k`
+    /// counts the residual adds: `2 (l + 1)` for the attention of layer `l`,
+    /// one more for its MLP.
+    depth_scaled,
 };
 
 pub const TopkMethod = enum {
@@ -153,8 +157,10 @@ pub const Mla = struct {
 
 /// Position-dependent query scaling `1 + attn_scale * log(floor((pos + offset) / floor_scale) + 1)`:
 /// Llama 4 (offset 1, layers without RoPE only), Mistral 4 and Ministral 3
-/// (`llama_4_scaling_beta`, offset 0, every layer).
-pub const AttnTemperature = struct { floor_scale: f32, attn_scale: f32, offset: f32 = 1.0, all_layers: bool = false };
+/// (`llama_4_scaling_beta`, offset 0, every layer). With `power`, the scale is
+/// `(1 + (pos + offset) / floor_scale) ^ attn_scale` instead (Beam's
+/// scalable softmax on its layers without RoPE: 2048, 0.1, offset 1).
+pub const AttnTemperature = struct { floor_scale: f32, attn_scale: f32, offset: f32 = 1.0, all_layers: bool = false, power: bool = false };
 
 /// Rotary table of the local (sliding) layers when it differs from the global
 /// one (Gemma 3 family, Granite SWA, per-layer-type `rope_parameters`): base,
@@ -248,6 +254,9 @@ pub const MoeConfig = struct {
     gate_temp: f32 = 1.0,
     /// Routing weights are renormalised with a `+1e-20` floor on their sum (DeepSeek V4).
     norm_eps_floor: bool = false,
+    /// Routing weights are renormalised as `w / (sum + norm_eps)` when it is
+    /// positive (LFM2-MoE: 1e-6).
+    norm_eps: f32 = 0,
     /// Group scores are the sum of the two best selection scores even without
     /// a correction bias (Kimi Linear's router).
     group_score_top2: bool = false,
@@ -478,6 +487,8 @@ pub const Names = struct {
     /// is set) or the sigmoid / softplus gate of AFMoE and Laguna (read when
     /// `Config.attn_gate` is not `.none`).
     attn_gate: ?[]const u8 = null,
+    /// Per-head bias `[heads]` added to that gate before its activation (Beam).
+    attn_gate_bias: ?[]const u8 = null,
     /// Attention Residual (Kimi K3): per layer the RMSNorm and `[1][hidden]`
     /// score projection of the attention-side and MLP-side aggregations, and
     /// at model level those of the output aggregation. Lists hold alternative
@@ -1012,7 +1023,6 @@ fn rejectKnownHybrid(model_type: []const u8) !void {
         .{ "openai-gpt", "OpenAI GPT-1 (learned positions with tied attention/feed-forward dropout blocks)" },
         .{ "cohere2_moe", "Command A MoE (parallel residual with an averaged shared expert)" },
         .{ "granitemoe_swa", "GraniteMoE SWA (sinks plus the Granite MoE layout; not yet verified)" },
-        .{ "lfm2_moe", "LFM2-MoE (short-convolution hybrid with sigmoid-routed experts, not yet verified against a reference forward pass)" },
     };
     inline for (table) |e| {
         if (std.mem.eql(u8, model_type, e[0])) {

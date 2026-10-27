@@ -514,7 +514,14 @@ fn readValue(comptime T: type, ctx: *Ctx, idx: c_int, cur: T, mode: Mode) Error!
                         _ = c.lua_getfield(L, i, f.name.ptr);
                         defer c.lua_settop(L, -2);
                         if (c.lua_type(L, -1) == c.LUA_TNIL) {
-                            if (@typeInfo(f.type) == .optional) @field(out, f.name) = null else return ctx.fail("{s} was removed", .{f.name});
+                            // A field with a default (one added after a
+                            // definition was written) takes it; any other
+                            // missing field is a mistake.
+                            if (@typeInfo(f.type) == .optional) {
+                                @field(out, f.name) = null;
+                            } else if (f.defaultValue()) |d| {
+                                @field(out, f.name) = d;
+                            } else return ctx.fail("{s} was removed", .{f.name});
                         } else @field(out, f.name) = try readValue(f.type, ctx, -1, @field(out, f.name), mode);
                     }
                 }
