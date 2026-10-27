@@ -36,16 +36,14 @@ Two kinds of evidence, in two columns:
   transformers or the release's own code (`ditch probe --residuals` against
   `tools/probe_reference.py`); details and every number are in
   [`tools/real-model-validation.md`](../tools/real-model-validation.md).
-  **82** families are verified this way. **2** (`internlm2`, `minicpm`) are
+  **83** families are verified this way. **2** (`internlm2`, `minicpm`) are
   checked on real weights against a float32 re-implementation of the release's
   own code, because that code no longer runs under transformers 5. **11** have
   only a random-weight stub compared with transformers (the stub has the
   family's real layout but meaningless weights): their releases are gated,
   ship `.bin` without a usable tokenizer, are refused by design or were never
   published, except `deepseek_v3`, `minimax` and `minimax_m2`, whose releases
-  have only been config-checked (`--dry-run`) so far. **1** (`spark2_5`) is
-  checked against its fixture only: its reference is the release's own
-  modeling code, which has not been run yet. A cut checks the kept layers,
+  have only been config-checked (`--dry-run`) so far. A cut checks the kept layers,
   not the full depth.
 
 | Group | Families |
@@ -71,7 +69,7 @@ Pre-norm attention with a gated (or relu²) MLP and llama-style tensor names.
 | `qwen2` | `qwen2_vl(_text)`, `qwen2_5_vl(_text)`, `qwen2_5_omni(_thinker/_text)` | yes | yes: Qwen2.5-0.5B-Instruct, whole (also FP8 and INT4) | q/k/v biases, tied embeddings. The VL and Omni text configs take the same path. |
 | `qwen3` | `qwen3_vl`, `qwen3_vl_text` | yes | yes: Qwen3-0.6B, whole | per-head q/k RMSNorm. Qwen3-VL text config uses the same path. |
 | `seed_oss` | — | yes | yes: Seed-OSS-36B-Instruct, 2 layers | q/k/v biases with an unbiased `o_proj` (`attention_out_bias`), explicit `head_dim`. Seed-OSS 36B. |
-| `spark2_5` | — | yes | not yet: the release (Spark-X2.6-4B) loads (`--dry-run`); its reference is the release's own modeling code, not run yet | a fused `[q \| k \| v]` projection, a per-head sigmoid (or SiLU) gate on the attention output, sliding and full layers with their own RoPE base and rotary fraction, a gated GELU MLP, embeddings under `model.embedding` tied to the output. Spark-X 2.5 / 2.6. |
+| `spark2_5` | — | yes | yes: Spark-X2.6-4B cut (against its own code) | a fused `[q \| k \| v]` projection, a per-head sigmoid (or SiLU) gate on the attention output, sliding and full layers with their own RoPE base and rotary fraction, a gated GELU MLP, embeddings under `model.embedding` tied to the output. Spark-X 2.5 / 2.6. |
 | `smollm3` | — | yes | yes: SmolLM3-3B, 4 layers | llama layout with `no_rope_layers`. |
 | `granite` | — | yes | yes: granite-3.3-2b-instruct, 4 layers | embedding, attention and residual multipliers, logits scaling. Granite 3.x dense. |
 | `granite_swa` | — | yes | stub only (no release) | Granite multipliers plus per-head attention sinks and sliding layers with their own rope base (`layer_rope_theta`). Granite 4 SWA dense. |

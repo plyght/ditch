@@ -103,13 +103,35 @@ def install_remote_code_shims():
         def expanded(self, *a, **kw):
             tied = getattr(self, "_tied_weights_keys", None)
             if isinstance(tied, list):
-                src = next((n for n, _ in self.named_parameters() if n.endswith("embed_tokens.weight")), None)
+                # The input embedding by identity, not by name (Spark's is model.embedding).
+                emb = self.get_input_embeddings()
+                weight = getattr(emb, "weight", None)
+                src = next((n for n, p in self.named_parameters() if p is weight), None)
                 self._tied_weights_keys = {k: src for k in tied} if src and self.config.tie_word_embeddings else {}
             return expand(self, *a, **kw)
         expanded._ditch_shim = True
         PreTrainedModel.get_expanded_tied_weights_keys = expanded
     if not hasattr(DynamicCache, "to_legacy_cache"):
         DynamicCache.to_legacy_cache = lambda self: tuple((l.keys, l.values) for l in self.layers)
+    # transformers 5 renamed the mask builders' `input_embeds` to `inputs_embeds`;
+    # code imports them by name, so the module attributes are wrapped before it loads.
+    import inspect
+    import transformers.masking_utils as mu
+    for name in ("create_causal_mask", "create_sliding_window_causal_mask", "create_chunked_causal_mask"):
+        fn = getattr(mu, name, None)
+        if fn is None or getattr(fn, "_ditch_shim", False):
+            continue
+        params = inspect.signature(fn).parameters
+
+        def renamed(*a, _fn=fn, params=params, **kw):
+            if "input_embeds" in kw and "inputs_embeds" not in kw:
+                kw["inputs_embeds"] = kw.pop("input_embeds")
+            # ...and dropped `cache_position` (positions come from the cache).
+            if "cache_position" not in params:
+                kw.pop("cache_position", None)
+            return _fn(*a, **kw)
+        renamed._ditch_shim = True
+        setattr(mu, name, renamed)
 
 
 PER_LAYER = False
@@ -246,6 +268,16 @@ def main():
     mixers = [m for n, m in model.named_modules() if n.endswith("hyper_connection_mixer") and "mtp" not in n]
     if mixers:
         mixers[-1].register_forward_hook(lambda mod, inp, outp: captured.__setitem__("pre_norm", outp))
+    # Remote code that ignores `output_hidden_states` (Spark): the decoder
+    # layers' inputs stand in for the hidden states.
+    decoder = max((m for n, m in model.named_modules() if isinstance(m, torch.nn.ModuleList)
+                   and n.split(".")[-1] in ("layers", "h", "blocks") and "mtp" not in n), key=len, default=None)
+    for li, m in enumerate(decoder or []):
+        def layer_input(mod, a, kw, li=li):
+            h = a[0] if a else kw.get("hidden_states")
+            if torch.is_tensor(h):
+                captured.setdefault("layer_in", {})[li] = h
+        m.register_forward_pre_hook(layer_input, with_kwargs=True)
     report = {"model": args.model, "prompts": []}
     for entry in probe["prompts"]:
         rec = {"user": entry["user"]}
@@ -284,6 +316,7 @@ def main():
             print(f"  token ids match ({len(ids)} tokens)")
         want_residuals = "residuals" in entry
         captured.pop("hc", None)
+        captured.pop("layer_in", None)
         with torch.no_grad():
             input_ids = torch.tensor([entry["ids"]])
             out = model(input_ids=input_ids, output_hidden_states=want_residuals)
@@ -293,6 +326,9 @@ def main():
             # last block's output is then the pre-norm last entry; the normed one goes).
             if want_residuals and getattr(getattr(model, "config", None), "model_type", "") in ("mamba", "mamba2", "falcon_mamba"):
                 out.hidden_states = (model.get_input_embeddings()(input_ids),) + tuple(out.hidden_states)[:-1]
+        if want_residuals and out.hidden_states is None and captured.get("layer_in") and "pre_norm" in captured:
+            li = captured["layer_in"]
+            out.hidden_states = tuple(li[i] for i in sorted(li)) + (captured["pre_norm"],)
         if want_residuals:
             hc = captured.get("hc")
             collapsed = [hc[i] for i in sorted(hc)] if hc else None

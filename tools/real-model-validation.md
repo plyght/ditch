@@ -5686,7 +5686,27 @@ and the first full-attention (NoPE) MoE layer. With 8 of 256 experts kept, the
 cut routes every token to all 8, so the selection itself is not exercised on
 real weights (the fixture does exercise it: 4 experts, top-2, 2 groups).
 
-**`spark2_5` (XHToken/Spark-X2.6-4B) is supported against its fixture.**
+The abliteration half of the check did not fit beside a float32 export of
+that cut on this disk (`WriteFailed`, the disk full). A second cut keeps 2
+of 256 experts (4.68 GB) and runs every check:
+
+    $ python tools/truncate_checkpoint.py reflection/Beam-1.0-501B-A23B --layers 0,3,5 beam_cut2 --experts 2
+    $ ditch verify beam_cut2 --kinds
+    ditch verify beam_cut2 (layers 0,1,2)
+      pass  truncate                   layers 0,1,2 of the release
+      pass  load and forward           ditch probe ran 2 prompt(s)
+      pass  chat template (Jinja)      the model's own template, rendered by ditch's Jinja interpreter
+      pass  chat template and tokens   rendered prompts and token ids identical on 2 prompt(s)
+      pass  residuals                  all 4 entries agree, worst 1.39e-6 relative (entry 2); last third / first third 1.46
+      pass  first-token logits         worst 1.53e-6 of the logit range; argmax equal
+      pass  greedy tokens              identical on 2 prompt(s)
+      pass  abliteration study         2 trials, trial 1 exported
+      pass  abliteration directions    4 entries x 5120: unit norm within 9.2e-8 (some entries zero)
+      pass  abliteration export        reloaded export vs in-memory model: max |Δ| first-token logit 0.0000, argmax agreement 100%
+      pass  abliteration edit          6 tensors edited; 6 matrices recomputed, worst excess over the rank-3 optimum 5.02e-8
+    OK: 11 passed, 0 failed, 0 skipped
+
+**`spark2_5` (XHToken/Spark-X2.6-4B) is verified against its own code.**
 Nothing new to ditch: a fused `[q | k | v]` projection, a per-head gate on the
 attention output (a `silu` gate mode is added beside `sigmoid` and
 `softplus`, since the release's code offers it), sliding and full layers with
@@ -5699,5 +5719,28 @@ their own RoPE base and rotary fraction (read from the per-layer-type
     Dry run: the model, prompts, memory and disk estimates are in order; stopping here (exit 0).
 
 transformers has no Spark class, so the reference is the release's own
-modeling code (`trust_remote_code`), which has not been run here yet; the
-fixture is written from a reading of that code.
+modeling code (`trust_remote_code`, read first: model code only, no network,
+file or process calls). It targets transformers 4.57, and three shims in
+`probe_reference.py` let it run under 5.x: the list form of
+`_tied_weights_keys` resolved to the input embedding by identity (Spark's is
+`model.embedding`, not `embed_tokens`), the mask builders' old `input_embeds`
+keyword renamed and their removed `cache_position` dropped. The code also
+ignores `output_hidden_states`, so the harness reads the residuals from
+forward pre-hooks on the decoder layers instead. The fixture's NumPy
+reference agrees with that code to 5e-5 on the fixture weights, and on a cut
+of the release:
+
+    $ ditch verify XHToken/Spark-X2.6-4B --kinds --max-layers 4
+    ditch verify XHToken/Spark-X2.6-4B (layers 0,3)
+      pass  truncate                   layers 0,3 of the release
+      pass  load and forward           ditch probe ran 2 prompt(s)
+      pass  chat template (Jinja)      the model's own template, rendered by ditch's Jinja interpreter
+      pass  chat template and tokens   rendered prompts and token ids identical on 2 prompt(s)
+      pass  residuals                  all 3 entries agree, worst 3.16e-6 relative (entry 1)
+      pass  first-token logits         worst 1.42e-6 of the logit range; argmax equal
+      pass  greedy tokens              identical on 2 prompt(s)
+      pass  abliteration study         2 trials, trial 1 exported
+      pass  abliteration directions    3 entries x 2560: unit norm within 9.4e-9 (some entries zero)
+      pass  abliteration export        reloaded export vs in-memory model: max |Δ| first-token logit 0.0000, argmax agreement 100%
+      pass  abliteration edit          4 tensors edited; 4 matrices recomputed, worst excess over the rank-3 optimum 1.41e-7
+    OK: 11 passed, 0 failed, 0 skipped
