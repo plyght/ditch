@@ -26,5 +26,9 @@ return {
     local scale = cfg.router_scaling_factor
     if type(scale) ~= "number" then scale = cfg.routed_scaling_factor end
     c.moe.routed_scaling_factor = num(scale, 1.0)
+    -- Tencent's checkpoints (Hy-Memory-30B-A3B) size the routed and shared
+    -- experts by expert_hidden_dim, as vLLM's hy_v3 does; their
+    -- moe_intermediate_size is the transformers default and wrong.
+    if type(cfg.expert_hidden_dim) == "number" then c.moe_intermediate_size = cfg.expert_hidden_dim end
   end,
 }

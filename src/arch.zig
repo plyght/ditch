@@ -2036,6 +2036,16 @@ test "parseConfig handles the MiniMax, HunYuan, ERNIE and Granite MoE keys" {
     try std.testing.expectEqual(@as(usize, 16), m3.moe_intermediate_size);
     try std.testing.expectEqual(RouterScoring.sigmoid, m3.moe.scoring);
     try std.testing.expect(m3.moe.swiglu != null);
+    // HunYuan V3: Tencent's own checkpoints size the experts by
+    // expert_hidden_dim, which wins over a disagreeing moe_intermediate_size.
+    const hy3 = try parseConfig(a,
+        \\{"model_type":"hy_v3","hidden_size":64,"intermediate_size":96,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":16,"num_hidden_layers":2,"vocab_size":100,"num_experts":8,"num_experts_per_tok":2,"num_shared_experts":1,"moe_intermediate_size":32,"expert_hidden_dim":16,"mlp_layer_types":["dense","sparse"]}
+    );
+    try std.testing.expectEqual(@as(usize, 16), hy3.moe_intermediate_size);
+    const hy3_plain = try parseConfig(a,
+        \\{"model_type":"hy_v3","hidden_size":64,"intermediate_size":96,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":16,"num_hidden_layers":2,"vocab_size":100,"num_experts":8,"num_experts_per_tok":2,"num_shared_experts":1,"moe_intermediate_size":32,"mlp_layer_types":["dense","sparse"]}
+    );
+    try std.testing.expectEqual(@as(usize, 32), hy3_plain.moe_intermediate_size);
     // HunYuan: per-layer lists, NTK-alpha base, q/k norm after RoPE.
     const hy = try parseConfig(a,
         \\{"model_type":"hunyuan_v1_moe","hidden_size":64,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":16,"num_hidden_layers":2,"vocab_size":100,"intermediate_size":32,"num_experts":[8,8],"moe_topk":[3,3],"rope_theta":10000.0,"rope_scaling":{"type":"dynamic","alpha":1000.0}}
