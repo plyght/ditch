@@ -640,8 +640,8 @@ pub fn loadLayer(model: *Model, arena: Allocator, li: usize, lp: []const u8) !Mo
             std.log.err("missing hash routing table {s}", .{table_name});
             return error.MissingWeights;
         };
-        if (ref.dtype != .i64 or ref.cols != self.top_k or ref.rows < c.vocab_size) {
-            std.log.err("hash routing table {s} is {s} [{d}][{d}], expected I64 [{d}][{d}]", .{ table_name, ref.dtype.safetensorsName(), ref.rows, ref.cols, c.vocab_size, self.top_k });
+        if ((ref.dtype != .i64 and ref.dtype != .i32) or ref.cols != self.top_k or ref.rows < c.vocab_size) {
+            std.log.err("hash routing table {s} is {s} [{d}][{d}], expected I64 or I32 [{d}][{d}]", .{ table_name, ref.dtype.safetensorsName(), ref.rows, ref.cols, c.vocab_size, self.top_k });
             return error.InvalidConfig;
         }
         const raw = try model.store.readVecF32(arena, ref);

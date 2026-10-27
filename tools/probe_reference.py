@@ -264,6 +264,18 @@ def main():
                 for suffix, i in hc_out.items() if n.endswith(suffix) and ".layers." in n and "mtp" not in n]
     for li, m, i in hc_sites:
         m.register_forward_hook(lambda mod, inp, outp, li=li, i=i: captured.setdefault("hc", {}).__setitem__(li, outp[i]))
+    # Raon-1-mini's `layers.N.self_attn_raon_mhc` returns the coefficients
+    # (h_pre, h_post, h_res) of the streams it reads; the collapse is h_pre's.
+    for n, m in model.named_modules():
+        if n.endswith(".self_attn_raon_mhc") and ".layers." in n:
+            li = int(n.split(".layers.")[-1].split(".")[0])
+
+            def raon_collapse(mod, inp, outp, li=li):
+                stream = inp[0]
+                b, t, hc, c = stream.shape
+                pre = outp[0].reshape(b, t, hc)
+                captured.setdefault("hc", {})[li] = torch.einsum("btn,btnc->btc", pre.float(), stream.float())
+            m.register_forward_hook(raon_collapse)
     # Qwen4-Exp has no final norm: its hyper-connection mixer's collapse is what the LM head reads.
     mixers = [m for n, m in model.named_modules() if n.endswith("hyper_connection_mixer") and "mtp" not in n]
     if mixers:

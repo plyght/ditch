@@ -113,6 +113,23 @@ test "truncate config: linear_attn_config ids, 1-based (Kimi) and 0-based (GLM)"
     try std.testing.expectEqual(@as(i64, 1), glm.object.get("first_k_dense_replace").?.integer);
 }
 
+test "truncate config and kinds: Raon-1-mini rda_config ids (1-based)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text =
+        \\{"num_hidden_layers": 6, "first_k_dense_replace": 1, "moe_layer_freq": 1,
+        \\ "rda_config": {"num_heads": 4, "rda_layers": [1, 2, 3, 5, 6], "mla_layers": [4]}}
+    ;
+    // Kinds: dense RDA (0), MoE RDA (1), MoE MLA (3).
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 3 }, try kinds(a, text));
+    const v = try edit(a, text, &.{ 0, 1, 3 }, &.{});
+    const rc = v.object.get("rda_config").?.object;
+    try expectInts(&.{ 1, 2 }, rc.get("rda_layers"));
+    try expectInts(&.{3}, rc.get("mla_layers"));
+    try std.testing.expectEqual(@as(i64, 4), rc.get("num_heads").?.integer);
+}
+
 test "truncate config: DeepSeek V4.1 id lists, engram pairing, candidate source and MTP" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

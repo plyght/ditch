@@ -36,6 +36,9 @@
 //!   are `weight` I8 `[..., R, C/2]` (E2M1 nibble pairs, low nibble first,
 //!   natural layout) with an F8_E8M0 `scale` `[..., R, C/32]` — the MXFP4
 //!   store bytes again, `w = code * 2^(scale - 127)`.
+//! * MXFP8 (Raon-1-mini, `quant_method = "mxfp8"`): `weight` F8_E4M3 with a
+//!   U8 (or F8_E8M0) `weight_scale_inv` `[..., R, C/32]` of E8M0 exponents,
+//!   `w = code * 2^(scale - 127)` (the FP8 reader with exponent scales).
 //! * compressed-tensors `pack-quantized` (Kimi K2.5): `weight_packed` I32 with
 //!   `num_bits`-wide fields packed densely from the low end, `weight_scale`
 //!   per group of `group_size` columns (or per row / per tensor),
@@ -144,6 +147,19 @@ pub fn parseQuantConfig(qc: ?std.json.ObjectMap) !QuantConfig {
             }
         }
         return out;
+    }
+    if (std.mem.eql(u8, method, "mxfp8")) {
+        // E4M3 codes with an E8M0 exponent per 32 columns (Raon-1-mini's
+        // routed experts): FP8 with power-of-two block scales.
+        if (obj.get("weight_block_size")) |bs| {
+            if (bs != .array or bs.array.items.len != 2 or bs.array.items[0] != .integer or bs.array.items[1] != .integer or
+                bs.array.items[0].integer != 1 or bs.array.items[1].integer != 32)
+            {
+                std.log.err("unsupported model: mxfp8 weight_block_size other than [1, 32]", .{});
+                return error.UnsupportedArchitecture;
+            }
+        }
+        return .{ .method = .fp8, .block_rows = 1, .block_cols = 32, .label = "mxfp8" };
     }
     if (std.mem.eql(u8, method, "mxfp4")) return .{ .method = .mxfp4, .label = "mxfp4" };
     if (std.mem.eql(u8, method, "compressed-tensors")) {
@@ -852,13 +868,16 @@ fn registerFp8(gpa: Allocator, io: Io, files: []const *safetensors.File, w: Foun
     defer gpa.free(module_scale_name);
     var scale_e8m0 = false;
     const sc: Found = findFloat(files, scale_inv_name) orelse findFloat(files, scale_name) orelse findFloat(files, module_scale_name) orelse blk: {
-        if (findRaw(files, module_scale_name)) |r| if (std.mem.eql(u8, r.info.dtype, "F8_E8M0")) {
-            scale_e8m0 = true;
-            break :blk .{
-                .file = r.file,
-                .info = .{ .name = r.info.name, .dtype = .f32, .shape = r.info.shape, .offset = r.info.offset, .byte_len = r.info.byte_len, .data = &.{} },
+        // MXFP8 (Raon) stores E8M0 exponents as U8 (or F8_E8M0) `weight_scale_inv`.
+        for ([_][]const u8{ module_scale_name, scale_inv_name, scale_name }) |sn| {
+            if (findRaw(files, sn)) |r| if (std.mem.eql(u8, r.info.dtype, "F8_E8M0") or std.mem.eql(u8, r.info.dtype, "U8")) {
+                scale_e8m0 = true;
+                break :blk .{
+                    .file = r.file,
+                    .info = .{ .name = r.info.name, .dtype = .f32, .shape = r.info.shape, .offset = r.info.offset, .byte_len = r.info.byte_len, .data = &.{} },
+                };
             };
-        };
+        }
         std.log.err("{s}: {s} weights without a weight_scale_inv/weight_scale/scale tensor", .{ name, w.info.dtype });
         return error.UnsupportedArchitecture;
     };
@@ -1338,5 +1357,12 @@ test "quant config parsing" {
     var f = try std.json.parseFromSlice(std.json.Value, gpa, "{\"quant_method\": \"fp8\", \"store_dtype\": \"float8_e4m3fn\"}", .{});
     defer f.deinit();
     try std.testing.expectEqual(Method.fp8, (try parseQuantConfig(f.value.object)).method);
+    // Raon-1-mini: MXFP8 is FP8 with an E8M0 scale per 32 columns.
+    var x = try std.json.parseFromSlice(std.json.Value, gpa, "{\"quant_method\": \"mxfp8\", \"activation_scheme\": \"dynamic\", \"weight_block_size\": [1, 32], \"dequantize\": false}", .{});
+    defer x.deinit();
+    const mx = try parseQuantConfig(x.value.object);
+    try std.testing.expectEqual(Method.fp8, mx.method);
+    try std.testing.expectEqual(@as(usize, 1), mx.block_rows);
+    try std.testing.expectEqual(@as(usize, 32), mx.block_cols);
     try std.testing.expectEqual(Method.none, (try parseQuantConfig(null)).method);
 }

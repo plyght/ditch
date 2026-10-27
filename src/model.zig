@@ -90,6 +90,7 @@ pub const Slot = enum {
     lin_g_a,
     lin_g_b,
     lin_g,
+    lin_w_gate,
     light_qkv,
     light_gate,
     // Mamba blocks
@@ -222,6 +223,8 @@ pub const LinearWeights = struct {
     g_b: ?Weight = null,
     /// Full-rank KDA output gate `[heads * head_dim][hidden]` (Kimi K3), replacing `g_a`/`g_b`.
     g: ?Weight = null,
+    /// Raon Delta Attention write gate `[heads][hidden]` (`Names.lin_w_gate`).
+    w_gate: ?Weight = null,
     /// Depthwise causal convolution `[conv_dim][1][kernel]` (read as
     /// `[conv_dim][kernel]`), or one tensor per q/k/v projection (original
     /// Kimi Linear checkpoints).
@@ -450,6 +453,7 @@ pub const Layer = struct {
             .lin_f_b => self.linear.?.f_b = w,
             .lin_g_a => self.linear.?.g_a = w,
             .lin_g_b => self.linear.?.g_b = w,
+            .lin_w_gate => self.linear.?.w_gate = w,
             .light_qkv => self.linear.?.light_qkv = w,
             .light_gate => self.linear.?.light_gate = w,
             .d_q_a => self.dsv4.?.q_a = w,
@@ -459,14 +463,14 @@ pub const Layer = struct {
             .d_comp_kv => self.dsv4.?.compressor.?.kv = w,
             .d_comp_gate => self.dsv4.?.compressor.?.gate = w,
             .d_engram_wkv => self.dsv4.?.engram.?.wkv = w,
-            .hc_attn_fn => self.hyper.?.attn.mhc.fn_w = w,
-            .hc_attn_down => self.hyper.?.attn.gated.down = w,
-            .hc_attn_up => self.hyper.?.attn.gated.up = w,
-            .hc_attn_inject => self.hyper.?.attn.gated.inject = w,
-            .hc_ffn_fn => self.hyper.?.ffn.mhc.fn_w = w,
-            .hc_ffn_down => self.hyper.?.ffn.gated.down = w,
-            .hc_ffn_up => self.hyper.?.ffn.gated.up = w,
-            .hc_ffn_inject => self.hyper.?.ffn.gated.inject = w,
+            .hc_attn_fn => self.hyper.?.attn.rebind(.fn_w, w),
+            .hc_attn_down => self.hyper.?.attn.rebind(.down, w),
+            .hc_attn_up => self.hyper.?.attn.rebind(.up, w),
+            .hc_attn_inject => self.hyper.?.attn.rebind(.inject, w),
+            .hc_ffn_fn => self.hyper.?.ffn.rebind(.fn_w, w),
+            .hc_ffn_down => self.hyper.?.ffn.rebind(.down, w),
+            .hc_ffn_up => self.hyper.?.ffn.rebind(.up, w),
+            .hc_ffn_inject => self.hyper.?.ffn.rebind(.inject, w),
             .ple_key => self.ngram.?.key = w,
             .ple_value => self.ngram.?.value = w,
             .ple_conv => self.ngram.?.conv = w,
@@ -1214,15 +1218,16 @@ pub const Model = struct {
             .a_log = &.{},
             .norm = &.{},
         };
-        const proj_names = .{ names.lin_q, names.lin_k, names.lin_v, names.lin_b, names.lin_g_a, names.lin_g_b, names.lin_g };
-        const proj_slots = .{ Slot.lin_q, Slot.lin_k, Slot.lin_v, Slot.lin_b, Slot.lin_g_a, Slot.lin_g_b, Slot.lin_g };
-        const proj_rows = .{ dim, dim, dim, heads, hd, dim, dim };
-        const proj_cols = .{ hidden, hidden, hidden, hidden, hidden, hd, hidden };
+        const proj_names = .{ names.lin_q, names.lin_k, names.lin_v, names.lin_b, names.lin_g_a, names.lin_g_b, names.lin_g, names.lin_w_gate };
+        const proj_slots = .{ Slot.lin_q, Slot.lin_k, Slot.lin_v, Slot.lin_b, Slot.lin_g_a, Slot.lin_g_b, Slot.lin_g, Slot.lin_w_gate };
+        const proj_rows = .{ dim, dim, dim, heads, hd, dim, dim, heads };
+        const proj_cols = .{ hidden, hidden, hidden, hidden, hidden, hd, hidden, hidden };
         inline for (proj_names, proj_slots, proj_rows, proj_cols) |t, slot, rows, cols| {
             // The output gate is the full-rank `g` or the low-rank `g_a`/`g_b` pair.
             const wanted = switch (slot) {
                 .lin_g => c.linear_full_rank_gate,
                 .lin_g_a, .lin_g_b => !c.linear_full_rank_gate,
+                .lin_w_gate => names.lin_w_gate != null,
                 else => true,
             };
             if (wanted) {
@@ -1241,6 +1246,7 @@ pub const Model = struct {
                     .lin_g_a => lin.g_a = w,
                     .lin_g_b => lin.g_b = w,
                     .lin_g => lin.g = w,
+                    .lin_w_gate => lin.w_gate = w,
                     else => unreachable,
                 }
             }
@@ -2078,6 +2084,12 @@ pub const Model = struct {
             self.export_config_json = try dequant.stripQuantizationConfig(arena, self.config_json);
         }
         for (self.files) |f| {
+            // Integer tables stored as I32 (MemT-1.0-Flash's `tid2eid`).
+            var i: usize = 0;
+            while (i < f.raw.count()) {
+                const r = f.raw.values()[i];
+                if (std.mem.eql(u8, r.dtype, "I32")) try f.promoteRaw(r.name, .i32) else i += 1;
+            }
             var it = f.raw.iterator();
             while (it.next()) |kv| std.log.warn("skipping tensor {s} with unsupported dtype {s}", .{ kv.key_ptr.*, kv.value_ptr.dtype });
         }
@@ -3552,6 +3564,13 @@ fn kdaForward(model: *const Model, layer: *const Layer, li: usize, ws: *Workspac
     const bbuf = try gpa.alloc(f32, n * nh);
     defer gpa.free(bbuf);
     try compute.matmulT(model.pool, gpa, bbuf, h, n, lin.b.?, null);
+    // Raon write gate: per head, v is scaled by sigmoid(b + w) / sigmoid(b).
+    const vscale = try gpa.alloc(f32, if (lin.w_gate != null) n * nh else 0);
+    defer gpa.free(vscale);
+    if (lin.w_gate) |wg| {
+        try compute.matmulT(model.pool, gpa, vscale, h, n, wg, null);
+        for (vscale, bbuf) |*v, b| v.* = @exp(logSigmoid(b + v.*) - logSigmoid(b));
+    }
     // Output gate: g(h) (full rank) or g_b(g_a(h)).
     const gate = try gpa.alloc(f32, n * dim);
     defer gpa.free(gate);
@@ -3604,6 +3623,7 @@ fn kdaForward(model: *const Model, layer: *const Layer, li: usize, ws: *Workspac
             const q = q0[hh * hd ..][0..hd];
             const k = k0[hh * hd ..][0..hd];
             const v = v0[hh * hd ..][0..hd];
+            if (vscale.len > 0) tensor.scale(v, vscale[t * nh + hh]);
             const gh = g[hh * hd ..][0..hd];
             // Per-channel decay: row i of the [k_dim][v_dim] state decays by exp(g[i]).
             for (0..hd) |i| {
@@ -3747,6 +3767,11 @@ fn l2normRows(x: []f32, heads: usize, dim: usize) void {
 fn softplus(x: f32) f32 {
     if (x > 20.0) return x;
     return @log(1.0 + @exp(x));
+}
+
+/// `log(sigmoid(x)) = -softplus(-x)`, finite for large negative `x`.
+fn logSigmoid(x: f32) f32 {
+    return -softplus(-x);
 }
 
 /// Mamba sublayer (Mamba2 or Mamba1): the input projection over every row

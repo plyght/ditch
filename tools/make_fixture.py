@@ -9,8 +9,8 @@ Usage: make_fixture.py <family> [<out_dir>] [--gguf]
             the Mamba families mamba2, nemotron_h, falcon_h1, jamba, granitemoehybrid
             and their variants, and the quantised variants qwen2_fp8, qwen2_int4,
             gpt_oss_mxfp4)
-            | deepseek_v4 | deepseek_v41 | qwen4_exp | glm5_next (hyper-connection
-              families, own generators)
+            | deepseek_v4 | deepseek_v41 | qwen4_exp | glm5_next | raon1_mini
+              | raon1_mini_mxfp8 (hyper-connection families, own generators)
             | qwen3_moe_big
     --gguf: additionally write <out_dir>_gguf/model.gguf, the same model as a
             llama.cpp GGUF file (f16 attention and embedding matrices, Q8_0
@@ -908,6 +908,21 @@ spec("qwen3_5_moe", tok="qwen2", prefix="model.language_model.", H=32, I=32, L=4
                              "linear_num_key_heads": 2, "linear_key_head_dim": 4, "linear_num_value_heads": 4,
                              "linear_value_head_dim": 4, "linear_conv_kernel_dim": 2},
              "vision_config": {"model_type": "qwen3_5_moe"}})
+# MemT-1.0-Nano (MemTensor): the qwen3_5_moe fixture under MemT's wrapper
+# config (`backbone_configs`, `memt`), with the memory module's tensors on
+# the full-attention layer. Without a memory state the release runs exactly
+# its backbone, so the reference is qwen3_5_moe's; ditch never reads the
+# memory tensors and they must survive exports.
+SPECS["memt_qwen3_5_moe"] = dict(
+    SPECS["qwen3_5_moe"],
+    config={"model_type": "memt_qwen3_5_moe", "architectures": ["MemTQwen3_5MoeForCausalLM"], "tie_word_embeddings": False,
+            "backbone_configs": SPECS["qwen3_5_moe"]["config"],
+            "memt": {"memory_update_mode": "token", "num_memory_heads": 4, "num_kv_heads": 4, "chunk_tokens": 2048,
+                     "output_gate_type": "silu", "output_gate_bias": False, "output_gate_softcap_enabled": True,
+                     "output_gate_softcap_limit": 2.0}},
+    extra_layer_tensors={3: [("self_attn.memt.in_proj.weight", (5 * 32 + 2 * 8, 32)), ("self_attn.memt.f_down.weight", (32, 8)),
+                             ("self_attn.memt.g_down.weight", (32, 8)), ("self_attn.memt.decay_bias", (32,)),
+                             ("self_attn.memt.decay_scale_log", (4,)), ("self_attn.memt.o_norm.weight", (8,))]})
 spec("glm4_moe", tok="llama3", H=32, I=32, L=3, NH=4, NKV=2, HD=8, rotary_dim=4, qk_norm="head", attn_bias=True, o_bias=False,
      moe={"E": 4, "K": 2, "MI": 12, "shared": 1, "shared_inter": 16, "scoring": "sigmoid", "group_limited": True, "n_group": 1, "topk_group": 1,
           "rsf": 2.5, "norm": True, "layers": [1, 2], "corr_bias": True, "layout": "separate", "prefix": "mlp.", "router": "gate.weight",
@@ -3151,7 +3166,7 @@ def dsv4_native_name(name):
     return n
 
 
-def generate_dsv4(family, out_dir, hub_names=False, native=False):
+def generate_dsv4(family, out_dir, hub_names=False, native=False, memt=False):
     """`hub_names` writes the hyper-connection tensors the way the released
     DeepSeek V4 / GLM-5.3-Flash checkpoints spell them (`layers.N.hc_attn_fn`,
     `hc_head_fn`) instead of transformers' module spelling (`attn_hc.fn`,
@@ -3164,7 +3179,13 @@ def generate_dsv4(family, out_dir, hub_names=False, native=False):
     matrices in FP8 with ue8m0 block scales (`<module>.scale`, F8_E8M0) and the
     routed experts in FP4 (I8 e2m1 nibble pairs with an F8_E8M0 scale per 32
     columns), `expert_dtype: fp4` at the top of config.json. The reference
-    runs on the dequantised weights."""
+    runs on the dequantised weights.
+
+    `memt` writes MemT-1.0-Flash's wrapper of the same model: model_type
+    `memt_deepseek_v4` with its `memt` settings, the memory module's tensors
+    (`self_attn.memt.*`, drawn from their own generator so every backbone
+    weight and the reference stay those of `deepseek_v4`; ditch never reads
+    them, they must survive exports) and the hash tables stored as I32."""
     v41 = family == "deepseek_v41"
     os.makedirs(out_dir, exist_ok=True)
     rng = np.random.default_rng(2026 if v41 else 2025)
@@ -3358,11 +3379,26 @@ def generate_dsv4(family, out_dir, hub_names=False, native=False):
             text_cfg.update({"expert_dtype": "fp4",
                              "quantization_config": {"activation_scheme": "dynamic", "fmt": "e4m3", "quant_method": "fp8",
                                                      "scale_fmt": "ue8m0", "weight_block_size": fp8_block}})
+    if memt:
+        config = dict(config, model_type="memt_deepseek_v4", architectures=["MemTDeepseekV4ForCausalLM"],
+                      memt={"layers": [2], "num_memory_heads": NH, "head_dim": HD, "q_rank": 8, "kv_rank": 8, "kv_groups": 2,
+                            "gate_rank": 8, "chunk_tokens": 2048, "projection": "grouped_kv_low_rank", "output_gate_bias": True})
+        mrng = np.random.default_rng(4242)
+        mp = "model.layers.2.self_attn.memt."
+        for n, shape in (("in_proj.weight", (8 + 2 * 8 + 3 * 4 + 8, H)), ("q_norm.weight", (8,)), ("q_up.weight", (NH * HD, 8)),
+                         ("k_group_norm", (8,)), ("k_group_up", (2, NH * HD // 2, 8)), ("v_group_norm", (8,)),
+                         ("v_group_up", (2, NH * HD // 2, 8)), ("b_up.weight", (NH, 4)), ("w_up.weight", (NH, 4)),
+                         ("f_down.weight", (NH * HD, 4)), ("g_down.weight", (NH * HD, 8)), ("g_down.bias", (NH * HD,)),
+                         ("decay_bias", (NH * HD,)), ("decay_scale_log", (NH,)), ("o_norm.weight", (HD,))):
+            weights[mp + n] = bf16_round(mrng.normal(0, 0.2, size=shape))
     json.dump(config, open(f"{out_dir}/config.json", "w"), indent=1)
     json.dump({"eos_token_id": vocab[eos], "bos_token_id": None, "do_sample": False}, open(f"{out_dir}/generation_config.json", "w"))
     stored = {}
     for n, w in weights.items():
-        stored[dsv4_native_name(n) if native else n] = ("I64", w) if w.dtype == np.int64 else ("BF16", bf16_bits(w))
+        if w.dtype == np.int64 and memt:
+            stored[n] = ("I32", w.astype(np.int32))
+        else:
+            stored[dsv4_native_name(n) if native else n] = ("I64", w) if w.dtype == np.int64 else ("BF16", bf16_bits(w))
     stored.update(quantised)
     header, blobs, offset = {}, [], 0
     for n in sorted(stored):
@@ -4285,6 +4321,303 @@ if FAMILY in ("qwen4_exp", "glm5_next"):
     generate_hyper(FAMILY, OUT)
     sys.exit(0)
 
+# ---------------------------------------------------------------------------
+# Raon-1-mini (raon1_mini) fixtures: Raon mHC residual streams, Raon Delta
+# Attention (KDA with the rda_w_proj write gate), NoPE MLA with a sigmoid
+# output gate, SiTU-GLU MLPs and a sigmoid MoE with a shared expert. The
+# reference follows the release's modeling_raon1_mini.py. `raon1_mini_mxfp8`
+# stores the routed experts as MXFP8 (E4M3 codes, U8 E8M0 `weight_scale_inv`
+# per 32 columns), the released layout.
+# ---------------------------------------------------------------------------
+
+
+def generate_raon(family, out_dir):
+    mxfp8 = family == "raon1_mini_mxfp8"
+    os.makedirs(out_dir, exist_ok=True)
+    rng = np.random.default_rng(2031)
+    vocab, encode, bos, eos = make_tokenizer("llama3", out_dir)
+    V = len(vocab)
+    eos_id = vocab[eos]
+    f32 = np.float32
+    H, L, HC = 32, 4, 4
+    NH, QLR, KVLR, NOPE, ROPE, VHD = 4, 12, 16, 8, 4, 8
+    NHl, DK, KC = 2, 8, 3
+    E, K, MI, DI = 4, 2, 32, 32
+    RSF, LOWER = 1.5, -5.0
+    GB, VB = 4.0, 25.0
+    eps, latent_eps, sel_eps, post_factor = 1e-5, 1e-6, 1e-5, 2.0
+    rda_layers = [1, 2, 4]  # 1-based, as rda_config lists them
+    mla_layers = [3]
+    lin_layers = [(i + 1) in rda_layers for i in range(L)]
+    SW, NZ = HC * H, (HC - 1) ** 2
+    weights = {}  # name -> (dtype, array)
+
+    def put(name, w):
+        weights[name] = ("BF16", w)
+        return w
+
+    def mat(name, rows, cols, scale=0.2):
+        return put(name, bf16_round(rng.normal(0, scale, size=(rows, cols))))
+
+    def vec(name, n, scale=0.2, mean=0.0):
+        return put(name, bf16_round(mean + rng.normal(0, scale, size=(n,))))
+
+    def scalar(name, mean, scale):
+        w = bf16_round(np.array(mean + rng.normal(0, scale), np.float32))
+        put(name, w.reshape(()))
+        return f32(w)
+
+    P = "model."
+    embed = mat(P + "embed_tokens.weight", V, H, 1.0)
+    lm_head = mat("lm_head.weight", V, H, 1.0)
+    final_norm = vec(P + "norm.weight", H, 0.1, 1.0)
+    layers = []
+    for i in range(L):
+        lp = P + f"layers.{i}."
+        d = {}
+        for site, name in (("attn", "self_attn_raon_mhc"), ("ffn", "mlp_raon_mhc")):
+            sp = lp + name + "."
+            d[site] = {"phi_pre": mat(sp + "phi_pre", HC, SW, 0.5), "phi_post": mat(sp + "phi_post", HC, SW, 0.5),
+                       "alpha_pre": scalar(sp + "alpha_pre", 1.0, 0.2), "alpha_post": scalar(sp + "alpha_post", 1.0, 0.2),
+                       "b_pre": vec(sp + "b_pre", HC, 0.3), "b_post": vec(sp + "b_post", HC, 0.3),
+                       "phi_z": mat(sp + "res.phi_z", NZ, SW, 0.5), "alpha_z": scalar(sp + "res.alpha_z", 1.0, 0.2),
+                       "b_z": vec(sp + "res.b_z", NZ, 0.5), "eta": scalar(sp + "res.eta", 0.5, 0.5)}
+        d["in_norm"] = vec(lp + "input_layernorm.weight", H, 0.1, 1.0)
+        d["post_norm"] = vec(lp + "post_attention_layernorm.weight", H, 0.1, 1.0)
+        ap = lp + "self_attn."
+        if lin_layers[i]:
+            dim = NHl * DK
+            for n in ("q", "k", "v"):
+                d[n] = mat(ap + f"{n}_proj.weight", dim, H)
+                d[n + "conv"] = mat(ap + f"{n}_conv1d.weight", dim, KC, 0.4)  # squeezed [C, K]
+            d["f_a"] = mat(ap + "f_a_proj.weight", DK, H)
+            d["f_b"] = mat(ap + "f_b_proj.weight", dim, DK)
+            d["b"] = mat(ap + "b_proj.weight", NHl, H)
+            d["w"] = mat(ap + "rda_w_proj.weight", NHl, H, 0.5)
+            d["g"] = mat(ap + "g_proj.weight", dim, H)
+            d["alog"] = vec(ap + "A_log", NHl, 0.5)
+            d["dt"] = vec(ap + "dt_bias", dim, 0.5)
+            d["lnorm"] = vec(ap + "o_norm.weight", DK, 0.1, 1.0)
+            d["o"] = mat(ap + "o_proj.weight", H, dim)
+        else:
+            d["q_a"] = mat(ap + "q_a_proj.weight", QLR, H)
+            d["q_a_norm"] = vec(ap + "q_a_layernorm.weight", QLR, 0.1, 1.0)
+            d["q_b"] = mat(ap + "q_b_proj.weight", NH * (NOPE + ROPE), QLR, 0.3)
+            d["kv_a"] = mat(ap + "kv_a_proj_with_mqa.weight", KVLR + ROPE, H)
+            d["kv_a_norm"] = vec(ap + "kv_a_layernorm.weight", KVLR, 0.1, 1.0)
+            d["kv_b"] = mat(ap + "kv_b_proj.weight", NH * (NOPE + VHD), KVLR)
+            d["g"] = mat(ap + "g_proj.weight", NH * VHD, H)
+            d["o"] = mat(ap + "o_proj.weight", H, NH * VHD)
+        if i >= 1:  # first_k_dense_replace = 1
+            mp = lp + "moe."
+            d["router"] = mat(mp + "gate.weight", E, H)
+            d["corr_b"] = put(mp + "gate.e_score_correction_bias", bf16_round(rng.normal(0, 0.5, size=(E,))))
+            experts = []
+            for e in range(E):
+                ex = {}
+                for n, shape in (("gate", (MI, H)), ("up", (MI, H)), ("down", (H, MI))):
+                    name = mp + f"experts.{e}.{n}_proj.weight"
+                    w = bf16_round(rng.normal(0, 0.2, size=shape))
+                    if mxfp8:
+                        w, codes, sc = quant_fp8_e8m0(w, (1, 32))
+                        weights[name] = ("F8_E4M3", codes)
+                        weights[name + "_scale_inv"] = ("U8", sc)
+                    else:
+                        put(name, w)
+                    ex[n] = w
+                experts.append(ex)
+            d["experts"] = experts
+            sp = mp + "shared_experts."
+            d["shared"] = {"gate": mat(sp + "gate_proj.weight", MI, H), "up": mat(sp + "up_proj.weight", MI, H),
+                           "down": mat(sp + "down_proj.weight", H, MI)}
+        else:
+            d["mlp"] = {"gate": mat(lp + "mlp.gate_proj.weight", DI, H), "up": mat(lp + "mlp.up_proj.weight", DI, H),
+                        "down": mat(lp + "mlp.down_proj.weight", H, DI)}
+        layers.append(d)
+
+    config = {
+        "model_type": "raon1_mini", "architectures": ["Raon1MiniForCausalLM"],
+        "hidden_size": H, "num_hidden_layers": L, "num_attention_heads": NH, "head_dim": DK,
+        "vocab_size": V, "tie_word_embeddings": False, "max_position_embeddings": 128,
+        "rms_norm_eps": eps, "rope_parameters": None, "hidden_act": "situ",
+        "activation_situ_beta": GB, "activation_situ_linear_beta": VB, "intermediate_size": DI,
+        "first_k_dense_replace": 1, "moe_layer_freq": 1, "num_experts": E, "num_experts_per_token": K,
+        "moe_intermediate_size": MI, "num_shared_experts": 1, "moe_router_activation_func": "sigmoid",
+        "moe_renormalize": True, "routed_scaling_factor": RSF, "q_lora_rank": QLR, "kv_lora_rank": KVLR,
+        "qk_nope_head_dim": NOPE, "qk_rope_head_dim": ROPE, "v_head_dim": VHD, "mla_use_nope": True,
+        "mla_use_output_gate": True, "raon_mhc_streams": HC, "rda_decay_rank": DK,
+        "rda_config": {"num_heads": NHl, "head_dim": DK, "conv_kernel_size": KC, "full_rank_gate": True,
+                       "gate_lower_bound": LOWER, "mla_layers": mla_layers, "rda_layers": rda_layers},
+        "eos_token_id": eos_id, "pad_token_id": eos_id, "torch_dtype": "bfloat16",
+    }
+    if mxfp8:
+        config["quantization_config"] = {"quant_method": "mxfp8", "activation_scheme": "dynamic", "weight_block_size": [1, 32],
+                                         "ignored_layers": ["lm_head", "model.layers.*.self_attn*", "model.layers.*.mlp*", "model.layers.*.moe.gate*",
+                                                            "model.layers.*.moe.shared_experts*", "model.layers.*.moe.experts$"],
+                                         "dequantize": False}
+    json.dump(config, open(f"{out_dir}/config.json", "w"), indent=1)
+    json.dump({"eos_token_id": eos_id, "bos_token_id": vocab[bos] if bos else None, "do_sample": False},
+              open(f"{out_dir}/generation_config.json", "w"))
+    header, blobs, offset = {}, [], 0
+    for n in sorted(weights):
+        dt, w = weights[n]
+        u = np.ascontiguousarray(bf16_bits(w) if dt == "BF16" else w.astype(np.uint8))
+        # (`ascontiguousarray` makes a 0-d scalar [1]; the checkpoint stores it as []).
+        header[n] = {"dtype": dt, "shape": list(np.shape(w)), "data_offsets": [offset, offset + u.nbytes]}
+        blobs.append(u.tobytes())
+        offset += u.nbytes
+    hb = json.dumps(header).encode()
+    hb += b" " * ((8 - len(hb) % 8) % 8)
+    with open(f"{out_dir}/model.safetensors", "wb") as f:
+        f.write(struct.pack("<Q", len(hb)))
+        f.write(hb)
+        for b in blobs:
+            f.write(b)
+
+    # --- reference forward pass (float32, after modeling_raon1_mini.py) ---
+
+    def rms(x, w, e=eps):
+        return (x / np.sqrt(np.mean(x * x, -1, keepdims=True) + f32(e)) * w).astype(f32)
+
+    def sigmoid(x):
+        return (1 / (1 + np.exp(-x))).astype(f32)
+
+    def silu(x):
+        return (x / (1 + np.exp(-x))).astype(f32)
+
+    def logsigmoid(x):
+        return -np.logaddexp(0, -x)
+
+    def situ_glu(g, v):
+        return (GB * np.tanh(g / GB) * sigmoid(g) * (VB * np.tanh(v / VB))).astype(f32)
+
+    def normalize(x):  # F.normalize(eps=1e-6)
+        return x / np.maximum(np.sqrt(np.sum(x * x, -1, keepdims=True)), 1e-6)
+
+    helm = np.zeros((HC, HC - 1), f32)
+    for k in range(1, HC):
+        helm[:k, k - 1] = 1.0
+        helm[k, k - 1] = -float(k)
+        helm[:, k - 1] /= np.sqrt(k * (k + 1.0))
+    eye = np.eye(HC, dtype=f32)
+    chart_b = 0.5 * (eye + 1.0 / HC)
+
+    def route(x, site):
+        T = x.shape[0]
+        flat = x.reshape(T, SW)
+        inv = 1 / np.sqrt(np.mean(flat * flat, -1, keepdims=True) + f32(sel_eps))
+        z = np.concatenate([flat @ site["phi_pre"].T, flat @ site["phi_post"].T, flat @ site["phi_z"].T], -1) * inv
+        h_pre = sigmoid(site["alpha_pre"] * z[:, :HC] + site["b_pre"])
+        h_post = post_factor * sigmoid(site["alpha_post"] * z[:, HC:2 * HC] + site["b_post"])
+        t_z = (site["alpha_z"] * z[:, 2 * HC:] + site["b_z"]).reshape(T, HC - 1, HC - 1)
+        e = np.einsum("im,bmk,jk->bij", helm, t_z, helm)
+        rho = np.maximum((-e / chart_b).max(axis=(-2, -1)), 0.0)
+        phi = chart_b + e / (1.0 + rho)[:, None, None]
+        gamma = sigmoid(site["eta"])
+        return h_pre, h_post, ((1 - gamma) * eye + gamma * phi).astype(f32)
+
+    def conv(x, w):
+        T, C = x.shape
+        y = np.zeros((T, C), f32)
+        for t in range(T):
+            for j in range(KC):
+                src = t - (KC - 1) + j
+                if src >= 0:
+                    y[t] += w[:, j] * x[src]
+        return silu(y)
+
+    def rda(d, h):
+        T = h.shape[0]
+        dim = NHl * DK
+        q = conv(h @ d["q"].T, d["qconv"]).reshape(T, NHl, DK)
+        k = conv(h @ d["k"].T, d["kconv"]).reshape(T, NHl, DK)
+        v = conv(h @ d["v"].T, d["vconv"]).reshape(T, NHl, DK)
+        q = normalize(q) * DK ** -0.5
+        k = normalize(k)
+        decay = ((h @ d["f_a"].T) @ d["f_b"].T).reshape(T, NHl, DK) + d["dt"].reshape(NHl, DK)
+        log_alpha = LOWER * sigmoid(np.exp(d["alog"])[None, :, None] * decay)
+        b_raw, w_raw = h @ d["b"].T, h @ d["w"].T
+        beta = sigmoid(b_raw)
+        v = v * np.exp(logsigmoid(b_raw + w_raw) - logsigmoid(b_raw))[..., None]
+        state = np.zeros((NHl, DK, DK), f32)  # [H, V, K]
+        out = np.zeros((T, NHl, DK), f32)
+        for t in range(T):
+            state = state * np.exp(log_alpha[t])[:, None, :]
+            pred = np.einsum("hvk,hk->hv", state, k[t])
+            state = state + beta[t][:, None, None] * np.einsum("hv,hk->hvk", v[t] - pred, k[t])
+            out[t] = np.einsum("hvk,hk->hv", state, q[t])
+        o = rms(out, d["lnorm"]) * sigmoid((h @ d["g"].T).reshape(T, NHl, DK))
+        return (o.reshape(T, dim) @ d["o"].T).astype(f32)
+
+    def mla(d, h):
+        T = h.shape[0]
+        q = (rms(h @ d["q_a"].T, d["q_a_norm"], latent_eps) @ d["q_b"].T).reshape(T, NH, NOPE + ROPE)
+        kv_full = h @ d["kv_a"].T
+        kv = (rms(kv_full[:, :KVLR], d["kv_a_norm"], latent_eps) @ d["kv_b"].T).reshape(T, NH, NOPE + VHD)
+        key = np.concatenate([kv[..., :NOPE], np.repeat(kv_full[:, None, KVLR:], NH, 1)], -1)
+        val = kv[..., NOPE:]
+        out = np.zeros((T, NH, VHD), f32)
+        mask = np.triu(np.ones((T, T), dtype=bool), k=1)
+        for hh in range(NH):
+            sc = (q[:, hh] @ key[:, hh].T) / np.sqrt(NOPE + ROPE)
+            sc = np.where(mask, -np.inf, sc)
+            pr = np.exp(sc - sc.max(-1, keepdims=True))
+            out[:, hh] = (pr / pr.sum(-1, keepdims=True)) @ val[:, hh]
+        o = out.reshape(T, NH * VHD) * sigmoid(h @ d["g"].T)
+        return (o @ d["o"].T).astype(f32)
+
+    def glu(m, x):
+        return (situ_glu(x @ m["gate"].T, x @ m["up"].T) @ m["down"].T).astype(f32)
+
+    def ffn(d, h):
+        if "experts" not in d:
+            return glu(d["mlp"], h)
+        sc = sigmoid(h @ d["router"].T)
+        out = np.zeros_like(h)
+        for t in range(h.shape[0]):
+            idx = np.argsort(-(sc[t] + d["corr_b"]), kind="stable")[:K]
+            w = sc[t][idx]
+            w = w / (w.sum() + f32(1e-20)) * f32(RSF)
+            for e, we in zip(idx, w):
+                out[t] += we * glu(d["experts"][e], h[t:t + 1])[0]
+        return (out + glu(d["shared"], h)).astype(f32)
+
+    def forward(tokens):
+        T = len(tokens)
+        x = np.repeat(embed[tokens][:, None, :], HC, axis=1).astype(f32)
+        hidden = []
+        for li, d in enumerate(layers):
+            pre, post, res = route(x, d["attn"])
+            collapsed = np.einsum("tn,tnc->tc", pre, x).astype(f32)
+            hidden.append(collapsed.copy())
+            h = rms(collapsed, d["in_norm"])
+            a = rda(d, h) if lin_layers[li] else mla(d, h)
+            x = (np.einsum("tij,tjc->tic", res, x) + post[:, :, None] * a[:, None, :]).astype(f32)
+            pre, post, res = route(x, d["ffn"])
+            m = ffn(d, rms(np.einsum("tn,tnc->tc", pre, x), d["post_norm"]))
+            x = (np.einsum("tij,tjc->tic", res, x) + post[:, :, None] * m[:, None, :]).astype(f32)
+        final = x.mean(1).astype(f32)
+        hidden.append(final.copy())
+        return (rms(final, final_norm) @ lm_head.T).astype(f32), hidden
+
+    cases = []
+    for t in ["the ant or you", "hello 42 the ant or you an era in the"]:
+        ids = encode(t)
+        if bos:
+            ids = [vocab[bos]] + ids
+        logits, hid = forward(ids)
+        cases.append({"text": t, "ids": ids, "last_logits": [round(float(v), 4) for v in logits[-1]],
+                      "argmax": int(np.argmax(logits[-1])),
+                      "last_hidden": [[round(float(v), 4) for v in hh[-1]] for hh in hid]})
+    json.dump({"family": family, "cases": cases}, open(f"{out_dir}/reference.json", "w"), separators=(",", ":"))
+    print(f"wrote fixture to {out_dir}: vocab={V}, layers={L}, hidden={H}, streams={HC}")
+
+
+if FAMILY in ("raon1_mini", "raon1_mini_mxfp8"):
+    generate_raon(FAMILY, OUT)
+    sys.exit(0)
+
+
 
 if FAMILY == "deepseek_v4_hubnames":
     generate_dsv4("deepseek_v4", OUT, hub_names=True)
@@ -4296,6 +4629,10 @@ if FAMILY == "deepseek_v4_native":
 
 if FAMILY in ("deepseek_v4", "deepseek_v41"):
     generate_dsv4(FAMILY, OUT)
+    sys.exit(0)
+
+if FAMILY == "memt_deepseek_v4":
+    generate_dsv4("deepseek_v4", OUT, memt=True)
     sys.exit(0)
 
 

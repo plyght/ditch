@@ -329,6 +329,21 @@ pub const File = struct {
         return self.next_virtual;
     }
 
+    /// Moves the raw tensor `name` into the typed index as `dtype` (an I32
+    /// integer table that no dequantiser claimed).
+    pub fn promoteRaw(self: *File, name: []const u8, dtype: DType) !void {
+        const r = self.raw.get(name) orelse return error.InvalidSafetensors;
+        try self.tensors.put(self.arena.allocator(), r.name, .{
+            .name = r.name,
+            .dtype = dtype,
+            .shape = r.shape,
+            .data = if (self.map) |m| m.memory[@intCast(r.offset)..][0..r.byte_len] else &.{},
+            .offset = r.offset,
+            .byte_len = r.byte_len,
+        });
+        _ = self.raw.orderedRemove(name);
+    }
+
     /// Registers a dequantiser as the bf16 tensor `dq.name` of `shape`
     /// (`data` is its decoded bytes when the file is mapped, else empty). The
     /// file owns `dq` from now on.

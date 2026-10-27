@@ -311,6 +311,10 @@ pub const HyperKind = enum {
     /// sigmoid input mixer averaged over the streams, and a sigmoid
     /// injection weight per stream on the block output (no stream mixing).
     gated,
+    /// Raon mHC (Raon-1-mini): sigmoid collapse and expansion weights and a
+    /// Helmert chart of a doubly-stochastic mixing matrix blended with the
+    /// identity; `eps` is the selector's RMS epsilon.
+    raon,
 };
 
 /// The final collapse of the streams before the last norm.
@@ -332,6 +336,8 @@ pub const Hyper = struct {
     eps: f32 = 1e-6,
     /// Rank of the gated input mixer (`hc_lowrank`).
     lowrank: usize = 0,
+    /// Raon mHC: the expansion weights are `post_factor * sigmoid(...)`.
+    post_factor: f32 = 2.0,
 };
 
 /// A sparse-attention indexer run as its dense equivalent: the reference
@@ -482,6 +488,10 @@ pub const Names = struct {
     /// Full-rank KDA output gate (Kimi K3 `use_full_rank_gate`), used instead
     /// of `lin_g_a`/`lin_g_b` when `Config.linear_full_rank_gate` is set.
     lin_g: ?[]const u8 = null,
+    /// Raon Delta Attention write gate `[heads][hidden]` (`rda_w_proj`): the
+    /// values are scaled per head by `sigmoid(b + w) / sigmoid(b)`, so the
+    /// write strength is `sigmoid(b + w)` while the erase stays `sigmoid(b)`.
+    lin_w_gate: ?[]const u8 = null,
     /// Gate on the attention output before `o`: the sigmoid gate of Kimi K3's
     /// MLA layers (`mla_use_output_gate`, read when `Config.mla_output_gate`
     /// is set) or the sigmoid / softplus gate of AFMoE and Laguna (read when
@@ -1133,6 +1143,8 @@ pub fn parseConfigAs(arena: Allocator, json_text: []const u8, family: ?*const Ar
         obj = tc;
         if (getStr(obj, "model_type")) |m| model_type = m;
     }
+    // MemT (MemTensor) nests its backbone's config under `backbone_configs`.
+    if (getObj(obj, "backbone_configs")) |bc| obj = bc;
     // Multimodal wrappers keep the text config nested.
     var arch_opt: ?*const Arch = null;
     if (getObj(obj, "text_config")) |tc| {

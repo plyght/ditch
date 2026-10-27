@@ -15,6 +15,12 @@
 //!   and their mean is the block input (there is no further input norm); the
 //!   block output is added to every stream with a sigmoid injection weight,
 //!   and the streams are never mixed.
+//! * Raon mHC (Raon-1-mini): projections of the RMS-scaled flattened streams
+//!   give sigmoid collapse weights `pre`, expansion weights
+//!   `post_factor * sigmoid` and a `(hc - 1)^2` chart `Z` of the stream
+//!   mixing matrix: `E = Q Z Qᵀ` with the Helmert basis `Q`, scaled into the
+//!   doubly-stochastic set around `B = (I + 11ᵀ/hc) / 2` and blended with the
+//!   identity by `sigmoid(eta)`.
 //!
 //! The final collapse before the last norm is the family's head: V4's
 //! weighted `hc_head`, V4.1's last collapse weights, GLM's unweighted mean or
@@ -58,6 +64,22 @@ pub const MhcSite = struct {
     scale: []const f32,
 };
 
+/// One Raon mHC site (`self_attn_raon_mhc` / `mlp_raon_mhc`).
+pub const RaonSite = struct {
+    /// `[hc][hc * hidden]` collapse and expansion selectors.
+    phi_pre: Weight,
+    phi_post: Weight,
+    /// `[(hc - 1)^2][hc * hidden]` mixing chart selector (`res.phi_z`).
+    phi_z: Weight,
+    /// Scales of pre, post and the chart (`alpha_pre`, `alpha_post`, `res.alpha_z`).
+    alpha: [3]f32,
+    b_pre: []const f32,
+    b_post: []const f32,
+    b_z: []const f32,
+    /// Identity blend `sigmoid(eta)` (`res.eta`).
+    eta: f32,
+};
+
 /// One gated site (`attn_hyper_connection` / `mlp_hyper_connection`, or the
 /// final `hyper_connection_mixer` without `inject`).
 pub const GatedSite = struct {
@@ -73,6 +95,27 @@ pub const GatedSite = struct {
 pub const Site = union(enum) {
     mhc: MhcSite,
     gated: GatedSite,
+    raon: RaonSite,
+
+    /// Rebinds a streamed matrix (model.zig's `Slot`s `hc_*_fn`, `_down`,
+    /// `_up`, `_inject`) to its field in whichever site flavour holds it.
+    pub fn rebind(self: *Site, comptime which: enum { fn_w, down, up, inject }, w: Weight) void {
+        switch (self.*) {
+            .mhc => |*m| m.fn_w = w,
+            .gated => |*g| switch (which) {
+                .down => g.down = w,
+                .up => g.up = w,
+                .inject => g.inject = w,
+                .fn_w => unreachable,
+            },
+            .raon => |*r| switch (which) {
+                .fn_w => r.phi_pre = w,
+                .down => r.phi_post = w,
+                .up => r.phi_z = w,
+                .inject => unreachable,
+            },
+        }
+    }
 };
 
 pub const LayerWeights = struct {
@@ -163,6 +206,29 @@ fn loadSite(model: *Model, layer: *Layer, arena: Allocator, lp: []const u8, site
                 .scale = try model_mod.loadVecChecked(model, try cat(arena, p, "scale"), 3),
             } };
         },
+        .raon => {
+            const p = try std.fmt.allocPrint(arena, "{s}{s}.", .{ lp, site });
+            const nz = (hc - 1) * (hc - 1);
+            const scalar = struct {
+                fn get(m: *Model, name: []const u8) !f32 {
+                    return (try model_mod.loadVecChecked(m, name, 1))[0];
+                }
+            }.get;
+            return .{ .raon = .{
+                .phi_pre = try model_mod.loadMatChecked(model, layer, slots.fn_w, try cat(arena, p, "phi_pre"), hc, sw),
+                .phi_post = try model_mod.loadMatChecked(model, layer, slots.down, try cat(arena, p, "phi_post"), hc, sw),
+                .phi_z = try model_mod.loadMatChecked(model, layer, slots.up, try cat(arena, p, "res.phi_z"), nz, sw),
+                .alpha = .{
+                    try scalar(model, try cat(arena, p, "alpha_pre")),
+                    try scalar(model, try cat(arena, p, "alpha_post")),
+                    try scalar(model, try cat(arena, p, "res.alpha_z")),
+                },
+                .b_pre = try model_mod.loadVecChecked(model, try cat(arena, p, "b_pre"), hc),
+                .b_post = try model_mod.loadVecChecked(model, try cat(arena, p, "b_post"), hc),
+                .b_z = try model_mod.loadVecChecked(model, try cat(arena, p, "res.b_z"), nz),
+                .eta = try scalar(model, try cat(arena, p, "res.eta")),
+            } };
+        },
         .gated => {
             const p = try cat(arena, lp, site);
             return .{ .gated = .{
@@ -250,7 +316,7 @@ const Mix = struct {
         var m = Mix{};
         errdefer m.deinit(gpa);
         switch (hy.kind) {
-            .mhc, .mhc_single_pass => {
+            .mhc, .mhc_single_pass, .raon => {
                 m.pre = try gpa.alloc(f32, n * hc);
                 m.post = try gpa.alloc(f32, n * hc);
                 m.comb = try gpa.alloc(f32, n * hc * hc);
@@ -326,6 +392,38 @@ fn siteMix(model: *const Model, site: *const Site, x: []const f32, n: usize, out
                 sinkhorn(comb, hc, hy.sinkhorn_iters, eps);
             }
         },
+        .raon => |s| {
+            // RMS scale of the flattened streams (no weight, the selector
+            // eps), applied after the projections; f64 sums as for mHC.
+            _ = tmp;
+            const nz = (hc - 1) * (hc - 1);
+            const rows_ = 2 * hc + nz;
+            const proj = try gpa.alloc(f32, n * rows_);
+            defer gpa.free(proj);
+            const wrow = try gpa.alloc(f32, sw);
+            defer gpa.free(wrow);
+            const inv = try gpa.alloc(f64, n);
+            defer gpa.free(inv);
+            for (0..n) |t| {
+                const src = x[t * sw ..][0..sw];
+                inv[t] = 1.0 / @sqrt(dot64(src, src) / @as(f64, @floatFromInt(sw)) + hy.eps);
+            }
+            for (0..rows_) |r| {
+                if (r < hc) s.phi_pre.row(r, wrow) else if (r < 2 * hc) s.phi_post.row(r - hc, wrow) else s.phi_z.row(r - 2 * hc, wrow);
+                for (0..n) |t| proj[t * rows_ + r] = @floatCast(dot64(x[t * sw ..][0..sw], wrow) * inv[t]);
+            }
+            const gamma = sigmoid(s.eta);
+            for (0..n) |t| {
+                const p = proj[t * rows_ ..][0..rows_];
+                for (0..hc) |j| {
+                    out.pre[t * hc + j] = sigmoid(s.alpha[0] * p[j] + s.b_pre[j]);
+                    out.post[t * hc + j] = hy.post_factor * sigmoid(s.alpha[1] * p[hc + j] + s.b_post[j]);
+                }
+                var z: [max_raon_streams * max_raon_streams]f32 = undefined;
+                for (0..nz) |k| z[k] = s.alpha[2] * p[2 * hc + k] + s.b_z[k];
+                raonChart(z[0..nz], hc, gamma, out.comb[t * hc * hc ..][0 .. hc * hc]);
+            }
+        },
         .gated => |s| {
             // (1 + w) RMSNorm per stream, silu(down / hc), sigmoid(up), and
             // the injection weights 2 sigmoid(inject / hc).
@@ -348,6 +446,49 @@ fn siteMix(model: *const Model, site: *const Site, x: []const f32, n: usize, out
             }
         },
     }
+}
+
+/// Streams a Raon mHC site supports (the chart is built on the stack).
+pub const max_raon_streams = 16;
+
+/// Entry `(i, m)` of the `[hc][hc - 1]` Helmert basis: orthonormal columns
+/// orthogonal to the ones vector (column `m` is `1` on rows `0..m`, `-(m+1)`
+/// on row `m + 1`, scaled by `1 / sqrt((m+1)(m+2))`).
+fn helmert(i: usize, m: usize) f32 {
+    const k: f32 = @floatFromInt(m + 1);
+    const v: f32 = if (i <= m) 1.0 else if (i == m + 1) -k else 0.0;
+    return v / @sqrt(k * (k + 1.0));
+}
+
+/// The Raon mixing matrix from its chart `z[(hc-1)^2]` (row-major `Z`):
+/// `E = Q Z Qᵀ`, `rho = max(0, max_ij -E_ij / B_ij)`, `Phi = B + E / (1 + rho)`
+/// with `B = (I + 11ᵀ/hc) / 2`, and `H = (1 - gamma) I + gamma Phi`.
+/// `comb[j][k]` receives `H[k][j]` (stream `j`'s weight in new stream `k`, as `expand` reads it).
+fn raonChart(z: []const f32, hc: usize, gamma: f32, comb: []f32) void {
+    const nm = hc - 1;
+    const inv_hc = 1.0 / @as(f32, @floatFromInt(hc));
+    var e: [max_raon_streams * max_raon_streams]f32 = undefined;
+    var qz: [max_raon_streams * max_raon_streams]f32 = undefined;
+    // qz = Q Z  ([hc][nm]), e = qz Qᵀ ([hc][hc]).
+    for (0..hc) |i| for (0..nm) |k| {
+        var acc: f32 = 0;
+        for (0..nm) |m| acc += helmert(i, m) * z[m * nm + k];
+        qz[i * nm + k] = acc;
+    };
+    var rho: f32 = 0;
+    for (0..hc) |i| for (0..hc) |j| {
+        var acc: f32 = 0;
+        for (0..nm) |k| acc += qz[i * nm + k] * helmert(j, k);
+        e[i * hc + j] = acc;
+        const b = 0.5 * ((if (i == j) @as(f32, 1) else 0) + inv_hc);
+        rho = @max(rho, -acc / b);
+    };
+    for (0..hc) |i| for (0..hc) |j| {
+        const id: f32 = if (i == j) 1 else 0;
+        const b = 0.5 * (id + inv_hc);
+        const phi = b + e[i * hc + j] / (1.0 + rho);
+        comb[j * hc + i] = (1.0 - gamma) * id + gamma * phi;
+    };
 }
 
 /// Projects `m[hc][hc]` onto the doubly-stochastic manifold: columns first,
@@ -425,7 +566,7 @@ fn collapseGated(normed: []const f32, w: []const f32, n: usize, hc: usize, hidde
 /// weights over the streams (mHC), or the mixer's weighted mean (gated).
 fn collapse(hy: arch.Hyper, mix: *const Mix, pre_mix: ?[]const f32, x: []const f32, n: usize, hc: usize, hidden: usize, out: []f32) void {
     switch (hy.kind) {
-        .mhc => collapseWeighted(x, mix.pre, n, hc, hidden, out),
+        .mhc, .raon => collapseWeighted(x, mix.pre, n, hc, hidden, out),
         .mhc_single_pass => collapseWeighted(x, pre_mix.?[0 .. n * hc], n, hc, hidden, out),
         .gated => collapseGated(mix.normed, mix.w, n, hc, hidden, out),
     }
@@ -440,7 +581,7 @@ fn expand(hy: arch.Hyper, mix: *const Mix, x: []f32, y: []const f32, n: usize, h
         const row = x[t * sw ..][0..sw];
         const yt = y[t * hidden ..][0..hidden];
         switch (hy.kind) {
-            .mhc, .mhc_single_pass => {
+            .mhc, .mhc_single_pass, .raon => {
                 @memcpy(tmp[0..sw], row);
                 const post = mix.post[t * hc ..][0..hc];
                 const comb = mix.comb[t * hc * hc ..][0 .. hc * hc];
@@ -589,4 +730,29 @@ test "dot64 keeps the small terms a long f32 sum drops" {
     for (a, b) |x, y| naive += x * y;
     try std.testing.expectEqual(@as(f32, 1), naive);
     try std.testing.expectEqual(@as(f64, 1 + 4096 * 0x1p-24), dot64(&a, &b));
+}
+
+test "raon chart: zero chart and gamma 1 give B, rows and columns sum to one" {
+    var comb: [16]f32 = undefined;
+    const z = [_]f32{0} ** 9;
+    raonChart(&z, 4, 1.0, &comb);
+    for (0..4) |i| for (0..4) |j| {
+        const b: f32 = 0.5 * ((if (i == j) @as(f32, 1) else 0) + 0.25);
+        try std.testing.expectApproxEqAbs(b, comb[i * 4 + j], 1e-7);
+    };
+    // Any chart: E has zero row and column sums (Qᵀ1 = 0), so H stays
+    // doubly stochastic, and rho keeps every entry non-negative.
+    const z2 = [_]f32{ 3, -1, 0.5, 2, -4, 1, 0, 0.25, -2 };
+    raonChart(&z2, 4, 0.7, &comb);
+    for (0..4) |i| {
+        var rs: f32 = 0;
+        var cs: f32 = 0;
+        for (0..4) |j| {
+            rs += comb[i * 4 + j];
+            cs += comb[j * 4 + i];
+            try std.testing.expect(comb[i * 4 + j] >= -1e-6);
+        }
+        try std.testing.expectApproxEqAbs(@as(f32, 1), rs, 1e-5);
+        try std.testing.expectApproxEqAbs(@as(f32, 1), cs, 1e-5);
+    }
 }

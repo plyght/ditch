@@ -68,6 +68,12 @@ const RegexKind = enum {
     /// (`(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+`), digits are single, and
     /// punctuation takes at most one line break or `/` after it.
     phrase,
+    /// Raon-1-mini's phrase pattern: CJK / kana runs (` ?[一-龥぀-ゟ゠-ヿ]+`)
+    /// first; words of the other letters (each with its marks) joined by
+    /// single spaces, after an optional space; digits in groups of three
+    /// counted from the right (`\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))`);
+    /// punctuation followed by any line breaks or `/`.
+    raon,
     llama3,
     /// nanochat's GPT-4-style split: Llama 3's with digit runs of at most two
     /// (`\p{N}{1,2}`). Its possessive quantifiers and single-`[\r\n]` line
@@ -850,6 +856,7 @@ pub const Tokenizer = struct {
         if (has(r, "\\p{Lu}")) return if (has(r, "|\\p{N}|")) .o200k_digit1 else .o200k;
         if (has(r, "\\p{P}\\p{S}")) return .deepseek3;
         if (has(r, "\\p{N}{1,2}") and has(r, "\\p{L}+")) return .nanochat;
+        if (has(r, "\\p{L})\\p{M}*)+(?: (?:(?:(?!")) return .raon;
         if (has(r, "{1,3}")) return .llama3;
         if (has(r, "(?:\\p{L}\\p{M}*(?: \\p{L}\\p{M}*)*)+")) return .phrase;
         if (has(r, "[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+") and has(r, "[^\\s\\p{L}\\p{M}\\p{N}]")) return .qwen3_5;
@@ -902,7 +909,7 @@ pub const Tokenizer = struct {
         if (!self.byte_level) return null;
         for (self.steps) |st| {
             if (st == .regex) return switch (st.regex) {
-                .qwen2, .qwen2_bare_punct, .qwen3_5, .phrase => "qwen2",
+                .qwen2, .qwen2_bare_punct, .qwen3_5, .phrase, .raon => "qwen2",
                 .llama3 => "llama-bpe",
                 // No llama.cpp pre-tokenizer splits digits in pairs; the nearest
                 // one (nanochat has no llama.cpp architecture to export to anyway).
@@ -1785,6 +1792,7 @@ const RegexSplitter = struct {
             .gpt2, .qwen2, .qwen2_bare_punct, .qwen3_5, .phrase, .llama3, .nanochat => {},
             .o200k, .o200k_digit1 => return self.matchO200k(start, first),
             .kimi => return self.matchKimi(start, first),
+            .raon => return self.matchRaon(start, first),
             .deepseek3 => return self.matchDeepseek3(start, first),
             .digits3 => {
                 if (!isNumber(first.cp)) return start;
@@ -1947,7 +1955,7 @@ const RegexSplitter = struct {
                 }
                 return self.matchWhitespace(start);
             },
-            .o200k, .o200k_digit1, .kimi, .deepseek3, .digits3, .newlines, .ds2_letters, .ds2_punct, .trailing_ws, .cjk, .cjk_kana, .nd_chunks510, .nd_lead, .nd_groups3, .script_runs => unreachable,
+            .o200k, .o200k_digit1, .kimi, .raon, .deepseek3, .digits3, .newlines, .ds2_letters, .ds2_punct, .trailing_ws, .cjk, .cjk_kana, .nd_chunks510, .nd_lead, .nd_groups3, .script_runs => unreachable,
             .qwen2, .qwen2_bare_punct, .qwen3_5, .phrase, .llama3, .nanochat => {
                 // '[^\r\n\p{L}\p{N}]?\p{L}+' (Qwen 3.5: `[\p{L}\p{M}]+`; phrase: see `phrase`)
                 const marks = self.kind == .qwen3_5;
@@ -2041,6 +2049,91 @@ const RegexSplitter = struct {
                 return self.matchWhitespace(start);
             },
         }
+    }
+
+    /// Raon-1-mini (see `RegexKind.raon`), alternative by alternative.
+    fn matchRaon(self: *const RegexSplitter, start: usize, first: Cp) usize {
+        const cjk = struct {
+            fn f(cp: u21) bool {
+                return (cp >= 0x4E00 and cp <= 0x9FA5) or (cp >= 0x3040 and cp <= 0x309F) or (cp >= 0x30A0 and cp <= 0x30FF);
+            }
+        }.f;
+        const word = struct {
+            fn f(cp: u21) bool {
+                return isLetter(cp) and !cjk(cp);
+            }
+        }.f;
+        // ` ?[CJK]+`, then ` ?W(?: W)*` with `W` = `(?:(?!CJK)\p{L}\p{M}*)+`.
+        inline for (.{ cjk, word }, 0..) |class, alt| {
+            var i = start;
+            var c = first;
+            if (c.cp == ' ') if (self.cpAt(i + 1)) |n| if (class(n.cp)) {
+                i += 1;
+                c = n;
+            };
+            if (class(c.cp)) {
+                while (self.cpAt(i)) |n| {
+                    if (class(n.cp) or (alt == 1 and inRanges(n.cp, &uni.marks))) {
+                        i += n.len;
+                    } else if (alt == 1 and n.cp == ' ') {
+                        const after = self.cpAt(i + 1) orelse break;
+                        if (!word(after.cp)) break;
+                        i += 1;
+                    } else break;
+                }
+                return i;
+            }
+        }
+        // `\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))`: the first group takes the
+        // run's length mod 3 (or 3), so the rest is whole groups of three.
+        if (isNumber(first.cp)) {
+            var run: usize = 0;
+            var j = start;
+            while (self.cpAt(j)) |n| {
+                if (!isNumber(n.cp)) break;
+                j += n.len;
+                run += 1;
+            }
+            const take = if (run % 3 == 0) 3 else run % 3;
+            return self.skipCps(start, take);
+        }
+        // ` ?[^\s\p{L}\p{N}]+[\r\n/]*`
+        const punct = struct {
+            fn f(cp: u21) bool {
+                return !isWhitespace(cp) and !isLetter(cp) and !isNumber(cp);
+            }
+        }.f;
+        var i = start;
+        var c = first;
+        if (c.cp == ' ') if (self.cpAt(i + 1)) |n| if (punct(n.cp)) {
+            i += 1;
+            c = n;
+        };
+        if (punct(c.cp)) {
+            while (self.cpAt(i)) |n| {
+                if (!punct(n.cp)) break;
+                i += n.len;
+            }
+            while (self.cpAt(i)) |n| {
+                if (!isNewline(n.cp) and n.cp != '/') break;
+                i += n.len;
+            }
+            return i;
+        }
+        // `\s*[\r\n]+`, then `\s+(?!\S)|\s+`
+        i = start;
+        var saw_nl = false;
+        var j = start;
+        while (self.cpAt(j)) |n| {
+            if (!isWhitespace(n.cp)) break;
+            j += n.len;
+            if (isNewline(n.cp)) {
+                saw_nl = true;
+                i = j;
+            }
+        }
+        if (saw_nl) return i;
+        return self.matchWhitespace(start);
     }
 
     /// o200k (gpt-oss, Phi-4, Nemotron Nano): `[^\r\n\p{L}\p{N}]?U*L+c? | [^\r\n\p{L}\p{N}]?U+L*c? |
@@ -2436,6 +2529,29 @@ test "pre-tokenizer variants found by the tokenizer sweep" {
     const class = try Tokenizer.parseCharClass(arena.allocator(), "\\s?[A-Za-z\u{b5}\u{c0}-\u{d6}\\-]+");
     try std.testing.expect(inRanges('q', class) and inRanges(0xB5, class) and inRanges(0xC3, class) and inRanges('-', class));
     try std.testing.expect(!inRanges(0xD7, class) and !inRanges(0x939, class) and !inRanges('[', class));
+}
+
+test "regex splitter raon: CJK runs, space-joined words, right-aligned digit groups" {
+    // Pieces from `tokenizers`' Split on KRAFTON/Raon-1-mini-preview's pattern.
+    const Case = struct { text: []const u8, want: []const []const u8 };
+    const cases = [_]Case{
+        .{ .text = "You are a helpful assistant.", .want = &.{ "You are a helpful assistant", "." } },
+        .{ .text = "1234567 and 12, 9999/10", .want = &.{ "1", "234", "567", " and", " ", "12", ",", " ", "9", "999", "/", "10" } },
+        .{ .text = "\u{65e5}\u{672c}\u{8a9e}\u{306e}\u{30c6}\u{30ad}\u{30b9}\u{30c8} and English \u{d55c}\u{ad6d}\u{c5b4} \u{bb38}\u{c7a5}\u{c785}\u{b2c8}\u{b2e4}", .want = &.{ "\u{65e5}\u{672c}\u{8a9e}\u{306e}\u{30c6}\u{30ad}\u{30b9}\u{30c8}", " and English \u{d55c}\u{ad6d}\u{c5b4} \u{bb38}\u{c7a5}\u{c785}\u{b2c8}\u{b2e4}" } },
+        .{ .text = " \u{6771}\u{4eac}\u{30bf}\u{30ef}\u{30fc} is tall", .want = &.{ " \u{6771}\u{4eac}\u{30bf}\u{30ef}\u{30fc}", " is tall" } },
+        .{ .text = "a/b\n\n  x  \ty", .want = &.{ "a", "/", "b", "\n\n", " ", " x", "  ", "\t", "y" } },
+        .{ .text = "\u{e9}t\u{e9} caf\u{e9} ok", .want = &.{ "\u{e9}t\u{e9} caf\u{e9} ok" } },
+        .{ .text = "e\u{301} x", .want = &.{ "e\u{301} x" } },
+        .{ .text = "Hello!!\n/next", .want = &.{ "Hello", "!!\n/", "next" } },
+        .{ .text = "na\u{ef}ve\u{2014}test\u{2026} 3.14159", .want = &.{ "na\u{ef}ve", "\u{2014}", "test", "\u{2026}", " ", "3", ".", "14", "159" } },
+        .{ .text = "\u{4e2d}\u{6587}mixed\u{82f1}\u{6587}", .want = &.{ "\u{4e2d}\u{6587}", "mixed", "\u{82f1}\u{6587}" } },
+    };
+    for (cases) |c| {
+        var it = RegexSplitter{ .text = c.text, .kind = .raon };
+        for (c.want) |w| try std.testing.expectEqualStrings(w, it.next().?);
+        try std.testing.expect(it.next() == null);
+    }
+    try std.testing.expectEqual(RegexKind.raon, Tokenizer.classifyRegex(" ?[\u{4e00}-\u{9fa5}\u{3040}-\u{309f}\u{30a0}-\u{30ff}]+| ?(?:(?:(?![\u{4e00}-\u{9fa5}\u{3040}-\u{309f}\u{30a0}-\u{30ff}])\\p{L})\\p{M}*)+(?: (?:(?:(?![\u{4e00}-\u{9fa5}\u{3040}-\u{309f}\u{30a0}-\u{30ff}])\\p{L})\\p{M}*)+)*|\\p{N}{1,3}(?=(?:\\p{N}{3})*(?!\\p{N}))| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"));
 }
 
 test "added tokens absorb the whitespace their lstrip / rstrip flags name (Phi-3)" {

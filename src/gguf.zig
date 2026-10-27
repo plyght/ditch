@@ -171,6 +171,7 @@ pub fn ggmlFromDtype(d: DType) GgmlType {
         .f16 => .f16,
         .bf16 => .bf16,
         .i64 => .i64,
+        .i32 => .i32,
         .q8_0 => .q8_0,
         .q4_0 => .q4_0,
         .q4_1 => .q4_1,
@@ -195,7 +196,7 @@ pub fn fileType(d: DType) u32 {
         .q4_k => 15,
         .q6_k => 18,
         .bf16 => 32,
-        .i64 => 0,
+        .i64, .i32 => 0,
         .q8_k => 1024, // "guessed"
     };
 }

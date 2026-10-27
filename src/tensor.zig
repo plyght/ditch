@@ -15,6 +15,11 @@ pub const DType = enum {
     /// 64-bit integers (index tables such as DeepSeek V4's `tid2eid`); carried
     /// through exports untouched and read as integers, never as weights.
     i64,
+    /// 32-bit integers (the same tables as MemT-1.0-Flash stores them). Not
+    /// read from a header directly: I32 is also the packed-code dtype of
+    /// pack-quantized weights, so an I32 tensor is first offered to
+    /// dequant.zig and promoted (`File.promoteRaw`) only when left over.
+    i32,
     // ggml block-quantised formats (see quant.zig); only meaningful for row-major matrices
     // whose row length is a multiple of the block size.
     q8_0,
@@ -32,13 +37,14 @@ pub const DType = enum {
             .f32 => 4,
             .f16, .bf16 => 2,
             .i64 => 8,
+            .i32 => 4,
             else => unreachable,
         };
     }
 
     pub fn isQuantized(self: DType) bool {
         return switch (self) {
-            .f32, .f16, .bf16, .i64 => false,
+            .f32, .f16, .bf16, .i64, .i32 => false,
             else => true,
         };
     }
@@ -89,6 +95,7 @@ pub const DType = enum {
             .f16 => "F16",
             .bf16 => "BF16",
             .i64 => "I64",
+            .i32 => "I32",
             .q8_0 => "Q8_0",
             .q4_0 => "Q4_0",
             .q4_1 => "Q4_1",
@@ -470,6 +477,10 @@ pub fn convertToF32(dtype: DType, bytes: []const u8, out: []f32) void {
             const src = std.mem.bytesAsSlice(i64, bytes[0 .. out.len * 8]);
             for (out, 0..) |*o, i| o.* = @floatFromInt(src[i]);
         },
+        .i32 => {
+            const src = std.mem.bytesAsSlice(i32, bytes[0 .. out.len * 4]);
+            for (out, 0..) |*o, i| o.* = @floatFromInt(src[i]);
+        },
         else => quant.dequantize(dtype, bytes, out),
     }
 }
@@ -487,6 +498,10 @@ pub fn convertFromF32(dtype: DType, src: []const f32, out: []u8) void {
         },
         .i64 => {
             const dst = std.mem.bytesAsSlice(i64, out[0 .. src.len * 8]);
+            for (src, 0..) |v, i| dst[i] = @intFromFloat(@round(v));
+        },
+        .i32 => {
+            const dst = std.mem.bytesAsSlice(i32, out[0 .. src.len * 4]);
             for (src, 0..) |v, i| dst[i] = @intFromFloat(@round(v));
         },
         else => quant.quantize(dtype, src, out),

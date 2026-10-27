@@ -1,0 +1,55 @@
+{
+ "model_type": "raon1_mini",
+ "architectures": [
+  "Raon1MiniForCausalLM"
+ ],
+ "hidden_size": 32,
+ "num_hidden_layers": 4,
+ "num_attention_heads": 4,
+ "head_dim": 8,
+ "vocab_size": 275,
+ "tie_word_embeddings": false,
+ "max_position_embeddings": 128,
+ "rms_norm_eps": 1e-05,
+ "rope_parameters": null,
+ "hidden_act": "situ",
+ "activation_situ_beta": 4.0,
+ "activation_situ_linear_beta": 25.0,
+ "intermediate_size": 32,
+ "first_k_dense_replace": 1,
+ "moe_layer_freq": 1,
+ "num_experts": 4,
+ "num_experts_per_token": 2,
+ "moe_intermediate_size": 32,
+ "num_shared_experts": 1,
+ "moe_router_activation_func": "sigmoid",
+ "moe_renormalize": true,
+ "routed_scaling_factor": 1.5,
+ "q_lora_rank": 12,
+ "kv_lora_rank": 16,
+ "qk_nope_head_dim": 8,
+ "qk_rope_head_dim": 4,
+ "v_head_dim": 8,
+ "mla_use_nope": true,
+ "mla_use_output_gate": true,
+ "raon_mhc_streams": 4,
+ "rda_decay_rank": 8,
+ "rda_config": {
+  "num_heads": 2,
+  "head_dim": 8,
+  "conv_kernel_size": 3,
+  "full_rank_gate": true,
+  "gate_lower_bound": -5.0,
+  "mla_layers": [
+   3
+  ],
+  "rda_layers": [
+   1,
+   2,
+   4
+  ]
+ },
+ "eos_token_id": 271,
+ "pad_token_id": 271,
+ "torch_dtype": "bfloat16"
+}

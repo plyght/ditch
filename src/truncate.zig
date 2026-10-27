@@ -222,10 +222,11 @@ pub fn editConfig(a: Allocator, root: *Value, layers: []const usize, drop: []con
         v.* = .{ .array = ids };
     };
     // Kimi-Linear / Kimi K3 name their layer kinds with 1-based ids,
-    // GLM-5.3-Flash with 0-based ones (its lists contain a 0).
-    if (tc.getPtr("linear_attn_config")) |lac| if (lac.* == .object) {
-        const one: i64 = if (linearIdsZeroBased(lac.object)) 0 else 1;
-        for ([_][]const u8{ "kda_layers", "full_attn_layers" }) |key| if (lac.object.getPtr(key)) |v| if (v.* == .array) {
+    // GLM-5.3-Flash with 0-based ones (its lists contain a 0); Raon-1-mini
+    // the same way in `rda_config`.
+    for (kind_id_lists) |kl| if (tc.getPtr(kl.config)) |lac| if (lac.* == .object) {
+        const one: i64 = if (linearIdsZeroBased(lac.object, kl.lists)) 0 else 1;
+        for (kl.lists) |key| if (lac.object.getPtr(key)) |v| if (v.* == .array) {
             var ids = JsonArray.init(a);
             for (v.array.items) |x| {
                 const id = asInt(x) orelse continue;
@@ -273,8 +274,14 @@ pub fn editConfig(a: Allocator, root: *Value, layers: []const usize, drop: []con
     };
 }
 
-fn linearIdsZeroBased(lac: ObjectMap) bool {
-    for ([_][]const u8{ "kda_layers", "full_attn_layers" }) |key| if (lac.get(key)) |v| if (v == .array) {
+/// Sub-dictionaries naming each layer's kind by lists of layer ids.
+const kind_id_lists = [_]struct { config: []const u8, lists: []const []const u8 }{
+    .{ .config = "linear_attn_config", .lists = &.{ "kda_layers", "full_attn_layers" } },
+    .{ .config = "rda_config", .lists = &.{ "rda_layers", "mla_layers" } },
+};
+
+fn linearIdsZeroBased(lac: ObjectMap, lists: []const []const u8) bool {
+    for (lists) |key| if (lac.get(key)) |v| if (v == .array) {
         for (v.array.items) |x| if (asInt(x)) |id| if (id == 0) return true;
     };
     return false;
@@ -343,9 +350,9 @@ pub fn kindLayers(a: Allocator, root: Value) ![]usize {
     for (id_lists) |key| if (tc.get(key)) |v| if (v == .array) {
         for (sigs, 0..) |*s, i| try sigFlag(a, s, key, inIds(v.array.items, @intCast(i), 0));
     };
-    if (tc.get("linear_attn_config")) |lac| if (lac == .object) {
-        const one: i64 = if (linearIdsZeroBased(lac.object)) 0 else 1;
-        for ([_][]const u8{ "kda_layers", "full_attn_layers" }) |key| if (lac.object.get(key)) |v| if (v == .array) {
+    for (kind_id_lists) |kl| if (tc.get(kl.config)) |lac| if (lac == .object) {
+        const one: i64 = if (linearIdsZeroBased(lac.object, kl.lists)) 0 else 1;
+        for (kl.lists) |key| if (lac.object.get(key)) |v| if (v == .array) {
             for (sigs, 0..) |*s, i| try sigFlag(a, s, key, inIds(v.array.items, @intCast(i), one));
         };
     };

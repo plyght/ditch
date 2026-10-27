@@ -75,6 +75,8 @@ def orig(name):  # float32 view of a source tensor, dequantised (and rounded to 
         # FP8 with a per-tensor, per-expert ([E, 1, 1]) or per-block scale
         sname = next((c for c in (base + '.weight_scale_inv', name + '_scale_inv', base + '.weight_scale', name + '_scale') if c in keys), None)
         w = src.tensor(name).float(); s = src.tensor(sname).float()
+        if src.header[sname]['dtype'] == 'U8':  # MXFP8 (Raon-1-mini): E8M0 exponents as bytes
+            s = torch.exp2(s - 127)
         if s.dim() == 0 or s.numel() == 1 or (s.dim() == w.dim() and all(a in (1, b) for a, b in zip(s.shape, w.shape))):
             return (w * s).to(torch.bfloat16).float()
         bs = q.get('weight_block_size') or [-(-w.shape[-2] // s.shape[-2]), -(-w.shape[-1] // s.shape[-1])]

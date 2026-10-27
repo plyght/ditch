@@ -220,6 +220,9 @@ test "qwen3_5 fixture" {
 test "qwen3_5_moe fixture" {
     try checkFixture("qwen3_5_moe");
 }
+test "memt_qwen3_5_moe fixture (MemT-1.0-Nano: backbone_configs wrapper, memory tensors unread)" {
+    try checkFixture("memt_qwen3_5_moe");
+}
 test "glm4_moe fixture" {
     try checkFixture("glm4_moe");
 }
@@ -231,6 +234,12 @@ test "glm4_moe_lite fixture (GLM-4.7-Flash)" {
 }
 test "glm5_next fixture (GLM-5.3-Flash)" {
     try checkFixture("glm5_next");
+}
+test "raon1_mini fixture (Raon mHC streams, RDA write gate, NoPE MLA with output gate, SiTU MoE)" {
+    try checkFixture("raon1_mini");
+}
+test "raon1_mini_mxfp8 fixture (MXFP8 routed experts: E4M3 with U8 E8M0 scales)" {
+    try checkFixture("raon1_mini_mxfp8");
 }
 test "qwen4_exp fixture (Qwen3.8-Flash-Next)" {
     try checkFixture("qwen4_exp");
@@ -304,6 +313,9 @@ test "deepseek_v3 fixture with rms_norm_eps 1e-5 and small latents (latent norms
 }
 test "deepseek_v4 fixture" {
     try checkFixture("deepseek_v4");
+}
+test "memt_deepseek_v4 fixture (MemT-1.0-Flash: memory tensors unread, I32 hash tables)" {
+    try checkFixture("memt_deepseek_v4");
 }
 test "deepseek_v41 fixture" {
     try checkFixture("deepseek_v41");
@@ -779,6 +791,9 @@ test "qwen3_next edit, export and streamed reload (linear attention, gated full 
 test "qwen3_5_moe edit, export and streamed reload (split linear projections, swish gate)" {
     try checkEditExportStream("qwen3_5_moe");
 }
+test "memt_qwen3_5_moe edit, export and streamed reload (memory tensors pass through)" {
+    try checkEditExportStream("memt_qwen3_5_moe");
+}
 test "glm4_moe edit, export and streamed reload (per-head q/k norms, sigmoid MoE)" {
     try checkEditExportStream("glm4_moe");
 }
@@ -790,6 +805,12 @@ test "glm4_moe_lite edit, export and streamed reload (stacked experts, group-lim
 }
 test "glm5_next edit, export and streamed reload (mHC streams, KDA, NoPE MLA behind the indexer)" {
     try checkEditExportStream("glm5_next");
+}
+test "raon1_mini edit, export and streamed reload (Raon mHC streams, RDA, NoPE MLA)" {
+    try checkEditExportStream("raon1_mini");
+}
+test "raon1_mini_mxfp8 edit, export and streamed reload (MXFP8 experts dequantised on export)" {
+    try checkEditExportStream("raon1_mini_mxfp8");
 }
 test "qwen4_exp edit, export and streamed reload (gated streams, sharded n-gram tables)" {
     try checkEditExportStream("qwen4_exp");
@@ -859,6 +880,9 @@ test "mimo_v2_mxfp4 edit, export and streamed reload (store_dtype mxfp4 experts 
 }
 test "deepseek_v4 edit, export and streamed reload (hyper-connections, hash routing, MTP pass-through)" {
     try checkEditExportStream("deepseek_v4");
+}
+test "memt_deepseek_v4 edit, export and streamed reload (memory tensors and I32 hash tables pass through)" {
+    try checkEditExportStream("memt_deepseek_v4");
 }
 test "deepseek_v41 edit, export and streamed reload (shared compressed KV, engram tables)" {
     try checkEditExportStream("deepseek_v41");

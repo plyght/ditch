@@ -64,6 +64,8 @@ def dequant_expert(store, module, cfg_q):
         w = store.tensor(module + ".weight")
         if module + ".weight_scale_inv" in k:  # FP8 blocks, dequantised to bf16 as the integrations do
             s = store.tensor(module + ".weight_scale_inv").float()
+            if store.header[module + ".weight_scale_inv"]["dtype"] == "U8":  # MXFP8: E8M0 exponents as bytes
+                s = torch.exp2(s - 127)
             if s.numel() == 1:  # one scale for the tensor (Mistral 4)
                 return (w.float() * s.reshape(())).to(torch.bfloat16).float()
             # The configured block, the last one partial (GLM-5.3's kv_a_proj

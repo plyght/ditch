@@ -1,99 +1,102 @@
-family afmoe	e491a96e93ed95bd
-family apertus	16d0874b3f8b8a7d
-family arcee	37b9686253738ac1
-family baichuan	88427332dbe52a8
-family beam	8bc50be272487280
-family biogpt	281f29a9cb1e28ed
-family bitnet	87b7ef5f4dddd81c
-family bloom	c3e1fdf0ed84d167
-family chatglm	cf4e23fc95554943
-family codegen	444852c59ea0c135
-family cohere	faeeca60087adf74
-family deepseek_v2	65cfc9b2f772e2d3
-family deepseek_v3	d6971a1f7f7e264a
-family deepseek_v32	429226ce73488531
-family deepseek_v4	315845980903069d
-family deepseek_v41	98d8ce3ccb3d1b1d
-family dots1	6190296916ebd492
-family ernie4_5	d9800c1c53580de4
-family ernie4_5_moe	867edc63177a3680
-family exaone	99c59adba221a64c
-family exaone4	4042a0f0789f7d7d
-family exaone_moe	730fd42d1ed2197e
-family falcon	e35cf091e6dd2b1
-family falcon_h1	8366a71bac94626e
-family flex_olmo	be25b60d1c4ce872
-family gemma2	8c27e89d65570dd3
-family gemma3	6918be3e0d23fb15
-family gemma3n	fbd1f4fad02439cc
-family gemma4	894fefd98f91ddb0
-family glm4	24c3ed3b5771c589
-family glm4_moe	ae3570ebe5d8726f
-family glm4_moe_lite	a07b5d284084e564
-family glm5_next	4b40d33acaf18f97
-family glm_moe_dsa	90f3262209f154c4
-family gpt2	cc3038e435452e46
-family gpt_bigcode	8ebb67cb63565d3e
-family gpt_neo	45bed54b3a9a1a01
-family gpt_neox	fd746d6dd0888719
-family gpt_oss	d1b183ec84c18126
-family gptj	d19e6ae007763feb
-family granite	81ff9a084849c706
-family granite_swa	9144daddd7e85877
-family granitemoe	2b594bd1219866d3
-family granitemoehybrid	58353917551bfe8e
-family helium	52d1ffa793915a73
-family hunyuan_v1_dense	48d013170766bd61
-family hunyuan_v1_moe	77c03ffa63e0b200
-family hy_v3	2267c5ddbdbd4035
-family internlm2	32a2905874610898
-family jais2	84d888410518080c
-family jamba	e466f0cfa39ee40f
-family kimi_k25	a1c8a9dec256b50c
-family kimi_k3	90abfccfe3d75998
-family kimi_linear	7498265fad033707
-family laguna	330a5548d1e411c
-family lfm2	c9063db74832d824
-family lfm2_moe	de7f13cb2dbda858
-family llama	c012c7270fe5c8d8
-family llama4	664890454944c8c9
-family mamba2	9e930c60a5363b5e
-family mellum	a96ff958ba2c5c5e
-family mimo_v2_flash	16ccb87cabe9bff5
-family minicpm	16d37d2448bd0096
-family minimax	4b6dff9d0246fdd2
-family minimax_m2	5e742b452a1b4a6e
-family minimax_m3_vl_text	32e64caf4ffff48f
-family ministral3	336029ead25f86f4
-family mistral	5fc81c2d2ba06754
-family mistral4	d3ac8f2f863195a7
-family mixtral	855cae58dbd94970
-family mpt	c2db0d21bdb19244
-family nanochat	ca0c0a59178229e1
-family nemotron	f38ee74883eefdd6
-family nemotron_h	b05f805b0a9ed7c6
-family olmo	8f3e6fa2a1320d92
-family olmo2	86e38be3b5d4f86d
-family olmoe	ba992a91461327b3
-family opt	77db4a8800f9bf68
-family persimmon	3e753d4d301c78cd
-family phi	cc58d6fca11afb7e
-family phi3	6421786e10c62da8
-family qwen2	35e67bdce7d787d2
-family qwen2_moe	5c5e43c52857db24
-family qwen3	79c0e546823ff61a
-family qwen3_5	65817247e38c5294
-family qwen3_5_moe	7b918c7b4a18f50e
-family qwen3_moe	fa8d06e5fecbf732
-family qwen3_next	197d56374043222c
-family qwen4_exp	4d5d43b16d031315
-family seed_oss	402be27d0f65d791
-family smollm3	47e7ad5060604a1d
-family solar_open	97a9f95722227e0a
-family spark2_5	7ce160d67a676621
-family stablelm	69e0d5eb37666d65
-family starcoder2	fb409f7a0bd3a333
-family xglm	25ecf7899aa89e94
+family afmoe	64b88d5164be6bf7
+family apertus	9ef63bdc073128e3
+family arcee	c9ec95b36db3c044
+family baichuan	70a6d7e133ffc3ce
+family beam	4eed694197639b47
+family biogpt	4662bacb4bf87b37
+family bitnet	4d357efb6cba5a03
+family bloom	9d4cbea593760a49
+family chatglm	55dc3f4bff06d784
+family codegen	540ca7b1012e0dc5
+family cohere	a6f855d03e4611bb
+family deepseek_v2	188a95278854b57e
+family deepseek_v3	545d70c0262bd6ea
+family deepseek_v32	fb14d4bf6c16e45b
+family deepseek_v4	14c3f3ea4e690819
+family deepseek_v41	87c7874d4ec74876
+family dots1	76b85435b619e259
+family ernie4_5	6f600b5d4ec70150
+family ernie4_5_moe	1011936773046e37
+family exaone	d573f46ef664b305
+family exaone4	5d7958322cc30de7
+family exaone_moe	a968fc7f54f6300e
+family falcon	c8a04a64ce730218
+family falcon_h1	761c3764c1fe0b74
+family flex_olmo	7a8d7b5fed8094b7
+family gemma2	d0d1dfcf44d3e03c
+family gemma3	3a1edc80b93d2cba
+family gemma3n	9cd4091acaa23944
+family gemma4	e9c3f85717eab0da
+family glm4	bfc1b15b9567d6f0
+family glm4_moe	b53aba76bac292c3
+family glm4_moe_lite	6f6dcd7e68c0f383
+family glm5_next	6057ce31c418fd97
+family glm_moe_dsa	71bfc60d65aac4ac
+family gpt2	9c068dd7474c8ec6
+family gpt_bigcode	248f556f27a17569
+family gpt_neo	e38f7a20115cd625
+family gpt_neox	1f770b235453e6cc
+family gpt_oss	30a2eaf6ccd98958
+family gptj	a7925fe0f1ac03ab
+family granite	e7afd09c842ce89b
+family granite_swa	bc33f0f545cedab2
+family granitemoe	1559bd3ef9ae98fe
+family granitemoehybrid	18c4c06b3e72d9f0
+family helium	24333464f71aa2b6
+family hunyuan_v1_dense	712fe74ca9fa1d57
+family hunyuan_v1_moe	f11165ad0a42b5b7
+family hy_v3	3ebb30dde3321896
+family internlm2	e5a4849bbd98d0aa
+family jais2	a6e0b4edb4513aab
+family jamba	89993c9fe24a3c1b
+family kimi_k25	1ffbc6d576e4e04a
+family kimi_k3	28ef03ddda82ac5
+family kimi_linear	cbb76ad6a106ec0c
+family laguna	22bf3704d99cf3ec
+family lfm2	73398f944068dddb
+family lfm2_moe	d713d0716e30bb73
+family llama	db39626b70d77ff
+family llama4	b1436ab82315bbf0
+family mamba2	8d0d806d7fce66f3
+family mellum	4145798c7a923d36
+family memt_deepseek_v4	dea26b049ade5da3
+family memt_qwen3_5_moe	ac74f3f751d982ca
+family mimo_v2_flash	18d72199e3a33990
+family minicpm	2ee4c1936ad788ba
+family minimax	2a69943f0c57a72e
+family minimax_m2	d06828132ecbcdb7
+family minimax_m3_vl_text	ed1ba163711799b0
+family ministral3	5119e0b8307eab0f
+family mistral	451962538dca8852
+family mistral4	5cf8bc72a3ff7fdf
+family mixtral	6ff5d0146142c8ae
+family mpt	43ec6045b7546c26
+family nanochat	ee83ecbf6acacf8f
+family nemotron	8ed0661cd7b04c4c
+family nemotron_h	f9ceef1c68ccf209
+family olmo	ec32af731bd46d41
+family olmo2	282b078c682a1895
+family olmoe	1fc771e1f62dca73
+family opt	d73a8608b32bef64
+family persimmon	daa4f9fd4f433c2b
+family phi	9bcc9d670af2d526
+family phi3	4a37c41bcad6e308
+family qwen2	4ac577eae3c8a3c8
+family qwen2_moe	a0bef8cb68593b94
+family qwen3	7bf087a679f6b98b
+family qwen3_5	32cc86d45ca51499
+family qwen3_5_moe	452f0bc27a3366b5
+family qwen3_moe	7aa9208500f9cf4e
+family qwen3_next	79c5baf5c44a8915
+family qwen4_exp	6c885216096593b4
+family raon1_mini	7be017fefb8c82fd
+family seed_oss	4177d003b310fa6f
+family smollm3	f4b503bbc5cea5d
+family solar_open	94739bf80a194660
+family spark2_5	68cde9d4349aaab2
+family stablelm	1124b53d23eb108a
+family starcoder2	25a46324d0bf4587
+family xglm	edc4ac02c26cb7b6
 config afmoe	7d1732b30681ba96
 config afmoe variant 1	7d1732b30681ba96
 config afmoe variant 2	579edd7d085ca5e0
@@ -244,199 +247,199 @@ config deepseek_v3_latent_eps variant 1	3f7561991f45e82e
 config deepseek_v3_latent_eps variant 2	de0171ba6bb22804
 config deepseek_v3_latent_eps variant 3	b99ff563a4609b14
 config deepseek_v3_latent_eps variant 4	ab36ef1ce7563a4
-config deepseek_v4	2547bf5db27963fd
+config deepseek_v4	df089ca6edb8b2d1
 config deepseek_v4 variant 1	e143995e51be5b25
-config deepseek_v4 variant 2	2547bf5db27963fd
-config deepseek_v4 variant 3	2547bf5db27963fd
-config deepseek_v4 variant 4	eb3045600367ff57
-config deepseek_v4 variant 5	eb3045600367ff57
-config deepseek_v4 variant 6	48f8bc7334075cd7
-config deepseek_v4 variant 7	2547bf5db27963fd
+config deepseek_v4 variant 2	df089ca6edb8b2d1
+config deepseek_v4 variant 3	df089ca6edb8b2d1
+config deepseek_v4 variant 4	83c31e2f3082a2f1
+config deepseek_v4 variant 5	83c31e2f3082a2f1
+config deepseek_v4 variant 6	993ccf1a4e51ac2c
+config deepseek_v4 variant 7	df089ca6edb8b2d1
 config deepseek_v4 variant 8	b99ff563a4609b14
 config deepseek_v4 variant 9	b99ff563a4609b14
 config deepseek_v4 variant 10	b99ff563a4609b14
-config deepseek_v4 variant 11	48f8bc7334075cd7
-config deepseek_v4 variant 12	48f8bc7334075cd7
-config deepseek_v4 variant 13	48f8bc7334075cd7
-config deepseek_v4 variant 14	b9461945809f0ef2
-config deepseek_v4 variant 15	f3e7da84f94a84e6
-config deepseek_v4 variant 16	3531c9a4ce6daae1
-config deepseek_v4 variant 17	2547bf5db27963fd
-config deepseek_v4 variant 18	5ae55d62e027a322
-config deepseek_v4 variant 19	2547bf5db27963fd
-config deepseek_v4 variant 20	68e2afc80cd8e3ab
+config deepseek_v4 variant 11	993ccf1a4e51ac2c
+config deepseek_v4 variant 12	993ccf1a4e51ac2c
+config deepseek_v4 variant 13	993ccf1a4e51ac2c
+config deepseek_v4 variant 14	f7fcd975f4a0000
+config deepseek_v4 variant 15	b26ddbc7f3bc2775
+config deepseek_v4 variant 16	20a1832b09727d79
+config deepseek_v4 variant 17	df089ca6edb8b2d1
+config deepseek_v4 variant 18	62c88b00f109b6e6
+config deepseek_v4 variant 19	df089ca6edb8b2d1
+config deepseek_v4 variant 20	51129a0709c80ec5
 config deepseek_v4 variant 21	b99ff563a4609b14
 config deepseek_v4 variant 22	b99ff563a4609b14
 config deepseek_v4 variant 23	b99ff563a4609b14
-config deepseek_v4 variant 24	cea5024a89004d4e
+config deepseek_v4 variant 24	33f6abe712dafc27
 config deepseek_v4 variant 25	b99ff563a4609b14
-config deepseek_v4 variant 26	21faa0a0836b92e5
-config deepseek_v4 variant 27	d49658e739973004
-config deepseek_v4 variant 28	d09f876137372477
-config deepseek_v4 variant 29	b70d11d85a656b5f
-config deepseek_v4 variant 30	bc404c31b1ab965
-config deepseek_v4 variant 31	1a756f18f3bcdf8f
-config deepseek_v4 variant 32	dd4f3ed822f0be5e
-config deepseek_v4 variant 33	3b2104e0ca613978
-config deepseek_v4 variant 34	a4a392eef460dd7e
-config deepseek_v4 variant 35	f3851e2bfa2ebfc
-config deepseek_v4 variant 36	7346c6b12618bfe2
-config deepseek_v4 variant 37	2547bf5db27963fd
-config deepseek_v4 variant 38	2547bf5db27963fd
-config deepseek_v4 variant 39	2547bf5db27963fd
-config deepseek_v4 variant 40	da7400c1325410d2
-config deepseek_v4 variant 41	4fea9328398b2996
-config deepseek_v4 variant 42	a4a392eef460dd7e
-config deepseek_v4 variant 43	ad231318ab05ef07
-config deepseek_v4 variant 44	f3851e2bfa2ebfc
-config deepseek_v4 variant 45	f3851e2bfa2ebfc
-config deepseek_v4 variant 46	f3851e2bfa2ebfc
-config deepseek_v4 variant 47	f3851e2bfa2ebfc
-config deepseek_v4 variant 48	3045f9f6779d0156
-config deepseek_v4 variant 49	af4bcb51d75e9797
-config deepseek_v4 variant 50	af4bcb51d75e9797
-config deepseek_v4 variant 51	2547bf5db27963fd
-config deepseek_v4 variant 52	2547bf5db27963fd
-config deepseek_v4 variant 53	dfdc185944cf553a
-config deepseek_v4 variant 54	9ec7e2ef1ad1e6ea
-config deepseek_v4 variant 55	dfdc185944cf553a
-config deepseek_v4 variant 56	dfdc185944cf553a
-config deepseek_v4 variant 57	713df972b5cdc9f6
-config deepseek_v4 variant 58	7b01faff9083b80a
-config deepseek_v4 variant 59	f18506d1e25232dd
-config deepseek_v4 variant 60	2547bf5db27963fd
-config deepseek_v4 variant 61	f988233c90f889c4
-config deepseek_v4 variant 62	fcfae0e87d73d79b
-config deepseek_v4 variant 63	2547bf5db27963fd
-config deepseek_v4 variant 64	7976c160a0fc4e75
+config deepseek_v4 variant 26	39135d2b6d483cc
+config deepseek_v4 variant 27	e2bb1c5c95d4d1b0
+config deepseek_v4 variant 28	6716f75ceaf95f6c
+config deepseek_v4 variant 29	c50da4f760597643
+config deepseek_v4 variant 30	4cb4fcb03584e955
+config deepseek_v4 variant 31	9d04077be1b38942
+config deepseek_v4 variant 32	e3063187fde5e8e1
+config deepseek_v4 variant 33	d1854ec88d03f4b7
+config deepseek_v4 variant 34	5b8aa72fd36b0ca1
+config deepseek_v4 variant 35	64f2370c9ba6ad97
+config deepseek_v4 variant 36	525694fb4e794472
+config deepseek_v4 variant 37	df089ca6edb8b2d1
+config deepseek_v4 variant 38	df089ca6edb8b2d1
+config deepseek_v4 variant 39	df089ca6edb8b2d1
+config deepseek_v4 variant 40	3bae116af7d3d667
+config deepseek_v4 variant 41	7c4d70fcb4186e20
+config deepseek_v4 variant 42	5b8aa72fd36b0ca1
+config deepseek_v4 variant 43	d2025f49e6416ee0
+config deepseek_v4 variant 44	64f2370c9ba6ad97
+config deepseek_v4 variant 45	64f2370c9ba6ad97
+config deepseek_v4 variant 46	64f2370c9ba6ad97
+config deepseek_v4 variant 47	64f2370c9ba6ad97
+config deepseek_v4 variant 48	cb2dcd0cabfa9948
+config deepseek_v4 variant 49	693ed1b15a4364ba
+config deepseek_v4 variant 50	693ed1b15a4364ba
+config deepseek_v4 variant 51	df089ca6edb8b2d1
+config deepseek_v4 variant 52	df089ca6edb8b2d1
+config deepseek_v4 variant 53	d306fc60adc1028
+config deepseek_v4 variant 54	607ac9683a19d679
+config deepseek_v4 variant 55	d306fc60adc1028
+config deepseek_v4 variant 56	d306fc60adc1028
+config deepseek_v4 variant 57	596571ec01bf911d
+config deepseek_v4 variant 58	6aa837ff6831b20f
+config deepseek_v4 variant 59	16e754d591cf465
+config deepseek_v4 variant 60	df089ca6edb8b2d1
+config deepseek_v4 variant 61	e9ca5deacbea65d0
+config deepseek_v4 variant 62	4f2c5e2ad43032d0
+config deepseek_v4 variant 63	df089ca6edb8b2d1
+config deepseek_v4 variant 64	62c1db94ce812b66
 config deepseek_v4 variant 65	b99ff563a4609b14
 config deepseek_v4 variant 66	b99ff563a4609b14
-config deepseek_v4 variant 67	8026c17aec2ab5b7
-config deepseek_v4 variant 68	7976c160a0fc4e75
-config deepseek_v4 variant 69	adc8c7fa1da759d0
-config deepseek_v4 variant 70	e39d6cf492778f
+config deepseek_v4 variant 67	c31aaf3c2679c90d
+config deepseek_v4 variant 68	62c1db94ce812b66
+config deepseek_v4 variant 69	549f089177888ba1
+config deepseek_v4 variant 70	a3348dfe562cdb2d
 config deepseek_v4 variant 71	b99ff563a4609b14
-config deepseek_v4 variant 72	f0a622e2e83b0616
-config deepseek_v4 variant 73	2547bf5db27963fd
-config deepseek_v4 variant 74	4e6ce3a36269b914
+config deepseek_v4 variant 72	3ab05ad2347e0dbf
+config deepseek_v4 variant 73	df089ca6edb8b2d1
+config deepseek_v4 variant 74	33448359e58a59b
 config deepseek_v4 variant 75	b99ff563a4609b14
 config deepseek_v4 variant 76	b99ff563a4609b14
-config deepseek_v4 variant 77	2547bf5db27963fd
-config deepseek_v4 variant 78	8ebd349d37da9819
-config deepseek_v4 variant 79	f0a622e2e83b0616
-config deepseek_v4 variant 80	f0a622e2e83b0616
+config deepseek_v4 variant 77	df089ca6edb8b2d1
+config deepseek_v4 variant 78	795f6b2c1b0fa508
+config deepseek_v4 variant 79	3ab05ad2347e0dbf
+config deepseek_v4 variant 80	3ab05ad2347e0dbf
 config deepseek_v4 variant 81	b99ff563a4609b14
 config deepseek_v4 variant 82	b99ff563a4609b14
-config deepseek_v4 variant 83	2547bf5db27963fd
+config deepseek_v4 variant 83	df089ca6edb8b2d1
 config deepseek_v4 variant 84	e143995e51be5b25
 config deepseek_v4 variant 85	b99ff563a4609b14
-config deepseek_v4 variant 86	8ebd349d37da9819
+config deepseek_v4 variant 86	795f6b2c1b0fa508
 config deepseek_v4 variant 87	b99ff563a4609b14
 config deepseek_v4 variant 88	b99ff563a4609b14
-config deepseek_v4 variant 89	3fd6259613da09c2
-config deepseek_v4 variant 90	d5f5634187d82d17
-config deepseek_v4 variant 91	344dd838833de879
-config deepseek_v4 variant 92	903bffd8f621bf8f
+config deepseek_v4 variant 89	60cf9be0b04d9ec8
+config deepseek_v4 variant 90	62e3a604018db094
+config deepseek_v4 variant 91	5245b0dae9c5860b
+config deepseek_v4 variant 92	7e57d73cf4e572a0
 config deepseek_v4 variant 93	b99ff563a4609b14
 config deepseek_v4 variant 94	b99ff563a4609b14
-config deepseek_v4 variant 95	1f0a8a2f14e90354
+config deepseek_v4 variant 95	c0f0e603fd6fc56e
 config deepseek_v4 variant 96	b99ff563a4609b14
 config deepseek_v4 variant 97	b99ff563a4609b14
-config deepseek_v4 variant 98	2547bf5db27963fd
-config deepseek_v4 variant 99	256f96201de76e44
-config deepseek_v41	8147e6f28ea852de
-config deepseek_v41 variant 1	8147e6f28ea852de
-config deepseek_v41 variant 2	e8b6c4f8f221e3cf
-config deepseek_v41 variant 3	8147e6f28ea852de
-config deepseek_v41 variant 4	8147e6f28ea852de
+config deepseek_v4 variant 98	df089ca6edb8b2d1
+config deepseek_v4 variant 99	7235be8db3b6403
+config deepseek_v41	eb8f3770afac793b
+config deepseek_v41 variant 1	eb8f3770afac793b
+config deepseek_v41 variant 2	7b1eb56c327b13
+config deepseek_v41 variant 3	eb8f3770afac793b
+config deepseek_v41 variant 4	eb8f3770afac793b
 config deepseek_v41 variant 5	e143995e51be5b25
-config deepseek_v41 variant 6	88af39058f754657
-config deepseek_v41 variant 7	c337039a143e8017
-config deepseek_v41 variant 8	8147e6f28ea852de
-config deepseek_v41 variant 9	c337039a143e8017
-config deepseek_v41 variant 10	8147e6f28ea852de
+config deepseek_v41 variant 6	dc8efbe88d288a4d
+config deepseek_v41 variant 7	601fea382b97191a
+config deepseek_v41 variant 8	eb8f3770afac793b
+config deepseek_v41 variant 9	601fea382b97191a
+config deepseek_v41 variant 10	eb8f3770afac793b
 config deepseek_v41 variant 11	b99ff563a4609b14
-config deepseek_v41 variant 12	5477fb4ab183930
+config deepseek_v41 variant 12	a1e89228984fa95
 config deepseek_v41 variant 13	b99ff563a4609b14
-config deepseek_v41 variant 14	e306210c7db2fad4
+config deepseek_v41 variant 14	5670930f17372cb7
 config deepseek_v41 variant 15	b99ff563a4609b14
 config deepseek_v41 variant 16	b99ff563a4609b14
-config deepseek_v41 variant 17	8147e6f28ea852de
+config deepseek_v41 variant 17	eb8f3770afac793b
 config deepseek_v41 variant 18	b99ff563a4609b14
-config deepseek_v41 variant 19	8147e6f28ea852de
-config deepseek_v41 variant 20	6eeda39ade450034
+config deepseek_v41 variant 19	eb8f3770afac793b
+config deepseek_v41 variant 20	24b9470425f639af
 config deepseek_v41 variant 21	b99ff563a4609b14
-config deepseek_v41 variant 22	8147e6f28ea852de
-config deepseek_v41 variant 23	8147e6f28ea852de
-config deepseek_v41 variant 24	b9ac0abb6b0b5aa7
+config deepseek_v41 variant 22	eb8f3770afac793b
+config deepseek_v41 variant 23	eb8f3770afac793b
+config deepseek_v41 variant 24	aed5243332ab0d35
 config deepseek_v41 variant 25	b99ff563a4609b14
-config deepseek_v41 variant 26	b9ac0abb6b0b5aa7
-config deepseek_v41 variant 27	79f54fcf056a700
-config deepseek_v41 variant 28	8147e6f28ea852de
+config deepseek_v41 variant 26	aed5243332ab0d35
+config deepseek_v41 variant 27	83c78f1617546626
+config deepseek_v41 variant 28	eb8f3770afac793b
 config deepseek_v41 variant 29	b99ff563a4609b14
 config deepseek_v41 variant 30	b99ff563a4609b14
 config deepseek_v41 variant 31	b99ff563a4609b14
-config deepseek_v41 variant 32	c7876a4c18dc45d7
-config deepseek_v41 variant 33	8147e6f28ea852de
-config deepseek_v41 variant 34	8147e6f28ea852de
-config deepseek_v41 variant 35	8147e6f28ea852de
-config deepseek_v41 variant 36	8147e6f28ea852de
+config deepseek_v41 variant 32	3728b41d1e53f80
+config deepseek_v41 variant 33	eb8f3770afac793b
+config deepseek_v41 variant 34	eb8f3770afac793b
+config deepseek_v41 variant 35	eb8f3770afac793b
+config deepseek_v41 variant 36	eb8f3770afac793b
 config deepseek_v41 variant 37	b99ff563a4609b14
-config deepseek_v41 variant 38	8147e6f28ea852de
-config deepseek_v41 variant 39	55f7debd62ed1177
-config deepseek_v41 variant 40	8147e6f28ea852de
-config deepseek_v41 variant 41	55f7debd62ed1177
+config deepseek_v41 variant 38	eb8f3770afac793b
+config deepseek_v41 variant 39	20d223121db8ad2e
+config deepseek_v41 variant 40	eb8f3770afac793b
+config deepseek_v41 variant 41	20d223121db8ad2e
 config deepseek_v41 variant 42	b99ff563a4609b14
-config deepseek_v41 variant 43	deb6a42aeb174316
+config deepseek_v41 variant 43	d6aeebac4ed99309
 config deepseek_v41 variant 44	b99ff563a4609b14
-config deepseek_v41 variant 45	818c4aea794180c9
-config deepseek_v41 variant 46	deb68206c487721
-config deepseek_v41 variant 47	3eac3947ac1ee19e
-config deepseek_v41 variant 48	ae38882669fe77f5
-config deepseek_v41 variant 49	4d4af54d2acbe50e
-config deepseek_v41 variant 50	4d4af54d2acbe50e
+config deepseek_v41 variant 45	1f3b25b78f5f15ca
+config deepseek_v41 variant 46	838a7f5b1d288a63
+config deepseek_v41 variant 47	7b52090cb341d222
+config deepseek_v41 variant 48	23a4331626aaab1e
+config deepseek_v41 variant 49	19c93aa80bdeb1c8
+config deepseek_v41 variant 50	19c93aa80bdeb1c8
 config deepseek_v41 variant 51	b99ff563a4609b14
-config deepseek_v41 variant 52	7d9b69a6b0e2c6a
+config deepseek_v41 variant 52	b2a776113c89884c
 config deepseek_v41 variant 53	b99ff563a4609b14
-config deepseek_v41 variant 54	af52dcb84dd065eb
-config deepseek_v41 variant 55	9f9dcf340a19780c
+config deepseek_v41 variant 54	62481e7c5a88339
+config deepseek_v41 variant 55	4f428a1a4396c6d0
 config deepseek_v41 variant 56	b99ff563a4609b14
 config deepseek_v41 variant 57	b99ff563a4609b14
 config deepseek_v41 variant 58	b99ff563a4609b14
-config deepseek_v41 variant 59	4d4af54d2acbe50e
-config deepseek_v41 variant 60	1aa253c801f01eb9
-config deepseek_v41 variant 61	19eeeabd46db3209
-config deepseek_v41 variant 62	8147e6f28ea852de
-config deepseek_v41 variant 63	4a9bec36a35d6421
-config deepseek_v41 variant 64	d3fe5ba852d20bc0
-config deepseek_v41 variant 65	74eb5407d475cf3d
-config deepseek_v41 variant 66	dbd39b4a7333e6bc
-config deepseek_v41 variant 67	603fd59baeb27c5d
-config deepseek_v41 variant 68	d3a644e3634f1c91
-config deepseek_v41 variant 69	e657bd4384466f25
-config deepseek_v41 variant 70	b74e390563f3858f
-config deepseek_v41 variant 71	d1589e50d62d256a
-config deepseek_v41 variant 72	70ba7d9d2d327246
-config deepseek_v41 variant 73	186632f80732b37f
-config deepseek_v41 variant 74	4c5783520d8613ac
-config deepseek_v41 variant 75	71103e9f94f90169
+config deepseek_v41 variant 59	19c93aa80bdeb1c8
+config deepseek_v41 variant 60	b009d2833a69dd65
+config deepseek_v41 variant 61	a253c02dd0284056
+config deepseek_v41 variant 62	eb8f3770afac793b
+config deepseek_v41 variant 63	a38f2ffa1e1c1f4a
+config deepseek_v41 variant 64	57796a6b88121f46
+config deepseek_v41 variant 65	a780ff4329433c8c
+config deepseek_v41 variant 66	618a29ac4f784fd1
+config deepseek_v41 variant 67	33e0c840a003314e
+config deepseek_v41 variant 68	e39a8897bdc6fe63
+config deepseek_v41 variant 69	104707d47d56dcae
+config deepseek_v41 variant 70	640124ee1a5d1255
+config deepseek_v41 variant 71	eefb0372314fcc69
+config deepseek_v41 variant 72	166960fd9a951ab3
+config deepseek_v41 variant 73	f077ea3640aa4c17
+config deepseek_v41 variant 74	474e5f4ba12539ca
+config deepseek_v41 variant 75	e6100783b11367db
 config deepseek_v41 variant 76	b99ff563a4609b14
-config deepseek_v41 variant 77	f33205fa7ae39849
-config deepseek_v41 variant 78	ba5dc527b31a72a7
-config deepseek_v41 variant 79	11e832f70bfb4b0f
-config deepseek_v41 variant 80	f8f8e0ba6e077c32
+config deepseek_v41 variant 77	e44a7fd3adb6a02f
+config deepseek_v41 variant 78	44e5c0047aebcbe3
+config deepseek_v41 variant 79	b36da133fc52b041
+config deepseek_v41 variant 80	556fdec069f86fa
 config deepseek_v41 variant 81	b99ff563a4609b14
 config deepseek_v41 variant 82	b99ff563a4609b14
-config deepseek_v41 variant 83	55f7debd62ed1177
+config deepseek_v41 variant 83	20d223121db8ad2e
 config deepseek_v41 variant 84	b99ff563a4609b14
-config deepseek_v4_hubnames	2547bf5db27963fd
-config deepseek_v4_hubnames variant 1	3fd6259613da09c2
-config deepseek_v4_hubnames variant 2	f0a622e2e83b0616
-config deepseek_v4_hubnames variant 3	f3851e2bfa2ebfc
-config deepseek_v4_native	84175d1ceaeefcd9
-config deepseek_v4_native variant 1	545b371d60b903e1
-config deepseek_v4_native variant 2	e06274b9c7a36c54
-config deepseek_v4_native variant 3	860117451b11b80c
+config deepseek_v4_hubnames	df089ca6edb8b2d1
+config deepseek_v4_hubnames variant 1	60cf9be0b04d9ec8
+config deepseek_v4_hubnames variant 2	3ab05ad2347e0dbf
+config deepseek_v4_hubnames variant 3	64f2370c9ba6ad97
+config deepseek_v4_native	f157a32d15ffdde5
+config deepseek_v4_native variant 1	8641275b3ab20528
+config deepseek_v4_native variant 2	96559e19a5d722ab
+config deepseek_v4_native variant 3	642e001fdd9faa9d
 config dots1	d525fb090b91102d
 config dots1 variant 1	b99ff563a4609b14
 config dots1 variant 2	7bf113078fe02ddb
@@ -781,70 +784,70 @@ config glm4_moe_lite variant 23	6b08353164d57f6f
 config glm4_moe_lite variant 24	b99ff563a4609b14
 config glm4_moe_lite variant 25	840df0f6d9e1baea
 config glm4_moe_lite variant 26	840df0f6d9e1baea
-config glm5_next	8b16fe0bb6932c56
-config glm5_next variant 1	a75959c8b496155d
-config glm5_next variant 2	8b16fe0bb6932c56
-config glm5_next variant 3	92b7e5bb75c7cb25
-config glm5_next variant 4	b114877f8c53ea5b
-config glm5_next variant 5	a75959c8b496155d
-config glm5_next variant 6	360a790d7fbbda74
-config glm5_next variant 7	8b16fe0bb6932c56
-config glm5_next variant 8	92908303d42ca262
-config glm5_next variant 9	46a3518c6e279672
-config glm5_next variant 10	a75959c8b496155d
-config glm5_next variant 11	8b16fe0bb6932c56
-config glm5_next variant 12	a75959c8b496155d
-config glm5_next variant 13	a75959c8b496155d
-config glm5_next variant 14	a75959c8b496155d
-config glm5_next variant 15	33dec8b3962d1b67
-config glm5_next variant 16	8b16fe0bb6932c56
-config glm5_next variant 17	998a85aac3bda3d2
+config glm5_next	9252f2d15922383
+config glm5_next variant 1	4e4291e7c1de6ff9
+config glm5_next variant 2	9252f2d15922383
+config glm5_next variant 3	78d864a37a6a4e83
+config glm5_next variant 4	836c5038591eb347
+config glm5_next variant 5	4e4291e7c1de6ff9
+config glm5_next variant 6	3e3bede727f42331
+config glm5_next variant 7	9252f2d15922383
+config glm5_next variant 8	3e09cb442b0fd959
+config glm5_next variant 9	f208430be5f98759
+config glm5_next variant 10	4e4291e7c1de6ff9
+config glm5_next variant 11	9252f2d15922383
+config glm5_next variant 12	4e4291e7c1de6ff9
+config glm5_next variant 13	4e4291e7c1de6ff9
+config glm5_next variant 14	4e4291e7c1de6ff9
+config glm5_next variant 15	7c2927c5d8b4c27d
+config glm5_next variant 16	9252f2d15922383
+config glm5_next variant 17	f9054b8ac18ee7cc
 config glm5_next variant 18	b99ff563a4609b14
-config glm5_next variant 19	8b16fe0bb6932c56
+config glm5_next variant 19	9252f2d15922383
 config glm5_next variant 20	b99ff563a4609b14
 config glm5_next variant 21	b99ff563a4609b14
 config glm5_next variant 22	b99ff563a4609b14
 config glm5_next variant 23	b99ff563a4609b14
 config glm5_next variant 24	b99ff563a4609b14
 config glm5_next variant 25	b99ff563a4609b14
-config glm5_next variant 26	16b3bc5c2b2f8cdd
+config glm5_next variant 26	7f1a12fbab729682
 config glm5_next variant 27	e143995e51be5b25
 config glm5_next variant 28	b99ff563a4609b14
 config glm5_next variant 29	b99ff563a4609b14
 config glm5_next variant 30	b99ff563a4609b14
-config glm5_next variant 31	2f5e7e8fd5606174
-config glm5_next variant 32	8b16fe0bb6932c56
-config glm5_next variant 33	8b16fe0bb6932c56
-config glm5_next variant 34	f6b931659aba163c
-config glm5_next variant 35	3c671eff802c9b86
+config glm5_next variant 31	527378cd65c49046
+config glm5_next variant 32	9252f2d15922383
+config glm5_next variant 33	9252f2d15922383
+config glm5_next variant 34	12a309d545d4f8e2
+config glm5_next variant 35	a842e8f587ca7be6
 config glm5_next variant 36	b99ff563a4609b14
-config glm5_next variant 37	47b2f48afaa2b5fe
-config glm5_next variant 38	8b16fe0bb6932c56
-config glm5_next variant 39	8b16fe0bb6932c56
-config glm5_next variant 40	c9f53c70a49c75a2
-config glm5_next variant 41	c9f53c70a49c75a2
-config glm5_next variant 42	8b16fe0bb6932c56
-config glm5_next variant 43	c9f53c70a49c75a2
-config glm5_next variant 44	2093f9e480705b9d
-config glm5_next variant 45	98cd72706c90b2f7
+config glm5_next variant 37	24d630d09d0d87e3
+config glm5_next variant 38	9252f2d15922383
+config glm5_next variant 39	9252f2d15922383
+config glm5_next variant 40	5c9dee87e8cd6eda
+config glm5_next variant 41	5c9dee87e8cd6eda
+config glm5_next variant 42	9252f2d15922383
+config glm5_next variant 43	5c9dee87e8cd6eda
+config glm5_next variant 44	dc71e86c54bc268c
+config glm5_next variant 45	48bf40cf3dee816a
 config glm5_next variant 46	e143995e51be5b25
-config glm5_next variant 47	994f9ae2a977f86b
+config glm5_next variant 47	144446916379ebf0
 config glm5_next variant 48	b99ff563a4609b14
-config glm5_next variant 49	2c9b556283c56f41
-config glm5_next variant 50	e7ec775cea68a3e2
-config glm5_next variant 51	8b16fe0bb6932c56
-config glm5_next variant 52	64de9928d2047b98
-config glm5_next variant 53	8b16fe0bb6932c56
-config glm5_next variant 54	e25cb12a2c2fbff3
-config glm5_next variant 55	1a8d7fba3c8c2f97
+config glm5_next variant 49	9be2c4db494a817
+config glm5_next variant 50	821cd297fd30b304
+config glm5_next variant 51	9252f2d15922383
+config glm5_next variant 52	db021b098f456bbf
+config glm5_next variant 53	9252f2d15922383
+config glm5_next variant 54	a0bbd8352883014e
+config glm5_next variant 55	deecfcf9ac3f7ff
 config glm5_next variant 56	b99ff563a4609b14
-config glm5_next variant 57	29c735c040370b18
-config glm5_next variant 58	d9c125390256beed
-config glm5_next variant 59	c17eb727e852f5ab
-config glm5_next variant 60	7b085bafb6f4ad8f
+config glm5_next variant 57	9a09361fd65f7ed7
+config glm5_next variant 58	ab618d9d78424705
+config glm5_next variant 59	57f81ecf63bed48d
+config glm5_next variant 60	f5871341e1736f59
 config glm5_next variant 61	e143995e51be5b25
 config glm5_next variant 62	e143995e51be5b25
-config glm5_next variant 63	8b16fe0bb6932c56
+config glm5_next variant 63	9252f2d15922383
 config glm_moe_dsa	5f5b39391b68b50f
 config glm_moe_dsa variant 1	f8aa623bd08dc047
 config glm_moe_dsa variant 2	5f5b39391b68b50f
@@ -1314,6 +1317,8 @@ config mellum variant 1	cefabc53c488296
 config mellum variant 2	a2ad0a905d0b4518
 config mellum variant 3	cefabc53c488296
 config mellum variant 4	a2ad0a905d0b4518
+config memt_deepseek_v4	638e9e383c14df82
+config memt_qwen3_5_moe	62660cabfcd603cb
 config mimo_v2	e3ea397819519a1a
 config mimo_v2 variant 1	e3ea397819519a1a
 config mimo_v2 variant 2	b5a8b989cc2b76e3
@@ -1859,95 +1864,97 @@ config qwen3_next	e1ff48a28abeab64
 config qwen3_next variant 1	5f57d3cea9f1e629
 config qwen3_next variant 2	5f57d3cea9f1e629
 config qwen3_next variant 3	1d712e9adb738bf7
-config qwen4_exp	ddd28ebade5c1ee4
-config qwen4_exp variant 1	54667e09dd2c8b8f
-config qwen4_exp variant 2	54667e09dd2c8b8f
-config qwen4_exp variant 3	54667e09dd2c8b8f
+config qwen4_exp	75665afdd8595d81
+config qwen4_exp variant 1	e34a89d0576402bc
+config qwen4_exp variant 2	e34a89d0576402bc
+config qwen4_exp variant 3	e34a89d0576402bc
 config qwen4_exp variant 4	e143995e51be5b25
-config qwen4_exp variant 5	54667e09dd2c8b8f
-config qwen4_exp variant 6	ddd28ebade5c1ee4
+config qwen4_exp variant 5	e34a89d0576402bc
+config qwen4_exp variant 6	75665afdd8595d81
 config qwen4_exp variant 7	e143995e51be5b25
-config qwen4_exp variant 8	54667e09dd2c8b8f
-config qwen4_exp variant 9	54667e09dd2c8b8f
-config qwen4_exp variant 10	db5f64028a26b94d
-config qwen4_exp variant 11	ddd28ebade5c1ee4
-config qwen4_exp variant 12	db5f64028a26b94d
-config qwen4_exp variant 13	ead005668749adfc
+config qwen4_exp variant 8	e34a89d0576402bc
+config qwen4_exp variant 9	e34a89d0576402bc
+config qwen4_exp variant 10	46ba42d767121885
+config qwen4_exp variant 11	75665afdd8595d81
+config qwen4_exp variant 12	46ba42d767121885
+config qwen4_exp variant 13	d6581a67761ee81b
 config qwen4_exp variant 14	e143995e51be5b25
-config qwen4_exp variant 15	f14e310846f7eecd
-config qwen4_exp variant 16	8ac7bfc8518a1156
-config qwen4_exp variant 17	f14e310846f7eecd
-config qwen4_exp variant 18	6fe31e7a22e5d249
-config qwen4_exp variant 19	657ae3bdcfe18a1c
-config qwen4_exp variant 20	ddd28ebade5c1ee4
-config qwen4_exp variant 21	e5f74f62fae6c63e
-config qwen4_exp variant 22	736fca55dcc34914
-config qwen4_exp variant 23	736fca55dcc34914
-config qwen4_exp variant 24	c2039de2062201f0
-config qwen4_exp variant 25	e5c347c85a7afcad
+config qwen4_exp variant 15	4efee16b959a1600
+config qwen4_exp variant 16	526a9f5952287fad
+config qwen4_exp variant 17	4efee16b959a1600
+config qwen4_exp variant 18	b2f26a8f6ba12c80
+config qwen4_exp variant 19	77c5a65d7a80119d
+config qwen4_exp variant 20	75665afdd8595d81
+config qwen4_exp variant 21	151cc000dbd1a167
+config qwen4_exp variant 22	cfd5d1ab13ecffc5
+config qwen4_exp variant 23	cfd5d1ab13ecffc5
+config qwen4_exp variant 24	c55e8c4e4ff0cf35
+config qwen4_exp variant 25	7b33108b8c2edee3
 config qwen4_exp variant 26	b99ff563a4609b14
 config qwen4_exp variant 27	b99ff563a4609b14
-config qwen4_exp variant 28	c2039de2062201f0
-config qwen4_exp variant 29	e5c347c85a7afcad
-config qwen4_exp variant 30	ccbcb0249da4548b
+config qwen4_exp variant 28	c55e8c4e4ff0cf35
+config qwen4_exp variant 29	7b33108b8c2edee3
+config qwen4_exp variant 30	8bfb58533e726d16
 config qwen4_exp variant 31	b99ff563a4609b14
-config qwen4_exp variant 32	af57e1feee21fdeb
-config qwen4_exp variant 33	2e48d5f57b40c37a
+config qwen4_exp variant 32	813cc0a9de33cd97
+config qwen4_exp variant 33	4ed5ae1fab3fd597
 config qwen4_exp variant 34	b99ff563a4609b14
 config qwen4_exp variant 35	b99ff563a4609b14
 config qwen4_exp variant 36	b99ff563a4609b14
 config qwen4_exp variant 37	b99ff563a4609b14
-config qwen4_exp variant 38	36ff6f6b267f2414
-config qwen4_exp variant 39	1341ed9e462f285d
+config qwen4_exp variant 38	61e15d19327061a3
+config qwen4_exp variant 39	27b42eb69caa85d4
 config qwen4_exp variant 40	b99ff563a4609b14
 config qwen4_exp variant 41	b99ff563a4609b14
 config qwen4_exp variant 42	b99ff563a4609b14
-config qwen4_exp variant 43	ddd28ebade5c1ee4
+config qwen4_exp variant 43	75665afdd8595d81
 config qwen4_exp variant 44	b99ff563a4609b14
-config qwen4_exp variant 45	e12b529ff4d41768
-config qwen4_exp variant 46	e12b529ff4d41768
-config qwen4_exp variant 47	e12b529ff4d41768
-config qwen4_exp variant 48	e12b529ff4d41768
-config qwen4_exp variant 49	ddd28ebade5c1ee4
-config qwen4_exp variant 50	63afa032fa25624d
+config qwen4_exp variant 45	461bfbb2f0122cde
+config qwen4_exp variant 46	461bfbb2f0122cde
+config qwen4_exp variant 47	461bfbb2f0122cde
+config qwen4_exp variant 48	461bfbb2f0122cde
+config qwen4_exp variant 49	75665afdd8595d81
+config qwen4_exp variant 50	4061fb53d95f624b
 config qwen4_exp variant 51	b99ff563a4609b14
 config qwen4_exp variant 52	b99ff563a4609b14
 config qwen4_exp variant 53	e143995e51be5b25
-config qwen4_exp variant 54	ddd28ebade5c1ee4
+config qwen4_exp variant 54	75665afdd8595d81
 config qwen4_exp variant 55	b99ff563a4609b14
 config qwen4_exp variant 56	b99ff563a4609b14
 config qwen4_exp variant 57	b99ff563a4609b14
-config qwen4_exp variant 58	ddd28ebade5c1ee4
+config qwen4_exp variant 58	75665afdd8595d81
 config qwen4_exp variant 59	b99ff563a4609b14
-config qwen4_exp variant 60	885bcdd997275ed0
+config qwen4_exp variant 60	1f0c7c64181af194
 config qwen4_exp variant 61	b99ff563a4609b14
 config qwen4_exp variant 62	b99ff563a4609b14
-config qwen4_exp variant 63	1a0794eea8ca9989
-config qwen4_exp variant 64	40133ecdc49871c1
-config qwen4_exp variant 65	ddd28ebade5c1ee4
+config qwen4_exp variant 63	9df4708f3654d0c
+config qwen4_exp variant 64	b06382df664c329c
+config qwen4_exp variant 65	75665afdd8595d81
 config qwen4_exp variant 66	b99ff563a4609b14
 config qwen4_exp variant 67	b99ff563a4609b14
-config qwen4_exp variant 68	e71916f09c35cd53
+config qwen4_exp variant 68	c6b2d3dc23412c78
 config qwen4_exp variant 69	b99ff563a4609b14
-config qwen4_exp variant 70	ddd28ebade5c1ee4
+config qwen4_exp variant 70	75665afdd8595d81
 config qwen4_exp variant 71	b99ff563a4609b14
 config qwen4_exp variant 72	b99ff563a4609b14
 config qwen4_exp variant 73	b99ff563a4609b14
 config qwen4_exp variant 74	b99ff563a4609b14
-config qwen4_exp variant 75	ddd28ebade5c1ee4
+config qwen4_exp variant 75	75665afdd8595d81
 config qwen4_exp variant 76	b99ff563a4609b14
 config qwen4_exp variant 77	b99ff563a4609b14
-config qwen4_exp variant 78	bda26968d7801ff5
-config qwen4_exp variant 79	e12b529ff4d41768
-config qwen4_exp variant 80	2ce9bc8b2044414d
-config qwen4_exp variant 81	81cd3cd5388d84eb
-config qwen4_exp variant 82	3fd6c21f17ecee6b
-config qwen4_exp variant 83	3b1d5b6aaff54e51
-config qwen4_exp variant 84	6f186d39cdcc8a1a
-config qwen4_exp variant 85	50ac2aaa54e0bf20
-config qwen4_exp variant 86	ddd28ebade5c1ee4
-config qwen4_exp variant 87	2df5048068c495f1
-config qwen4_exp variant 88	96c1e81d3d18829a
+config qwen4_exp variant 78	fd40bcb8e0b9c941
+config qwen4_exp variant 79	461bfbb2f0122cde
+config qwen4_exp variant 80	ba83aa3291d0d533
+config qwen4_exp variant 81	1bf0dc93c3633848
+config qwen4_exp variant 82	18e0ab13c93eeea0
+config qwen4_exp variant 83	5b402bbaa798e13b
+config qwen4_exp variant 84	937bf89049fc1278
+config qwen4_exp variant 85	795302322069666a
+config qwen4_exp variant 86	75665afdd8595d81
+config qwen4_exp variant 87	9a4ddc511a0bde51
+config qwen4_exp variant 88	e936462b1dfd393a
+config raon1_mini	5b4e7dd770fa9af7
+config raon1_mini_mxfp8	8cf694189960b76
 config seed_oss	ba55f0031d0bf1ea
 config smollm3	74a682cbf7409e57
 config smollm3 variant 1	74a682cbf7409e57
