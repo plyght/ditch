@@ -100,11 +100,11 @@ Useful flags (all also settable in `config.lua`; see `ditch --help`):
 ## Supported models
 
 Families are described by Lua model definitions (`src/models/*.lua`, compiled
-in), one per Hugging Face `model_type`. **96 families** are defined, from GPT-2,
+in), one per Hugging Face `model_type`. **99 families** are defined, from GPT-2,
 GPT-NeoX and BLOOM to Llama, Qwen, Gemma, Phi, GLM, Mistral, Granite, Kimi K3
 and DeepSeek V4.1 — dense and mixture-of-experts, Mamba and linear-attention
 hybrids, and quantised checkpoints. Every one has a fixture test against a
-NumPy reference forward pass (`tools/make_fixture.py`). **83** are also
+NumPy reference forward pass (`tools/make_fixture.py`). **84** are also
 verified on a released checkpoint (whole, or cut to its first layers) against
 transformers or the release's own code in float32; 2 more (`internlm2`,
 `minicpm`) on real weights against a re-implementation of their own code; the

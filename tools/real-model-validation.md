@@ -5744,3 +5744,57 @@ of the release:
       pass  abliteration export        reloaded export vs in-memory model: max |Δ| first-token logit 0.0000, argmax agreement 100%
       pass  abliteration edit          4 tensors edited; 4 matrices recomputed, worst excess over the rank-3 optimum 1.41e-7
     OK: 11 passed, 0 failed, 0 skipped
+
+## New and trending models (issue #1): Raon-1-mini
+
+**`raon1_mini` (KRAFTON/Raon-1-mini-preview) is verified against its own code.**
+transformers has no Raon class, so the reference is the release's modeling
+code (read first: model code only; its one file operation is
+transformers' quantizer patch for loading MXFP8). It targets transformers
+5.16.1: under 5.21 the fine-grained FP8 integration fuses the `moe.experts`
+container into its own module and asks for an activation named `situ`, which
+it does not have, so the reference runs in a 5.16.1 environment. Four things
+were new to ditch:
+
+* **Raon mHC**, a third hyper-connection site kind (`src/hyper.zig`): the
+  sigmoid collapse and expansion selectors and the Helmert chart of a
+  doubly-stochastic mixing matrix, blended with the identity (see
+  `docs/models.md`).
+* **The RDA write gate**: Kimi Delta Attention whose values are scaled per
+  head by `sigmoid(b + w) / sigmoid(b)` (`rda_w_proj`), so writes are
+  `sigmoid(b + w)` strong while erases stay `sigmoid(b)`.
+* **MXFP8** routed experts: E4M3 codes with U8 E8M0 scales per 32 columns, read
+  by the FP8 decoder with power-of-two scales.
+* **The pre-tokenizer**, which keeps runs of space-joined words as one piece
+  (`You are a` is token 174602), puts CJK/kana runs first and groups digits in
+  threes from the right. ditch had classified the pattern as Llama 3's: the
+  first verify ran ditch's forward correctly (residuals 7e-7) on different
+  token ids (`2656 459 247` for `174602`), and the greedy tokens parted. The
+  splitter now follows the pattern alternative by alternative, checked
+  against `tokenizers` on English, CJK, Hangul with marks, digits,
+  punctuation and whitespace.
+
+The verify also found two harness gaps: `ditch truncate --kinds` did not read
+`rda_config.rda_layers` / `mla_layers` (the cut kept layers 0 and 1, both RDA,
+and no MLA layer), and the abliteration check read the U8 E8M0 scales as
+numbers instead of exponents (the expert gate and up projections looked
+edited). Both are fixed. The fixture's NumPy reference agrees with the
+release code to 5e-5 (bf16 and MXFP8 experts). The real-weights cut keeps a
+dense RDA layer, an MoE RDA layer and an MoE MLA layer, with 8 of 128 experts
+(top-6 still routes) so the float32 exports fit on this disk:
+
+    $ python tools/truncate_checkpoint.py KRAFTON/Raon-1-mini-preview --layers 0,1,3 raon_cut --experts 8
+    $ ditch verify raon_cut --python ref516/bin/python
+    ditch verify raon_cut (layers 0,1,2)
+      pass  truncate                   layers 0,1,2 of the release
+      pass  load and forward           ditch probe ran 2 prompt(s)
+      pass  chat template (Jinja)      the model's own template, rendered by ditch's Jinja interpreter
+      pass  chat template and tokens   rendered prompts and token ids identical on 2 prompt(s)
+      pass  residuals                  all 4 entries agree, worst 1.08e-6 relative (entry 1); last third / first third 0.77
+      pass  first-token logits         worst 5.96e-7 of the logit range; argmax equal
+      pass  greedy tokens              identical on 2 prompt(s)
+      pass  abliteration study         2 trials, trial 1 exported
+      pass  abliteration directions    4 entries x 2560: unit norm within 1.0e-7 (some entries zero)
+      pass  abliteration export        reloaded export vs in-memory model: max |Δ| first-token logit 0.0000, argmax agreement 100%
+      pass  abliteration edit          20 tensors edited; 20 matrices recomputed, worst excess over the rank-3 optimum 2.56e-6
+    OK: 11 passed, 0 failed, 0 skipped

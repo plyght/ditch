@@ -1,7 +1,7 @@
 # Supported models
 
 ditch describes every model family it can run with one Lua model definition,
-`src/models/<model_type>.lua`, compiled into the binary. **There are 96
+`src/models/<model_type>.lua`, compiled into the binary. **There are 99
 definitions**, one per Hugging Face `model_type`, each with the tensor-name
 templates, norm and residual layout, attention and MLP layouts, positional
 encoding and MoE routing of that family, in terms of the building blocks
@@ -19,7 +19,8 @@ How a checkpoint is matched:
 * An Omni wrapper's `thinker_config` and a multimodal wrapper's `text_config`
   are unwrapped first, so the text model is what runs. A wrapper that has its
   own entry (Kimi K3, Kimi K2.5, MiMo V2, DeepSeek V4.1, GLM-5.3-Flash,
-  Qwen3.8-Flash-Next) wins over the family of its text config.
+  Qwen3.8-Flash-Next) wins over the family of its text config. MemT-1.0's
+  `backbone_configs` is unwrapped the same way.
 * An unknown `model_type` is an error that names the related families and
   suggests `ditch add-model`. Unknown layer types, quantisation formats and
   activations are errors too, never silent fallbacks.
@@ -28,7 +29,7 @@ Two kinds of evidence, in two columns:
 
 * **Fixture**: the family's forward pass is checked against a NumPy reference
   built from the Hugging Face implementation (`tools/make_fixture.py`,
-  `src/model_test.zig`). All 96 entries have one. A fixture is written from a
+  `src/model_test.zig`). All 99 entries have one. A fixture is written from a
   reading of the implementation, so it can share a misreading with the code;
   several families passed their fixture and still failed on real weights.
 * **Real weights**: a released checkpoint, whole or cut to its first layers
@@ -36,7 +37,7 @@ Two kinds of evidence, in two columns:
   transformers or the release's own code (`ditch probe --residuals` against
   `tools/probe_reference.py`); details and every number are in
   [`tools/real-model-validation.md`](../tools/real-model-validation.md).
-  **83** families are verified this way. **2** (`internlm2`, `minicpm`) are
+  **84** families are verified this way. **2** (`internlm2`, `minicpm`) are
   checked on real weights against a float32 re-implementation of the release's
   own code, because that code no longer runs under transformers 5. **11** have
   only a random-weight stub compared with transformers (the stub has the
@@ -52,10 +53,10 @@ Two kinds of evidence, in two columns:
 | [Gemma, GLM and ChatGLM](#gemma-glm-and-chatglm) | 6 |
 | [GPT-era and other legacy decoders](#gpt-era-and-other-legacy-decoders) | 14 |
 | [Mixture of experts](#mixture-of-experts) | 28 |
-| [Linear-attention and convolution hybrids](#linear-attention-and-convolution-hybrids) | 10 |
+| [Linear-attention and convolution hybrids](#linear-attention-and-convolution-hybrids) | 12 |
 | [State-space (Mamba) hybrids](#state-space-mamba-hybrids) | 5 |
-| [Sparse-indexer and hyper-connection families](#sparse-indexer-and-hyper-connection-families) | 3 |
-| **Total** | **96** |
+| [Sparse-indexer and hyper-connection families](#sparse-indexer-and-hyper-connection-families) | 4 |
+| **Total** | **99** |
 
 ## Llama-layout dense
 
@@ -174,10 +175,12 @@ than on dense models.
 | `qwen3_next` | — | yes | yes: Qwen3-Next-80B-A3B-Instruct, 4 layers | Gated DeltaNet linear layers (fused projections, `full_attention_interval`), sigmoid-gated full attention with per-head q/k norms, partial rotary, softmax MoE with shared expert. Qwen3-Next, Qwen3-Coder-Next. |
 | `qwen3_5` | `qwen3_5_text` | yes | yes: Qwen3.5-0.8B, whole | Qwen3.5 / Qwen3.8 dense: Gated DeltaNet with split projections and explicit `layer_types`, gated full attention, partial rotary. Multimodal wrappers keep the text config nested; vision weights pass through. |
 | `qwen3_5_moe` | `qwen3_5_moe_text` | yes | yes: Qwen3.5-35B-A3B, 4 layers (64 of 256 experts); Qwen3.8-2.4T cut | split-projection linear layers with a swish output gate, fused softmax MoE with shared expert. |
+| `memt_qwen3_5_moe` | — | yes | not yet: the release (MemT-1.0-Nano) loads (`--dry-run`) | MemT-1.0-Nano (MemTensor): a `qwen3_5_moe` backbone (config under `backbone_configs.text_config`) with a persistent memory module on the full-attention layers. The memory is read only when a caller passes a memory state (the release's `commit_memory` / session API); without one the model is exactly its backbone, which is what ditch runs. The memory tensors (`self_attn.memt.*`) pass through exports; the memory read enters before `o_proj`, so an `o_proj` edit applies to it too. |
 | `qwen4_exp` | `qwen4_exp_text` | yes | yes: Qwen3.8-Flash-Next cut | Qwen3.8-Flash-Next text config: gated hyper-connections over `hc_count` residual streams, Gated DeltaNet layers, sigmoid-gated full attention behind a QSA indexer (see [exactness bounds](#sparse-indexer-exactness-bounds)), per-layer n-gram embeddings (PLE, sharded tables read one row at a time), fused softmax MoE with a gated shared expert on every layer. |
 | `minimax` | `minimax_text_01`, `minimax_m1`, `MiniMaxText01`, `MiniMaxM1` | yes | stub only; MiniMax-Text-01 and M1 config-checked (`--dry-run`) | lightning attention layers (silu qkv, per-head decay recurrence, sigmoid output gate) alternating with softmax attention, the renormalised residual layout with α/β scales, softmax top-k MoE. |
 | `kimi_linear` | — | yes | yes: Kimi-Linear-48B-A3B-Instruct, 4 layers | Kimi-Linear-48B-A3B: Kimi Delta Attention with per-channel decay from a low-rank forget gate and q/k/v short convolution, 3:1 with MLA layers without RoPE, DeepSeek-V3-style sigmoid MoE with shared experts. Both the original checkpoint layout and the transformers module layout. |
 | `glm5_next` | `glm5_next_text` | yes | yes: GLM-5.3-Flash cut | GLM-5.3-Flash text config: manifold-constrained hyper-connections collapsed by an unweighted mean, KDA layers with the safe lower-bound forget gate, NoPE MLA layers behind a k-pool DSA indexer (see [exactness bounds](#sparse-indexer-exactness-bounds)), sigmoid MoE with top-2 group scores and floored renormalisation, clamped SwiGLU. |
+| `raon1_mini` | — | yes | yes: Raon-1-mini-preview cut (against its own code) | Raon-1-mini (KRAFTON): [Raon mHC](#raon-mhc-raon-1-mini) streams, Raon Delta Attention (KDA with the safe lower-bound forget gate, a full-rank output gate, separate squeezed q/k/v convolutions and the `rda_w_proj` write gate on the values), NoPE MLA with a sigmoid output gate, SiTU-GLU MLPs, sigmoid MoE with correction bias and a shared expert under `moe.`. bf16 or the released MXFP8 routed experts. Its pre-tokenizer keeps space-joined words as one piece (`You are a`). |
 | `kimi_k3` | `kimi_k3_text` | yes | yes: Kimi-K3 cut (against its own code) | Kimi K3: the image-video wrapper around a `kimi_linear` text config with [Attention Residual](#attention-residual-kimi-k3), KDA layers with the full-rank output gate and the safe forget gate, MLA layers with a sigmoid output gate, latent MoE with 896 experts, SiTU activation, two shared experts. bf16 or the released compressed-tensors MXFP4 experts. |
 
 ## State-space (Mamba) hybrids
@@ -202,11 +205,24 @@ projection.
 | `glm_moe_dsa` | — | yes | yes: GLM-5.3 and altar-1 cuts | GLM-5 family: MLA with a sparse indexer run as dense attention, sigmoid MoE with correction bias and shared experts. |
 | `deepseek_v4` | — | yes | yes: DeepSeek-V4-Flash, 4 layers | hyper-connections (`hc_mult` streams, Sinkhorn-mixed), low-rank q with unweighted head norm, shared-KV sliding attention with sinks and inverse-roped output, grouped output projection, CSA (overlapping pooled windows) and HCA branches with their own rope, sqrtsoftplus routing with correction bias, hash-routed (`tid2eid`) layers, clamped SwiGLU, shared expert. MTP tensors pass through. |
 | `deepseek_v41` | `deepseek_v41_text` | yes | yes: DeepSeek V4.1 cut (against its own code) | DeepSeek V4.1-Flash: single-pass hyper-connections, CSA2 shared compressed KV (`kv_source` groups), FP8/FP4 quantisation-aware rounding of the window KV and latents, engram n-gram hash layers (lazy table rows, tokenizer-derived compressed ids), `gate_temp` routing. Vision tensors pass through. |
+| `memt_deepseek_v4` | — | yes | not yet: the release (MemT-1.0-Flash) loads (`--dry-run`) | MemT-1.0-Flash (MemTensor): a DeepSeek-V4-Flash backbone (flat `deepseek_v4` config, bf16 experts, I32 `tid2eid` tables) with a persistent memory module on the attention of the `memt.layers`. As for the Nano, ditch runs the model as it runs without a memory state; the memory tensors pass through exports and its read enters through `o_a_proj` / `o_b_proj`. |
 
 For these families the residual at layer L is the single mixed vector that
 enters layer L's attention block, and the last entry is the final collapse
 that enters the output norm; the edited weights are the same output and down
 projections as everywhere else.
+
+### Raon mHC (Raon-1-mini)
+
+Raon-1-mini keeps four residual streams, copies of the embedding at the
+start, averaged into the final norm at the end. Around every attention and
+MLP block, projections of the RMS-scaled flattened streams give the collapse
+weights `sigmoid(...)`, the expansion weights `2 sigmoid(...)` and a
+`(n - 1)²` chart `Z` of the stream mixing matrix: `E = Q Z Qᵀ` with the
+Helmert basis `Q` (orthogonal to the all-ones vector), scaled into the
+doubly-stochastic set around `B = (I + 11ᵀ/n) / 2` and blended with the
+identity by `sigmoid(eta)`. `src/hyper.zig` runs it as a third site kind beside
+the Sinkhorn mHC of DeepSeek V4 / GLM-5.3-Flash and Qwen4-Exp's gated sites.
 
 ## Sparse-indexer exactness bounds
 
@@ -299,6 +315,10 @@ model:
   (E2M1 nibble pairs, low nibble first; `w = code * 2^(scale - 127)`) under the
   plain tensor names, `mxfp4_block_size` giving the 32-element group. The bf16
   MoE router (`moe_router_dtype`) is read as it is.
+* **MXFP8** (`quant_method = "mxfp8"`: Raon-1-mini's routed experts as
+  released): `weight` F8_E4M3 with a U8 (or F8_E8M0) `weight_scale_inv`
+  `[out, in / 32]` of E8M0 exponents, `w = code * 2^(scale - 127)`; the FP8
+  reader with power-of-two block scales.
 * **DeepSeek V4 / V4.1 as released** (`quant_method = "fp8"`, `scale_fmt =
   "ue8m0"`, `expert_dtype = "fp4"` at the top level of config.json or inside
   `quantization_config`): the FP8 weights' block scales are F8_E8M0 exponents
