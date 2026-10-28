@@ -5798,3 +5798,82 @@ dense RDA layer, an MoE RDA layer and an MoE MLA layer, with 8 of 128 experts
       pass  abliteration export        reloaded export vs in-memory model: max |Δ| first-token logit 0.0000, argmax agreement 100%
       pass  abliteration edit          20 tensors edited; 20 matrices recomputed, worst excess over the rank-3 optimum 2.56e-6
     OK: 11 passed, 0 failed, 0 skipped
+
+## New and trending models (issue #1): MemT-1.0 Nano and Flash
+
+**`memt_qwen3_5_moe` (MemTensor/MemT-1.0-Nano) and `memt_deepseek_v4`
+(MemTensor/MemT-1.0-Flash) are verified against their own code.** MemT
+adds a persistent memory module to a backbone's attention layers (Nano:
+Qwen3.5-MoE; Flash: DeepSeek-V4-Flash). The release code was read first: the
+model files hold model code plus a session API whose only file operations
+save and load memory state to a path the caller names; `encoding_dsv4.py`
+(Flash's prompt format) is string formatting only. The memory is read only
+when a caller passes a memory state (`commit_memory`, the session API).
+Without one, `MemTMemory.forward` returns before touching it and the model is
+exactly its backbone, which is what ditch runs and what the checks compare.
+The memory tensors pass through exports untouched.
+
+What the two needed:
+
+* `backbone_configs` (Nano's config nests the backbone there) unwrapped by the
+  config reader and by both truncate tools.
+* Flash's `tid2eid` hash tables stored as I32: integer tables promoted from the
+  raw index after dequantisation had its pick (I32 is also pack-quantized's
+  code dtype, so it cannot be typed at parse time).
+* Under the MemT wrapper, Qwen3.5-MoE's default top-k renormalisation was not
+  applied (its model-type check was a prefix match). The fixture caught it:
+  the real Nano would have routed with unnormalised weights.
+* Flash's `memt.layers` (0-based, top level) is renumbered by the truncate
+  tools, and the expert cut no longer slices attention tensors that happen to
+  have one row per expert (the CSA indexer's `gate_proj`, 256 rows).
+* The prompt format. Neither MemT-Flash nor DeepSeek-V4-Flash ships a Jinja
+  template. Their `encoding_dsv4.py` in chat mode (MemT's README:
+  `enable_thinking=False`) ends the prompt with `<｜Assistant｜></think>`,
+  and ditch's `deepseek_v4` family rendered it without the `</think>`, so a
+  model abliterated with ditch saw thinking-mode prompts. Both families now
+  use the `deepseek_v31` layout, which is that format, and the reference
+  harness renders prompts with a release's `encoding_dsv4.py` when there is
+  no template. (The DeepSeek-V4-Flash verification above used `--raw`, so it
+  never compared templates.)
+
+The references run in the transformers version the releases pin (5.12.1):
+5.21 has moved Qwen3.5-MoE's kernel helpers and decoder-layer attributes the
+release code uses. Cuts keep 16 of 256 experts (Nano) and 8 of 256 (Flash),
+so the float32 exports fit on this disk; Flash's kept layers are learned-routed
+(the hash-routed layers' tables name all 256 experts):
+
+    $ python tools/truncate_checkpoint.py MemTensor/MemT-1.0-Nano --layers 0,3 memt_nano_cut --experts 16
+    $ ditch verify memt_nano_cut --python ref512/bin/python
+    ditch verify memt_nano_cut (layers 0,1)
+      pass  truncate                   layers 0,1 of the release
+      pass  load and forward           ditch probe ran 2 prompt(s)
+      pass  chat template (Jinja)      the model's own template, rendered by ditch's Jinja interpreter
+      pass  chat template and tokens   rendered prompts and token ids identical on 2 prompt(s)
+      pass  residuals                  all 3 entries agree, worst 5.23e-7 relative (entry 2)
+      pass  first-token logits         worst 1.42e-6 of the logit range; argmax equal
+      pass  greedy tokens              identical on 2 prompt(s)
+      pass  abliteration study         2 trials, trial 1 exported
+      pass  abliteration directions    3 entries x 2048: unit norm within 8.7e-8 (some entries zero)
+      pass  abliteration export        reloaded export vs in-memory model: max |Δ| first-token logit 0.0000, argmax agreement 100%
+      pass  abliteration edit          6 tensors edited; 36 matrices recomputed, worst excess over the rank-3 optimum 9.26e-8
+    OK: 11 passed, 0 failed, 0 skipped
+
+    $ python tools/truncate_checkpoint.py MemTensor/MemT-1.0-Flash --layers 3,4 memt_flash_cut --experts 8
+    $ ditch verify memt_flash_cut --python ref512/bin/python
+    ditch verify memt_flash_cut (layers 0,1)
+      pass  truncate                   layers 0,1 of the release
+      pass  load and forward           ditch probe ran 2 prompt(s)
+      skip  chat template (Jinja)      the model ships no chat template; ditch uses its deepseek_v31 family
+      pass  chat template and tokens   rendered prompts and token ids identical on 2 prompt(s)
+      pass  residuals                  all 3 entries agree, worst 7.96e-7 relative (entry 2)
+      pass  first-token logits         worst 5.26e-7 of the logit range; argmax equal
+      pass  greedy tokens              identical on 2 prompt(s)
+      pass  abliteration study         2 trials, trial 1 exported
+      pass  abliteration directions    3 entries x 4096: unit norm within 9.0e-8 (some entries zero)
+      pass  abliteration export        reloaded export vs in-memory model: max |Δ| first-token logit 0.0000, argmax agreement 100%
+      pass  abliteration edit          2 tensors edited; 2 matrices recomputed, worst excess over the rank-3 optimum 2.75e-7
+    OK: 10 passed, 0 failed, 1 skipped
+
+The prompts are short, so Flash's HCA layer emits no compressed entry and
+the CSA layer a handful; the compressed branches themselves were checked on
+DeepSeek-V4-Flash with a 317-token passage (above).

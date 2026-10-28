@@ -113,6 +113,24 @@ test "truncate config: linear_attn_config ids, 1-based (Kimi) and 0-based (GLM)"
     try std.testing.expectEqual(@as(i64, 1), glm.object.get("first_k_dense_replace").?.integer);
 }
 
+test "truncate config: MemT's backbone_configs text config" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = try edit(a,
+        \\{"model_type": "memt_qwen3_5_moe", "backbone_configs": {"model_type": "qwen3_5_moe", "text_config": {"num_hidden_layers": 4,
+        \\ "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"]}}, "memt": {"chunk_tokens": 2048}}
+    , &.{ 0, 3 }, &.{});
+    const tc = v.object.get("backbone_configs").?.object.get("text_config").?.object;
+    try std.testing.expectEqual(@as(i64, 2), tc.get("num_hidden_layers").?.integer);
+    try std.testing.expectEqual(@as(usize, 2), tc.get("layer_types").?.array.items.len);
+    // MemT-1.0-Flash: the memory layers (0-based, top level) are renumbered.
+    const f = try edit(a,
+        \\{"model_type": "memt_deepseek_v4", "num_hidden_layers": 8, "memt": {"layers": [4, 6], "chunk_tokens": 2048}}
+    , &.{ 3, 4 }, &.{});
+    try expectInts(&.{1}, f.object.get("memt").?.object.get("layers"));
+}
+
 test "truncate config and kinds: Raon-1-mini rda_config ids (1-based)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

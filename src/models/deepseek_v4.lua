@@ -3,7 +3,7 @@ local dsv4 = require("dsv4")
 return {
   model_type = "deepseek_v4",
   llama_cpp = nil,
-  chat = "deepseek",
+  chat = "deepseek_v31",
   verified = true,
   notes = "fixture: hyper-connections (hc_mult streams, Sinkhorn-mixed), low-rank q with unweighted head norm, shared-KV sliding attention with sinks and inverse-roped output, grouped output projection, CSA (overlapping pooled windows; Lightning Indexer as dense: exact while every reachable entry fits index_topk) and HCA branches with their own rope, sqrtsoftplus MoE with correction bias, hash-routed (tid2eid) layers, clamped SwiGLU, shared expert, MTP tensors passed through. The released checkpoints (DeepSeek's own tensor names, FP8 with ue8m0 block scales, FP4 e2m1 experts) are renamed and dequantised on load; DeepSeek-V4-Flash's first four layers (sliding, CSA and HCA attention, hash and learned routing) match transformers in float32 on the real weights.",
   rope_style = "gptj",

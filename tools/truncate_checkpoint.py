@@ -84,7 +84,9 @@ for f in files:
         hf_hub_download(repo, f, local_dir=out)
 
 cfg = json.load(open(f"{out}/config.json"))
-tc = cfg.get('text_config', cfg)
+# MemT-1.0 nests its backbone's config under `backbone_configs`.
+tc = cfg.get('backbone_configs', cfg)
+tc = tc.get('text_config', tc)
 n_orig = tc['num_hidden_layers']
 tc['num_hidden_layers'] = N
 for key in ('layer_types', 'mlp_layer_types', 'num_attention_heads_per_layer', 'compress_ratios', 'is_moe_layer', 'sliding_windows', 'hybrid_layer_pattern', 'moe_layer_freq', 'no_rope_layers', 'intermediate_size', 'activation_sparsity_pattern'):
@@ -124,6 +126,9 @@ for sub, keys in (('linear_attn_config', ('kda_layers', 'full_attn_layers')),
         for key in keys:
             if isinstance(lac.get(key), list):
                 lac[key] = [new_id[x - one] + one for x in lac[key] if x - one in new_id]
+# MemT-1.0-Flash lists its memory layers (0-based) in the top-level `memt`.
+if isinstance(cfg.get('memt'), dict) and isinstance(cfg['memt'].get('layers'), list):
+    cfg['memt']['layers'] = [new_id[x] for x in cfg['memt']['layers'] if x in new_id]
 # Nemotron-H spells its layer kinds as one character per layer.
 if isinstance(tc.get('hybrid_override_pattern'), str):
     tc['hybrid_override_pattern'] = ''.join(tc['hybrid_override_pattern'][j] for j in layers)
@@ -153,7 +158,10 @@ json.dump(cfg, open(f"{out}/config.json", 'w'), indent=1)
 expert_idx_re = re.compile(r'experts\.(\d+)\.')
 def expert_rows(name, shape):
     # tensors indexed by expert along their first axis: stacked experts, the router, its bias
-    return bool(E_orig and shape and shape[0] == E_orig and layer_re.search(name) and re.search(r'(expert|gate|router|correction)', name))
+    # (never attention tensors: DeepSeek V4's CSA indexer has a `gate_proj` of
+    # index_n_heads rows, which can equal the expert count)
+    return bool(E_orig and shape and shape[0] == E_orig and layer_re.search(name) and re.search(r'(expert|gate|router|correction)', name)
+                and not re.search(r'(self_attn|attention|\.attn\.)', name))
 
 if 'model.safetensors.index.json' in files:
     wm = json.load(open(hf_hub_download(repo, 'model.safetensors.index.json', local_dir='/tmp/truncate_idx_' + repo.replace('/', '_'))))['weight_map']

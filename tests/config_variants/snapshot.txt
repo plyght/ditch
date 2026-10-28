@@ -12,7 +12,7 @@ family cohere	a6f855d03e4611bb
 family deepseek_v2	188a95278854b57e
 family deepseek_v3	545d70c0262bd6ea
 family deepseek_v32	fb14d4bf6c16e45b
-family deepseek_v4	14c3f3ea4e690819
+family deepseek_v4	fb97afd4ab4f2f40
 family deepseek_v41	87c7874d4ec74876
 family dots1	76b85435b619e259
 family ernie4_5	6f600b5d4ec70150
@@ -59,7 +59,7 @@ family llama	db39626b70d77ff
 family llama4	b1436ab82315bbf0
 family mamba2	8d0d806d7fce66f3
 family mellum	4145798c7a923d36
-family memt_deepseek_v4	dea26b049ade5da3
+family memt_deepseek_v4	2b8047daa195a065
 family memt_qwen3_5_moe	ac74f3f751d982ca
 family mimo_v2_flash	18d72199e3a33990
 family minicpm	2ee4c1936ad788ba

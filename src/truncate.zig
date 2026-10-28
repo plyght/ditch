@@ -134,8 +134,13 @@ fn truthy(v: Value) bool {
 /// present (multimodal checkpoints), else the top level.
 pub fn textConfig(root: *Value) !*ObjectMap {
     if (root.* != .object) return error.InvalidConfig;
-    if (root.object.getPtr("text_config")) |tc| if (tc.* == .object) return &tc.object;
-    return &root.object;
+    // MemT-1.0 nests its backbone's config under `backbone_configs`.
+    var obj = &root.object;
+    if (obj.getPtr("backbone_configs")) |bc| if (bc.* == .object) {
+        obj = &bc.object;
+    };
+    if (obj.getPtr("text_config")) |tc| if (tc.* == .object) return &tc.object;
+    return obj;
 }
 
 fn numLayers(tc: ObjectMap) !usize {
@@ -234,6 +239,12 @@ pub fn editConfig(a: Allocator, root: *Value, layers: []const usize, drop: []con
             }
             v.* = .{ .array = ids };
         };
+    };
+    // MemT-1.0-Flash lists its memory layers (0-based) in the top-level `memt`.
+    if (root.object.getPtr("memt")) |m| if (m.* == .object) if (m.object.getPtr("layers")) |v| if (v.* == .array) {
+        var ids = JsonArray.init(a);
+        for (v.array.items) |x| if (asInt(x)) |id| if (newId(layers, id)) |n| try ids.append(.{ .integer = n });
+        v.* = .{ .array = ids };
     };
     // Nemotron-H spells its layer kinds as one character per layer.
     if (tc.getPtr("hybrid_override_pattern")) |p| if (p.* == .string) {

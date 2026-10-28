@@ -34,7 +34,9 @@ the text, while ditch adds the id at tokenisation time; the texts are
 compared with that leading token removed, and the token ids decide.
 """
 import argparse
+import importlib.util
 import json
+import os
 import sys
 
 import numpy as np
@@ -220,12 +222,23 @@ def main():
     if trc:
         install_remote_code_shims()
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=trc)
+    dsv4_encoder = None
     if not args.raw and not getattr(tok, "chat_template", None):
-        # A base model without a template: ditch probes it as raw text too.
-        print("the tokenizer has no chat template; comparing raw prompts")
-        args.raw = True
+        # DeepSeek V4 releases (and MemT-1.0-Flash) ship no Jinja template:
+        # their prompt format is encoding_dsv4.py, used here in chat mode.
+        for rel in ("encoding_dsv4.py", "encoding/encoding_dsv4.py"):
+            path = os.path.join(args.model, rel)
+            if os.path.isfile(path):
+                spec = importlib.util.spec_from_file_location("encoding_dsv4", path)
+                dsv4_encoder = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(dsv4_encoder)
+                print(f"the tokenizer has no chat template; rendering prompts with {rel} (chat mode)")
+                break
+        else:
+            # A base model without a template: ditch probes it as raw text too.
+            print("the tokenizer has no chat template; comparing raw prompts")
+            args.raw = True
     if args.factory:
-        import importlib.util
         spec = importlib.util.spec_from_file_location("reference_factory", args.factory)
         factory = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(factory)
@@ -297,6 +310,9 @@ def main():
         messages = [{"role": "system", "content": args.system_prompt}, {"role": "user", "content": entry["user"]}]
         if args.raw:
             text = entry["user"]
+            ids = tok(text, add_special_tokens=False)["input_ids"]
+        elif dsv4_encoder is not None:
+            text = dsv4_encoder.encode_messages(messages, "chat")
             ids = tok(text, add_special_tokens=False)["input_ids"]
         else:
             try:
