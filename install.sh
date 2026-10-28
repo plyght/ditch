@@ -7,7 +7,7 @@
 # that have it), checks it against the release's SHA256SUMS and puts `ditch`
 # in ~/.local/bin. Settings, all optional:
 #
-#   DITCH_VERSION=v0.7.0         a release tag (default: the latest release)
+#   DITCH_VERSION=v0.8.0         a release tag (default: the latest release)
 #   DITCH_INSTALL_DIR=/usr/local/bin
 #   DITCH_BASELINE=1             the portable x86-64 build even when AVX2 is there
 #   DITCH_STATIC=1               the static (musl) Linux build, which cannot use a GPU
@@ -216,7 +216,7 @@ ditch installer
   curl -fsSL https://ditchcensorship.com/install | sh
   curl -fsSL https://ditchcensorship.com/install | sh -s -- --uninstall
 
-  DITCH_VERSION=v0.7.0         a release tag (default: the latest release)
+  DITCH_VERSION=v0.8.0         a release tag (default: the latest release)
   DITCH_INSTALL_DIR=DIR        where to put ditch (default: ~/.local/bin)
   DITCH_BASELINE=1             the portable x86-64 build even when AVX2 is there
   DITCH_STATIC=1               the static (musl) Linux build, which cannot use a GPU
